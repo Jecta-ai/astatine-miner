@@ -1,0 +1,69 @@
+schema-version = 1
+network = "testnet"
+chain-id = 1439
+native-symbol = "INJ"
+native-decimals = 18
+primary-rpc = "https://k8s.testnet.json-rpc.injective.network/"
+archival-rpc = "https://testnet.evm.archival.chain.virtual.json-rpc.injective.network/"
+mining-enabled = true
+
+[solidity-source]
+canonical-main-commit = "9527a16bcabc83fe1b6dc1bf6dffb770ae793710"
+observed-deployment-checkout = "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30"
+observed-deployment-branch = "feature/genesis-activator"
+deployment-label-reference = "genesis-activator-v2"
+work-codec-identical-to-canonical-main = true
+
+[reference-snapshot]
+block-number = 144713400
+block-hash = "0x8d15cb73994cf3c614c643e2822d61078dcb9e453b57f3c30b9f4257f215579e"
+
+[ast-token]
+address = "0x361FC326ff4e83a8299BFe036455Df781E5e4fdD"
+decimals = 9
+runtime-code-hash = "0x374e8e354b84990e6fb359b78f1b32e4c56c857facd619ceb223d5ed270b4d1d"
+
+[[nodes]]
+id = 1
+address = "0x24fE68D91F698e608ab92d22c0d00FA09f417868"
+runtime-code-hash = "0xab7dc77942b54f53fdf2a33a49816f61ace8a3a32af0f2c9d8117e90f89f1d7b"
+
+[[nodes]]
+id = 2
+address = "0xe95d999D146b50C24B5364b74E7a3abc92757612"
+runtime-code-hash = "0xab7dc77942b54f53fdf2a33a49816f61ace8a3a32af0f2c9d8117e90f89f1d7b"
+
+[[nodes]]
+id = 3
+address = "0xA118B50Fa3f7B5232D73b69AfA6e01647545c659"
+runtime-code-hash = "0xab7dc77942b54f53fdf2a33a49816f61ace8a3a32af0f2c9d8117e90f89f1d7b"
+
+[[nodes]]
+id = 4
+address = "0x72f02C75480163fB047C260565948e136C240ef3"
+runtime-code-hash = "0xab7dc77942b54f53fdf2a33a49816f61ace8a3a32af0f2c9d8117e90f89f1d7b"
+
+[[nodes]]
+id = 5
+address = "0x199A94831afADD27CCa33D8Bb265055842f80DE4"
+runtime-code-hash = "0xab7dc77942b54f53fdf2a33a49816f61ace8a3a32af0f2c9d8117e90f89f1d7b"
+
+[[nodes]]
+id = 6
+address = "0x02AAb49Ed48B23B351440bb3aCB43C62bEd6F451"
+runtime-code-hash = "0xab7dc77942b54f53fdf2a33a49816f61ace8a3a32af0f2c9d8117e90f89f1d7b"
+
+[[nodes]]
+id = 7
+address = "0x5d9b284F80dC493073Fb2E668f60A110603b4dA5"
+runtime-code-hash = "0xab7dc77942b54f53fdf2a33a49816f61ace8a3a32af0f2c9d8117e90f89f1d7b"
+
+[[nodes]]
+id = 8
+address = "0x19Bf884b1B033c3846a0fE80f03F40D6A65073cA"
+runtime-code-hash = "0xab7dc77942b54f53fdf2a33a49816f61ace8a3a32af0f2c9d8117e90f89f1d7b"
+
+[[nodes]]
+id = 9
+address = "0xfddB3d2877AaC41fA6325E760B97eA1F7A1E97ff"
+runtime-code-hash = "0xab7dc77942b54f53fdf2a33a49816f61ace8a3a32af0f2c9d8117e90f89f1d7b"

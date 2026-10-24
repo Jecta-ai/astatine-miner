@@ -1,0 +1,2 @@
+# Keep upstream license-text formatting in the generated dependency notice.
+THIRD_PARTY_LICENSES.md whitespace=-blank-at-eol,cr-at-eol,-blank-at-eof

@@ -1,0 +1,38 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Build, test, lint, and verify licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust components
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Test
+        run: cargo test --locked
+      - name: Release build
+        run: cargo build --locked --release
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Install pinned license tools
+        run: |
+          cargo install cargo-deny --locked --version 0.20.2
+          cargo install cargo-about --locked --version 0.9.2 --features cli
+      - name: Validate dependency policies
+        run: cargo deny check
+      - name: Regenerate third-party license notices
+        run: |
+          cargo about generate --locked about.hbs --output-file "$RUNNER_TEMP/THIRD_PARTY_LICENSES.md"
+          cmp THIRD_PARTY_LICENSES.md "$RUNNER_TEMP/THIRD_PARTY_LICENSES.md"
