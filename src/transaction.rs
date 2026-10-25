@@ -4,7 +4,10 @@ use crate::{
     contracts::{AstatineMinerRead, IERC20Read},
     diagnostics::DiagnosticBuffer,
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
-    rpc::{NetworkClient, ReadSnapshot, RpcLog, TransactionReceipt, is_transient_receipt_error},
+    rpc::{
+        NetworkClient, ReadSnapshot, RpcLog, TransactionReceipt, is_transient_receipt_error,
+        is_window_expired_revert, is_window_not_expired_revert,
+    },
     wallet::signer_address,
 };
 use alloy_primitives::{Address, B256, Bytes, U256, hex, keccak256};
@@ -56,6 +59,77 @@ pub struct SignedTransaction {
 pub enum TransactionAction {
     SubmitProof,
     FinalizeWindow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionPolicyRefusalKind {
+    SessionLimitExceeded,
+    InsufficientConfirmedBalance,
+    SigningDisabled,
+}
+
+#[derive(Debug)]
+pub struct TransactionPolicyRefusal {
+    pub kind: TransactionPolicyRefusalKind,
+    details: String,
+}
+
+impl std::fmt::Display for TransactionPolicyRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.details)
+    }
+}
+
+impl std::error::Error for TransactionPolicyRefusal {}
+
+#[derive(Debug)]
+pub struct StaleTransactionPreflight {
+    details: String,
+}
+
+#[derive(Debug)]
+pub struct MinedTransactionReverted {
+    pub action: TransactionAction,
+    pub window_id: u64,
+    details: String,
+}
+
+impl std::fmt::Display for StaleTransactionPreflight {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.details)
+    }
+}
+
+impl std::error::Error for StaleTransactionPreflight {}
+
+impl std::fmt::Display for MinedTransactionReverted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.details)
+    }
+}
+
+impl std::error::Error for MinedTransactionReverted {}
+
+pub fn transaction_policy_refusal(error: &anyhow::Error) -> Option<TransactionPolicyRefusalKind> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<TransactionPolicyRefusal>()
+            .map(|refusal| refusal.kind)
+    })
+}
+
+pub fn is_stale_transaction_preflight(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<StaleTransactionPreflight>().is_some())
+}
+
+pub fn mined_transaction_reverted(error: &anyhow::Error) -> Option<(TransactionAction, u64)> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<MinedTransactionReverted>()
+            .map(|reverted| (reverted.action, reverted.window_id))
+    })
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -463,11 +537,14 @@ impl TransactionJournal {
             .checked_add(maximum_exposure)
             .context("session spending total overflow")?;
         if session_total > session_limit {
-            bail!(
-                "transaction maximum exposure exceeds the configured per-session limit ({} > {}) wei",
-                session_total,
-                session_limit
-            );
+            return Err(TransactionPolicyRefusal {
+                kind: TransactionPolicyRefusalKind::SessionLimitExceeded,
+                details: format!(
+                    "transaction maximum exposure exceeds the configured per-session limit ({} > {}) wei",
+                    session_total, session_limit
+                ),
+            }
+            .into());
         }
         let total_exposure = self
             .pending_exposure()?
@@ -477,11 +554,14 @@ impl TransactionJournal {
             .checked_add(total_exposure)
             .context("minimum reserve plus transaction exposure overflow")?;
         if confirmed_balance < required_balance {
-            bail!(
-                "insufficient confirmed INJ balance after reserve and pending exposure: need at least {} wei, have {} wei",
-                required_balance,
-                confirmed_balance
-            );
+            return Err(TransactionPolicyRefusal {
+                kind: TransactionPolicyRefusalKind::InsufficientConfirmedBalance,
+                details: format!(
+                    "insufficient confirmed INJ balance after reserve and pending exposure: need at least {} wei, have {} wei",
+                    required_balance, confirmed_balance
+                ),
+            }
+            .into());
         }
         if self.state.entries.len() >= MAX_JOURNAL_ENTRIES {
             bail!("transaction journal reached its entry limit; archive it before further mining");
@@ -1622,6 +1702,14 @@ impl TransactionManager {
             .context("active session exposure exceeds configured spending limit")
     }
 
+    pub fn proof_attempted(&self, contract: Address, window_id: u64) -> bool {
+        self.journal
+            .state
+            .proof_attempted_through
+            .get(&proof_attempt_key(contract))
+            .is_some_and(|last_attempted| window_id <= *last_attempted)
+    }
+
     pub fn session_exposure(&self) -> Result<Option<U256>> {
         if self.journal.state.active_session.is_none() {
             return Ok(None);
@@ -1641,7 +1729,13 @@ impl TransactionManager {
             bail!("transaction signing is disabled outside the approved Injective Testnet profile");
         }
         if self.session_limit.is_zero() {
-            bail!("transaction signing is disabled because the configured session cap is zero");
+            return Err(TransactionPolicyRefusal {
+                kind: TransactionPolicyRefusalKind::SigningDisabled,
+                details:
+                    "transaction signing is disabled because the configured session cap is zero"
+                        .to_owned(),
+            }
+            .into());
         }
         if self.journal.has_unresolved() {
             bail!(
@@ -1670,9 +1764,33 @@ impl TransactionManager {
             self.wallet,
             &intent,
         )?;
-        let quote = client
+        let quote = match client
             .fee_quote(self.wallet, intent.contract, value, &data)
-            .await?;
+            .await
+        {
+            Ok(quote) => quote,
+            Err(error)
+                if intent.action == TransactionAction::SubmitProof
+                    && is_window_expired_revert(&error) =>
+            {
+                return Err(StaleTransactionPreflight {
+                    details: "eth_estimateGas reports WindowExpired; local proof was discarded and chain state must be refreshed"
+                        .to_owned(),
+                }
+                .into());
+            }
+            Err(error)
+                if intent.action == TransactionAction::FinalizeWindow
+                    && is_window_not_expired_revert(&error) =>
+            {
+                return Err(StaleTransactionPreflight {
+                    details: "eth_estimateGas reports WindowNotExpired; fresh canonical state must be checked before retrying"
+                        .to_owned(),
+                }
+                .into());
+            }
+            Err(error) => return Err(error).context("quote fees for transaction preflight"),
+        };
         let nonce = client.pending_nonce(self.wallet).await?;
         let pending_balance = client.pending_balance(self.wallet).await?;
         let fresh_snapshot = client.snapshot(Some(self.wallet)).await?;
@@ -1696,9 +1814,11 @@ impl TransactionManager {
             bail!("selected node contract address differs from its built-in Testnet pin");
         }
         if client.pending_nonce(self.wallet).await? != nonce {
-            bail!(
-                "wallet pending nonce changed before transaction signing; refresh before retrying"
-            );
+            return Err(StaleTransactionPreflight {
+                details: "wallet pending nonce changed before transaction signing; refresh before retrying"
+                    .to_owned(),
+            }
+            .into());
         }
         let request = Eip1559Request {
             chain_id: self.chain_id,
@@ -1837,14 +1957,19 @@ impl TransactionManager {
                 {
                     ReceiptProgress::Settled(outcome) => {
                         if !receipt.status {
-                            let actual_cost =
-                                self.journal.entry(signed.hash)?.actual_cost_wei.context(
-                                    "settled reverted transaction has no recorded actual cost",
-                                )?;
-                            bail!(
-                                "transaction {:#x} was mined but reverted ({actual_cost} wei) and charged gas; it will not be retried",
-                                signed.hash
-                            );
+                            let entry = self.journal.entry(signed.hash)?;
+                            let actual_cost = entry.actual_cost_wei.context(
+                                "settled reverted transaction has no recorded actual cost",
+                            )?;
+                            return Err(MinedTransactionReverted {
+                                action: entry.action,
+                                window_id: entry.window_id,
+                                details: format!(
+                                    "transaction {:#x} was mined but reverted ({actual_cost} wei) and charged gas; this transaction hash will not be resent",
+                                    signed.hash
+                                ),
+                            }
+                            .into());
                         }
                         return Ok(ConfirmedAction {
                             transaction_hash: signed.hash,
@@ -1946,22 +2071,32 @@ fn validate_fresh_state(
     wallet: Address,
     intent: &TransactionIntent,
 ) -> Result<()> {
-    let node = snapshot
-        .nodes
-        .iter()
-        .find(|node| node.id == intent.node_id)
-        .context("selected node is missing from the fresh verified snapshot")?;
-    let state = node
-        .state
-        .as_ref()
-        .context("selected node state is unavailable or not ABI-verified")?;
+    let stale = |details: &str| {
+        anyhow::Error::new(StaleTransactionPreflight {
+            details: details.to_owned(),
+        })
+    };
+    let Some(node) = snapshot.nodes.iter().find(|node| node.id == intent.node_id) else {
+        return Err(stale(
+            "selected node is missing from the fresh verified snapshot",
+        ));
+    };
+    let Some(state) = node.state.as_ref() else {
+        return Err(stale(
+            "selected node state is unavailable or not ABI-verified",
+        ));
+    };
     if state.work.window_id != intent.window_id {
-        bail!("selected node advanced to a different window before transaction signing");
+        return Err(stale(
+            "selected node advanced to a different window before transaction signing",
+        ));
     }
     match (intent.action, intent.proof.as_ref()) {
         (TransactionAction::SubmitProof, Some(proof)) => {
             if !state.eligible || proof.header.len() > state.work.max_header_length as usize {
-                bail!("fresh on-chain work is no longer eligible for proof submission");
+                return Err(stale(
+                    "fresh on-chain work is no longer eligible for proof submission",
+                ));
             }
             let context = WorkContext {
                 chain_id,
@@ -1978,12 +2113,16 @@ fn validate_fresh_state(
                     .as_ref()
                     .is_some_and(|candidate| !beats_incumbent(proof.work_hash, candidate.work_hash))
             {
-                bail!("fresh on-chain seed, target, or incumbent invalidated the local proof");
+                return Err(stale(
+                    "fresh on-chain seed, target, or incumbent invalidated the local proof",
+                ));
             }
         }
         (TransactionAction::FinalizeWindow, None) => {
             if !state.finalizable || state.mining_paused {
-                bail!("fresh on-chain state is not permissionlessly finalizable");
+                return Err(stale(
+                    "fresh on-chain state is not permissionlessly finalizable",
+                ));
             }
         }
         _ => bail!("transaction action and proof intent do not match"),
@@ -2567,18 +2706,19 @@ mod tests {
         Eip1559Request, PreparedTransaction, ProofData, ProofSubmission, SUBMISSION_FEE_WEI,
         TransactionAction, TransactionActivity, TransactionActivityState,
         TransactionDashboardState, TransactionEntry, TransactionIntent, TransactionJournal,
-        TransactionManager, TransactionStatus, encode_rlp_list, entry_hash, parse_decimal_wei,
-        rlp_bytes, rlp_u64, rlp_u256, sign_eip1559, validate_archive_ledger,
-        verify_finalization_events, verify_submission_events,
+        TransactionManager, TransactionPolicyRefusalKind, TransactionStatus, encode_rlp_list,
+        entry_hash, parse_decimal_wei, rlp_bytes, rlp_u64, rlp_u256, sign_eip1559,
+        transaction_policy_refusal, validate_archive_ledger, verify_finalization_events,
+        verify_submission_events,
     };
     use crate::{
-        cli::Network,
+        cli::{MineArgs, Network},
         config::{AppConfig, ConfigStore, parse_inj_wei},
         contracts::{AstatineMinerRead, IERC20Read},
         diagnostics::DiagnosticBuffer,
         mining::{
-            DashboardContext, FinalizationOptions, NodeSlot, finalize_initial_expired_windows,
-            start_read_only_observer, update_slots,
+            DashboardContext, FinalizationOptions, MiningProbe, NodeSlot, ObserverUpdate,
+            finalize_initial_expired_windows, start_read_only_observer, update_slots,
         },
         protocol::{WorkContext, WorkHasher, meets_target},
         rpc::{NetworkClient, RpcLog, TransactionReceipt},
@@ -2591,6 +2731,7 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         net::TcpListener,
+        num::NonZeroUsize,
         path::PathBuf,
         process::{Child, Command, Stdio},
         str::FromStr,
@@ -3080,6 +3221,10 @@ mod tests {
             ))
             .unwrap_err();
         assert!(format!("{cap_error:#}").contains("maximum exposure exceeds"));
+        assert_eq!(
+            transaction_policy_refusal(&cap_error),
+            Some(TransactionPolicyRefusalKind::SessionLimitExceeded)
+        );
         assert!(!capped.has_unresolved());
 
         let reserve_root = tempdir().unwrap();
@@ -3105,6 +3250,10 @@ mod tests {
             ))
             .unwrap_err();
         assert!(format!("{reserve_error:#}").contains("insufficient confirmed INJ balance"));
+        assert_eq!(
+            transaction_policy_refusal(&reserve_error),
+            Some(TransactionPolicyRefusalKind::InsufficientConfirmedBalance)
+        );
         assert!(!reserve.has_unresolved());
     }
 
@@ -3516,8 +3665,8 @@ mod tests {
         };
         let mut manager = TransactionManager::open(&store, &config, account, token).unwrap();
         let selected = HashSet::from_iter(1..=9_u8);
-        let mut blocked = HashSet::new();
         let pending_sync = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let finalization_state = Arc::new(std::sync::RwLock::new(HashMap::new()));
         assert!(
             finalize_initial_expired_windows(
                 &network,
@@ -3527,7 +3676,7 @@ mod tests {
                 account,
                 &mut snapshot,
                 FinalizationOptions {
-                    blocked: &mut blocked,
+                    finalization_state: &finalization_state,
                     dashboard: &None,
                     pending_sync: &pending_sync,
                 },
@@ -3587,6 +3736,652 @@ mod tests {
         assert!(submitted.receipt.status);
         assert_eq!(submitted.outcome, "candidate-updated");
         assert!(!manager.journal.has_unresolved());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Forge and Anvil; run with ASTATINE_EVM_ROOT set"]
+    async fn autonomous_runtime_mines_and_finalizes_across_three_consecutive_windows() {
+        let root = std::env::var_os("ASTATINE_EVM_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .join("astatineEVM")
+                    .join("evm")
+            });
+        assert!(root.join("src/AstatineMiner.sol").is_file());
+        let build = Command::new("forge")
+            .args(["build", "--root"])
+            .arg(&root)
+            .output()
+            .expect("Forge is required for the autonomous local lifecycle test");
+        assert!(
+            build.status.success(),
+            "Forge build failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = port_listener.local_addr().unwrap().port();
+            drop(port_listener);
+            let mut process = Command::new("anvil")
+                .args([
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &port.to_string(),
+                    "--chain-id",
+                    "1439",
+                    "--accounts",
+                    "3",
+                    "--silent",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("Anvil is required for the autonomous local lifecycle test");
+            let _process_guard = AnvilGuard(&mut process);
+            let endpoint = format!("http://127.0.0.1:{port}");
+            let rpc = reqwest::Client::new();
+            wait_for_anvil(&rpc, &endpoint).await;
+
+            let signer = test_signer();
+            let account = signer_address(&signer);
+            let accounts =
+                rpc_request_local(&rpc, &endpoint, "eth_accounts", serde_json::json!([]))
+                    .await
+                    .unwrap();
+            let deployment_wallet = Address::from_str(accounts[0].as_str().unwrap()).unwrap();
+            let funded_balance = U256::from(1_000_u64) * U256::from(10_u8).pow(U256::from(18));
+            rpc_request_local(
+                &rpc,
+                &endpoint,
+                "anvil_setBalance",
+                serde_json::json!([format!("{account:#x}"), format!("{funded_balance:#x}")]),
+            )
+            .await
+            .unwrap();
+
+            let token_artifact = read_artifact(&root.join("out/MockAST.sol/MockAST.json"));
+            let miner_artifact =
+                read_artifact(&root.join("out/AstatineMiner.sol/AstatineMiner.json"));
+            let miner_bytecode = artifact_bytecode(&miner_artifact);
+            let decimals = 9_u8;
+            let token_unit = U256::from(10_u8).pow(U256::from(decimals));
+            let allocation = U256::from(1_000_u64) * token_unit;
+            let total_allocation = allocation * U256::from(9_u8);
+            let reward = U256::from(100_u64) * token_unit;
+            let mut token_init = artifact_bytecode(&token_artifact);
+            token_init.extend_from_slice(&abi_uint8_word(decimals));
+            let token = deploy_unlocked(&rpc, &endpoint, deployment_wallet, &token_init).await;
+            let mint = LocalMockAST::mintCall {
+                account: deployment_wallet,
+                amount: total_allocation,
+            }
+            .abi_encode();
+            send_unlocked(
+                &rpc,
+                &endpoint,
+                deployment_wallet,
+                Some(token),
+                &mint,
+                U256::ZERO,
+            )
+            .await;
+            let mut miners = Vec::with_capacity(9);
+            for node_id in 1..=9_u8 {
+                let miner = deploy_local_miner(LocalMinerDeployment {
+                    client: &rpc,
+                    endpoint: &endpoint,
+                    deployment_wallet,
+                    token,
+                    token_decimals: decimals,
+                    allocation,
+                    reward,
+                    miner_bytecode: &miner_bytecode,
+                })
+                .await;
+                let approve = LocalMockAST::approveCall {
+                    spender: miner,
+                    amount: allocation,
+                }
+                .abi_encode();
+                send_unlocked(
+                    &rpc,
+                    &endpoint,
+                    deployment_wallet,
+                    Some(token),
+                    &approve,
+                    U256::ZERO,
+                )
+                .await;
+                let fund = LocalAstatineMiner::fundASTCall { amount: allocation }.abi_encode();
+                send_unlocked(
+                    &rpc,
+                    &endpoint,
+                    deployment_wallet,
+                    Some(miner),
+                    &fund,
+                    U256::ZERO,
+                )
+                .await;
+                let activate = LocalAstatineMiner::activateGenesisCall {
+                    initialSeed: B256::with_last_byte(0x40 + node_id),
+                }
+                .abi_encode();
+                send_unlocked(
+                    &rpc,
+                    &endpoint,
+                    deployment_wallet,
+                    Some(miner),
+                    &activate,
+                    U256::ZERO,
+                )
+                .await;
+                miners.push((
+                    node_id,
+                    miner,
+                    local_code_hash(&rpc, &endpoint, miner).await,
+                ));
+                if node_id == 1 {
+                    rpc_request_local(&rpc, &endpoint, "evm_increaseTime", serde_json::json!([30]))
+                        .await
+                        .unwrap();
+                    rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+                        .await
+                        .unwrap();
+                }
+            }
+            rpc_request_local(&rpc, &endpoint, "evm_increaseTime", serde_json::json!([30]))
+                .await
+                .unwrap();
+            rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+                .await
+                .unwrap();
+
+            let network = NetworkClient::local_test_client_with_nodes(
+                &endpoint,
+                &miners,
+                token,
+                local_code_hash(&rpc, &endpoint, token).await,
+                decimals,
+            )
+            .unwrap();
+            network.fail_next_finalization_fee_quote_once();
+            let expired = network.snapshot(Some(account)).await.unwrap();
+            assert_eq!(expired.nodes.len(), 9);
+            assert!(
+                expired.nodes.iter().any(|node| {
+                    node.id == 1
+                        && node
+                            .state
+                            .as_ref()
+                            .is_some_and(|state| state.finalizable && !state.eligible)
+                }),
+                "node1 snapshot at block {} timestamp {}: {:?}",
+                expired.block.number,
+                expired.block.timestamp,
+                expired
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == 1)
+                    .and_then(|node| node.state.as_ref())
+            );
+            assert!(expired.nodes.iter().any(|node| {
+                node.id == 3
+                    && node
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.eligible && !state.finalizable)
+            }));
+            let temp = tempdir().unwrap();
+            let store = ConfigStore::at_root(temp.path().to_path_buf());
+            let config = AppConfig {
+                network: Network::Testnet,
+                wallet_address: Some(format!("{account:#x}")),
+                cpu_threads: 1,
+                minimum_reserve_inj: "0".to_owned(),
+                per_session_spending_limit_inj: "1".to_owned(),
+                transaction_confirmations: 1,
+                ..AppConfig::default()
+            };
+            store.save(&config).unwrap();
+            let run_store = store.clone();
+            let run_config = config.clone();
+            let run_network = network.clone();
+            let run_signer = clone_signer(&signer);
+            let args = MineArgs {
+                compute_only: false,
+                threads: NonZeroUsize::new(1),
+                nodes: vec![1, 3],
+            };
+            let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+            let mut runtime = tokio::spawn(async move {
+                crate::mining::run_with_client(
+                    &run_store,
+                    run_config,
+                    args,
+                    run_network,
+                    Some(run_signer),
+                    Some(probe_tx),
+                )
+                .await
+            });
+            let probe = match tokio::time::timeout(Duration::from_secs(5), probe_rx).await {
+                Ok(Ok(probe)) => probe,
+                Ok(Err(_)) => panic!(
+                    "mining runtime exited before worker startup: {:?}",
+                    runtime.await
+                ),
+                Err(_) => panic!("production mining runtime did not start within five seconds"),
+            };
+            let initial_finalization = tokio::select! {
+                entry = wait_for_journal_entry_for_window(
+                    &store,
+                    1,
+                    TransactionAction::FinalizeWindow,
+                    0,
+                    TransactionStatus::MinedSuccess,
+                ) => entry,
+                result = &mut runtime => panic!("production runtime exited before startup window finalized: {result:?}"),
+            };
+            assert_eq!(initial_finalization.window_id, 0);
+            let _node1_window1 = wait_for_eligible_window(&network, 1, 1).await;
+            let node3_window0 = wait_for_eligible_window(&network, 3, 0).await;
+            wait_for_active_probe(&probe, 1, 1).await;
+            wait_for_active_probe(&probe, 3, 0).await;
+            wait_for_hash_increase(&probe, 1, 0).await;
+            wait_for_hash_increase(&probe, 3, 0).await;
+            let proof = wait_for_journal_entry_for_window(
+                &store,
+                1,
+                TransactionAction::SubmitProof,
+                1,
+                TransactionStatus::MinedSuccess,
+            )
+            .await;
+            assert_eq!(proof.outcome.as_deref(), Some("candidate-updated"));
+            let _active_snapshot = wait_for_candidate(&network, 1, 1, account).await;
+            let node3_proof = wait_for_journal_entry_for_window(
+                &store,
+                3,
+                TransactionAction::SubmitProof,
+                0,
+                TransactionStatus::MinedSuccess,
+            )
+            .await;
+            assert_eq!(node3_proof.outcome.as_deref(), Some("candidate-updated"));
+            let _node3_candidate = wait_for_candidate(&network, 3, 0, account).await;
+            let node1_hashes = probe.slots[0].completed_hashes();
+            assert!(!runtime.is_finished());
+            wait_for_no_unresolved_transactions(&store).await;
+
+            let mut observed_updates = probe.observer_updates.clone();
+            let _ = observed_updates.borrow_and_update();
+            rpc_request_local(
+                &rpc,
+                &endpoint,
+                "anvil_setAutomine",
+                serde_json::json!([false]),
+            )
+            .await
+            .unwrap();
+            advance_window_past_expiry(&rpc, &endpoint, &network, 3, &node3_window0).await;
+            let while_node3_finalizing = network.snapshot(None).await.unwrap();
+            assert!(while_node3_finalizing.nodes.iter().any(|node| {
+                node.id == 1
+                    && node
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.work.window_id == 1 && state.eligible)
+            }));
+            let pending_node3_finalization = wait_for_journal_entry_for_window(
+                &store,
+                3,
+                TransactionAction::FinalizeWindow,
+                0,
+                TransactionStatus::Broadcast,
+            )
+            .await;
+            let pending_hash = entry_hash(&pending_node3_finalization).unwrap();
+            assert!(
+                network
+                    .transaction_receipt(pending_hash)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let observed = wait_for_observer_snapshot(
+                &mut observed_updates,
+                while_node3_finalizing.block.number,
+            )
+            .await;
+            assert!(observed.nodes.iter().any(|node| {
+                node.id == 1
+                    && node
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.work.window_id == 1 && state.eligible)
+            }));
+            wait_for_hash_increase(&probe, 1, node1_hashes).await;
+            assert!(!runtime.is_finished());
+            rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+                .await
+                .unwrap();
+            rpc_request_local(
+                &rpc,
+                &endpoint,
+                "anvil_setAutomine",
+                serde_json::json!([true]),
+            )
+            .await
+            .unwrap();
+            let node3_finalized = wait_for_journal_entry_for_window(
+                &store,
+                3,
+                TransactionAction::FinalizeWindow,
+                0,
+                TransactionStatus::MinedSuccess,
+            )
+            .await;
+            assert!(node3_finalized.receipt_status.unwrap());
+            wait_for_active_probe(&probe, 3, 1).await;
+
+            let node1_window1 = wait_for_eligible_window(&network, 1, 1).await;
+            advance_window_past_expiry(&rpc, &endpoint, &network, 1, &node1_window1).await;
+            let first_rewarding_finalization = wait_for_journal_entry_for_window(
+                &store,
+                1,
+                TransactionAction::FinalizeWindow,
+                1,
+                TransactionStatus::MinedSuccess,
+            )
+            .await;
+            assert!(first_rewarding_finalization.receipt_status.unwrap());
+            wait_for_verified_reward(&store, 1, 1).await;
+            let second_window = wait_for_eligible_window(&network, 1, 2).await;
+            wait_for_active_probe(&probe, 1, 2).await;
+            wait_for_hash_increase(&probe, 1, node1_hashes).await;
+            assert!(!runtime.is_finished());
+            let node1_window2_proof = wait_for_journal_entry_for_window(
+                &store,
+                1,
+                TransactionAction::SubmitProof,
+                2,
+                TransactionStatus::MinedSuccess,
+            )
+            .await;
+            assert_eq!(
+                node1_window2_proof.outcome.as_deref(),
+                Some("candidate-updated")
+            );
+            let _node1_window2_candidate = wait_for_candidate(&network, 1, 2, account).await;
+            let node3_window1_proof = wait_for_journal_entry_for_window(
+                &store,
+                3,
+                TransactionAction::SubmitProof,
+                1,
+                TransactionStatus::MinedSuccess,
+            )
+            .await;
+            assert_eq!(
+                node3_window1_proof.outcome.as_deref(),
+                Some("candidate-updated")
+            );
+            let _node3_window1_candidate = wait_for_candidate(&network, 3, 1, account).await;
+            wait_for_no_unresolved_transactions(&store).await;
+
+            rpc_request_local(
+                &rpc,
+                &endpoint,
+                "anvil_setAutomine",
+                serde_json::json!([false]),
+            )
+            .await
+            .unwrap();
+            advance_window_past_expiry(&rpc, &endpoint, &network, 1, &second_window).await;
+            let pending_node1_finalization = wait_for_journal_entry_for_window(
+                &store,
+                1,
+                TransactionAction::FinalizeWindow,
+                2,
+                TransactionStatus::Broadcast,
+            )
+            .await;
+            assert!(
+                network
+                    .transaction_receipt(entry_hash(&pending_node1_finalization).unwrap())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+                .await
+                .unwrap();
+            let second_finalization = wait_for_journal_entry_for_window(
+                &store,
+                1,
+                TransactionAction::FinalizeWindow,
+                2,
+                TransactionStatus::MinedSuccess,
+            )
+            .await;
+            assert!(second_finalization.receipt_status.unwrap());
+
+            let node3_after_node1_finalization = network.snapshot(None).await.unwrap();
+            let node3_finalization_window = node3_after_node1_finalization
+                .nodes
+                .iter()
+                .find(|node| node.id == 3)
+                .and_then(|node| node.state.as_ref())
+                .expect("node 03 should remain verified")
+                .work
+                .window_id;
+            if node3_after_node1_finalization
+                .nodes
+                .iter()
+                .any(|node| node.id == 3 && node.state.as_ref().is_some_and(|state| state.eligible))
+            {
+                advance_window_past_expiry(
+                    &rpc,
+                    &endpoint,
+                    &network,
+                    3,
+                    &node3_after_node1_finalization,
+                )
+                .await;
+            }
+            let pending_node3_finalization = wait_for_journal_entry_for_window(
+                &store,
+                3,
+                TransactionAction::FinalizeWindow,
+                node3_finalization_window,
+                TransactionStatus::Broadcast,
+            )
+            .await;
+            assert!(
+                network
+                    .transaction_receipt(entry_hash(&pending_node3_finalization).unwrap())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+                .await
+                .unwrap();
+            let node3_second_finalization = wait_for_journal_entry_for_window(
+                &store,
+                3,
+                TransactionAction::FinalizeWindow,
+                node3_finalization_window,
+                TransactionStatus::MinedSuccess,
+            )
+            .await;
+            assert!(node3_second_finalization.receipt_status.unwrap());
+            let third_window = wait_for_eligible_window(&network, 1, 3).await;
+            wait_for_active_probe(&probe, 1, 3).await;
+            let node3_third_window =
+                wait_for_eligible_window(&network, 3, node3_finalization_window + 1).await;
+            wait_for_active_probe(&probe, 3, node3_finalization_window + 1).await;
+            let hashes_after_second_finalization = probe.slots[0].completed_hashes();
+            wait_for_hash_increase(&probe, 1, hashes_after_second_finalization).await;
+            assert!(third_window.block.number >= second_window.block.number);
+            assert!(node3_third_window.block.number >= third_window.block.number);
+            assert!(!runtime.is_finished());
+
+            let mut observer_updates = probe.observer_updates.clone();
+            let _ = observer_updates.borrow_and_update();
+            let pending_proof = wait_for_pending_proof(&store).await;
+            assert!(matches!(pending_proof.node_id, 1 | 3));
+            let pending_hash = entry_hash(&pending_proof).unwrap();
+            assert!(network.transaction_known(pending_hash).await.unwrap());
+            assert!(
+                network
+                    .transaction_receipt(pending_hash)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let nonce_with_pending = local_pending_nonce(&rpc, &endpoint, account).await;
+            assert!(nonce_with_pending > pending_proof.nonce);
+
+            probe.stop_signal.request_stop();
+            let first_stop = tokio::time::timeout(Duration::from_secs(10), &mut runtime)
+                .await
+                .expect("Ctrl+C-equivalent stop must complete while receipt is pending")
+                .expect("runtime task must join cleanly");
+            assert!(first_stop.is_ok());
+            let journal_after_stop: super::JournalState =
+                serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                    .unwrap();
+            let retained_pending = journal_after_stop
+                .entries
+                .iter()
+                .find(|entry| entry_hash(entry).unwrap() == pending_hash)
+                .unwrap();
+            assert_eq!(retained_pending.status, TransactionStatus::Broadcast);
+            assert!(U256::from_str(&retained_pending.maximum_exposure_wei).unwrap() > U256::ZERO);
+            let entry_count_before_recovery = journal_after_stop.entries.len();
+            let nonce_before_recovery = local_pending_nonce(&rpc, &endpoint, account).await;
+
+            let recovery_store = store.clone();
+            let recovery_config = config.clone();
+            let recovery_network = network.clone();
+            let recovery_signer = clone_signer(&signer);
+            let recovery_args = MineArgs {
+                compute_only: false,
+                threads: NonZeroUsize::new(1),
+                nodes: vec![pending_proof.node_id],
+            };
+            let (recovery_probe_tx, recovery_probe_rx) = tokio::sync::oneshot::channel();
+            let mut recovery_runtime = tokio::spawn(async move {
+                crate::mining::run_with_client(
+                    &recovery_store,
+                    recovery_config,
+                    recovery_args,
+                    recovery_network,
+                    Some(recovery_signer),
+                    Some(recovery_probe_tx),
+                )
+                .await
+            });
+            let recovery_probe = tokio::time::timeout(Duration::from_secs(5), recovery_probe_rx)
+                .await
+                .expect("recovery runtime must start")
+                .expect("recovery runtime probe must remain connected");
+            wait_for_active_probe(
+                &recovery_probe,
+                pending_proof.node_id,
+                pending_proof.window_id,
+            )
+            .await;
+            let mut recovery_updates = recovery_probe.observer_updates.clone();
+            let _ = recovery_updates.borrow_and_update();
+            let recovery_head = network.latest_block_snapshot().await.unwrap();
+            let observed_during_recovery =
+                wait_for_observer_snapshot(&mut recovery_updates, recovery_head.number).await;
+            assert!(observed_during_recovery.nodes.iter().any(|node| {
+                node.id == pending_proof.node_id
+                    && node
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.work.window_id == pending_proof.window_id)
+            }));
+            let recovery_hashes =
+                recovery_probe.slots[usize::from(pending_proof.node_id - 1)].completed_hashes();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert_eq!(
+                local_pending_nonce(&rpc, &endpoint, account).await,
+                nonce_before_recovery
+            );
+            wait_for_hash_increase(&recovery_probe, pending_proof.node_id, recovery_hashes).await;
+            let journal_during_recovery: super::JournalState =
+                serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(
+                journal_during_recovery.entries.len(),
+                entry_count_before_recovery
+            );
+            assert!(journal_during_recovery.entries.iter().any(|entry| {
+                entry_hash(entry).unwrap() == pending_hash
+                    && entry.status == TransactionStatus::Broadcast
+            }));
+            assert!(
+                network
+                    .transaction_receipt(pending_hash)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+                .await
+                .unwrap();
+            rpc_request_local(
+                &rpc,
+                &endpoint,
+                "anvil_setAutomine",
+                serde_json::json!([true]),
+            )
+            .await
+            .unwrap();
+            let settled_pending = wait_for_journal_entry_for_window(
+                &store,
+                pending_proof.node_id,
+                TransactionAction::SubmitProof,
+                pending_proof.window_id,
+                TransactionStatus::MinedSuccess,
+            )
+            .await;
+            assert_eq!(
+                settled_pending.outcome.as_deref(),
+                Some("candidate-updated")
+            );
+            let _recovered_candidate = wait_for_candidate(
+                &network,
+                pending_proof.node_id,
+                pending_proof.window_id,
+                account,
+            )
+            .await;
+            assert_eq!(
+                local_pending_nonce(&rpc, &endpoint, account).await,
+                nonce_before_recovery
+            );
+
+            recovery_probe.stop_signal.request_stop();
+            let recovery_stop =
+                tokio::time::timeout(Duration::from_secs(10), &mut recovery_runtime)
+                    .await
+                    .expect("recovered runtime should stop cleanly")
+                    .expect("recovered runtime task should join cleanly");
+            assert!(recovery_stop.is_ok());
+        })
+        .await
+        .expect("autonomous miner must finalize, reopen, hash and submit across three windows");
     }
 
     #[tokio::test]
@@ -3878,6 +4673,7 @@ mod tests {
             transaction_mode: true,
             compute_only: false,
             workers_started: Arc::new(AtomicBool::new(true)),
+            total_hashes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             selected: observer_selected.clone(),
             slots: Arc::clone(&observer_slots),
             schedule: Arc::clone(&observer_schedule),
@@ -3892,6 +4688,7 @@ mod tests {
                 }],
             })),
             pending_sync: Arc::new(RwLock::new(HashMap::new())),
+            finalization_state: Arc::new(RwLock::new(HashMap::new())),
         };
         let observer_seed = observer_network.snapshot(Some(account)).await.unwrap();
         update_slots(
@@ -4483,6 +5280,265 @@ mod tests {
             sleep(Duration::from_millis(50)).await;
         }
         panic!("transaction journal did not reach {status:?} for {action:?}");
+    }
+
+    async fn wait_for_journal_entry_for_window(
+        store: &ConfigStore,
+        node_id: u8,
+        action: TransactionAction,
+        window_id: u64,
+        status: TransactionStatus,
+    ) -> super::TransactionEntry {
+        tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                if let Some(contents) = store.read_transaction_journal().unwrap() {
+                    let state: super::JournalState = serde_json::from_slice(&contents).unwrap();
+                    if let Some(entry) = state.entries.into_iter().find(|entry| {
+                        entry.node_id == node_id
+                            && entry.action == action
+                            && entry.window_id == window_id
+                    }) {
+                        if entry.status == TransactionStatus::MinedReverted {
+                            panic!(
+                                "{action:?} for window {window_id} reverted: {:?}",
+                                entry.outcome
+                            );
+                        }
+                        if entry.status == status {
+                            return entry;
+                        }
+                    }
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "journal did not reach {status:?} for node {node_id} {action:?} window {window_id}"
+            )
+        })
+    }
+
+    async fn wait_for_eligible_window(
+        network: &NetworkClient,
+        node_id: u8,
+        window_id: u64,
+    ) -> crate::rpc::ReadSnapshot {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let snapshot = network.snapshot(None).await.unwrap();
+                if snapshot.nodes.iter().any(|node| {
+                    node.id == node_id
+                        && node.state.as_ref().is_some_and(|state| {
+                            state.work.window_id == window_id && state.eligible
+                        })
+                }) {
+                    return snapshot;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("node {node_id:02} did not become eligible in window {window_id}")
+        })
+    }
+
+    async fn wait_for_candidate(
+        network: &NetworkClient,
+        node_id: u8,
+        window_id: u64,
+        expected_miner: Address,
+    ) -> crate::rpc::ReadSnapshot {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let snapshot = network.snapshot(None).await.unwrap();
+                if snapshot.nodes.iter().any(|node| {
+                    node.id == node_id
+                        && node.state.as_ref().is_some_and(|state| {
+                            state.work.window_id == window_id
+                                && state
+                                    .candidate
+                                    .as_ref()
+                                    .is_some_and(|candidate| candidate.miner == expected_miner)
+                        })
+                }) {
+                    return snapshot;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("on-chain candidate was not verified for node {node_id:02} window {window_id}")
+        })
+    }
+
+    async fn wait_for_hash_increase(probe: &MiningProbe, node_id: u8, previous: u64) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while probe.slots[usize::from(node_id - 1)].completed_hashes() <= previous {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("CPU worker hash counter for node {node_id:02} must increase"));
+    }
+
+    async fn wait_for_active_probe(probe: &MiningProbe, node_id: u8, window_id: u64) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let scheduled = probe
+                    .schedule
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&usize::from(node_id - 1));
+                if scheduled
+                    && probe.slots[usize::from(node_id - 1)].active_window_id() == Some(window_id)
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("production runtime did not schedule node {node_id:02} window {window_id}")
+        });
+    }
+
+    async fn wait_for_observer_snapshot(
+        updates: &mut tokio::sync::watch::Receiver<ObserverUpdate>,
+        minimum_block: u64,
+    ) -> crate::rpc::ReadSnapshot {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                updates.changed().await.unwrap();
+                let update = { updates.borrow().clone() };
+                if let ObserverUpdate::Snapshot(snapshot) = update
+                    && snapshot.block.number >= minimum_block
+                {
+                    return snapshot;
+                }
+            }
+        })
+        .await
+        .expect("read-only observer did not publish a verified snapshot")
+    }
+
+    async fn wait_for_pending_proof(store: &ConfigStore) -> super::TransactionEntry {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(contents) = store.read_transaction_journal().unwrap() {
+                    let state: super::JournalState = serde_json::from_slice(&contents).unwrap();
+                    if let Some(entry) = state.entries.into_iter().find(|entry| {
+                        entry.action == TransactionAction::SubmitProof
+                            && entry.status == TransactionStatus::Broadcast
+                    }) {
+                        return entry;
+                    }
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("proof transaction did not reach journaled Broadcast state")
+    }
+
+    async fn wait_for_no_unresolved_transactions(store: &ConfigStore) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let unresolved = store
+                    .read_transaction_journal()
+                    .unwrap()
+                    .map(|contents| {
+                        let journal: super::JournalState =
+                            serde_json::from_slice(&contents).unwrap();
+                        journal
+                            .entries
+                            .iter()
+                            .any(|entry| entry.status.is_unresolved())
+                    })
+                    .unwrap_or(false);
+                if !unresolved {
+                    return;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("journaled transaction should settle before the next test action");
+    }
+
+    async fn advance_window_past_expiry(
+        rpc: &reqwest::Client,
+        endpoint: &str,
+        network: &NetworkClient,
+        node_id: u8,
+        snapshot: &crate::rpc::ReadSnapshot,
+    ) {
+        let state = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .unwrap()
+            .state
+            .as_ref()
+            .unwrap();
+        let expected_window = state.work.window_id;
+        let remaining = state
+            .work
+            .window_expiry_time
+            .saturating_sub(snapshot.block.timestamp);
+        rpc_request_local(
+            rpc,
+            endpoint,
+            "evm_increaseTime",
+            serde_json::json!([remaining.saturating_add(1)]),
+        )
+        .await
+        .unwrap();
+        rpc_request_local(rpc, endpoint, "evm_mine", serde_json::json!([]))
+            .await
+            .unwrap();
+        let expired = network.snapshot(None).await.unwrap();
+        assert!(
+            expired.nodes.iter().any(|node| {
+                node.id == node_id
+                    && node.state.as_ref().is_some_and(|state| {
+                        state.work.window_id == expected_window
+                            && expired.block.timestamp > state.work.window_expiry_time
+                            && state.finalizable
+                            && !state.eligible
+                    })
+            }),
+            "fresh verified canonical snapshot must confirm actual expiry"
+        );
+    }
+
+    async fn wait_for_verified_reward(store: &ConfigStore, node_id: u8, window_id: u64) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(contents) = store.read_transaction_journal().unwrap() {
+                    let journal: super::JournalState = serde_json::from_slice(&contents).unwrap();
+                    if journal.entries.iter().any(|entry| {
+                        entry.action == TransactionAction::SubmitProof
+                            && entry.node_id == node_id
+                            && entry.window_id == window_id
+                            && entry.reward_confirmed
+                            && entry
+                                .reward_outcome
+                                .as_deref()
+                                .is_some_and(|outcome| outcome.starts_with("reward-paid:"))
+                    }) {
+                        return;
+                    }
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("reward event must be verified and recorded in the journal");
     }
 
     async fn rpc_request_local(

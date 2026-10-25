@@ -1,6 +1,9 @@
 #![allow(clippy::too_many_arguments)]
 alloy_sol_types::sol! {
     interface AstatineMinerRead {
+        error WindowExpired();
+        error WindowNotExpired();
+
         struct WorkInfo {
             bool started;
             bool ended;

@@ -45,6 +45,10 @@ pub enum NodeStatus {
     Confirming,
     Syncing,
     Waiting,
+    WaitingForChain,
+    FinalizationRequired,
+    FinalizationRetrying,
+    FinalizationBlocked,
     Recovering,
     Paused,
     Ended,
@@ -59,6 +63,10 @@ impl NodeStatus {
             Self::Confirming => "CONFIRMING",
             Self::Syncing => "SYNCING",
             Self::Waiting => "WAITING",
+            Self::WaitingForChain => "WAIT CHAIN",
+            Self::FinalizationRequired => "FINALIZE",
+            Self::FinalizationRetrying => "RETRYING",
+            Self::FinalizationBlocked => "BLOCKED",
             Self::Recovering => "RECOVERING",
             Self::Paused => "PAUSED",
             Self::Ended => "ENDED",
@@ -69,7 +77,14 @@ impl NodeStatus {
     fn color(self) -> Color {
         match self {
             Self::Mining => EMERALD,
-            Self::Finalizing | Self::Confirming | Self::Syncing | Self::Recovering => AMBER,
+            Self::Finalizing
+            | Self::Confirming
+            | Self::Syncing
+            | Self::WaitingForChain
+            | Self::FinalizationRequired
+            | Self::FinalizationRetrying
+            | Self::FinalizationBlocked
+            | Self::Recovering => AMBER,
             Self::RpcError => ERROR_RED,
             Self::Waiting | Self::Paused | Self::Ended => MUTED,
         }
@@ -147,7 +162,7 @@ impl DashboardNode {
         if self.status == NodeStatus::Mining
             && self.mining_deadline.is_none_or(|deadline| now >= deadline)
         {
-            NodeStatus::Waiting
+            NodeStatus::WaitingForChain
         } else {
             self.status
         }
@@ -182,6 +197,7 @@ pub struct DashboardModel {
     pub block_number: u64,
     pub block_hash: B256,
     pub snapshot_observed_at: Instant,
+    pub last_block_advanced_at: Instant,
     pub snapshot_ready: bool,
     pub selected_nodes: Vec<DashboardNode>,
     pub compute_only: bool,
@@ -206,6 +222,30 @@ impl DashboardModel {
             "CONNECTING"
         } else if now.saturating_duration_since(self.snapshot_observed_at) > SNAPSHOT_STALE_AFTER {
             "STALE DATA"
+        } else if self
+            .selected_nodes
+            .iter()
+            .any(|node| node.status_at(now) == NodeStatus::FinalizationBlocked)
+        {
+            "FINALIZATION BLOCKED"
+        } else if self
+            .selected_nodes
+            .iter()
+            .any(|node| node.status_at(now) == NodeStatus::FinalizationRequired)
+        {
+            "FINALIZATION REQUIRED"
+        } else if self
+            .selected_nodes
+            .iter()
+            .any(|node| node.status_at(now) == NodeStatus::FinalizationRetrying)
+        {
+            "RETRYING FINALIZATION"
+        } else if self
+            .selected_nodes
+            .iter()
+            .any(|node| node.status_at(now) == NodeStatus::WaitingForChain)
+        {
+            "WAITING FOR CHAIN"
         } else if !self
             .selected_nodes
             .iter()
@@ -554,6 +594,11 @@ pub enum DashboardEventKind {
 }
 
 impl DashboardSignal {
+    #[cfg(test)]
+    pub(crate) fn request_stop(&self) {
+        self.send(DashboardEvent::StopRequested);
+    }
+
     fn send(&self, event: DashboardEvent) {
         if matches!(event, DashboardEvent::StopRequested) {
             self.state.stop_requested.store(true, Ordering::Release);
@@ -1242,7 +1287,12 @@ fn version_mode_line(model: &DashboardModel, colors: bool) -> Line<'static> {
     let mode = model.mode(Instant::now());
     let mode_color = match mode {
         "LIVE MINING" => EMERALD,
-        "RECOVERING" | "STOPPING" => AMBER,
+        "RECOVERING"
+        | "STOPPING"
+        | "WAITING FOR CHAIN"
+        | "FINALIZATION REQUIRED"
+        | "RETRYING FINALIZATION" => AMBER,
+        "FINALIZATION BLOCKED" => ERROR_RED,
         "RPC ERROR" => ERROR_RED,
         "STALE DATA" => AMBER,
         _ => MUTED,
@@ -1272,7 +1322,7 @@ pub fn format_time_left(seconds: u64) -> String {
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
-fn hashes_per_second(previous: u64, current: u64, elapsed_secs: f64) -> f64 {
+pub(crate) fn hashes_per_second(previous: u64, current: u64, elapsed_secs: f64) -> f64 {
     current.wrapping_sub(previous) as f64 / elapsed_secs.max(0.001)
 }
 
@@ -1440,6 +1490,7 @@ mod tests {
             block_number: 144_123_456,
             block_hash: B256::with_last_byte(4),
             snapshot_observed_at: Instant::now(),
+            last_block_advanced_at: Instant::now(),
             snapshot_ready: true,
             selected_nodes: nodes,
             compute_only: false,
@@ -1570,11 +1621,16 @@ mod tests {
         );
         assert_eq!(
             view.selected_nodes[0].status_at(observed + Duration::from_secs(60)),
-            NodeStatus::Waiting
+            NodeStatus::WaitingForChain
         );
         assert_eq!(
             view.selected_nodes[0].time_left(observed + Duration::from_secs(60)),
             None
+        );
+        view.snapshot_observed_at = observed + Duration::from_secs(60);
+        assert_eq!(
+            view.mode(observed + Duration::from_secs(60)),
+            "WAITING FOR CHAIN"
         );
         view.selected_nodes[0].status = NodeStatus::Paused;
         assert_eq!(
@@ -1620,6 +1676,15 @@ mod tests {
         view.signing_enabled = true;
         view.selected_nodes[0].status = NodeStatus::Waiting;
         assert_eq!(view.mode(Instant::now()), "WAITING FOR WORK");
+        view.selected_nodes[0].status = NodeStatus::WaitingForChain;
+        assert_eq!(view.mode(Instant::now()), "WAITING FOR CHAIN");
+        view.selected_nodes[0].status = NodeStatus::FinalizationRequired;
+        assert_eq!(view.mode(Instant::now()), "FINALIZATION REQUIRED");
+        view.selected_nodes[0].status = NodeStatus::FinalizationRetrying;
+        assert_eq!(view.mode(Instant::now()), "RETRYING FINALIZATION");
+        view.selected_nodes[0].status = NodeStatus::FinalizationBlocked;
+        assert_eq!(view.mode(Instant::now()), "FINALIZATION BLOCKED");
+        view.selected_nodes[0].status = NodeStatus::Waiting;
         view.connection_error = Some("RPC unavailable".to_owned());
         assert_eq!(view.mode(Instant::now()), "RPC ERROR");
         view.connection_error = None;

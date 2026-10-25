@@ -5,12 +5,15 @@ use crate::{
     protocol::{WorkContext, WorkHasher, meets_target, work_domain_v2},
 };
 use alloy_primitives::{Address, B256, Bytes, U256, hex, keccak256};
-use alloy_sol_types::{SolCall, SolEvent, SolType, SolValue};
+use alloy_sol_types::{SolCall, SolError, SolEvent, SolType, SolValue};
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use serde::{Deserialize, de::DeserializeOwned};
 use std::{collections::HashMap, time::Duration};
 use tokio::task::JoinSet;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
 use crate::deployment::TokenPin;
@@ -206,6 +209,8 @@ pub struct NetworkClient {
     endpoints: Vec<RpcEndpoint>,
     pub verification: DeploymentVerification,
     diagnostics: Option<DiagnosticBuffer>,
+    #[cfg(test)]
+    fail_next_finalization_fee_quote: std::sync::Arc<AtomicUsize>,
 }
 
 impl NetworkClient {
@@ -250,6 +255,8 @@ impl NetworkClient {
             manifest,
             endpoints,
             diagnostics: None,
+            #[cfg(test)]
+            fail_next_finalization_fee_quote: std::sync::Arc::new(AtomicUsize::new(0)),
             verification: DeploymentVerification {
                 token_verified: false,
                 reference_snapshot_verified: false,
@@ -354,6 +361,19 @@ impl NetworkClient {
         value: U256,
         data: &[u8],
     ) -> Result<FeeQuote> {
+        #[cfg(test)]
+        if data.starts_with(&AstatineMinerRead::finalizeWindowCall::SELECTOR)
+            && self
+                .fail_next_finalization_fee_quote
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Err(anyhow::Error::new(TransientRpcFailure {
+                details: "test-injected HTTP 503 from fee quote provider".to_owned(),
+            }));
+        }
         let endpoint = self.primary_endpoint()?;
         let transaction = serde_json::json!({
             "from": format!("{from:#x}"),
@@ -692,6 +712,8 @@ impl NetworkClient {
             manifest,
             endpoints: vec![endpoint],
             diagnostics: None,
+            #[cfg(test)]
+            fail_next_finalization_fee_quote: std::sync::Arc::new(AtomicUsize::new(0)),
             verification: DeploymentVerification {
                 token_verified: true,
                 reference_snapshot_verified: false,
@@ -710,6 +732,12 @@ impl NetworkClient {
                     .collect(),
             },
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_finalization_fee_quote_once(&self) {
+        self.fail_next_finalization_fee_quote
+            .fetch_add(1, Ordering::Release);
     }
 
     async fn verify_deployment(&mut self) -> Result<()> {
@@ -981,15 +1009,23 @@ impl NetworkClient {
     async fn best_block(&self) -> Result<(Vec<RpcEndpoint>, BlockSnapshot)> {
         let mut candidates = Vec::new();
         let mut errors = Vec::new();
+        let mut all_errors_transient = true;
         for endpoint in &self.endpoints {
             match endpoint_block(endpoint).await {
                 Ok((number, block)) => candidates.push((endpoint.clone(), number, block)),
-                Err(error) => errors.push(format!("{}: {error:#}", endpoint.name)),
+                Err(error) => {
+                    all_errors_transient &= is_transient_rpc_error(&error);
+                    errors.push(format!("{}: {error:#}", endpoint.name));
+                }
             }
         }
         candidates.sort_by_key(|(_, number, _)| std::cmp::Reverse(*number));
         let Some((best_endpoint, best_number, best_block)) = candidates.first().cloned() else {
-            bail!("all configured RPCs failed: {}", errors.join("; "));
+            let details = errors.join("; ");
+            if all_errors_transient {
+                return Err(anyhow::Error::new(TransientRpcFailure { details }));
+            }
+            bail!("all configured RPCs failed: {details}");
         };
         for (_, number, other_block) in &candidates {
             if *number == best_number && other_block.hash != best_block.hash {
@@ -1243,6 +1279,33 @@ struct ReceiptStatusUnavailable {
     details: String,
 }
 
+#[derive(Debug)]
+struct TransientRpcFailure {
+    details: String,
+}
+
+impl std::fmt::Display for TransientRpcFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "transient RPC failure: {}", self.details)
+    }
+}
+
+impl std::error::Error for TransientRpcFailure {}
+
+#[derive(Debug)]
+struct RpcServerError {
+    code: i64,
+    message: String,
+}
+
+impl std::fmt::Display for RpcServerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "JSON-RPC error {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RpcServerError {}
+
 impl std::fmt::Display for ReceiptStatusUnavailable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "receipt status unavailable: {}", self.details)
@@ -1255,6 +1318,60 @@ pub fn is_transient_receipt_error(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.downcast_ref::<ReceiptStatusUnavailable>().is_some())
+}
+
+pub fn is_transient_rpc_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<TransientRpcFailure>().is_some()
+            || cause.downcast_ref::<reqwest::Error>().is_some_and(|rpc| {
+                rpc.is_timeout()
+                    || rpc.is_connect()
+                    || rpc
+                        .status()
+                        .is_some_and(|status| status.is_server_error() || status.as_u16() == 429)
+            })
+            || cause
+                .downcast_ref::<RpcServerError>()
+                .is_some_and(|rpc| transient_json_rpc_error(rpc.code, &rpc.message))
+    })
+}
+
+pub fn is_window_expired_revert(error: &anyhow::Error) -> bool {
+    rpc_error_matches_contract_selector(error, AstatineMinerRead::WindowExpired::SELECTOR)
+        || format!("{error:#}").contains("WindowExpired")
+}
+
+pub fn is_window_not_expired_revert(error: &anyhow::Error) -> bool {
+    rpc_error_matches_contract_selector(error, AstatineMinerRead::WindowNotExpired::SELECTOR)
+        || format!("{error:#}").contains("WindowNotExpired")
+}
+
+fn rpc_error_matches_contract_selector(error: &anyhow::Error, selector: [u8; 4]) -> bool {
+    let selector = format!("0x{}", hex::encode(selector));
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<RpcServerError>()
+            .is_some_and(|rpc| rpc.message.contains(&selector))
+    })
+}
+
+fn transient_json_rpc_error(code: i64, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    if message.contains("execution reverted") || message.contains("revert") {
+        return false;
+    }
+    code == -32603
+        || code == -32005
+        || [
+            "temporar",
+            "unavailable",
+            "rate limit",
+            "too many requests",
+            "timed out",
+            "try again",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
 }
 
 #[derive(Deserialize)]
@@ -1308,7 +1425,11 @@ async fn rpc_request<T: DeserializeOwned>(
     let response: RpcResponse<T> = serde_json::from_slice(&body)
         .with_context(|| format!("decode {method} JSON-RPC response from {}", endpoint.name))?;
     if let Some(error) = response.error {
-        bail!("{method} JSON-RPC error {}: {}", error.code, error.message);
+        return Err(anyhow::Error::new(RpcServerError {
+            code: error.code,
+            message: error.message,
+        }))
+        .with_context(|| format!("{method} JSON-RPC request to {}", endpoint.name));
     }
     response
         .result()
@@ -1660,7 +1781,8 @@ fn parse_hex_u256(value: &str) -> Result<U256> {
 mod tests {
     use super::{
         NetworkClient, RpcEndpoint, RpcResponse, RpcResult, SUBMISSION_FEE_WEI, decode_candidate,
-        decode_mining, decode_work, is_transient_receipt_error, rpc_request,
+        decode_mining, decode_work, is_transient_receipt_error, is_transient_rpc_error,
+        is_window_expired_revert, is_window_not_expired_revert, rpc_request,
     };
     use alloy_primitives::{Address, B256, Bytes, U256};
     use alloy_sol_types::{SolCall, SolValue};
@@ -1871,6 +1993,72 @@ mod tests {
         assert!(is_transient_receipt_error(&error));
         assert!(format!("{error:#}").contains("read transaction receipt"));
         primary_server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_rpc_failures_are_retryable_but_contract_reverts_are_not() {
+        let (endpoint, server) = mock_endpoint("primary", vec![(503, "{}".to_owned())]);
+        let error = rpc_request::<String>(&endpoint, "eth_blockNumber", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(is_transient_rpc_error(&error));
+        server.join().unwrap();
+
+        let rate_limit = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32005, "message": "rate limit exceeded"},
+        })
+        .to_string();
+        let (endpoint, server) = mock_endpoint("primary", vec![(200, rate_limit)]);
+        let error = rpc_request::<String>(&endpoint, "eth_estimateGas", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(is_transient_rpc_error(&error));
+        server.join().unwrap();
+
+        let revert = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32000, "message": "execution reverted: WindowNotExpired"},
+        })
+        .to_string();
+        let (endpoint, server) = mock_endpoint("primary", vec![(200, revert)]);
+        let error = rpc_request::<String>(&endpoint, "eth_estimateGas", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(!is_transient_rpc_error(&error));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_expiry_reverts_are_distinguished_from_provider_failures() {
+        let expired = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": 3, "message": "execution reverted: custom error 0x7bbfb6fe"},
+        })
+        .to_string();
+        let (endpoint, server) = mock_endpoint("primary", vec![(200, expired)]);
+        let error = rpc_request::<String>(&endpoint, "eth_estimateGas", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(is_window_expired_revert(&error));
+        assert!(!is_transient_rpc_error(&error));
+        server.join().unwrap();
+
+        let not_expired = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": 3, "message": "execution reverted: custom error 0xd5bd6e95"},
+        })
+        .to_string();
+        let (endpoint, server) = mock_endpoint("primary", vec![(200, not_expired)]);
+        let error = rpc_request::<String>(&endpoint, "eth_estimateGas", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(is_window_not_expired_revert(&error));
+        server.join().unwrap();
     }
 
     #[tokio::test]

@@ -8,10 +8,11 @@ use crate::{
     deployment::DeploymentManifest,
     diagnostics::DiagnosticBuffer,
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
-    rpc::{NetworkClient, NodeState, ReadSnapshot},
+    rpc::{BlockSnapshot, NetworkClient, NodeState, ReadSnapshot, is_transient_rpc_error},
     transaction::{
-        ConfirmedAction, ProofSubmission, TransactionActivityState, TransactionDashboardState,
-        TransactionManager,
+        ConfirmedAction, ProofSubmission, TransactionAction, TransactionActivityState,
+        TransactionDashboardState, TransactionManager, TransactionPolicyRefusalKind,
+        is_stale_transaction_preflight, mined_transaction_reverted, transaction_policy_refusal,
     },
     wallet::{selected_address, unlock_selected_interactive},
 };
@@ -37,7 +38,11 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const IDLE_INTERVAL: Duration = Duration::from_millis(20);
 const NONCE_BATCH_SIZE: usize = 2_048;
+const PENDING_PROOF_QUEUE_CAPACITY: usize = 64;
 const WORK_EXPIRY_SAFETY_SECS: u64 = 2;
+const STALE_PREFLIGHT_RETRY: Duration = Duration::from_secs(1);
+const OBSERVER_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_PROOF_PREFLIGHT_RETRIES: u8 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HashingContext {
@@ -109,6 +114,9 @@ pub(crate) struct NodeSlot {
     id: u8,
     generation: AtomicU64,
     work: RwLock<Option<Arc<WorkJob>>>,
+    suspended_work: Mutex<Option<Arc<WorkJob>>>,
+    last_observed_head: Mutex<Option<(u64, B256)>>,
+    completed_hashes: AtomicU64,
     nonces: Mutex<NonceAllocator>,
     local_best: Mutex<Option<B256>>,
 }
@@ -119,18 +127,67 @@ impl NodeSlot {
             id,
             generation: AtomicU64::new(0),
             work: RwLock::new(None),
+            suspended_work: Mutex::new(None),
+            last_observed_head: Mutex::new(None),
+            completed_hashes: AtomicU64::new(0),
             nonces: Mutex::new(NonceAllocator::default()),
             local_best: Mutex::new(None),
         }
     }
 
     fn current_work(&self) -> Option<Arc<WorkJob>> {
+        self.current_work_at(Instant::now())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn active_window_id(&self) -> Option<u64> {
+        self.current_work()
+            .map(|work| work.fingerprint.hashing_context.window_id)
+    }
+
+    pub(crate) fn completed_hashes(&self) -> u64 {
+        self.completed_hashes.load(Ordering::Relaxed)
+    }
+
+    fn current_work_at(&self, now: Instant) -> Option<Arc<WorkJob>> {
         let work = self
             .work
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()?;
-        (Instant::now() < work.valid_until).then_some(work)
+        (now < work.valid_until).then_some(work)
+    }
+
+    fn diagnostic_work(&self) -> (bool, bool, Option<Instant>, Option<u64>) {
+        let current = self
+            .work
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let active = current
+            .as_ref()
+            .is_some_and(|work| Instant::now() < work.valid_until);
+        if let Some(work) = current {
+            return (
+                active,
+                false,
+                Some(work.valid_until),
+                Some(work.fingerprint.hashing_context.window_id),
+            );
+        }
+        let suspended = self
+            .suspended_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        suspended.map_or((false, false, None, None), |work| {
+            (
+                false,
+                true,
+                Some(work.valid_until),
+                Some(work.fingerprint.hashing_context.window_id),
+            )
+        })
     }
 
     fn is_generation_current(&self, generation: u64) -> bool {
@@ -144,14 +201,46 @@ impl NodeSlot {
             .reserve(NONCE_BATCH_SIZE)
     }
 
+    fn reset_local_best_for_generation(&self, generation: u64) {
+        let mut best = self
+            .local_best
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_generation_current(generation) {
+            *best = None;
+        }
+    }
+
     fn set_work(
         &self,
         network: &DeploymentManifest,
         miner: Address,
         contract: Address,
         state: Option<&NodeState>,
-        block_timestamp: u64,
+        block: &BlockSnapshot,
     ) -> Result<bool> {
+        self.set_work_at(network, miner, contract, state, block, Instant::now())
+    }
+
+    fn set_work_at(
+        &self,
+        network: &DeploymentManifest,
+        miner: Address,
+        contract: Address,
+        state: Option<&NodeState>,
+        block: &BlockSnapshot,
+        now: Instant,
+    ) -> Result<bool> {
+        let head = (block.number, block.hash);
+        let head_advanced = {
+            let mut last_head = self
+                .last_observed_head
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let advanced = last_head.is_some_and(|previous| previous != head);
+            *last_head = Some(head);
+            advanced
+        };
         let next = if let Some(state) = state.filter(|state| state.eligible) {
             if state.work.max_header_length == 0 {
                 bail!(
@@ -193,55 +282,81 @@ impl NodeSlot {
             .work
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let unchanged = match (&*current, &next) {
-            (None, None) => true,
-            (Some(existing), Some((fingerprint, _, _))) => existing.fingerprint == *fingerprint,
-            _ => false,
+        let Some((fingerprint, target, incumbent)) = next else {
+            let Some(previous) = current.take() else {
+                return Ok(false);
+            };
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            *self
+                .suspended_work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(previous);
+            return Ok(true);
         };
-        if unchanged {
-            return Ok(false);
+
+        let current_job = current.clone();
+        let suspended_job = self
+            .suspended_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let previous = current_job.as_ref().or(suspended_job.as_ref());
+        let context_unchanged = previous.is_some_and(|existing| {
+            existing.fingerprint.hashing_context == fingerprint.hashing_context
+        });
+        let same_expiry = previous.is_some_and(|existing| {
+            existing.fingerprint.window_expiry_time == fingerprint.window_expiry_time
+        });
+        let deadline_source = previous.filter(|_| context_unchanged && same_expiry);
+
+        let remaining = fingerprint
+            .window_expiry_time
+            .saturating_sub(block.timestamp)
+            .saturating_sub(WORK_EXPIRY_SAFETY_SECS);
+        let proposed_deadline = now
+            .checked_add(Duration::from_secs(remaining))
+            .unwrap_or(now);
+
+        if let Some(existing) = current_job.as_ref()
+            && existing.fingerprint == fingerprint
+        {
+            let valid_until = if existing.valid_until > now {
+                existing.valid_until.min(proposed_deadline)
+            } else if head_advanced {
+                proposed_deadline
+            } else {
+                existing.valid_until
+            };
+            if valid_until == existing.valid_until {
+                return Ok(false);
+            }
+            let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            *current = Some(Arc::new(WorkJob {
+                fingerprint,
+                generation,
+                hasher: existing.hasher.clone(),
+                target,
+                incumbent,
+                valid_until,
+            }));
+            *self
+                .suspended_work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            return Ok(true);
         }
 
-        let context_unchanged = match (&*current, &next) {
-            (Some(existing), Some((fingerprint, _, _))) => {
-                existing.fingerprint.hashing_context == fingerprint.hashing_context
-            }
-            _ => false,
-        };
-        let next_work = if let Some((fingerprint, target, incumbent)) = next {
-            let preserve_deadline = context_unchanged
-                && current.as_ref().is_some_and(|existing| {
-                    existing.fingerprint.window_expiry_time == fingerprint.window_expiry_time
-                });
-            let hasher = if context_unchanged {
-                current
-                    .as_ref()
-                    .expect("unchanged context requires existing work")
-                    .hasher
-                    .clone()
-            } else {
-                WorkHasher::new(&fingerprint.hashing_context.work_context())?
-            };
-            let now = Instant::now();
-            let remaining = fingerprint
-                .window_expiry_time
-                .saturating_sub(block_timestamp)
-                .saturating_sub(WORK_EXPIRY_SAFETY_SECS);
-            let proposed_deadline = now
-                .checked_add(Duration::from_secs(remaining))
-                .unwrap_or(now);
-            let valid_until = if preserve_deadline {
-                current
-                    .as_ref()
-                    .expect("unchanged context requires existing work")
-                    .valid_until
-                    .min(proposed_deadline)
-            } else {
-                proposed_deadline
-            };
-            Some((fingerprint, hasher, target, incumbent, valid_until))
+        let hasher = if let Some(previous) = deadline_source {
+            previous.hasher.clone()
         } else {
-            None
+            WorkHasher::new(&fingerprint.hashing_context.work_context())?
+        };
+        let valid_until = match deadline_source {
+            Some(previous) if previous.valid_until > now => {
+                previous.valid_until.min(proposed_deadline)
+            }
+            Some(previous) if !head_advanced => previous.valid_until,
+            Some(_) | None => proposed_deadline,
         };
 
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -255,16 +370,18 @@ impl NodeSlot {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
-        *current = next_work.map(|(fingerprint, hasher, target, incumbent, valid_until)| {
-            Arc::new(WorkJob {
-                fingerprint,
-                generation,
-                hasher,
-                target,
-                incumbent,
-                valid_until,
-            })
-        });
+        *current = Some(Arc::new(WorkJob {
+            fingerprint,
+            generation,
+            hasher,
+            target,
+            incumbent,
+            valid_until,
+        }));
+        *self
+            .suspended_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         Ok(true)
     }
 }
@@ -323,17 +440,33 @@ pub(crate) struct DashboardContext {
     pub(crate) transaction_mode: bool,
     pub(crate) compute_only: bool,
     pub(crate) workers_started: Arc<AtomicBool>,
+    pub(crate) total_hashes: Arc<AtomicU64>,
     pub(crate) selected: HashSet<u8>,
     pub(crate) slots: Arc<Vec<NodeSlot>>,
     pub(crate) schedule: Arc<RwLock<Vec<usize>>>,
     pub(crate) transaction_state: Arc<RwLock<TransactionDashboardState>>,
     pub(crate) pending_sync: Arc<RwLock<HashMap<u8, PendingDashboardSync>>>,
+    pub(crate) finalization_state: Arc<RwLock<HashMap<u8, FinalizationState>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PendingDashboardSync {
     window_id: u64,
     receipt_block: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FinalizationState {
+    Retrying {
+        window_id: u64,
+        attempts: u8,
+        retry_at: Instant,
+        reason: String,
+    },
+    Blocked {
+        window_id: u64,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -349,7 +482,16 @@ pub(crate) struct ReadOnlyObserver {
     force_refresh: mpsc::Sender<()>,
     refresh_epoch: Arc<AtomicU64>,
     refresh_gate: Arc<Mutex<()>>,
+    last_publication_at: Arc<Mutex<Instant>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct MiningProbe {
+    pub(crate) slots: Arc<Vec<NodeSlot>>,
+    pub(crate) schedule: Arc<RwLock<Vec<usize>>>,
+    pub(crate) observer_updates: watch::Receiver<ObserverUpdate>,
+    pub(crate) stop_signal: DashboardSignal,
 }
 
 impl ReadOnlyObserver {
@@ -367,6 +509,13 @@ impl ReadOnlyObserver {
             ObserverUpdate::Snapshot(snapshot) => Some(snapshot.clone()),
             ObserverUpdate::RpcError { .. } | ObserverUpdate::Fatal(_) => None,
         }
+    }
+
+    pub(crate) fn publication_age(&self) -> Duration {
+        self.last_publication_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .elapsed()
     }
 
     pub(crate) async fn stop(&mut self) -> Result<()> {
@@ -392,6 +541,35 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
     if !args.compute_only && config.network != crate::cli::Network::Testnet {
         bail!("autonomous transaction signing is disabled outside Injective Testnet");
     }
+    selected_address(&config)?;
+    let client = NetworkClient::connect(config.network).await?;
+    run_runtime(store, config, args, client, None, None).await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_with_client(
+    store: &ConfigStore,
+    config: crate::config::AppConfig,
+    args: MineArgs,
+    client: NetworkClient,
+    supplied_signer: Option<bip32::secp256k1::ecdsa::SigningKey>,
+    probe_sender: Option<tokio::sync::oneshot::Sender<MiningProbe>>,
+) -> Result<()> {
+    run_runtime(store, config, args, client, supplied_signer, probe_sender).await
+}
+
+async fn run_runtime(
+    store: &ConfigStore,
+    config: crate::config::AppConfig,
+    args: MineArgs,
+    mut client: NetworkClient,
+    supplied_signer: Option<bip32::secp256k1::ecdsa::SigningKey>,
+    probe_sender: Option<tokio::sync::oneshot::Sender<MiningProbe>>,
+) -> Result<()> {
+    let probe_stop_signal = probe_sender.as_ref().map(|_| DashboardSignal::default());
+    if !args.compute_only && config.network != crate::cli::Network::Testnet {
+        bail!("autonomous transaction signing is disabled outside Injective Testnet");
+    }
     let address = selected_address(&config)?;
     let spending_limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
     let transaction_mode = !args.compute_only && !spending_limit.is_zero();
@@ -411,7 +589,6 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
         );
     }
     let selected = selected_nodes(&args.nodes)?;
-    let mut client = NetworkClient::connect(config.network).await?;
     if !client.has_mining_deployment() {
         bail!(
             "{} has no verified Astatine mining deployment; mining is disabled",
@@ -448,8 +625,15 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
             "An unresolved or underconfirmed transaction is being recovered. No further transactions will be signed until it settles; maximum exposure remains reserved."
         );
     }
-    let mut signer = if transaction_mode && signing_ready {
-        Some(unlock_selected_interactive(store, &config)?)
+    let mut supplied_signer = supplied_signer;
+    let mut signer = if transaction_mode {
+        if let Some(signer) = supplied_signer.take() {
+            Some(signer)
+        } else if signing_ready {
+            Some(unlock_selected_interactive(store, &config)?)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -461,6 +645,9 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
     }
     let slots = Arc::new((1..=9).map(NodeSlot::new).collect::<Vec<_>>());
     let schedule = Arc::new(RwLock::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let total_hashes = Arc::new(AtomicU64::new(0));
     let diagnostics = DiagnosticBuffer::default();
     let transaction_state = Arc::new(RwLock::new(initial_transaction_dashboard_state(
         transactions.as_ref(),
@@ -475,15 +662,14 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
         transaction_mode,
         compute_only: args.compute_only,
         workers_started: Arc::new(AtomicBool::new(false)),
+        total_hashes: Arc::clone(&total_hashes),
         selected: selected.clone(),
         slots: Arc::clone(&slots),
         schedule: Arc::clone(&schedule),
         transaction_state: Arc::clone(&transaction_state),
         pending_sync: Arc::new(RwLock::new(HashMap::new())),
+        finalization_state: Arc::new(RwLock::new(HashMap::new())),
     };
-    let stop = Arc::new(AtomicBool::new(false));
-    let cursor = Arc::new(AtomicUsize::new(0));
-    let total_hashes = Arc::new(AtomicU64::new(0));
     let initial_transaction_state = transaction_state
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -508,7 +694,7 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
         Arc::clone(&transaction_state),
     );
     let dashboard_updater = dashboard.as_ref().map(Dashboard::updater);
-    let mut snapshot = client.snapshot(Some(address)).await?;
+    let snapshot = client.snapshot(Some(address)).await?;
     let changed = update_slots(
         &slots,
         &schedule,
@@ -528,7 +714,6 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
     let mut observed_updates = observer.updates.clone();
     let _ = observed_updates.borrow_and_update();
 
-    let mut blocked_finalizations = HashSet::new();
     if let Some(manager) = transactions.as_mut()
         && let Err(error) = manager.reconcile_rewards(&client, &snapshot).await
     {
@@ -536,53 +721,6 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
             &dashboard,
             format!("reward-event verification will retry after the next snapshot: {error:#}"),
         );
-    }
-    if let (Some(manager), Some(signer)) = (transactions.as_mut(), signer.as_ref()) {
-        if !manager.journal.has_unresolved() && !manager.budget_remaining()?.is_zero() {
-            let finalizing = snapshot
-                .nodes
-                .iter()
-                .filter(|node| {
-                    selected.contains(&node.id)
-                        && node
-                            .state
-                            .as_ref()
-                            .is_some_and(|state| state.finalizable && !state.mining_paused)
-                })
-                .map(|node| node.id)
-                .collect::<Vec<_>>();
-            mark_dashboard_nodes(
-                &dashboard,
-                finalizing,
-                NodeStatus::Finalizing,
-                Some("Finalizing expired windows...".to_owned()),
-            );
-        }
-        let finalized = finalize_initial_expired_windows(
-            &client,
-            &selected,
-            manager,
-            signer,
-            address,
-            &mut snapshot,
-            FinalizationOptions {
-                blocked: &mut blocked_finalizations,
-                dashboard: &dashboard,
-                pending_sync: &dashboard_context.pending_sync,
-            },
-        )
-        .await?;
-        if finalized {
-            observer.force_refresh();
-            if let Err(error) = manager.reconcile_rewards(&client, &snapshot).await {
-                report_mining_warning(
-                    &dashboard,
-                    format!(
-                        "reward-event verification will retry after the next snapshot: {error:#}"
-                    ),
-                );
-            }
-        }
     }
     if !client.verification.token_verified {
         report_mining_warning(
@@ -596,9 +734,11 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                 "Per-session spending limit is zero; autonomous signing is disabled. Hashing continues without submissions or finalizations."
             );
         }
-        print_startup(&client, address, threads, &snapshot, &slots, changed);
+        print_startup(
+            &client, address, threads, &snapshot, &slots, &selected, changed,
+        );
     }
-    let (proof_sender, mut proof_receiver) = mpsc::unbounded_channel();
+    let (proof_sender, mut proof_receiver) = mpsc::channel(PENDING_PROOF_QUEUE_CAPACITY);
     let mut workers = Vec::with_capacity(threads);
     for worker_id in 0..threads {
         let slots = Arc::clone(&slots);
@@ -640,6 +780,17 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
         .workers_started
         .store(true, Ordering::Release);
     observer.force_refresh();
+    if let Some(probe_sender) = probe_sender {
+        let _ = probe_sender.send(MiningProbe {
+            slots: Arc::clone(&slots),
+            schedule: Arc::clone(&schedule),
+            observer_updates: observer.updates.clone(),
+            stop_signal: probe_stop_signal
+                .as_ref()
+                .expect("test stop signal must be initialized")
+                .clone(),
+        });
+    }
 
     let mut progress_ticker = time::interval(PROGRESS_INTERVAL);
     progress_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -650,9 +801,13 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
     let mut last_snapshot = observer.latest_snapshot().unwrap_or(snapshot);
     let mut fatal_error = None;
     let mut budget_exhausted = false;
-    let dashboard_signal = dashboard.as_ref().map(Dashboard::signal);
+    let mut stale_proof_warning_window = HashMap::<u8, u64>::new();
+    let dashboard_signal = dashboard
+        .as_ref()
+        .map(Dashboard::signal)
+        .or_else(|| probe_stop_signal.clone());
 
-    loop {
+    'mining_loop: loop {
         tokio::select! {
             signal = &mut ctrl_c => {
                 if let Err(error) = signal {
@@ -677,7 +832,8 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                     fatal_error = Some(anyhow!("read-only chain observer stopped unexpectedly"));
                     break;
                 }
-                match observed_updates.borrow_and_update().clone() {
+                let update = take_observer_update(&mut observed_updates);
+                match update {
                     ObserverUpdate::Snapshot(snapshot) => {
                         let mut snapshot = observer.latest_snapshot().unwrap_or(snapshot);
                         if let Some(manager) = transactions.as_mut()
@@ -737,52 +893,37 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                         if let (Some(manager), Some(signer)) =
                             (transactions.as_mut(), signer.as_ref())
                         {
-                            let can_finalize = if manager.journal.has_unresolved() {
-                                false
-                            } else {
-                                match manager.budget_remaining() {
-                                    Ok(remaining) => !remaining.is_zero(),
-                                    Err(error) => {
-                                        fatal_error = Some(error.context("read remaining spending limit"));
-                                        break;
+                            let finalization_result = tokio::select! {
+                                result = maybe_finalize_expired(
+                                    &client,
+                                    &selected,
+                                    manager,
+                                    signer,
+                                    address,
+                                    &snapshot,
+                                    FinalizationOptions {
+                                        finalization_state: &dashboard_context.finalization_state,
+                                        dashboard: &dashboard,
+                                        pending_sync: &dashboard_context.pending_sync,
+                                    },
+                                ) => Some(result),
+                                signal = &mut ctrl_c => {
+                                    if let Err(error) = signal {
+                                        report_mining_warning(&dashboard, format!("Ctrl+C signal handler failed: {error}"));
                                     }
+                                    None
+                                }
+                                event = wait_for_dashboard_event(dashboard_signal.clone()) => {
+                                    if let DashboardEventKind::Failure(error) = event {
+                                        fatal_error = Some(anyhow!("dashboard failed: {error}"));
+                                    }
+                                    None
                                 }
                             };
-                            if can_finalize {
-                                let finalizing = snapshot
-                                    .nodes
-                                    .iter()
-                                    .filter(|node| {
-                                        selected.contains(&node.id)
-                                            && node.state.as_ref().is_some_and(|state| {
-                                                state.finalizable && !state.mining_paused
-                                            })
-                                    })
-                                    .map(|node| node.id)
-                                    .collect::<Vec<_>>();
-                                if !finalizing.is_empty() {
-                                    mark_dashboard_nodes(
-                                        &dashboard,
-                                        finalizing,
-                                        NodeStatus::Finalizing,
-                                        Some("Finalizing expired windows...".to_owned()),
-                                    );
-                                }
-                            }
-                            match maybe_finalize_expired(
-                                &client,
-                                &selected,
-                                manager,
-                                signer,
-                                address,
-                                FinalizationOptions {
-                                    blocked: &mut blocked_finalizations,
-                                    dashboard: &dashboard,
-                                    pending_sync: &dashboard_context.pending_sync,
-                                },
-                            )
-                            .await
-                            {
+                            let Some(finalization_result) = finalization_result else {
+                                break 'mining_loop;
+                            };
+                            match finalization_result {
                                 Ok(true) => observer.force_refresh(),
                                 Ok(false) => {}
                                 Err(error) => {
@@ -817,6 +958,14 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                 }
             }
             _ = progress_ticker.tick() => {
+                let observer_age = observer.publication_age();
+                if observer_age > OBSERVER_STALL_TIMEOUT {
+                    fatal_error = Some(anyhow!(
+                        "read-only chain observer has not published a snapshot or error for {} seconds; mining is stopping rather than showing healthy WAITING",
+                        observer_age.as_secs()
+                    ));
+                    break;
+                }
                 let elapsed = last_progress.elapsed();
                 if dashboard.is_none() && elapsed >= PROGRESS_INTERVAL {
                     print_progress(
@@ -848,6 +997,19 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                         } else if let (Some(manager), Some(signer)) =
                             (transactions.as_mut(), signer.as_ref())
                         {
+                            let Some(work) = slot.current_work() else {
+                                continue;
+                            };
+                            if work.generation != proof.generation
+                                || !slot.is_generation_current(proof.generation)
+                            {
+                                continue;
+                            }
+                            let contract = work.fingerprint.hashing_context.contract;
+                            let window_id = work.fingerprint.hashing_context.window_id;
+                            if manager.proof_attempted(contract, window_id) {
+                                continue;
+                            }
                             if manager.journal.has_unresolved() {
                                 report_mining_info(
                                     &dashboard,
@@ -863,11 +1025,6 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                 );
                                 continue;
                             }
-                            let Some(work) = slot.current_work() else {
-                                continue;
-                            };
-                            let contract = work.fingerprint.hashing_context.contract;
-                            let window_id = work.fingerprint.hashing_context.window_id;
                             let header = work.fingerprint.hashing_context.header.clone();
                             mark_dashboard_nodes(
                                 &dashboard,
@@ -875,20 +1032,106 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                 NodeStatus::Confirming,
                                 Some(format!("Node {:02} • Confirming proof...", proof.node_id)),
                             );
-                            match manager.submit_proof(
-                                &client,
-                                signer,
-                                ProofSubmission {
-                                    contract,
-                                    node_id: proof.node_id,
-                                    window_id,
-                                    nonce: proof.nonce,
-                                    header,
-                                    work_hash: proof.hash,
-                                },
-                            )
-                            .await
-                            {
+                            let mut retry_attempts = 0_u8;
+                            let submission_result = loop {
+                                let result = tokio::select! {
+                                    result = manager.submit_proof(
+                                        &client,
+                                        signer,
+                                        ProofSubmission {
+                                            contract,
+                                            node_id: proof.node_id,
+                                            window_id,
+                                            nonce: proof.nonce,
+                                            header: header.clone(),
+                                            work_hash: proof.hash,
+                                        },
+                                    ) => Some(result),
+                                    signal = &mut ctrl_c => {
+                                        if let Err(error) = signal {
+                                            report_mining_warning(&dashboard, format!("Ctrl+C signal handler failed: {error}"));
+                                        }
+                                        None
+                                    }
+                                    event = wait_for_dashboard_event(dashboard_signal.clone()) => {
+                                        if let DashboardEventKind::Failure(error) = event {
+                                            fatal_error = Some(anyhow!("dashboard failed: {error}"));
+                                        }
+                                        None
+                                    }
+                                };
+                                let Some(result) = result else {
+                                    break 'mining_loop;
+                                };
+                                match result {
+                                    Err(error)
+                                        if is_transient_rpc_error(&error)
+                                            && !manager.journal.has_unresolved()
+                                            && !manager.journal.has_unverified_receipt() =>
+                                    {
+                                        retry_attempts = retry_attempts.saturating_add(1);
+                                        if retry_attempts >= MAX_PROOF_PREFLIGHT_RETRIES {
+                                            slot.reset_local_best_for_generation(proof.generation);
+                                            report_mining_warning(
+                                                &dashboard,
+                                                format!(
+                                                    "transient proof RPC retry limit reached for node {:02} window {window_id}; returning to hashing with fresh nonces: {error:#}",
+                                                    proof.node_id
+                                                ),
+                                            );
+                                            break Err(anyhow!(
+                                                "transient proof preflight retry limit reached; resume local proof search"
+                                            ));
+                                        }
+                                        if retry_attempts == 1 || retry_attempts.is_multiple_of(5) {
+                                            report_mining_warning(
+                                                &dashboard,
+                                                format!(
+                                                    "proof preflight for node {:02} window {window_id} hit a transient RPC error; reserved nonce and proof attempt remain untouched, retry {retry_attempts} will revalidate: {error:#}",
+                                                    proof.node_id
+                                                ),
+                                            );
+                                        }
+                                        observer.force_refresh();
+                                        let delay = finalization_retry_delay(retry_attempts);
+                                        mark_dashboard_nodes(
+                                            &dashboard,
+                                            [proof.node_id],
+                                            NodeStatus::Mining,
+                                            Some(format!(
+                                                "Node {:02} window #{window_id} • retrying proof preflight in {}s",
+                                                proof.node_id,
+                                                delay.as_secs()
+                                            )),
+                                        );
+                                        tokio::select! {
+                                            _ = time::sleep(delay) => {}
+                                            signal = &mut ctrl_c => {
+                                                if let Err(error) = signal {
+                                                    report_mining_warning(&dashboard, format!("Ctrl+C signal handler failed: {error}"));
+                                                }
+                                                break 'mining_loop;
+                                            }
+                                            event = wait_for_dashboard_event(dashboard_signal.clone()) => {
+                                                if let DashboardEventKind::Failure(error) = event {
+                                                    fatal_error = Some(anyhow!("dashboard failed: {error}"));
+                                                }
+                                                break 'mining_loop;
+                                            }
+                                        }
+                                        if !slot.current_work().is_some_and(|current| {
+                                            current.generation == proof.generation
+                                                && slot.is_generation_current(proof.generation)
+                                        }) {
+                                            break Err(anyhow!(
+                                                "local work generation changed before transient proof retry"
+                                            ));
+                                        }
+                                    }
+                                    result => break result,
+                                }
+                            };
+                            match submission_result {
                                 Ok(action) => {
                                     report_mining_info(
                                         &dashboard,
@@ -916,13 +1159,26 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                     );
                                     observer.force_refresh();
                                 }
-                                Err(error) if manager.journal.has_unresolved() => {
-                                    fatal_error = Some(error);
-                                    break;
-                                }
-                                Err(error) if manager.journal.has_unverified_receipt() => {
-                                    fatal_error = Some(error);
-                                    break;
+                                Err(error)
+                                    if manager.journal.has_unresolved()
+                                        || manager.journal.has_unverified_receipt() =>
+                                {
+                                    report_mining_warning(
+                                        &dashboard,
+                                        format!(
+                                            "proof outcome remains journaled as unresolved; no further transaction will be signed, but read-only recovery and mining observation will continue: {error:#}"
+                                        ),
+                                    );
+                                    mark_dashboard_nodes(
+                                        &dashboard,
+                                        [proof.node_id],
+                                        NodeStatus::Recovering,
+                                        Some(format!(
+                                            "Node {:02} • recovering journaled proof outcome...",
+                                            proof.node_id
+                                        )),
+                                    );
+                                    observer.force_refresh();
                                 }
                                 Err(error) if is_policy_refusal(&error) => {
                                     budget_exhausted |= is_session_limit_refusal(&error);
@@ -938,16 +1194,26 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                     );
                                 }
                                 Err(error) if is_stale_proof(&error) => {
-                                    report_mining_warning(
-                                        &dashboard,
-                                        format!("discarded stale proof for node {}: {error:#}", proof.node_id),
-                                    );
+                                    if stale_proof_warning_window.get(&proof.node_id)
+                                        != Some(&window_id)
+                                    {
+                                        stale_proof_warning_window
+                                            .insert(proof.node_id, window_id);
+                                        report_mining_warning(
+                                            &dashboard,
+                                            format!("discarded stale proof for node {} window {window_id}: {error:#}", proof.node_id),
+                                        );
+                                    }
                                     mark_dashboard_nodes(
                                         &dashboard,
                                         [proof.node_id],
-                                        NodeStatus::Waiting,
-                                        None,
+                                        NodeStatus::Syncing,
+                                        Some(format!(
+                                            "Node {:02} window #{window_id} • revalidating after stale proof...",
+                                            proof.node_id
+                                        )),
                                     );
+                                    observer.force_refresh();
                                 }
                                 Err(error) => {
                                     fatal_error = Some(error);
@@ -1012,6 +1278,9 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
         flush_dashboard_diagnostics(dashboard);
         result
     } else {
+        for message in diagnostics.drain() {
+            eprintln!("astatine: {message}");
+        }
         Ok(())
     };
     if let Err(error) = restore_result
@@ -1028,8 +1297,13 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
     Ok(())
 }
 
+fn take_observer_update(updates: &mut watch::Receiver<ObserverUpdate>) -> ObserverUpdate {
+    let borrowed = updates.borrow_and_update();
+    (*borrowed).clone()
+}
+
 pub(crate) struct FinalizationOptions<'a> {
-    pub blocked: &'a mut HashSet<(u8, u64)>,
+    pub finalization_state: &'a Arc<RwLock<HashMap<u8, FinalizationState>>>,
     pub dashboard: &'a Option<Dashboard>,
     pub pending_sync: &'a Arc<RwLock<HashMap<u8, PendingDashboardSync>>>,
 }
@@ -1040,12 +1314,65 @@ async fn maybe_finalize_expired(
     manager: &mut TransactionManager,
     signer: &bip32::secp256k1::ecdsa::SigningKey,
     wallet: Address,
+    last_verified_snapshot: &ReadSnapshot,
     options: FinalizationOptions<'_>,
 ) -> Result<bool> {
-    if manager.journal.has_unresolved() || manager.budget_remaining()?.is_zero() {
+    if manager.journal.has_unresolved() {
         return Ok(false);
     }
-    let snapshot = client.snapshot(Some(wallet)).await?;
+    let snapshot = match client.snapshot(Some(wallet)).await {
+        Ok(snapshot) => snapshot,
+        Err(error) if is_transient_rpc_error(&error) => {
+            for node in &last_verified_snapshot.nodes {
+                let Some(state) = node
+                    .state
+                    .as_ref()
+                    .filter(|state| selected.contains(&node.id) && state.finalizable)
+                else {
+                    continue;
+                };
+                let previous = options
+                    .finalization_state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&node.id)
+                    .cloned();
+                let attempts = retry_attempts(previous.as_ref()).saturating_add(1);
+                let delay = finalization_retry_delay(attempts);
+                record_finalization_state(
+                    &options,
+                    node.id,
+                    FinalizationState::Retrying {
+                        window_id: state.work.window_id,
+                        attempts,
+                        retry_at: Instant::now() + delay,
+                        reason: format!("fresh finalization snapshot unavailable: {error:#}"),
+                    },
+                );
+            }
+            return Ok(false);
+        }
+        Err(error) => return Err(error).context("read fresh state before window finalization"),
+    };
+    {
+        let mut states = options
+            .finalization_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        states.retain(|node_id, state| {
+            let Some(node) = snapshot.nodes.iter().find(|node| node.id == *node_id) else {
+                return true;
+            };
+            let Some(work) = node.state.as_ref() else {
+                return true;
+            };
+            let tracked_window = match state {
+                FinalizationState::Retrying { window_id, .. }
+                | FinalizationState::Blocked { window_id, .. } => *window_id,
+            };
+            work.work.window_id == tracked_window && work.finalizable && !work.mining_paused
+        });
+    }
     let mut finalized_any = false;
     for node in &snapshot.nodes {
         if !selected.contains(&node.id) {
@@ -1058,8 +1385,59 @@ async fn maybe_finalize_expired(
         else {
             continue;
         };
-        let key = (node.id, state.work.window_id);
-        if options.blocked.contains(&key) {
+        let previous = options
+            .finalization_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&node.id)
+            .filter(|tracked| match tracked {
+                FinalizationState::Retrying { window_id, .. }
+                | FinalizationState::Blocked { window_id, .. } => {
+                    *window_id == state.work.window_id
+                }
+            })
+            .cloned();
+        if let Some(FinalizationState::Blocked { reason, .. }) = &previous {
+            mark_dashboard_nodes(
+                options.dashboard,
+                [node.id],
+                NodeStatus::FinalizationBlocked,
+                Some(format!(
+                    "Node {:02} • Finalization blocked: {reason}",
+                    node.id
+                )),
+            );
+            continue;
+        }
+        if let Some(FinalizationState::Retrying {
+            retry_at, reason, ..
+        }) = &previous
+            && Instant::now() < *retry_at
+        {
+            let seconds = retry_at
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+                .max(1);
+            mark_dashboard_nodes(
+                options.dashboard,
+                [node.id],
+                NodeStatus::FinalizationRetrying,
+                Some(format!(
+                    "Node {:02} window #{} • Finalization retry in {seconds}s ({reason})",
+                    node.id, state.work.window_id
+                )),
+            );
+            continue;
+        }
+        if manager.budget_remaining()?.is_zero() {
+            record_finalization_state(
+                &options,
+                node.id,
+                FinalizationState::Blocked {
+                    window_id: state.work.window_id,
+                    reason: "configured session spending limit is exhausted".to_owned(),
+                },
+            );
             continue;
         }
         mark_dashboard_nodes(
@@ -1073,6 +1451,11 @@ async fn maybe_finalize_expired(
             .await
         {
             Ok(action) => {
+                options
+                    .finalization_state
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&node.id);
                 report_mining_info(
                     options.dashboard,
                     confirmed_action_message("finalization", &action),
@@ -1096,38 +1479,204 @@ async fn maybe_finalize_expired(
                 );
                 finalized_any = true;
             }
-            Err(error) if manager.journal.has_unresolved() => return Err(error),
-            Err(error) if manager.journal.has_unverified_receipt() => return Err(error),
-            Err(error) if is_policy_refusal(&error) => {
+            Err(error)
+                if manager.journal.has_unresolved() || manager.journal.has_unverified_receipt() =>
+            {
                 report_mining_warning(
                     options.dashboard,
                     format!(
-                        "node {} window {} finalization skipped: {error:#}",
+                        "node {} window {} finalization outcome is journaled and requires recovery; no rebroadcast will occur: {error:#}",
                         node.id, state.work.window_id
                     ),
                 );
-                mark_dashboard_nodes(options.dashboard, [node.id], NodeStatus::Waiting, None);
-                options.blocked.insert(key);
+                break;
             }
             Err(error) => {
-                report_mining_warning(
-                    options.dashboard,
-                    format!(
-                        "node {} window {} finalization deferred: {error:#}",
-                        node.id, state.work.window_id
-                    ),
-                );
-                mark_dashboard_nodes(options.dashboard, [node.id], NodeStatus::Waiting, None);
-                options.blocked.insert(key);
+                if let Some(kind) = transaction_policy_refusal(&error) {
+                    let reason = match kind {
+                        TransactionPolicyRefusalKind::SessionLimitExceeded => {
+                            format!("session cap refuses this finalization: {error:#}")
+                        }
+                        TransactionPolicyRefusalKind::InsufficientConfirmedBalance => {
+                            format!(
+                                "confirmed INJ balance/reserve refuses this finalization: {error:#}"
+                            )
+                        }
+                        TransactionPolicyRefusalKind::SigningDisabled => {
+                            format!("transaction signing is disabled: {error:#}")
+                        }
+                    };
+                    record_finalization_state(
+                        &options,
+                        node.id,
+                        FinalizationState::Blocked {
+                            window_id: state.work.window_id,
+                            reason,
+                        },
+                    );
+                } else if mined_transaction_reverted(&error).is_some_and(|(action, window_id)| {
+                    action == TransactionAction::FinalizeWindow && window_id == state.work.window_id
+                }) {
+                    match client.snapshot(Some(wallet)).await {
+                        Ok(fresh) => {
+                            let still_finalizable = fresh.nodes.iter().any(|fresh_node| {
+                                fresh_node.id == node.id
+                                    && fresh_node.state.as_ref().is_some_and(|fresh_state| {
+                                        fresh_state.work.window_id == state.work.window_id
+                                            && fresh_state.finalizable
+                                            && !fresh_state.mining_paused
+                                    })
+                            });
+                            if still_finalizable {
+                                record_finalization_state(
+                                    &options,
+                                    node.id,
+                                    FinalizationState::Blocked {
+                                        window_id: state.work.window_id,
+                                        reason: format!(
+                                            "a confirmed finalization transaction reverted while fresh canonical state still reports this window finalizable; inspect contract/RPC state before restarting: {error:#}"
+                                        ),
+                                    },
+                                );
+                            } else {
+                                options
+                                    .finalization_state
+                                    .write()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .remove(&node.id);
+                                report_mining_warning(
+                                    options.dashboard,
+                                    format!(
+                                        "node {} window {} finalization reverted; fresh canonical state has advanced and the transaction will not be resent",
+                                        node.id, state.work.window_id
+                                    ),
+                                );
+                            }
+                        }
+                        Err(state_error) => record_finalization_state(
+                            &options,
+                            node.id,
+                            FinalizationState::Blocked {
+                                window_id: state.work.window_id,
+                                reason: format!(
+                                    "a confirmed finalization transaction reverted and fresh state could not be verified; inspect canonical state before restarting: {state_error:#}"
+                                ),
+                            },
+                        ),
+                    }
+                } else if is_stale_transaction_preflight(&error) {
+                    let attempts = retry_attempts(previous.as_ref()).saturating_add(1);
+                    record_finalization_state(
+                        &options,
+                        node.id,
+                        FinalizationState::Retrying {
+                            window_id: state.work.window_id,
+                            attempts,
+                            retry_at: Instant::now() + STALE_PREFLIGHT_RETRY,
+                            reason: format!("fresh state changed; revalidating: {error:#}"),
+                        },
+                    );
+                } else if is_transient_rpc_error(&error) {
+                    let attempts = retry_attempts(previous.as_ref()).saturating_add(1);
+                    let delay = finalization_retry_delay(attempts);
+                    record_finalization_state(
+                        &options,
+                        node.id,
+                        FinalizationState::Retrying {
+                            window_id: state.work.window_id,
+                            attempts,
+                            retry_at: Instant::now() + delay,
+                            reason: format!("transient RPC error: {error:#}"),
+                        },
+                    );
+                } else {
+                    record_finalization_state(
+                        &options,
+                        node.id,
+                        FinalizationState::Blocked {
+                            window_id: state.work.window_id,
+                            reason: format!("permanent or unclassified failure: {error:#}"),
+                        },
+                    );
+                }
             }
         }
-        if manager.budget_remaining()?.is_zero() {
+        if manager.journal.has_unresolved() || manager.budget_remaining()?.is_zero() {
             break;
         }
     }
     Ok(finalized_any)
 }
 
+fn retry_attempts(previous: Option<&FinalizationState>) -> u8 {
+    previous.map_or(0, |state| match state {
+        FinalizationState::Retrying { attempts, .. } => *attempts,
+        FinalizationState::Blocked { .. } => 0,
+    })
+}
+
+fn finalization_retry_delay(attempts: u8) -> Duration {
+    let exponent = attempts.saturating_sub(1).min(5);
+    Duration::from_secs((1_u64 << exponent).min(MAX_POLL_INTERVAL.as_secs()))
+}
+
+fn record_finalization_state(
+    options: &FinalizationOptions<'_>,
+    node_id: u8,
+    state: FinalizationState,
+) {
+    let changed = {
+        let mut states = options
+            .finalization_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if states.get(&node_id) == Some(&state) {
+            false
+        } else {
+            states.insert(node_id, state.clone());
+            true
+        }
+    };
+    if !changed {
+        return;
+    }
+    match state {
+        FinalizationState::Retrying {
+            window_id,
+            attempts,
+            retry_at,
+            reason,
+        } => {
+            let delay = retry_at
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+                .max(1);
+            let message = format!(
+                "node {node_id:02} window {window_id} finalization retry {attempts} scheduled in {delay}s: {reason}"
+            );
+            report_mining_warning(options.dashboard, message.clone());
+            mark_dashboard_nodes(
+                options.dashboard,
+                [node_id],
+                NodeStatus::FinalizationRetrying,
+                Some(message),
+            );
+        }
+        FinalizationState::Blocked { window_id, reason } => {
+            let message =
+                format!("node {node_id:02} window {window_id} finalization blocked: {reason}");
+            report_mining_warning(options.dashboard, message.clone());
+            mark_dashboard_nodes(
+                options.dashboard,
+                [node_id],
+                NodeStatus::FinalizationBlocked,
+                Some(message),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) async fn finalize_initial_expired_windows(
     client: &NetworkClient,
     selected: &HashSet<u8>,
@@ -1137,7 +1686,8 @@ pub(crate) async fn finalize_initial_expired_windows(
     snapshot: &mut ReadSnapshot,
     options: FinalizationOptions<'_>,
 ) -> Result<bool> {
-    if !maybe_finalize_expired(client, selected, manager, signer, wallet, options).await? {
+    if !maybe_finalize_expired(client, selected, manager, signer, wallet, snapshot, options).await?
+    {
         return Ok(false);
     }
     *snapshot = client.snapshot(Some(wallet)).await?;
@@ -1157,21 +1707,31 @@ fn confirmed_action_message(label: &str, action: &ConfirmedAction) -> String {
 }
 
 fn is_policy_refusal(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}").to_ascii_lowercase();
-    message.contains("maximum exposure exceeds")
-        || message.contains("configured per-session limit")
-        || message.contains("insufficient confirmed inj balance")
-        || message.contains("spending limit is zero")
+    transaction_policy_refusal(error).is_some()
 }
 
 fn is_session_limit_refusal(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}").to_ascii_lowercase();
-    message.contains("maximum exposure exceeds") || message.contains("configured per-session limit")
+    matches!(
+        transaction_policy_refusal(error),
+        Some(
+            TransactionPolicyRefusalKind::SessionLimitExceeded
+                | TransactionPolicyRefusalKind::SigningDisabled
+        )
+    )
 }
 
 fn is_stale_proof(error: &anyhow::Error) -> bool {
+    if mined_transaction_reverted(error)
+        .is_some_and(|(action, _)| action == TransactionAction::SubmitProof)
+    {
+        return true;
+    }
+    if is_stale_transaction_preflight(error) {
+        return true;
+    }
     let message = format!("{error:#}").to_ascii_lowercase();
-    message.contains("fresh on-chain")
+    message.contains("transient proof preflight retry limit reached")
+        || message.contains("fresh on-chain")
         || message.contains("different window")
         || message.contains("no longer eligible")
         || message.contains("pending nonce changed")
@@ -1209,7 +1769,7 @@ pub(crate) fn update_slots(
                 .flatten()
         });
         let contract = node.map(|node| node.address).unwrap_or(Address::ZERO);
-        changed |= slot.set_work(manifest, miner, contract, state, snapshot.block.timestamp)?;
+        changed |= slot.set_work(manifest, miner, contract, state, &snapshot.block)?;
         if slot.current_work().is_some() {
             active.push(index);
         }
@@ -1226,6 +1786,13 @@ enum SnapshotFreshness {
     Reorg,
 }
 
+#[derive(Clone, Copy)]
+struct ObserverProgress<'a> {
+    last_snapshot: &'a ReadSnapshot,
+    last_successful_read_at: Instant,
+    last_head_advanced_at: Instant,
+}
+
 pub(crate) fn start_read_only_observer(
     client: NetworkClient,
     context: DashboardContext,
@@ -1239,12 +1806,15 @@ pub(crate) fn start_read_only_observer(
     let (force_refresh, mut refresh_rx) = mpsc::channel(1);
     let refresh_epoch = Arc::new(AtomicU64::new(0));
     let refresh_gate = Arc::new(Mutex::new(()));
+    let last_publication_at = Arc::new(Mutex::new(Instant::now()));
     let observer_refresh_epoch = Arc::clone(&refresh_epoch);
     let observer_refresh_gate = Arc::clone(&refresh_gate);
+    let observer_last_publication_at = Arc::clone(&last_publication_at);
     let task = tokio::spawn(async move {
         let mut last_block = initial_snapshot.block.clone();
         let mut last_snapshot = initial_snapshot;
         let mut last_observed_at = Instant::now();
+        let mut last_head_advanced_at = last_observed_at;
         let mut delay = POLL_INTERVAL;
         let mut consecutive_errors = 0_u8;
         loop {
@@ -1284,23 +1854,26 @@ pub(crate) fn start_read_only_observer(
                                 continue;
                             }
                             let message = format!("read-only snapshot rejected: {error:#}");
-                            clear_observed_work(
-                                &context,
-                                &client.manifest,
-                                last_snapshot.block.timestamp,
-                            );
+                            clear_observed_work(&context, &client.manifest, &last_snapshot.block);
                             observer_rpc_error(
-                                &client,
                                 &context,
                                 &updater,
                                 &diagnostics,
-                                &last_snapshot,
+                                ObserverProgress {
+                                    last_snapshot: &last_snapshot,
+                                    last_successful_read_at: last_observed_at,
+                                    last_head_advanced_at,
+                                },
                                 &message,
                                 &mut consecutive_errors,
                             );
                             let report =
                                 consecutive_errors == 1 || consecutive_errors.is_multiple_of(5);
                             updates_tx.send_replace(ObserverUpdate::RpcError { message, report });
+                            *observer_last_publication_at
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Instant::now();
                             drop(commit);
                             delay = next_poll_delay(delay);
                             continue;
@@ -1330,11 +1903,7 @@ pub(crate) fn start_read_only_observer(
                         &snapshot,
                     ) {
                         let message = format!("update verified mining work: {error:#}");
-                        clear_observed_work(
-                            &context,
-                            &client.manifest,
-                            last_snapshot.block.timestamp,
-                        );
+                        clear_observed_work(&context, &client.manifest, &last_snapshot.block);
                         if let Some(updater) = &updater {
                             updater.update(|model| model.critical_error = Some(message.clone()));
                         }
@@ -1350,16 +1919,32 @@ pub(crate) fn start_read_only_observer(
                         &snapshot,
                         last_observed_at,
                         request_started.elapsed(),
-                        updater.as_ref(),
+                        &diagnostics,
+                    );
+                    let observed_at = Instant::now();
+                    if snapshot.block.number != last_block.number
+                        || snapshot.block.hash != last_block.hash
+                    {
+                        last_head_advanced_at = observed_at;
+                    }
+                    trace_node_liveness(
+                        &context,
+                        &snapshot,
+                        last_observed_at,
+                        last_head_advanced_at,
+                        observed_at,
                         &diagnostics,
                     );
                     last_block = snapshot.block.clone();
                     last_snapshot = snapshot.clone();
-                    last_observed_at = Instant::now();
+                    last_observed_at = observed_at;
                     consecutive_errors = 0;
                     delay = POLL_INTERVAL;
                     refresh_dashboard(updater.as_ref(), &context, &snapshot);
                     updates_tx.send_replace(ObserverUpdate::Snapshot(snapshot));
+                    *observer_last_publication_at
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
                     drop(commit);
                 }
                 Err(error) => {
@@ -1372,18 +1957,24 @@ pub(crate) fn start_read_only_observer(
                         continue;
                     }
                     let message = format!("RPC refresh failed; stale work stopped: {error:#}");
-                    clear_observed_work(&context, &client.manifest, last_snapshot.block.timestamp);
+                    clear_observed_work(&context, &client.manifest, &last_snapshot.block);
                     observer_rpc_error(
-                        &client,
                         &context,
                         &updater,
                         &diagnostics,
-                        &last_snapshot,
+                        ObserverProgress {
+                            last_snapshot: &last_snapshot,
+                            last_successful_read_at: last_observed_at,
+                            last_head_advanced_at,
+                        },
                         &message,
                         &mut consecutive_errors,
                     );
                     let report = consecutive_errors == 1 || consecutive_errors.is_multiple_of(5);
                     updates_tx.send_replace(ObserverUpdate::RpcError { message, report });
+                    *observer_last_publication_at
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
                     drop(commit);
                     delay = next_poll_delay(delay);
                 }
@@ -1396,6 +1987,7 @@ pub(crate) fn start_read_only_observer(
         force_refresh,
         refresh_epoch,
         refresh_gate,
+        last_publication_at,
         task,
     }
 }
@@ -1470,7 +2062,6 @@ fn trace_snapshot_transitions(
     current: &ReadSnapshot,
     previous_observed_at: Instant,
     request_elapsed: Duration,
-    updater: Option<&DashboardUpdater>,
     diagnostics: &DiagnosticBuffer,
 ) {
     for node_id in selected {
@@ -1518,11 +2109,90 @@ fn trace_snapshot_transitions(
             observation_interval_ms,
             request_elapsed.as_millis(),
         );
-        if updater.is_some() {
-            diagnostics.push(message);
-        } else {
-            eprintln!("astatine: {message}");
-        }
+        diagnostics.push(message);
+    }
+}
+
+fn trace_node_liveness(
+    context: &DashboardContext,
+    snapshot: &ReadSnapshot,
+    last_successful_read_at: Instant,
+    last_head_advanced_at: Instant,
+    observed_at: Instant,
+    diagnostics: &DiagnosticBuffer,
+) {
+    let schedule = context
+        .schedule
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let activities = context
+        .transaction_state
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let finalization = context
+        .finalization_state
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let worker_enabled = context.workers_started.load(Ordering::Acquire);
+    let exposure = activities
+        .session_exposure
+        .map(|amount| amount.to_string())
+        .unwrap_or_else(|| "unavailable".to_owned());
+    for node_id in &context.selected {
+        let node = snapshot.nodes.iter().find(|node| node.id == *node_id);
+        let trusted = node.is_some_and(|node| node.pin.runtime_verified && node.pin.abi_verified);
+        let state = node
+            .filter(|_| trusted)
+            .and_then(|node| node.state.as_ref());
+        let slot = &context.slots[usize::from(*node_id - 1)];
+        let (slot_active, slot_suspended, deadline, slot_window) = slot.diagnostic_work();
+        let scheduled = schedule.contains(&usize::from(*node_id - 1));
+        let local_deadline_expired = deadline.is_some_and(|deadline| observed_at >= deadline);
+        let transaction = activities
+            .activities
+            .iter()
+            .find(|activity| activity.node_id == *node_id)
+            .map(|activity| format!("{:?}@{}", activity.state, activity.window_id))
+            .unwrap_or_else(|| "none".to_owned());
+        let finalization_state = finalization
+            .get(node_id)
+            .map(|state| format!("{state:?}"))
+            .unwrap_or_else(|| "none".to_owned());
+        let (eligible, finalizable, paused, ended, chain_window) =
+            state.map_or((false, false, false, false, None), |state| {
+                (
+                    state.eligible,
+                    state.finalizable,
+                    state.mining_paused,
+                    state.work.ended,
+                    Some(state.work.window_id),
+                )
+            });
+        let deadline_state = deadline.map_or_else(
+            || "none".to_owned(),
+            |deadline| {
+                format!(
+                    "{}ms_remaining",
+                    deadline.saturating_duration_since(observed_at).as_millis()
+                )
+            },
+        );
+        diagnostics.push(format!(
+            "node-liveness node={node_id:02} window={chain_window:?} block={} hash={:#x} verified={trusted} eligible={eligible} finalizable={finalizable} paused={paused} ended={ended} local_slot={slot_active} suspended={slot_suspended} slot_window={slot_window:?} scheduled={scheduled} workers_enabled={worker_enabled} deadline={deadline_state} deadline_expired={local_deadline_expired} head_progress_age_ms={} successful_rpc_age_ms={} node_hashes={} hashes_total={} tx={transaction} exposure_wei={exposure} finalization={finalization_state}",
+            snapshot.block.number,
+            snapshot.block.hash,
+            observed_at
+                .saturating_duration_since(last_head_advanced_at)
+                .as_millis(),
+            observed_at
+                .saturating_duration_since(last_successful_read_at)
+                .as_millis(),
+            slot.completed_hashes(),
+            context.total_hashes.load(Ordering::Relaxed),
+        ));
     }
 }
 
@@ -1553,16 +2223,10 @@ fn display_candidate(candidate: Option<Address>) -> String {
 fn clear_observed_work(
     context: &DashboardContext,
     manifest: &DeploymentManifest,
-    block_timestamp: u64,
+    block: &BlockSnapshot,
 ) {
     for slot in context.slots.iter() {
-        let _ = slot.set_work(
-            manifest,
-            context.address,
-            Address::ZERO,
-            None,
-            block_timestamp,
-        );
+        let _ = slot.set_work(manifest, context.address, Address::ZERO, None, block);
     }
     *context
         .schedule
@@ -1571,19 +2235,27 @@ fn clear_observed_work(
 }
 
 fn observer_rpc_error(
-    _client: &NetworkClient,
     context: &DashboardContext,
     updater: &Option<DashboardUpdater>,
     diagnostics: &DiagnosticBuffer,
-    last_snapshot: &ReadSnapshot,
+    progress: ObserverProgress<'_>,
     message: &str,
     consecutive_errors: &mut u8,
 ) {
     *consecutive_errors = consecutive_errors.saturating_add(1);
     if *consecutive_errors == 1 || consecutive_errors.is_multiple_of(5) {
-        diagnostics.push(message.to_owned());
+        diagnostics.push(format!(
+            "{message}; last_verified_block={} hash={:#x} last_successful_read_age_ms={} last_head_advance_age_ms={}",
+            progress.last_snapshot.block.number,
+            progress.last_snapshot.block.hash,
+            Instant::now()
+                .saturating_duration_since(progress.last_successful_read_at)
+                .as_millis(),
+            Instant::now()
+                .saturating_duration_since(progress.last_head_advanced_at)
+                .as_millis(),
+        ));
     }
-    refresh_dashboard(updater.as_ref(), context, last_snapshot);
     if let Some(updater) = updater {
         let activities = context
             .transaction_state
@@ -1605,6 +2277,7 @@ fn observer_rpc_error(
                     };
                 } else {
                     node.status = NodeStatus::RpcError;
+                    node.mining_deadline = None;
                 }
             }
         });
@@ -1628,6 +2301,11 @@ fn dashboard_model(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    let finalization_state = context
+        .finalization_state
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let mut nodes = Vec::with_capacity(selected_ids.len());
     let mut first_error = None;
     for id in selected_ids {
@@ -1645,8 +2323,27 @@ fn dashboard_model(
             state,
             trusted,
             context.workers_started.load(Ordering::Acquire) && slot_work.is_some(),
+            context.workers_started.load(Ordering::Acquire),
             activity.map(|activity| activity.state),
         );
+        if activity.is_none()
+            && let Some(state) = state
+            && let Some(finalization) = finalization_state.get(&id)
+        {
+            status = match finalization {
+                FinalizationState::Retrying { window_id, .. }
+                    if *window_id == state.work.window_id =>
+                {
+                    NodeStatus::FinalizationRetrying
+                }
+                FinalizationState::Blocked { window_id, .. }
+                    if *window_id == state.work.window_id =>
+                {
+                    NodeStatus::FinalizationBlocked
+                }
+                _ => status,
+            };
+        }
         let pending = pending_sync.get(&id).copied();
         let syncing = pending.is_some_and(|pending| {
             activity.is_none()
@@ -1689,6 +2386,53 @@ fn dashboard_model(
             reward,
         });
     }
+    let current_action = nodes.iter().find_map(|node| {
+        let window_id = node.window_id?;
+        match (node.status, finalization_state.get(&node.id)) {
+            (
+                NodeStatus::FinalizationRetrying,
+                Some(FinalizationState::Retrying {
+                    window_id: tracked,
+                    retry_at,
+                    reason,
+                    ..
+                }),
+            ) if *tracked == window_id => {
+                let seconds = retry_at
+                    .saturating_duration_since(Instant::now())
+                    .as_secs()
+                    .max(1);
+                Some(format!(
+                    "Node {:02} window #{window_id} • retrying finalization in {seconds}s: {reason}",
+                    node.id
+                ))
+            }
+            (
+                NodeStatus::FinalizationBlocked,
+                Some(FinalizationState::Blocked {
+                    window_id: tracked,
+                    reason,
+                }),
+            ) if *tracked == window_id => Some(format!(
+                "Node {:02} window #{window_id} • finalization blocked: {reason}",
+                node.id
+            )),
+            (NodeStatus::FinalizationRequired, _) => Some(format!(
+                "Node {:02} window #{window_id} • finalization required{}",
+                node.id,
+                if context.compute_only || !context.transaction_mode {
+                    "; Testnet transaction signing is disabled"
+                } else {
+                    "; verifying transaction budget and canonical state"
+                }
+            )),
+            (NodeStatus::WaitingForChain, _) => Some(format!(
+                "Node {:02} window #{window_id} • local work stopped at its safety deadline; waiting for a newer canonical block",
+                node.id
+            )),
+            _ => None,
+        }
+    });
     DashboardModel {
         network: context.network,
         chain_id: context.chain_id,
@@ -1700,6 +2444,7 @@ fn dashboard_model(
         block_number: snapshot.block.number,
         block_hash: snapshot.block.hash,
         snapshot_observed_at: observed_at,
+        last_block_advanced_at: observed_at,
         snapshot_ready: true,
         selected_nodes: nodes,
         compute_only: context.compute_only,
@@ -1710,7 +2455,7 @@ fn dashboard_model(
             .any(|activity| activity.state == TransactionActivityState::Recovering),
         stopping: false,
         hashrate: 0.0,
-        current_action: None,
+        current_action,
         connection_error: first_error,
         critical_error: None,
     }
@@ -1747,6 +2492,7 @@ fn initial_dashboard_model(
         block_number: 0,
         block_hash: B256::ZERO,
         snapshot_observed_at: Instant::now(),
+        last_block_advanced_at: Instant::now(),
         snapshot_ready: false,
         selected_nodes,
         compute_only: context.compute_only,
@@ -1766,6 +2512,7 @@ fn dashboard_node_status(
     state: Option<&NodeState>,
     trusted: bool,
     has_current_work: bool,
+    workers_started: bool,
     activity: Option<TransactionActivityState>,
 ) -> NodeStatus {
     if let Some(activity) = activity {
@@ -1783,8 +2530,12 @@ fn dashboard_node_status(
         NodeStatus::Paused
     } else if !state.work.started || state.work.ended || state.work.remaining_allocation.is_zero() {
         NodeStatus::Ended
+    } else if state.finalizable {
+        NodeStatus::FinalizationRequired
     } else if state.eligible && has_current_work {
         NodeStatus::Mining
+    } else if state.eligible && workers_started {
+        NodeStatus::WaitingForChain
     } else {
         NodeStatus::Waiting
     }
@@ -1821,6 +2572,22 @@ fn refresh_dashboard(
     let chain_timestamp = snapshot.block.timestamp;
     updater.update(|model| {
         let hashrate = model.hashrate;
+        let head_advanced = reconcile_head_progress(model, &mut updated, observed_at);
+        if !head_advanced
+            && let Some(node) = updated
+                .selected_nodes
+                .iter()
+                .find(|node| node.status == NodeStatus::WaitingForChain)
+        {
+            let age = observed_at
+                .saturating_duration_since(updated.last_block_advanced_at)
+                .as_secs();
+            updated.current_action = Some(format!(
+                "Node {:02} window #{} • waiting for a new canonical block ({age}s); stale work is stopped",
+                node.id,
+                node.window_id.unwrap_or_default()
+            ));
+        }
         for node in &mut updated.selected_nodes {
             let Some(previous) = model.selected_nodes.iter().find(|old| old.id == node.id) else {
                 continue;
@@ -1855,6 +2622,22 @@ fn refresh_dashboard(
             .clone();
         apply_transaction_state_to_model(model, &transaction_state);
     });
+}
+
+fn reconcile_head_progress(
+    previous: &DashboardModel,
+    next: &mut DashboardModel,
+    observed_at: Instant,
+) -> bool {
+    let advanced = !previous.snapshot_ready
+        || next.block_number != previous.block_number
+        || next.block_hash != previous.block_hash;
+    next.last_block_advanced_at = if advanced {
+        observed_at
+    } else {
+        previous.last_block_advanced_at
+    };
+    advanced
 }
 
 fn mark_dashboard_nodes(
@@ -1921,7 +2704,7 @@ fn apply_transaction_state_to_model(model: &mut DashboardModel, state: &Transact
             };
         }
     }
-    model.current_action = state.activities.first().map(|activity| {
+    let transaction_action = state.activities.first().map(|activity| {
         let action = match activity.state {
             TransactionActivityState::Finalizing => "Finalizing window",
             TransactionActivityState::Confirming => "Confirming transaction",
@@ -1932,6 +2715,15 @@ fn apply_transaction_state_to_model(model: &mut DashboardModel, state: &Transact
             activity.node_id, activity.window_id
         )
     });
+    if transaction_action.is_some() {
+        model.current_action = transaction_action;
+    } else if model.current_action.as_deref().is_some_and(|action| {
+        action.contains("Confirming transaction")
+            || action.contains("Finalizing window...")
+            || action.contains("Recovering transaction")
+    }) {
+        model.current_action = None;
+    }
 }
 
 fn initial_transaction_dashboard_state(
@@ -1993,6 +2785,7 @@ fn print_startup(
     threads: usize,
     snapshot: &ReadSnapshot,
     slots: &[NodeSlot],
+    selected: &HashSet<u8>,
     selected_work_changed: bool,
 ) {
     let ast_decimals = client
@@ -2016,8 +2809,31 @@ fn print_startup(
         .iter()
         .filter(|slot| slot.current_work().is_some())
         .count();
+    let finalizable = snapshot
+        .nodes
+        .iter()
+        .filter(|node| selected.contains(&node.id))
+        .filter(|node| {
+            node.state
+                .as_ref()
+                .is_some_and(|state| state.finalizable && !state.mining_paused)
+        })
+        .count();
     if eligible == 0 {
-        println!("No eligible work in selected nodes; waiting for fresh verified windows.");
+        if finalizable > 0 {
+            println!(
+                "{} selected window(s) require permissionless finalization; read-only observation and automatic finalization are active.",
+                finalizable
+            );
+        } else if snapshot.nodes.iter().any(|node| {
+            selected.contains(&node.id) && node.state.as_ref().is_some_and(|state| state.eligible)
+        }) {
+            println!(
+                "Verified work is eligible but the local slot is waiting for a fresh canonical head; stale work is stopped."
+            );
+        } else {
+            println!("No eligible work in selected nodes; waiting for fresh verified windows.");
+        }
     } else {
         println!(
             "Hashing {} eligible node(s); Ctrl+C stops safely.",
@@ -2059,7 +2875,7 @@ fn worker_loop(
     stop: Arc<AtomicBool>,
     cursor: Arc<AtomicUsize>,
     total_hashes: Arc<AtomicU64>,
-    proofs: mpsc::UnboundedSender<ProofFound>,
+    proofs: mpsc::Sender<ProofFound>,
 ) {
     while !stop.load(Ordering::Acquire) {
         let mut active = schedule
@@ -2115,7 +2931,7 @@ fn worker_loop(
             }
             *best = Some(hash);
             drop(best);
-            let _ = proofs.send(ProofFound {
+            let _ = proofs.try_send(ProofFound {
                 node_id: slot.id,
                 generation: work.generation,
                 nonce,
@@ -2125,6 +2941,8 @@ fn worker_loop(
             });
         }
         total_hashes.fetch_add(completed, Ordering::Relaxed);
+        slot.completed_hashes
+            .fetch_add(completed, Ordering::Relaxed);
     }
 }
 
@@ -2179,15 +2997,17 @@ fn network_label(network: crate::cli::Network) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        DashboardContext, NodeSlot, NonceAllocator, PendingDashboardSync, SnapshotFreshness,
-        compare_snapshot_freshness, dashboard_model, dashboard_node_status, next_poll_delay,
-        next_scheduled_slot, selected_nodes, should_unlock_recovered_wallet, update_slots,
+        DashboardContext, FinalizationState, NodeSlot, NonceAllocator, ObserverUpdate,
+        PENDING_PROOF_QUEUE_CAPACITY, PendingDashboardSync, SnapshotFreshness,
+        compare_snapshot_freshness, dashboard_model, dashboard_node_status,
+        finalization_retry_delay, next_poll_delay, next_scheduled_slot, reconcile_head_progress,
+        selected_nodes, should_unlock_recovered_wallet, take_observer_update, update_slots,
         worker_loop,
     };
     use crate::{
         cli::{MineArgs, Network},
         config::ConfigStore,
-        dashboard::NodeStatus,
+        dashboard::{NodeStatus, hashes_per_second},
         deployment::DeploymentManifest,
         protocol::{WorkContext, WorkHasher, meets_target},
         rpc::{
@@ -2207,7 +3027,7 @@ mod tests {
         time::{Duration, Instant},
     };
     use tempfile::tempdir;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot, watch};
     use tokio::time::timeout;
 
     fn eligible_state() -> NodeState {
@@ -2234,49 +3054,62 @@ mod tests {
         }
     }
 
+    fn test_block(number: u64, timestamp: u64) -> BlockSnapshot {
+        BlockSnapshot {
+            number,
+            timestamp,
+            hash: B256::with_last_byte(number as u8),
+        }
+    }
+
     #[test]
     fn dashboard_node_status_requires_verified_live_work_and_respects_transactions() {
         let mut state = eligible_state();
         assert_eq!(
-            dashboard_node_status(Some(&state), true, true, None),
+            dashboard_node_status(Some(&state), true, true, true, None),
             NodeStatus::Mining
         );
         assert_eq!(
-            dashboard_node_status(Some(&state), true, false, None),
+            dashboard_node_status(Some(&state), true, false, false, None),
             NodeStatus::Waiting
         );
         assert_eq!(
-            dashboard_node_status(Some(&state), false, true, None),
+            dashboard_node_status(Some(&state), true, false, true, None),
+            NodeStatus::WaitingForChain
+        );
+        assert_eq!(
+            dashboard_node_status(Some(&state), false, true, true, None),
             NodeStatus::RpcError
         );
         assert_eq!(
-            dashboard_node_status(None, true, false, None),
+            dashboard_node_status(None, true, false, false, None),
             NodeStatus::RpcError
         );
 
         state.mining_paused = true;
         assert_eq!(
-            dashboard_node_status(Some(&state), true, true, None),
+            dashboard_node_status(Some(&state), true, true, true, None),
             NodeStatus::Paused
         );
         state.mining_paused = false;
         state.work.ended = true;
         assert_eq!(
-            dashboard_node_status(Some(&state), true, true, None),
+            dashboard_node_status(Some(&state), true, true, true, None),
             NodeStatus::Ended
         );
         state.work.ended = false;
         state.finalizable = true;
         state.eligible = false;
         assert_eq!(
-            dashboard_node_status(Some(&state), true, false, None),
-            NodeStatus::Waiting
+            dashboard_node_status(Some(&state), true, false, true, None),
+            NodeStatus::FinalizationRequired
         );
 
         assert_eq!(
             dashboard_node_status(
                 Some(&state),
                 true,
+                false,
                 false,
                 Some(TransactionActivityState::Finalizing)
             ),
@@ -2287,6 +3120,7 @@ mod tests {
                 Some(&state),
                 true,
                 false,
+                false,
                 Some(TransactionActivityState::Confirming)
             ),
             NodeStatus::Confirming
@@ -2295,6 +3129,7 @@ mod tests {
             dashboard_node_status(
                 Some(&state),
                 true,
+                false,
                 false,
                 Some(TransactionActivityState::Recovering)
             ),
@@ -2342,11 +3177,13 @@ mod tests {
             transaction_mode: false,
             compute_only: true,
             workers_started: Arc::new(AtomicBool::new(true)),
+            total_hashes: Arc::new(AtomicU64::new(0)),
             selected: selected.clone(),
             slots: Arc::clone(&slots),
             schedule: Arc::clone(&schedule),
             transaction_state: Arc::new(RwLock::new(TransactionDashboardState::default())),
             pending_sync: Arc::new(RwLock::new(HashMap::new())),
+            finalization_state: Arc::new(RwLock::new(HashMap::new())),
         };
         update_slots(
             &slots,
@@ -2373,6 +3210,142 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 3, 7]
         );
+        let advanced_at = model.last_block_advanced_at;
+        let repeated_read_at = Instant::now() + Duration::from_secs(5);
+        let mut repeated = model.clone();
+        repeated.snapshot_observed_at = repeated_read_at;
+        assert!(!reconcile_head_progress(
+            &model,
+            &mut repeated,
+            repeated_read_at
+        ));
+        assert_eq!(repeated.last_block_advanced_at, advanced_at);
+
+        repeated.block_number += 1;
+        repeated.block_hash = B256::with_last_byte(2);
+        assert!(reconcile_head_progress(
+            &model,
+            &mut repeated,
+            repeated_read_at
+        ));
+        assert_eq!(repeated.last_block_advanced_at, repeated_read_at);
+    }
+
+    #[test]
+    fn dashboard_distinguishes_required_retrying_and_blocked_finalization_from_chain_wait() {
+        let wallet = Address::with_last_byte(9);
+        let selected = HashSet::from([1_u8]);
+        let slots = Arc::new((1..=9).map(NodeSlot::new).collect::<Vec<_>>());
+        let schedule = Arc::new(RwLock::new(Vec::new()));
+        let mut state = eligible_state();
+        state.eligible = false;
+        state.finalizable = true;
+        let snapshot = ReadSnapshot {
+            block: test_block(101, state.work.window_expiry_time + 1),
+            native_balance: Some(U256::from(100)),
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![NodeView {
+                id: 1,
+                address: Address::with_last_byte(1),
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(state.clone()),
+                error: None,
+            }],
+        };
+        let finalization_state = Arc::new(RwLock::new(HashMap::new()));
+        let context = DashboardContext {
+            network: Network::Testnet,
+            chain_id: 1439,
+            address: wallet,
+            threads: 1,
+            spending_limit: U256::from(1),
+            transaction_mode: true,
+            compute_only: false,
+            workers_started: Arc::new(AtomicBool::new(true)),
+            total_hashes: Arc::new(AtomicU64::new(0)),
+            selected: selected.clone(),
+            slots: Arc::clone(&slots),
+            schedule: Arc::clone(&schedule),
+            transaction_state: Arc::new(RwLock::new(TransactionDashboardState::default())),
+            pending_sync: Arc::new(RwLock::new(HashMap::new())),
+            finalization_state: Arc::clone(&finalization_state),
+        };
+        let required = dashboard_model(&context, &snapshot, Instant::now());
+        assert_eq!(
+            required.selected_nodes[0].status,
+            NodeStatus::FinalizationRequired
+        );
+        assert_eq!(required.mode(Instant::now()), "FINALIZATION REQUIRED");
+
+        finalization_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                1,
+                FinalizationState::Retrying {
+                    window_id: state.work.window_id,
+                    attempts: 1,
+                    retry_at: Instant::now() + Duration::from_secs(1),
+                    reason: "temporary RPC failure".to_owned(),
+                },
+            );
+        let retrying = dashboard_model(&context, &snapshot, Instant::now());
+        assert_eq!(
+            retrying.selected_nodes[0].status,
+            NodeStatus::FinalizationRetrying
+        );
+        assert!(
+            retrying
+                .current_action
+                .as_deref()
+                .unwrap()
+                .contains("temporary RPC")
+        );
+
+        finalization_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                1,
+                FinalizationState::Blocked {
+                    window_id: state.work.window_id,
+                    reason: "session cap exhausted".to_owned(),
+                },
+            );
+        let blocked = dashboard_model(&context, &snapshot, Instant::now());
+        assert_eq!(
+            blocked.selected_nodes[0].status,
+            NodeStatus::FinalizationBlocked
+        );
+        assert_eq!(blocked.mode(Instant::now()), "FINALIZATION BLOCKED");
+        assert!(
+            blocked
+                .current_action
+                .as_deref()
+                .unwrap()
+                .contains("session cap")
+        );
+
+        finalization_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        state.eligible = true;
+        state.finalizable = false;
+        let mut waiting_snapshot = snapshot.clone();
+        waiting_snapshot.nodes[0].state = Some(state);
+        let waiting = dashboard_model(&context, &waiting_snapshot, Instant::now());
+        assert_eq!(
+            waiting.selected_nodes[0].status,
+            NodeStatus::WaitingForChain
+        );
+        assert_eq!(waiting.mode(Instant::now()), "WAITING FOR CHAIN");
     }
 
     #[test]
@@ -2428,6 +3401,113 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn watch_ref_from_match_scrutinee_blocks_publisher_across_async_arm() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (sender, receiver) = watch::channel(ObserverUpdate::RpcError {
+                    message: "initial".to_owned(),
+                    report: false,
+                });
+                let (entered_tx, entered_rx) = oneshot::channel();
+                let (finish_tx, finish_rx) = oneshot::channel();
+                let mut consumer_receiver = receiver.clone();
+                let consumer = tokio::task::spawn_local(async move {
+                    match consumer_receiver.borrow_and_update().clone() {
+                        ObserverUpdate::RpcError { .. } => {
+                            entered_tx.send(()).unwrap();
+                            finish_rx.await.unwrap();
+                        }
+                        _ => panic!("unexpected observer update"),
+                    }
+                });
+                entered_rx.await.unwrap();
+
+                let publisher = sender.clone();
+                let (published_tx, published_rx) = std::sync::mpsc::channel();
+                let thread = thread::spawn(move || {
+                    publisher.send_replace(ObserverUpdate::RpcError {
+                        message: "next".to_owned(),
+                        report: false,
+                    });
+                    published_tx.send(()).unwrap();
+                });
+                assert_eq!(
+                    published_rx.recv_timeout(Duration::from_millis(50)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+                    "the match scrutinee read guard should remain held through the async arm"
+                );
+                finish_tx.send(()).unwrap();
+                consumer.await.unwrap();
+                published_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("publisher should continue after the match expression ends");
+                thread.join().unwrap();
+                assert!(matches!(
+                    &*receiver.borrow(),
+                    ObserverUpdate::RpcError { message, .. } if message == "next"
+                ));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn owned_observer_update_does_not_block_publication_during_await() {
+        let initial = ObserverUpdate::RpcError {
+            message: "initial".to_owned(),
+            report: false,
+        };
+        let (sender, mut receiver) = watch::channel(initial);
+        let update = take_observer_update(&mut receiver);
+        let (finish_transaction_tx, finish_transaction_rx) = oneshot::channel();
+        let consumer = tokio::spawn(async move {
+            let _owned_update = update;
+            finish_transaction_rx.await.unwrap();
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !consumer.is_finished(),
+            "simulated transaction wait is pending"
+        );
+
+        let refresh_gate = Arc::new(std::sync::Mutex::new(()));
+        let publisher_gate = Arc::clone(&refresh_gate);
+        let publisher = tokio::task::spawn_blocking(move || {
+            let _commit = publisher_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sender.send_replace(ObserverUpdate::RpcError {
+                message: "published while transaction awaits".to_owned(),
+                report: false,
+            });
+        });
+        tokio::time::timeout(Duration::from_secs(1), publisher)
+            .await
+            .expect("watch publisher must not wait for transaction completion")
+            .unwrap();
+
+        let force_refresh_gate = Arc::clone(&refresh_gate);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || {
+                let _commit = force_refresh_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }),
+        )
+        .await
+        .expect("forced refresh must not deadlock behind publication")
+        .unwrap();
+        finish_transaction_tx.send(()).unwrap();
+        consumer.await.unwrap();
+        assert!(matches!(
+            &*receiver.borrow(),
+            ObserverUpdate::RpcError { message, .. }
+                if message == "published while transaction awaits"
+        ));
+    }
+
     #[test]
     fn accepted_proof_waits_for_receipt_block_then_uses_only_verified_best_candidate() {
         let wallet = Address::with_last_byte(9);
@@ -2469,6 +3549,7 @@ mod tests {
             transaction_mode: false,
             compute_only: false,
             workers_started: Arc::new(AtomicBool::new(true)),
+            total_hashes: Arc::new(AtomicU64::new(0)),
             selected: selected.clone(),
             slots: Arc::clone(&slots),
             schedule: Arc::clone(&schedule),
@@ -2480,6 +3561,7 @@ mod tests {
                     receipt_block: 10,
                 },
             )]))),
+            finalization_state: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let syncing = dashboard_model(&context, &snapshot, Instant::now());
@@ -2549,16 +3631,17 @@ mod tests {
         let miner = Address::with_last_byte(8);
         let contract = Address::with_last_byte(9);
         let state = eligible_state();
+        let block = test_block(1, 100);
 
         assert!(
-            slot.set_work(&manifest, miner, contract, Some(&state), 100)
+            slot.set_work(&manifest, miner, contract, Some(&state), &block)
                 .unwrap()
         );
         let initial_generation = slot.current_work().unwrap().generation;
         assert_eq!(slot.reserve_nonces(), Some((0, super::NONCE_BATCH_SIZE)));
         assert!(
             !slot
-                .set_work(&manifest, miner, contract, Some(&state), 100)
+                .set_work(&manifest, miner, contract, Some(&state), &block)
                 .unwrap()
         );
         assert_eq!(slot.reserve_nonces(), Some((2048, super::NONCE_BATCH_SIZE)));
@@ -2566,7 +3649,7 @@ mod tests {
         let mut changed_state = eligible_state();
         changed_state.work.target = U256::MAX - U256::from(1);
         assert!(
-            slot.set_work(&manifest, miner, contract, Some(&changed_state), 100)
+            slot.set_work(&manifest, miner, contract, Some(&changed_state), &block)
                 .unwrap()
         );
         let target_generation = slot.current_work().unwrap().generation;
@@ -2582,7 +3665,7 @@ mod tests {
             first_valid_solve_secs: 2,
         });
         assert!(
-            slot.set_work(&manifest, miner, contract, Some(&changed_state), 100)
+            slot.set_work(&manifest, miner, contract, Some(&changed_state), &block)
                 .unwrap()
         );
         let incumbent_generation = slot.current_work().unwrap().generation;
@@ -2591,7 +3674,7 @@ mod tests {
 
         changed_state.work.seed = B256::with_last_byte(4);
         assert!(
-            slot.set_work(&manifest, miner, contract, Some(&changed_state), 100)
+            slot.set_work(&manifest, miner, contract, Some(&changed_state), &block)
                 .unwrap()
         );
         let context_generation = slot.current_work().unwrap().generation;
@@ -2599,7 +3682,7 @@ mod tests {
         assert_eq!(slot.reserve_nonces(), Some((0, super::NONCE_BATCH_SIZE)));
 
         assert!(
-            slot.set_work(&manifest, miner, contract, None, 100)
+            slot.set_work(&manifest, miner, contract, None, &block)
                 .unwrap()
         );
         assert!(!slot.is_generation_current(context_generation));
@@ -2626,15 +3709,190 @@ mod tests {
         let slot = NodeSlot::new(1);
         let mut state = eligible_state();
         state.work.window_expiry_time = 102;
+        let block = test_block(1, 100);
         slot.set_work(
             &manifest,
             Address::with_last_byte(8),
             Address::with_last_byte(9),
             Some(&state),
-            100,
+            &block,
         )
         .unwrap();
         assert!(slot.current_work().is_none());
+    }
+
+    #[tokio::test]
+    async fn eligible_slot_rearms_only_after_a_new_verified_head_and_hashes_again() {
+        let manifest = DeploymentManifest::load(Network::Testnet).unwrap();
+        let miner = Address::with_last_byte(8);
+        let contract = Address::with_last_byte(9);
+        let slot = NodeSlot::new(1);
+        let slots = Arc::new(vec![slot]);
+        let schedule = Arc::new(RwLock::new(Vec::new()));
+        let selected = HashSet::from([1_u8]);
+        let mut state = eligible_state();
+        state.work.window_expiry_time = 110;
+        state.work.target = U256::MAX;
+
+        let start = Instant::now();
+        let first_head = test_block(100, 100);
+        assert!(
+            slots[0]
+                .set_work_at(&manifest, miner, contract, Some(&state), &first_head, start)
+                .unwrap()
+        );
+        let initial_generation = slots[0].current_work_at(start).unwrap().generation;
+        let local_deadline = start + Duration::from_secs(8);
+        let after_local_deadline = local_deadline + Duration::from_secs(1);
+        assert!(slots[0].current_work_at(after_local_deadline).is_none());
+
+        assert!(
+            !slots[0]
+                .set_work_at(
+                    &manifest,
+                    miner,
+                    contract,
+                    Some(&state),
+                    &first_head,
+                    after_local_deadline,
+                )
+                .unwrap()
+        );
+        assert!(slots[0].current_work_at(after_local_deadline).is_none());
+
+        let next_head = test_block(101, 100);
+        assert!(
+            slots[0]
+                .set_work_at(
+                    &manifest,
+                    miner,
+                    contract,
+                    Some(&state),
+                    &next_head,
+                    after_local_deadline,
+                )
+                .unwrap()
+        );
+        let restarted = slots[0].current_work_at(after_local_deadline).unwrap();
+        assert!(restarted.generation > initial_generation);
+        assert_eq!(
+            restarted.fingerprint.hashing_context.window_id,
+            state.work.window_id
+        );
+
+        let snapshot = ReadSnapshot {
+            block: next_head,
+            native_balance: None,
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![NodeView {
+                id: 1,
+                address: contract,
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(state),
+                error: None,
+            }],
+        };
+        update_slots(&slots, &schedule, &manifest, miner, &selected, &snapshot).unwrap();
+        assert_eq!(
+            *schedule
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            [0]
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let hashes = Arc::new(AtomicU64::new(0));
+        let (sender, mut receiver) = mpsc::channel(PENDING_PROOF_QUEUE_CAPACITY);
+        let worker_slots = Arc::clone(&slots);
+        let worker_schedule = Arc::clone(&schedule);
+        let worker_stop = Arc::clone(&stop);
+        let worker_cursor = Arc::clone(&cursor);
+        let worker_hashes = Arc::clone(&hashes);
+        let worker = thread::spawn(move || {
+            worker_loop(
+                worker_slots,
+                worker_schedule,
+                worker_stop,
+                worker_cursor,
+                worker_hashes,
+                sender,
+            );
+        });
+        let proof = timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("worker should resume hashing on a new eligible head")
+            .expect("worker should find a proof under the maximum target");
+        stop.store(true, Ordering::Release);
+        worker.join().expect("worker should stop cleanly");
+        assert_eq!(proof.node_id, 1);
+        assert!(hashes.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn verified_chain_time_can_shorten_but_never_extend_a_work_deadline() {
+        let manifest = DeploymentManifest::load(Network::Testnet).unwrap();
+        let slot = NodeSlot::new(1);
+        let mut state = eligible_state();
+        state.work.window_expiry_time = 110;
+        let miner = Address::with_last_byte(8);
+        let contract = Address::with_last_byte(9);
+        let start = Instant::now();
+        let first_head = test_block(1, 100);
+        slot.set_work_at(&manifest, miner, contract, Some(&state), &first_head, start)
+            .unwrap();
+        let original_deadline = slot.current_work_at(start).unwrap().valid_until;
+
+        let advanced_head = test_block(2, 106);
+        let observed_at = start + Duration::from_secs(1);
+        slot.set_work_at(
+            &manifest,
+            miner,
+            contract,
+            Some(&state),
+            &advanced_head,
+            observed_at,
+        )
+        .unwrap();
+        let shortened_deadline = slot.current_work_at(observed_at).unwrap().valid_until;
+        assert!(shortened_deadline < original_deadline);
+        assert_eq!(shortened_deadline, start + Duration::from_secs(3));
+
+        let repeated_observation = observed_at + Duration::from_secs(1);
+        assert!(
+            !slot
+                .set_work_at(
+                    &manifest,
+                    miner,
+                    contract,
+                    Some(&state),
+                    &advanced_head,
+                    repeated_observation,
+                )
+                .unwrap()
+        );
+        assert!(slot.current_work_at(shortened_deadline).is_none());
+
+        let next_head = test_block(3, 107);
+        slot.set_work_at(
+            &manifest,
+            miner,
+            contract,
+            Some(&state),
+            &next_head,
+            shortened_deadline + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(
+            slot.current_work_at(shortened_deadline + Duration::from_secs(1))
+                .is_some()
+        );
     }
 
     #[test]
@@ -2655,6 +3913,11 @@ mod tests {
             next_poll_delay(super::MAX_POLL_INTERVAL),
             super::MAX_POLL_INTERVAL
         );
+        assert_eq!(finalization_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(finalization_retry_delay(2), Duration::from_secs(2));
+        assert_eq!(finalization_retry_delay(3), Duration::from_secs(4));
+        assert_eq!(finalization_retry_delay(7), super::MAX_POLL_INTERVAL);
+        assert_eq!(finalization_retry_delay(u8::MAX), super::MAX_POLL_INTERVAL);
     }
 
     #[test]
@@ -2752,15 +4015,21 @@ mod tests {
         let contract = Address::with_last_byte(9);
         let mut state = eligible_state();
         state.work.target = U256::MAX;
-        slot.set_work(&manifest, miner, contract, Some(&state), 100)
-            .unwrap();
+        slot.set_work(
+            &manifest,
+            miner,
+            contract,
+            Some(&state),
+            &test_block(1, 100),
+        )
+        .unwrap();
 
         let slots = Arc::new(vec![slot]);
         let schedule = Arc::new(RwLock::new(vec![0]));
         let stop = Arc::new(AtomicBool::new(false));
         let cursor = Arc::new(AtomicUsize::new(0));
         let total_hashes = Arc::new(AtomicU64::new(0));
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = mpsc::channel(PENDING_PROOF_QUEUE_CAPACITY);
         let worker_slots = Arc::clone(&slots);
         let worker_schedule = Arc::clone(&schedule);
         let worker_stop = Arc::clone(&stop);
@@ -2800,5 +4069,82 @@ mod tests {
         );
         assert!(meets_target(proof.hash, U256::MAX));
         assert!(total_hashes.load(Ordering::Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn hashrate_returns_to_zero_after_all_scheduled_work_is_invalidated() {
+        let manifest = DeploymentManifest::load(Network::Testnet).unwrap();
+        let miner = Address::with_last_byte(8);
+        let contract = Address::with_last_byte(9);
+        let slot = NodeSlot::new(1);
+        let mut state = eligible_state();
+        state.work.target = U256::ZERO;
+        let block = test_block(1, 100);
+        slot.set_work(&manifest, miner, contract, Some(&state), &block)
+            .unwrap();
+
+        let slots = Arc::new(vec![slot]);
+        let schedule = Arc::new(RwLock::new(vec![0]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let hashes = Arc::new(AtomicU64::new(0));
+        let (sender, _receiver) = mpsc::channel(PENDING_PROOF_QUEUE_CAPACITY);
+        let worker_slots = Arc::clone(&slots);
+        let worker_schedule = Arc::clone(&schedule);
+        let worker_stop = Arc::clone(&stop);
+        let worker_cursor = Arc::clone(&cursor);
+        let worker_hashes = Arc::clone(&hashes);
+        let worker = thread::spawn(move || {
+            worker_loop(
+                worker_slots,
+                worker_schedule,
+                worker_stop,
+                worker_cursor,
+                worker_hashes,
+                sender,
+            );
+        });
+        timeout(Duration::from_secs(2), async {
+            while hashes.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("active work must produce completed hashes");
+
+        slots[0]
+            .set_work(&manifest, miner, contract, None, &block)
+            .unwrap();
+        *schedule
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Vec::new();
+        let stable_hash_count = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut previous = hashes.load(Ordering::Relaxed);
+            let mut unchanged_samples = 0_u8;
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let current = hashes.load(Ordering::Relaxed);
+                if current == previous {
+                    unchanged_samples = unchanged_samples.saturating_add(1);
+                    if unchanged_samples == 3 {
+                        return current;
+                    }
+                } else {
+                    previous = current;
+                    unchanged_samples = 0;
+                }
+            }
+        })
+        .await
+        .expect("hash counter should settle after work invalidation");
+        assert!(stable_hash_count > 0);
+        assert!(slots[0].current_work().is_none());
+        assert_eq!(
+            hashes_per_second(stable_hash_count, stable_hash_count, 1.0),
+            0.0
+        );
+
+        stop.store(true, Ordering::Release);
+        worker.join().expect("worker should stop cleanly");
     }
 }

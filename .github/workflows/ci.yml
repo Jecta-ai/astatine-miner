@@ -26,12 +26,18 @@ jobs:
         run: cargo build --locked --release
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Install pinned license tools
+      - name: Install pinned dependency validation tools
         run: |
           cargo install cargo-deny --locked --version 0.20.2
           cargo install cargo-about --locked --version 0.9.2 --features cli
+          cargo install cargo-audit --locked --version 0.22.2
       - name: Validate dependency policies
         run: cargo deny check
+      - name: Audit locked dependencies
+        run: |
+          # RUSTSEC-2026-0387 is only present through Alloy's inactive optional k256 0.13 lock entry.
+          # cargo-deny checks every configured target's active graph without advisory ignores.
+          cargo audit --ignore RUSTSEC-2026-0387
       - name: Regenerate third-party license notices
         run: |
           cargo about generate --locked about.hbs --output-file "$RUNNER_TEMP/THIRD_PARTY_LICENSES.md"
