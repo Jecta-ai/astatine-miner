@@ -1,6 +1,7 @@
 use crate::{
     contracts::{AstatineMinerRead, IERC20Read},
     deployment::{DeploymentManifest, NodePin, parse_address, parse_hash},
+    diagnostics::DiagnosticBuffer,
     protocol::{WorkContext, WorkHasher, meets_target, work_domain_v2},
 };
 use alloy_primitives::{Address, B256, Bytes, U256, hex, keccak256};
@@ -204,6 +205,7 @@ pub struct NetworkClient {
     pub manifest: DeploymentManifest,
     endpoints: Vec<RpcEndpoint>,
     pub verification: DeploymentVerification,
+    diagnostics: Option<DiagnosticBuffer>,
 }
 
 impl NetworkClient {
@@ -247,6 +249,7 @@ impl NetworkClient {
         let mut client = Self {
             manifest,
             endpoints,
+            diagnostics: None,
             verification: DeploymentVerification {
                 token_verified: false,
                 reference_snapshot_verified: false,
@@ -255,6 +258,19 @@ impl NetworkClient {
         };
         client.verify_deployment().await?;
         Ok(client)
+    }
+
+    pub fn set_diagnostics(&mut self, diagnostics: DiagnosticBuffer) {
+        self.diagnostics = Some(diagnostics);
+    }
+
+    fn report_diagnostic(&self, message: impl Into<String>) {
+        let message = message.into();
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.push(message);
+        } else {
+            eprintln!("{message}");
+        }
     }
 
     pub fn has_mining_deployment(&self) -> bool {
@@ -573,10 +589,10 @@ impl NetworkClient {
                     "RPC {} disagrees with the primary block hash at {block_number}; refusing to settle the receipt",
                     endpoint.name
                 ),
-                Err(error) => eprintln!(
+                Err(error) => self.report_diagnostic(format!(
                     "RPC {} cannot corroborate block {block_number}: {error:#}",
                     endpoint.name
-                ),
+                )),
             }
         }
         Ok(canonical)
@@ -675,6 +691,7 @@ impl NetworkClient {
         Ok(Self {
             manifest,
             endpoints: vec![endpoint],
+            diagnostics: None,
             verification: DeploymentVerification {
                 token_verified: true,
                 reference_snapshot_verified: false,
@@ -702,8 +719,9 @@ impl NetworkClient {
         if self.manifest.reference_snapshot.is_some()
             && !self.verification.reference_snapshot_verified
         {
-            eprintln!(
+            self.report_diagnostic(
                 "Historical reference block was unavailable or did not match; live runtime pins are still required."
+                    .to_owned(),
             );
         }
 
@@ -761,7 +779,7 @@ impl NetworkClient {
         match check {
             Ok(()) => true,
             Err(error) => {
-                eprintln!("AST token is unverified: {error:#}");
+                self.report_diagnostic(format!("AST token is unverified: {error:#}"));
                 false
             }
         }
@@ -901,7 +919,7 @@ impl NetworkClient {
         while let Some(joined) = node_jobs.join_next().await {
             match joined {
                 Ok(node) => nodes.push(node),
-                Err(error) => eprintln!("node reader task failed: {error}"),
+                Err(error) => self.report_diagnostic(format!("node reader task failed: {error}")),
             }
         }
         nodes.sort_by_key(|node| node.id);
@@ -988,14 +1006,14 @@ impl NetworkClient {
             }
             match block_at(&candidate, best_number).await {
                 Ok(block) if block.hash == best_block.hash => snapshot_endpoints.push(candidate),
-                Ok(_) => eprintln!(
+                Ok(_) => self.report_diagnostic(format!(
                     "RPC {} disagrees with snapshot block {}; excluding it for this read.",
                     candidate.name, best_number
-                ),
-                Err(error) => eprintln!(
+                )),
+                Err(error) => self.report_diagnostic(format!(
                     "RPC {} cannot serve snapshot block {}: {error:#}",
                     candidate.name, best_number
-                ),
+                )),
             }
         }
         if snapshot_endpoints.is_empty() {

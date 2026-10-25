@@ -2,6 +2,7 @@ use crate::{
     cli::Network,
     config::{AppConfig, ConfigStore, parse_inj_wei},
     contracts::{AstatineMinerRead, IERC20Read},
+    diagnostics::DiagnosticBuffer,
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{NetworkClient, ReadSnapshot, RpcLog, TransactionReceipt, is_transient_receipt_error},
     wallet::signer_address,
@@ -17,6 +18,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 use tokio::time::{Instant, sleep};
@@ -976,6 +978,8 @@ pub struct TransactionManager {
     session_limit: U256,
     minimum_reserve: U256,
     confirmations_required: u8,
+    diagnostics: Option<DiagnosticBuffer>,
+    dashboard_sink: Option<TransactionDashboardSink>,
 }
 
 #[derive(Clone, Debug)]
@@ -984,6 +988,27 @@ pub struct ConfirmedAction {
     pub receipt: TransactionReceipt,
     pub outcome: String,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionActivityState {
+    Finalizing,
+    Confirming,
+    Recovering,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionActivity {
+    pub node_id: u8,
+    pub state: TransactionActivityState,
+}
+
+#[derive(Clone, Debug)]
+pub struct TransactionDashboardState {
+    pub session_exposure: Option<U256>,
+    pub activities: Vec<TransactionActivity>,
+}
+
+pub type TransactionDashboardSink = Arc<dyn Fn(TransactionDashboardState) + Send + Sync>;
 
 enum ReceiptProgress {
     Settled(String),
@@ -1074,7 +1099,76 @@ impl TransactionManager {
             session_limit: parse_inj_wei(&config.per_session_spending_limit_inj)?,
             minimum_reserve: parse_inj_wei(&config.minimum_reserve_inj)?,
             confirmations_required: config.transaction_confirmations,
+            diagnostics: None,
+            dashboard_sink: None,
         })
+    }
+
+    pub fn set_diagnostics(&mut self, diagnostics: DiagnosticBuffer) {
+        self.diagnostics = Some(diagnostics);
+    }
+
+    pub fn set_dashboard_sink(&mut self, sink: TransactionDashboardSink) {
+        self.dashboard_sink = Some(sink);
+        self.publish_dashboard_state();
+    }
+
+    pub fn dashboard_activities(&self) -> Vec<TransactionActivity> {
+        self.journal
+            .state
+            .entries
+            .iter()
+            .filter(|entry| entry.status.is_unresolved())
+            .map(|entry| TransactionActivity {
+                node_id: entry.node_id,
+                state: if entry.status == TransactionStatus::Unknown {
+                    TransactionActivityState::Recovering
+                } else if entry.status == TransactionStatus::Included {
+                    TransactionActivityState::Confirming
+                } else if entry.action == TransactionAction::FinalizeWindow {
+                    TransactionActivityState::Finalizing
+                } else {
+                    TransactionActivityState::Confirming
+                },
+            })
+            .collect()
+    }
+
+    fn report_info(&self, message: impl Into<String>) {
+        let message = message.into();
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.push(message);
+        } else {
+            println!("{message}");
+        }
+    }
+
+    fn report_warning(&self, message: impl Into<String>) {
+        let message = message.into();
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.push(message);
+        } else {
+            eprintln!("{message}");
+        }
+    }
+
+    fn publish_dashboard_state(&self) {
+        let Some(sink) = &self.dashboard_sink else {
+            return;
+        };
+        let session_exposure = match self.session_exposure() {
+            Ok(exposure) => exposure,
+            Err(error) => {
+                self.report_warning(format!(
+                    "dashboard could not read transaction session exposure: {error:#}"
+                ));
+                None
+            }
+        };
+        sink(TransactionDashboardState {
+            session_exposure,
+            activities: self.dashboard_activities(),
+        });
     }
 
     pub async fn reconcile(&mut self, client: &NetworkClient) -> Result<()> {
@@ -1092,15 +1186,15 @@ impl TransactionManager {
                 client.primary_nonce(wallet, "latest").await,
                 client.pending_nonce(wallet).await,
             ) {
-                (Ok(latest_nonce), Ok(pending_nonce)) => eprintln!(
+                (Ok(latest_nonce), Ok(pending_nonce)) => self.report_warning(format!(
                     "transaction {hash:#x} remains unresolved (known={known}, latest nonce={latest_nonce}, pending nonce={pending_nonce}, recorded nonce={}); no transaction will be resent",
                     entry.nonce
-                ),
-                (latest_result, pending_result) => eprintln!(
+                )),
+                (latest_result, pending_result) => self.report_warning(format!(
                     "transaction {hash:#x} remains unresolved (known={known}, nonce lookup unavailable: latest={:?}, pending={:?}); maximum exposure remains reserved",
                     latest_result.err(),
                     pending_result.err()
-                ),
+                )),
             }
         }
         Ok(())
@@ -1119,15 +1213,15 @@ impl TransactionManager {
                             entry = self.journal.entry(hash)?;
                         }
                         Ok(None) => {
-                            eprintln!(
+                            self.report_warning(format!(
                                 "legacy transaction {hash:#x} has no RPC sender record yet; retaining maximum exposure"
-                            );
+                            ));
                             continue;
                         }
                         Err(error) => {
-                            eprintln!(
+                            self.report_warning(format!(
                                 "cannot recover legacy transaction sender for {hash:#x}; retaining maximum exposure: {error:#}"
-                            );
+                            ));
                             continue;
                         }
                     }
@@ -1139,21 +1233,23 @@ impl TransactionManager {
                             .await?
                         {
                             ReceiptProgress::Settled(outcome) => {
-                                println!("settled recovered transaction {hash:#x}: {outcome}");
+                                self.report_info(format!(
+                                    "settled recovered transaction {hash:#x}: {outcome}"
+                                ));
                             }
                             ReceiptProgress::Pending => {}
                             ReceiptProgress::Uncertain => {
-                                eprintln!(
+                                self.report_warning(format!(
                                     "transaction {hash:#x} lost canonical inclusion; maximum exposure remains reserved"
-                                );
+                                ));
                             }
                         }
                     }
                     Ok(None) if entry.status == TransactionStatus::Included => {
                         self.journal.mark_uncertain(hash)?;
-                        eprintln!(
+                        self.report_warning(format!(
                             "included transaction {hash:#x} is no longer returned by RPC; maximum exposure restored"
-                        );
+                        ));
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -1162,13 +1258,13 @@ impl TransactionManager {
                             self.journal.mark_uncertain(hash)?;
                         }
                         if transient {
-                            eprintln!(
+                            self.report_warning(format!(
                                 "transaction {hash:#x} receipt recovery is temporarily unavailable; preserving journal state and maximum exposure: {error:#}"
-                            );
+                            ));
                         } else {
-                            eprintln!(
+                            self.report_warning(format!(
                                 "transaction {hash:#x} recovery query failed; exposure remains reserved: {error:#}"
-                            );
+                            ));
                         }
                     }
                 }
@@ -1200,21 +1296,23 @@ impl TransactionManager {
                             .process_receipt(client, &entry, &receipt, latest_block)
                             .await?;
                         if matches!(progress, ReceiptProgress::Uncertain) {
-                            eprintln!("transaction {hash:#x} reorged; maximum exposure restored");
+                            self.report_warning(format!(
+                                "transaction {hash:#x} reorged; maximum exposure restored"
+                            ));
                         }
                     }
                     Ok(None) | Err(_) => {
                         self.journal.mark_uncertain(hash)?;
-                        eprintln!(
+                        self.report_warning(format!(
                             "settled transaction {hash:#x} is no longer canonical; maximum exposure restored"
-                        );
+                        ));
                     }
                 },
                 Err(error) => {
                     self.journal.mark_uncertain(hash)?;
-                    eprintln!(
+                    self.report_warning(format!(
                         "cannot verify canonical block for {hash:#x}; maximum exposure restored: {error:#}"
-                    );
+                    ));
                 }
             }
         }
@@ -1223,6 +1321,7 @@ impl TransactionManager {
             self.journal
                 .ensure_wallet_session(self.wallet, self.session_limit)?;
         }
+        self.publish_dashboard_state();
         Ok(())
     }
 
@@ -1252,29 +1351,29 @@ impl TransactionManager {
                     .journal
                     .update_reward_confirmations(entry_hash(entry)?, confirmations)?;
                 if newly_confirmed {
-                    println!(
+                    self.report_info(format!(
                         "node {} window {} reward payout evidence reached {} confirmations: {}",
                         entry.node_id,
                         entry.window_id,
                         confirmations,
                         entry.reward_outcome.as_deref().unwrap_or("unknown")
-                    );
+                    ));
                 }
                 Ok(())
             }
             Ok(None) => {
                 self.journal.clear_reward_block_hash(entry_hash(entry)?)?;
-                eprintln!(
+                self.report_warning(format!(
                     "reward event for node {} window {} is no longer canonical; reward evidence is pending revalidation",
                     entry.node_id, entry.window_id
-                );
+                ));
                 Ok(())
             }
             Err(error) => {
                 self.journal.clear_reward_block_hash(entry_hash(entry)?)?;
-                eprintln!(
+                self.report_warning(format!(
                     "reward event canonicality check failed; reward evidence is pending revalidation: {error:#}"
-                );
+                ));
                 Ok(())
             }
         }
@@ -1298,11 +1397,15 @@ impl TransactionManager {
             Ok(Some(confirmations)) => confirmations,
             Ok(None) => {
                 self.journal.mark_uncertain(hash)?;
+                self.publish_dashboard_state();
                 return Ok(ReceiptProgress::Uncertain);
             }
             Err(error) => {
                 self.journal.mark_uncertain(hash)?;
-                eprintln!("receipt canonicality check failed for {hash:#x}: {error:#}");
+                self.publish_dashboard_state();
+                self.report_warning(format!(
+                    "receipt canonicality check failed for {hash:#x}: {error:#}"
+                ));
                 return Ok(ReceiptProgress::Uncertain);
             }
         };
@@ -1313,10 +1416,13 @@ impl TransactionManager {
             .unwrap_or_else(|_| "receipt-event-unverified".to_owned());
         self.journal
             .record_included(hash, receipt, confirmations, stored_outcome)?;
+        self.publish_dashboard_state();
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
-                eprintln!("receipt event verification is pending for {hash:#x}: {error:#}");
+                self.report_warning(format!(
+                    "receipt event verification is pending for {hash:#x}: {error:#}"
+                ));
                 return Ok(ReceiptProgress::Pending);
             }
         };
@@ -1332,12 +1438,15 @@ impl TransactionManager {
                     confirmations,
                     "receipt-cost-unverified".to_owned(),
                 )?;
-                eprintln!("receipt cost remains unverified for {hash:#x}: {error:#}");
+                self.report_warning(format!(
+                    "receipt cost remains unverified for {hash:#x}: {error:#}"
+                ));
                 return Ok(ReceiptProgress::Pending);
             }
         };
         self.journal
             .settle_receipt(hash, receipt, confirmations, actual_cost, outcome.clone())?;
+        self.publish_dashboard_state();
         Ok(ReceiptProgress::Settled(outcome))
     }
 
@@ -1407,15 +1516,15 @@ impl TransactionManager {
                     outcome: outcome.clone(),
                 })?;
                 if reward_confirmations >= u64::from(proof_confirmations_required) {
-                    println!(
+                    self.report_info(format!(
                         "node {} window {} wallet {wallet:#x} reward evidence confirmed: {outcome}",
                         candidate.node_id, candidate.window_id
-                    );
+                    ));
                 } else {
-                    println!(
+                    self.report_info(format!(
                         "node {} window {} wallet {wallet:#x} reward event observed; awaiting {} block confirmations",
                         candidate.node_id, candidate.window_id, proof_confirmations_required
-                    );
+                    ));
                 }
             }
         }
@@ -1497,6 +1606,13 @@ impl TransactionManager {
         self.session_limit
             .checked_sub(self.journal.session_spent_or_reserved()?)
             .context("active session exposure exceeds configured spending limit")
+    }
+
+    pub fn session_exposure(&self) -> Result<Option<U256>> {
+        if self.journal.state.active_session.is_none() {
+            return Ok(None);
+        }
+        self.journal.session_spent_or_reserved().map(Some)
     }
 
     async fn send(
@@ -1597,6 +1713,7 @@ impl TransactionManager {
             confirmed_balance: spendable_balance,
             confirmations_required: self.confirmations_required,
         })?;
+        self.publish_dashboard_state();
 
         match client.broadcast_raw_transaction(&signed.raw).await {
             Ok(returned_hash) if returned_hash == signed.hash => {
@@ -1606,6 +1723,7 @@ impl TransactionManager {
             Ok(returned_hash) => {
                 self.journal
                     .set_broadcast_state(signed.hash, TransactionStatus::Unknown)?;
+                self.publish_dashboard_state();
                 bail!(
                     "RPC acknowledged unexpected transaction hash {returned_hash:#x}; recorded expected hash {:#x} and will not retry",
                     signed.hash
@@ -1614,12 +1732,14 @@ impl TransactionManager {
             Err(error) => {
                 self.journal
                     .set_broadcast_state(signed.hash, TransactionStatus::Unknown)?;
+                self.publish_dashboard_state();
                 return Err(error).context(format!(
                     "broadcast outcome is unknown for {:#x}; the journal prevents rebroadcast",
                     signed.hash
                 ));
             }
         }
+        self.publish_dashboard_state();
 
         let deadline = Instant::now() + RECEIPT_WAIT;
         let mut receipt_poll_errors = 0_u32;
@@ -1644,10 +1764,10 @@ impl TransactionManager {
                     receipt_poll_errors = receipt_poll_errors.saturating_add(1);
                     let details = format!("{error:#}");
                     if receipt_poll_errors == 1 || receipt_poll_errors.is_multiple_of(5) {
-                        eprintln!(
+                        self.report_warning(format!(
                             "receipt lookup temporarily failed for {:#x}; journaled exposure remains reserved and polling will retry without rebroadcasting: {details}",
                             signed.hash
-                        );
+                        ));
                     }
                     last_receipt_error = Some(details);
                     (None, true)
@@ -1666,10 +1786,10 @@ impl TransactionManager {
                         receipt_poll_errors = receipt_poll_errors.saturating_add(1);
                         let details = format!("read latest block for receipt finality: {error:#}");
                         if receipt_poll_errors == 1 || receipt_poll_errors.is_multiple_of(5) {
-                            eprintln!(
+                            self.report_warning(format!(
                                 "receipt finality lookup temporarily failed for {:#x}; journaled exposure remains reserved and polling will retry: {details}",
                                 signed.hash
-                            );
+                            ));
                         }
                         last_receipt_error = Some(details);
                         sleep(RECEIPT_POLL_INTERVAL).await;
@@ -2412,7 +2532,8 @@ fn unix_time_secs() -> u64 {
 mod tests {
     use super::{
         Eip1559Request, PreparedTransaction, ProofData, ProofSubmission, SUBMISSION_FEE_WEI,
-        TransactionAction, TransactionEntry, TransactionIntent, TransactionJournal,
+        TransactionAction, TransactionActivity, TransactionActivityState,
+        TransactionDashboardState, TransactionEntry, TransactionIntent, TransactionJournal,
         TransactionManager, TransactionStatus, encode_rlp_list, entry_hash, parse_decimal_wei,
         rlp_bytes, rlp_u64, rlp_u256, sign_eip1559, validate_archive_ledger,
         verify_finalization_events, verify_submission_events,
@@ -2421,7 +2542,7 @@ mod tests {
         cli::Network,
         config::{AppConfig, ConfigStore},
         contracts::{AstatineMinerRead, IERC20Read},
-        mining::finalize_initial_expired_windows,
+        mining::{FinalizationOptions, finalize_initial_expired_windows},
         protocol::{WorkContext, WorkHasher, meets_target},
         rpc::{NetworkClient, RpcLog, TransactionReceipt},
         wallet::signer_address,
@@ -2436,7 +2557,7 @@ mod tests {
         path::PathBuf,
         process::{Child, Command, Stdio},
         str::FromStr,
-        sync::Arc,
+        sync::{Arc, Mutex},
         time::Duration,
     };
     use tempfile::tempdir;
@@ -2502,6 +2623,66 @@ mod tests {
             confirmed_balance,
             confirmations_required: 2,
         }
+    }
+
+    #[test]
+    fn dashboard_sink_uses_journaled_session_exposure_and_pending_activity() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x99);
+        let mut manager =
+            TransactionManager::open(&store, &config, wallet, Address::with_last_byte(0x88))
+                .unwrap();
+        let latest = Arc::new(Mutex::new(None::<TransactionDashboardState>));
+        let sink_latest = Arc::clone(&latest);
+        manager.set_dashboard_sink(Arc::new(move |state| {
+            *sink_latest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(state);
+        }));
+        assert_eq!(
+            latest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|state| state.session_exposure),
+            Some(U256::ZERO)
+        );
+
+        let request = test_request();
+        let tx_hash = B256::with_last_byte(0x42);
+        manager
+            .journal
+            .prepare(prepared_test_transaction(
+                &request,
+                tx_hash,
+                U256::from(1_000_000_000_000_000_000_u128),
+                U256::from(100_000_000_000_000_000_u128),
+                U256::from(2_000_000_000_000_000_000_u128),
+                Some(ProofData {
+                    nonce: 7,
+                    work_hash: B256::with_last_byte(7),
+                    header: b"test-header".to_vec(),
+                }),
+            ))
+            .unwrap();
+        manager.publish_dashboard_state();
+
+        let state = latest.lock().unwrap().clone().unwrap();
+        let maximum_exposure =
+            request.value + U256::from(request.gas_limit) * request.max_fee_per_gas;
+        assert_eq!(state.session_exposure, Some(maximum_exposure));
+        assert_eq!(
+            state.activities,
+            [TransactionActivity {
+                node_id: 1,
+                state: TransactionActivityState::Confirming,
+            }]
+        );
     }
 
     #[test]
@@ -3305,8 +3486,11 @@ mod tests {
                 &mut manager,
                 &signer,
                 account,
-                &mut blocked,
                 &mut snapshot,
+                FinalizationOptions {
+                    blocked: &mut blocked,
+                    dashboard: &None,
+                },
             )
             .await
             .unwrap()

@@ -1,10 +1,18 @@
 use crate::{
     cli::MineArgs,
     config::{ConfigStore, parse_inj_wei},
+    dashboard::{
+        Dashboard, DashboardEventKind, DashboardModel, DashboardNode, DashboardSignal,
+        DashboardUpdater, NodeStatus,
+    },
     deployment::DeploymentManifest,
+    diagnostics::DiagnosticBuffer,
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{NetworkClient, NodeState, ReadSnapshot},
-    transaction::{ConfirmedAction, ProofSubmission, TransactionManager},
+    transaction::{
+        ConfirmedAction, ProofSubmission, TransactionActivityState, TransactionDashboardState,
+        TransactionManager,
+    },
     wallet::{selected_address, unlock_selected_interactive},
 };
 use alloy_primitives::{Address, B256, U256};
@@ -280,6 +288,41 @@ fn should_unlock_recovered_wallet(
         && !has_unresolved_transaction
 }
 
+struct CpuWorkers {
+    stop: Arc<AtomicBool>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl CpuWorkers {
+    fn stop_and_join(&mut self) -> bool {
+        self.stop.store(true, Ordering::Release);
+        let mut panicked = false;
+        for worker in self.workers.drain(..) {
+            panicked |= worker.join().is_err();
+        }
+        panicked
+    }
+}
+
+impl Drop for CpuWorkers {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
+}
+
+struct DashboardContext<'a> {
+    network: crate::cli::Network,
+    chain_id: u64,
+    address: Address,
+    threads: usize,
+    spending_limit: U256,
+    transaction_mode: bool,
+    compute_only: bool,
+    workers_started: bool,
+    selected: &'a HashSet<u8>,
+    slots: &'a [NodeSlot],
+}
+
 pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
     let config = store.load()?;
     if !args.compute_only && config.network != crate::cli::Network::Testnet {
@@ -304,7 +347,7 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
         );
     }
     let selected = selected_nodes(&args.nodes)?;
-    let client = NetworkClient::connect(config.network).await?;
+    let mut client = NetworkClient::connect(config.network).await?;
     if !client.has_mining_deployment() {
         bail!(
             "{} has no verified Astatine mining deployment; mining is disabled",
@@ -352,42 +395,22 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
     {
         bail!("unlocked signer does not match the selected wallet");
     }
-    if !client.verification.token_verified {
-        eprintln!(
-            "AST token runtime pin is unavailable; mining proofs can still be computed, but AST balance is not trusted."
-        );
-    }
-
     let slots = Arc::new((1..=9).map(NodeSlot::new).collect::<Vec<_>>());
     let schedule = Arc::new(RwLock::new(Vec::new()));
+    let mut dashboard_context = DashboardContext {
+        network: client.manifest.network,
+        chain_id: client.manifest.chain_id,
+        address,
+        threads,
+        spending_limit,
+        transaction_mode,
+        compute_only: args.compute_only,
+        workers_started: false,
+        selected: &selected,
+        slots: slots.as_slice(),
+    };
     let mut snapshot = client.snapshot(Some(address)).await?;
-    let mut blocked_finalizations = HashSet::new();
-    if let Some(manager) = transactions.as_mut()
-        && let Err(error) = manager.reconcile_rewards(&client, &snapshot).await
-    {
-        eprintln!("reward-event verification will retry after the next snapshot: {error:#}");
-    }
-    if let (Some(manager), Some(signer)) = (transactions.as_mut(), signer.as_ref()) {
-        if finalize_initial_expired_windows(
-            &client,
-            &selected,
-            manager,
-            signer,
-            address,
-            &mut blocked_finalizations,
-            &mut snapshot,
-        )
-        .await?
-            && let Err(error) = manager.reconcile_rewards(&client, &snapshot).await
-        {
-            eprintln!("reward-event verification will retry after the next snapshot: {error:#}");
-        }
-    } else if !args.compute_only && spending_limit.is_zero() {
-        println!(
-            "Per-session spending limit is zero; autonomous signing is disabled. Hashing continues without submissions or finalizations."
-        );
-    }
-    let changed = update_slots(
+    let mut changed = update_slots(
         &slots,
         &schedule,
         &client.manifest,
@@ -395,11 +418,110 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
         &selected,
         &snapshot,
     )?;
-    print_startup(&client, address, threads, &snapshot, &slots, changed);
-
     let stop = Arc::new(AtomicBool::new(false));
     let cursor = Arc::new(AtomicUsize::new(0));
     let total_hashes = Arc::new(AtomicU64::new(0));
+    let diagnostics = DiagnosticBuffer::default();
+    let model = dashboard_model(
+        &dashboard_context,
+        &snapshot,
+        transactions.as_ref(),
+        &diagnostics,
+    );
+    let mut dashboard = Dashboard::start(model, Arc::clone(&total_hashes), diagnostics.clone())?;
+    if dashboard.is_none() {
+        for message in diagnostics.drain() {
+            eprintln!("astatine: {message}");
+        }
+    }
+    if let Some(dashboard) = &dashboard {
+        let diagnostics = dashboard.diagnostics();
+        client.set_diagnostics(diagnostics.clone());
+        if let Some(manager) = transactions.as_mut() {
+            manager.set_diagnostics(diagnostics);
+        }
+    }
+    connect_transaction_dashboard(&mut transactions, &dashboard);
+
+    let mut blocked_finalizations = HashSet::new();
+    if let Some(manager) = transactions.as_mut()
+        && let Err(error) = manager.reconcile_rewards(&client, &snapshot).await
+    {
+        report_mining_warning(
+            &dashboard,
+            format!("reward-event verification will retry after the next snapshot: {error:#}"),
+        );
+    }
+    if let (Some(manager), Some(signer)) = (transactions.as_mut(), signer.as_ref()) {
+        if !manager.journal.has_unresolved() && !manager.budget_remaining()?.is_zero() {
+            let finalizing = snapshot
+                .nodes
+                .iter()
+                .filter(|node| {
+                    selected.contains(&node.id)
+                        && node
+                            .state
+                            .as_ref()
+                            .is_some_and(|state| state.finalizable && !state.mining_paused)
+                })
+                .map(|node| node.id)
+                .collect::<Vec<_>>();
+            mark_dashboard_nodes(
+                &dashboard,
+                finalizing,
+                NodeStatus::Finalizing,
+                Some("Finalizing expired windows...".to_owned()),
+            );
+        }
+        if finalize_initial_expired_windows(
+            &client,
+            &selected,
+            manager,
+            signer,
+            address,
+            &mut snapshot,
+            FinalizationOptions {
+                blocked: &mut blocked_finalizations,
+                dashboard: &dashboard,
+            },
+        )
+        .await?
+            && let Err(error) = manager.reconcile_rewards(&client, &snapshot).await
+        {
+            report_mining_warning(
+                &dashboard,
+                format!("reward-event verification will retry after the next snapshot: {error:#}"),
+            );
+        }
+    }
+    changed |= update_slots(
+        &slots,
+        &schedule,
+        &client.manifest,
+        address,
+        &selected,
+        &snapshot,
+    )?;
+    refresh_dashboard(
+        &dashboard,
+        &dashboard_context,
+        &snapshot,
+        transactions.as_ref(),
+    );
+    if !client.verification.token_verified {
+        report_mining_warning(
+            &dashboard,
+            "AST token runtime pin is unavailable; mining proofs can still be computed, but AST balance is not trusted.",
+        );
+    }
+    if dashboard.is_none() {
+        if !args.compute_only && spending_limit.is_zero() {
+            println!(
+                "Per-session spending limit is zero; autonomous signing is disabled. Hashing continues without submissions or finalizations."
+            );
+        }
+        print_startup(&client, address, threads, &snapshot, &slots, changed);
+    }
     let (proof_sender, mut proof_receiver) = mpsc::unbounded_channel();
     let mut workers = Vec::with_capacity(threads);
     for worker_id in 0..threads {
@@ -434,6 +556,11 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
         }
     }
     drop(proof_sender);
+    let mut worker_guard = CpuWorkers {
+        stop: Arc::clone(&stop),
+        workers,
+    };
+    dashboard_context.workers_started = true;
 
     let mut progress_ticker = time::interval(PROGRESS_INTERVAL);
     progress_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -445,16 +572,35 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
     let mut poll_delay = POLL_INTERVAL;
     let mut next_poll = time::Instant::now() + poll_delay;
     let mut last_snapshot = snapshot;
+    refresh_dashboard(
+        &dashboard,
+        &dashboard_context,
+        &last_snapshot,
+        transactions.as_ref(),
+    );
     let mut fatal_error = None;
     let mut budget_exhausted = false;
+    let dashboard_signal = dashboard.as_ref().map(Dashboard::signal);
 
     loop {
         tokio::select! {
             signal = &mut ctrl_c => {
                 if let Err(error) = signal {
-                    eprintln!("Ctrl+C signal handler failed: {error}");
+                    report_mining_warning(
+                        &dashboard,
+                        format!("Ctrl+C signal handler failed: {error}"),
+                    );
                 }
                 break;
+            }
+            event = wait_for_dashboard_event(dashboard_signal.clone()) => {
+                match event {
+                    DashboardEventKind::StopRequested => break,
+                    DashboardEventKind::Failure(error) => {
+                        fatal_error = Some(anyhow!("dashboard failed: {error}"));
+                        break;
+                    }
+                }
             }
             _ = time::sleep_until(next_poll) => {
                 match client.snapshot(Some(address)).await {
@@ -468,6 +614,12 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                             fatal_error = Some(error.context("monitor transaction finality and reorg state"));
                             break;
                         }
+                        refresh_dashboard(
+                            &dashboard,
+                            &dashboard_context,
+                            &snapshot,
+                            transactions.as_ref(),
+                        );
                         if let Some(manager) = transactions.as_ref()
                             && should_unlock_recovered_wallet(
                                 transaction_mode,
@@ -476,7 +628,20 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                 manager.journal.has_unresolved(),
                             )
                         {
-                            let recovered_signer = match unlock_selected_interactive(store, &config) {
+                            if let Some(dashboard) = dashboard.as_mut()
+                                && let Err(error) = dashboard.suspend().await
+                            {
+                                fatal_error = Some(error.context("suspend dashboard for wallet unlock"));
+                                break;
+                            }
+                            let unlock_result = unlock_selected_interactive(store, &config);
+                            if let Some(dashboard) = dashboard.as_mut()
+                                && let Err(error) = dashboard.resume(Arc::clone(&total_hashes))
+                            {
+                                fatal_error = Some(error.context("resume dashboard after wallet unlock"));
+                                break;
+                            }
+                            let recovered_signer = match unlock_result {
                                 Ok(recovered_signer)
                                     if crate::wallet::signer_address(&recovered_signer) == address =>
                                 {
@@ -496,18 +661,56 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                 }
                             };
                             signer = Some(recovered_signer);
-                            println!("Transaction recovery settled; autonomous Testnet signing is resuming.");
+                            report_mining_info(
+                                &dashboard,
+                                "Transaction recovery settled; autonomous Testnet signing is resuming.",
+                            );
                         }
                         if let (Some(manager), Some(signer)) =
                             (transactions.as_mut(), signer.as_ref())
                         {
+                            let can_finalize = if manager.journal.has_unresolved() {
+                                false
+                            } else {
+                                match manager.budget_remaining() {
+                                    Ok(remaining) => !remaining.is_zero(),
+                                    Err(error) => {
+                                        fatal_error = Some(error.context("read remaining spending limit"));
+                                        break;
+                                    }
+                                }
+                            };
+                            if can_finalize {
+                                let finalizing = snapshot
+                                    .nodes
+                                    .iter()
+                                    .filter(|node| {
+                                        selected.contains(&node.id)
+                                            && node.state.as_ref().is_some_and(|state| {
+                                                state.finalizable && !state.mining_paused
+                                            })
+                                    })
+                                    .map(|node| node.id)
+                                    .collect::<Vec<_>>();
+                                if !finalizing.is_empty() {
+                                    mark_dashboard_nodes(
+                                        &dashboard,
+                                        finalizing.clone(),
+                                        NodeStatus::Finalizing,
+                                        Some("Finalizing expired windows...".to_owned()),
+                                    );
+                                }
+                            }
                             match maybe_finalize_expired(
                                 &client,
                                 &selected,
                                 manager,
                                 signer,
                                 address,
-                                &mut blocked_finalizations,
+                                FinalizationOptions {
+                                    blocked: &mut blocked_finalizations,
+                                    dashboard: &dashboard,
+                                },
                             )
                             .await
                             {
@@ -528,7 +731,10 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                         if let Some(manager) = transactions.as_mut()
                             && let Err(error) = manager.reconcile_rewards(&client, &snapshot).await
                         {
-                            eprintln!("reward-event verification will retry after the next snapshot: {error:#}");
+                            report_mining_warning(
+                                &dashboard,
+                                format!("reward-event verification will retry after the next snapshot: {error:#}"),
+                            );
                         }
                         let changed = update_slots(
                             &slots,
@@ -539,16 +745,32 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                             &snapshot,
                         )?;
                         last_snapshot = snapshot;
-                        if changed || last_progress.elapsed() >= PROGRESS_INTERVAL {
+                        refresh_dashboard(
+                            &dashboard,
+                            &dashboard_context,
+                            &last_snapshot,
+                            transactions.as_ref(),
+                        );
+                        if dashboard.is_none()
+                            && (changed || last_progress.elapsed() >= PROGRESS_INTERVAL)
+                        {
                             let elapsed = last_progress.elapsed();
-                            print_progress(&last_snapshot, &slots, total_hashes.swap(0, Ordering::Relaxed), elapsed);
+                            print_progress(
+                                &last_snapshot,
+                                &slots,
+                                total_hashes.swap(0, Ordering::Relaxed),
+                                elapsed,
+                            );
                             last_progress = time::Instant::now();
                         }
                     }
                     Err(error) => {
                         consecutive_rpc_errors = consecutive_rpc_errors.saturating_add(1);
                         if consecutive_rpc_errors == 1 || consecutive_rpc_errors.is_multiple_of(5) {
-                            eprintln!("RPC refresh failed; stale work stopped: {error:#}");
+                            report_mining_warning(
+                                &dashboard,
+                                format!("RPC refresh failed; stale work stopped: {error:#}"),
+                            );
                         }
                         for slot in slots.iter() {
                             slot.set_work(
@@ -562,7 +784,32 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                         *schedule
                             .write()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Vec::new();
-                        total_hashes.store(0, Ordering::Relaxed);
+                        if let Some(dashboard) = &dashboard {
+                            let active_nodes = transactions
+                                .as_ref()
+                                .map(TransactionManager::dashboard_activities)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|activity| (activity.node_id, activity.state))
+                                .collect::<std::collections::HashMap<_, _>>();
+                            dashboard.update(|model| {
+                                model.connection_error = Some(format!("{error:#}"));
+                                for node in &mut model.selected_nodes {
+                                    if let Some(activity) = active_nodes.get(&node.id) {
+                                        node.status = match activity {
+                                            TransactionActivityState::Finalizing => NodeStatus::Finalizing,
+                                            TransactionActivityState::Confirming => NodeStatus::Confirming,
+                                            TransactionActivityState::Recovering => NodeStatus::Recovering,
+                                        };
+                                    } else {
+                                        node.status = NodeStatus::RpcError;
+                                    }
+                                    node.mining_deadline = None;
+                                }
+                            });
+                        } else {
+                            total_hashes.store(0, Ordering::Relaxed);
+                        }
                         poll_delay = next_poll_delay(poll_delay);
                     }
                 }
@@ -570,7 +817,7 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
             }
             _ = progress_ticker.tick() => {
                 let elapsed = last_progress.elapsed();
-                if elapsed >= PROGRESS_INTERVAL {
+                if dashboard.is_none() && elapsed >= PROGRESS_INTERVAL {
                     print_progress(
                         &last_snapshot,
                         &slots,
@@ -590,18 +837,29 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                     {
                         let incumbent = proof.incumbent.map(|hash| format!("; beats incumbent {hash:#x}")).unwrap_or_default();
                         if args.compute_only {
-                            println!("valid local proof: node={} nonce={} hash={:#x} target={:#x}{}; not submitted",
-                                proof.node_id, proof.nonce, proof.hash, proof.target, incumbent);
+                            report_mining_info(
+                                &dashboard,
+                                format!(
+                                    "valid local proof: node={} nonce={} hash={:#x} target={:#x}{}; not submitted",
+                                    proof.node_id, proof.nonce, proof.hash, proof.target, incumbent
+                                ),
+                            );
                         } else if let (Some(manager), Some(signer)) =
                             (transactions.as_mut(), signer.as_ref())
                         {
                             if manager.journal.has_unresolved() {
-                                println!("valid local proof for node {} was withheld while a previous transaction is under recovery", proof.node_id);
+                                report_mining_info(
+                                    &dashboard,
+                                    format!("valid local proof for node {} was withheld while a previous transaction is under recovery", proof.node_id),
+                                );
                                 continue;
                             }
                             if budget_exhausted || manager.budget_remaining()?.is_zero() {
                                 budget_exhausted = true;
-                                println!("valid local proof for node {} was not submitted: session spending limit is exhausted", proof.node_id);
+                                report_mining_info(
+                                    &dashboard,
+                                    format!("valid local proof for node {} was not submitted: session spending limit is exhausted", proof.node_id),
+                                );
                                 continue;
                             }
                             let Some(work) = slot.current_work() else {
@@ -610,6 +868,12 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                             let contract = work.fingerprint.hashing_context.contract;
                             let window_id = work.fingerprint.hashing_context.window_id;
                             let header = work.fingerprint.hashing_context.header.clone();
+                            mark_dashboard_nodes(
+                                &dashboard,
+                                [proof.node_id],
+                                NodeStatus::Confirming,
+                                Some(format!("Node {:02} • Confirming proof...", proof.node_id)),
+                            );
                             match manager.submit_proof(
                                 &client,
                                 signer,
@@ -621,8 +885,21 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                     header,
                                     work_hash: proof.hash,
                                 },
-                            ).await {
-                                Ok(action) => print_confirmed_action("proof", &action),
+                            )
+                            .await
+                            {
+                                Ok(action) => {
+                                    report_mining_info(
+                                        &dashboard,
+                                        confirmed_action_message("proof", &action),
+                                    );
+                                    mark_dashboard_nodes(
+                                        &dashboard,
+                                        [proof.node_id],
+                                        NodeStatus::Waiting,
+                                        None,
+                                    );
+                                }
                                 Err(error) if manager.journal.has_unresolved() => {
                                     fatal_error = Some(error);
                                     break;
@@ -633,10 +910,28 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                 }
                                 Err(error) if is_policy_refusal(&error) => {
                                     budget_exhausted |= is_session_limit_refusal(&error);
-                                    eprintln!("valid proof was not submitted: {error:#}");
+                                    report_mining_warning(
+                                        &dashboard,
+                                        format!("valid proof was not submitted: {error:#}"),
+                                    );
+                                    mark_dashboard_nodes(
+                                        &dashboard,
+                                        [proof.node_id],
+                                        NodeStatus::Mining,
+                                        None,
+                                    );
                                 }
                                 Err(error) if is_stale_proof(&error) => {
-                                    eprintln!("discarded stale proof for node {}: {error:#}", proof.node_id);
+                                    report_mining_warning(
+                                        &dashboard,
+                                        format!("discarded stale proof for node {}: {error:#}", proof.node_id),
+                                    );
+                                    mark_dashboard_nodes(
+                                        &dashboard,
+                                        [proof.node_id],
+                                        NodeStatus::Waiting,
+                                        None,
+                                    );
                                 }
                                 Err(error) => {
                                     fatal_error = Some(error);
@@ -644,7 +939,10 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                 }
                             }
                         } else {
-                            println!("valid local proof for node {} was not submitted: transaction signing is disabled", proof.node_id);
+                            report_mining_info(
+                                &dashboard,
+                                format!("valid local proof for node {} was not submitted: transaction signing is disabled", proof.node_id),
+                            );
                         }
                     }
                 }
@@ -652,34 +950,66 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
         }
     }
 
-    stop.store(true, Ordering::Release);
-    for worker in workers {
-        if worker.join().is_err() {
-            eprintln!("CPU worker stopped after an internal panic");
+    if worker_guard.stop_and_join() {
+        report_mining_warning(&dashboard, "CPU worker stopped after an internal panic.");
+    }
+
+    let mut stopped_message = None;
+    if fatal_error.is_none() {
+        if let Some(manager) = transactions.as_mut() {
+            if manager.journal.has_unresolved() {
+                stopped_message = Some(
+                    "Stopped with transaction exposure reserved for read-only recovery. The session remains open in the private journal.",
+                );
+            } else if let Err(error) = manager.close_session() {
+                fatal_error = Some(error.context("close transaction spending session"));
+            } else {
+                stopped_message = Some(
+                    "Stopped autonomous Testnet mining. Transaction journal retained without private key material.",
+                );
+            }
+        } else if args.compute_only {
+            stopped_message =
+                Some("Stopped compute-only mining. No transactions were signed or sent.");
+        } else {
+            stopped_message = Some(
+                "Stopped mining. No transactions were signed or sent because the session limit is zero.",
+            );
         }
+    }
+
+    if let Some(error) = fatal_error.as_ref()
+        && let Some(dashboard) = &dashboard
+    {
+        dashboard.update(|model| {
+            model.critical_error = Some(format!("{error:#}"));
+            model.current_action = None;
+        });
+    }
+    let restore_result = if let Some(dashboard) = dashboard.as_mut() {
+        let result = dashboard.stop().await;
+        flush_dashboard_diagnostics(dashboard);
+        result
+    } else {
+        Ok(())
+    };
+    if let Err(error) = restore_result
+        && fatal_error.is_none()
+    {
+        fatal_error = Some(error.context("restore mining dashboard terminal"));
     }
     if let Some(error) = fatal_error {
         return Err(error);
     }
-    if let Some(manager) = transactions.as_mut() {
-        if manager.journal.has_unresolved() {
-            println!(
-                "Stopped with transaction exposure reserved for read-only recovery. The session remains open in the private journal."
-            );
-        } else {
-            manager.close_session()?;
-            println!(
-                "Stopped autonomous Testnet mining. Transaction journal retained without private key material."
-            );
-        }
-    } else if args.compute_only {
-        println!("Stopped compute-only mining. No transactions were signed or sent.");
-    } else {
-        println!(
-            "Stopped mining. No transactions were signed or sent because the session limit is zero."
-        );
+    if let Some(message) = stopped_message {
+        println!("{message}");
     }
     Ok(())
+}
+
+pub(crate) struct FinalizationOptions<'a> {
+    pub blocked: &'a mut HashSet<(u8, u64)>,
+    pub dashboard: &'a Option<Dashboard>,
 }
 
 async fn maybe_finalize_expired(
@@ -688,7 +1018,7 @@ async fn maybe_finalize_expired(
     manager: &mut TransactionManager,
     signer: &bip32::secp256k1::ecdsa::SigningKey,
     wallet: Address,
-    blocked: &mut HashSet<(u8, u64)>,
+    options: FinalizationOptions<'_>,
 ) -> Result<bool> {
     if manager.journal.has_unresolved() || manager.budget_remaining()?.is_zero() {
         return Ok(false);
@@ -707,32 +1037,50 @@ async fn maybe_finalize_expired(
             continue;
         };
         let key = (node.id, state.work.window_id);
-        if blocked.contains(&key) {
+        if options.blocked.contains(&key) {
             continue;
         }
+        mark_dashboard_nodes(
+            options.dashboard,
+            [node.id],
+            NodeStatus::Finalizing,
+            Some(format!("Node {:02} • Finalizing window...", node.id)),
+        );
         match manager
             .finalize_window(client, signer, node.address, node.id, state.work.window_id)
             .await
         {
             Ok(action) => {
-                print_confirmed_action("finalization", &action);
+                report_mining_info(
+                    options.dashboard,
+                    confirmed_action_message("finalization", &action),
+                );
+                mark_dashboard_nodes(options.dashboard, [node.id], NodeStatus::Waiting, None);
                 finalized_any = true;
             }
             Err(error) if manager.journal.has_unresolved() => return Err(error),
             Err(error) if manager.journal.has_unverified_receipt() => return Err(error),
             Err(error) if is_policy_refusal(&error) => {
-                eprintln!(
-                    "node {} window {} finalization skipped: {error:#}",
-                    node.id, state.work.window_id
+                report_mining_warning(
+                    options.dashboard,
+                    format!(
+                        "node {} window {} finalization skipped: {error:#}",
+                        node.id, state.work.window_id
+                    ),
                 );
-                blocked.insert(key);
+                mark_dashboard_nodes(options.dashboard, [node.id], NodeStatus::Waiting, None);
+                options.blocked.insert(key);
             }
             Err(error) => {
-                eprintln!(
-                    "node {} window {} finalization deferred: {error:#}",
-                    node.id, state.work.window_id
+                report_mining_warning(
+                    options.dashboard,
+                    format!(
+                        "node {} window {} finalization deferred: {error:#}",
+                        node.id, state.work.window_id
+                    ),
                 );
-                blocked.insert(key);
+                mark_dashboard_nodes(options.dashboard, [node.id], NodeStatus::Waiting, None);
+                options.blocked.insert(key);
             }
         }
         if manager.budget_remaining()?.is_zero() {
@@ -748,26 +1096,26 @@ pub(crate) async fn finalize_initial_expired_windows(
     manager: &mut TransactionManager,
     signer: &bip32::secp256k1::ecdsa::SigningKey,
     wallet: Address,
-    blocked: &mut HashSet<(u8, u64)>,
     snapshot: &mut ReadSnapshot,
+    options: FinalizationOptions<'_>,
 ) -> Result<bool> {
-    if !maybe_finalize_expired(client, selected, manager, signer, wallet, blocked).await? {
+    if !maybe_finalize_expired(client, selected, manager, signer, wallet, options).await? {
         return Ok(false);
     }
     *snapshot = client.snapshot(Some(wallet)).await?;
     Ok(true)
 }
 
-fn print_confirmed_action(label: &str, action: &ConfirmedAction) {
+fn confirmed_action_message(label: &str, action: &ConfirmedAction) -> String {
     let effective_price = action
         .receipt
         .effective_gas_price
         .map(|price| price.to_string())
         .unwrap_or_else(|| "unknown".to_owned());
-    println!(
+    format!(
         "{label} confirmed: tx={:#x} | {} | gas={} | effective price={} wei",
         action.transaction_hash, action.outcome, action.receipt.gas_used, effective_price
-    );
+    )
 }
 
 fn is_policy_refusal(error: &anyhow::Error) -> bool {
@@ -832,6 +1180,231 @@ fn update_slots(
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = active;
     Ok(changed)
+}
+
+fn dashboard_model(
+    context: &DashboardContext<'_>,
+    snapshot: &ReadSnapshot,
+    transactions: Option<&TransactionManager>,
+    diagnostics: &DiagnosticBuffer,
+) -> DashboardModel {
+    let mut selected_ids = context.selected.iter().copied().collect::<Vec<_>>();
+    selected_ids.sort_unstable();
+    let activities = transactions
+        .map(TransactionManager::dashboard_activities)
+        .unwrap_or_default();
+    let mut nodes = Vec::with_capacity(selected_ids.len());
+    let mut first_error = None;
+    for id in selected_ids {
+        let view = snapshot.nodes.iter().find(|node| node.id == id);
+        let trusted = view.is_some_and(|node| node.pin.runtime_verified && node.pin.abi_verified);
+        let state = view.and_then(|node| node.state.as_ref());
+        let activity = activities.iter().find(|activity| activity.node_id == id);
+        let slot_work = context.slots[usize::from(id - 1)].current_work();
+        let status = dashboard_node_status(
+            state,
+            trusted,
+            context.workers_started && slot_work.is_some(),
+            activity.map(|activity| activity.state),
+        );
+        if first_error.is_none() {
+            first_error = view
+                .and_then(|node| node.error.as_deref().or(node.pin.error.as_deref()))
+                .map(str::to_owned);
+        }
+        let candidate = trusted
+            .then(|| {
+                state.and_then(|state| state.candidate.as_ref().map(|candidate| candidate.miner))
+            })
+            .flatten();
+        let reward = trusted
+            .then(|| state.map(|state| state.work.reward_per_window))
+            .flatten();
+        nodes.push(DashboardNode {
+            id,
+            status,
+            expiry_timestamp: state
+                .filter(|state| state.eligible)
+                .map(|state| state.work.window_expiry_time),
+            mining_deadline: slot_work.map(|work| work.valid_until),
+            candidate,
+            reward,
+        });
+    }
+    let session_exposure = transactions.and_then(|manager| match manager.session_exposure() {
+        Ok(exposure) => exposure,
+        Err(error) => {
+            diagnostics.push(format!(
+                "dashboard could not read transaction session exposure: {error:#}"
+            ));
+            None
+        }
+    });
+    DashboardModel {
+        network: context.network,
+        chain_id: context.chain_id,
+        wallet: context.address,
+        inj_balance: snapshot.native_balance,
+        cpu_threads: context.threads,
+        session_limit: Some(context.spending_limit),
+        session_exposure,
+        block_number: snapshot.block.number,
+        block_timestamp: snapshot.block.timestamp,
+        snapshot_observed_at: Instant::now(),
+        selected_nodes: nodes,
+        compute_only: context.compute_only,
+        signing_enabled: context.transaction_mode,
+        recovering: transactions.is_some_and(|manager| manager.journal.has_unresolved()),
+        stopping: false,
+        hashrate: 0.0,
+        current_action: None,
+        connection_error: first_error,
+        critical_error: None,
+    }
+}
+
+fn dashboard_node_status(
+    state: Option<&NodeState>,
+    trusted: bool,
+    has_current_work: bool,
+    activity: Option<TransactionActivityState>,
+) -> NodeStatus {
+    if let Some(activity) = activity {
+        return match activity {
+            TransactionActivityState::Finalizing => NodeStatus::Finalizing,
+            TransactionActivityState::Confirming => NodeStatus::Confirming,
+            TransactionActivityState::Recovering => NodeStatus::Recovering,
+        };
+    }
+    if !trusted || state.is_none() {
+        return NodeStatus::RpcError;
+    }
+    let state = state.expect("checked above");
+    if state.mining_paused {
+        NodeStatus::Paused
+    } else if !state.work.started || state.work.ended || state.work.remaining_allocation.is_zero() {
+        NodeStatus::Ended
+    } else if state.eligible && has_current_work {
+        NodeStatus::Mining
+    } else {
+        NodeStatus::Waiting
+    }
+}
+
+fn refresh_dashboard(
+    dashboard: &Option<Dashboard>,
+    context: &DashboardContext<'_>,
+    snapshot: &ReadSnapshot,
+    transactions: Option<&TransactionManager>,
+) {
+    let Some(dashboard) = dashboard else {
+        return;
+    };
+    let diagnostics = dashboard.diagnostics();
+    let updated = dashboard_model(context, snapshot, transactions, &diagnostics);
+    dashboard.update(|model| {
+        let hashrate = model.hashrate;
+        *model = updated;
+        model.hashrate = hashrate;
+    });
+}
+
+fn mark_dashboard_nodes(
+    dashboard: &Option<Dashboard>,
+    node_ids: impl IntoIterator<Item = u8>,
+    status: NodeStatus,
+    action: Option<String>,
+) {
+    let Some(dashboard) = dashboard else {
+        return;
+    };
+    let node_ids = node_ids.into_iter().collect::<HashSet<_>>();
+    dashboard.update(|model| {
+        for node in &mut model.selected_nodes {
+            if node_ids.contains(&node.id) {
+                node.status = status;
+                node.mining_deadline = None;
+            }
+        }
+        model.current_action = action;
+    });
+}
+
+fn connect_transaction_dashboard(
+    transactions: &mut Option<TransactionManager>,
+    dashboard: &Option<Dashboard>,
+) {
+    let (Some(manager), Some(dashboard)) = (transactions.as_mut(), dashboard.as_ref()) else {
+        return;
+    };
+    let updater = dashboard.updater();
+    manager.set_dashboard_sink(Arc::new(move |state| {
+        apply_transaction_dashboard_state(&updater, state);
+    }));
+}
+
+fn apply_transaction_dashboard_state(updater: &DashboardUpdater, state: TransactionDashboardState) {
+    updater.update(|model| {
+        model.session_exposure = state.session_exposure;
+        model.recovering = state
+            .activities
+            .iter()
+            .any(|activity| activity.state == TransactionActivityState::Recovering);
+        for activity in &state.activities {
+            let Some(node) = model
+                .selected_nodes
+                .iter_mut()
+                .find(|node| node.id == activity.node_id)
+            else {
+                continue;
+            };
+            node.status = match activity.state {
+                TransactionActivityState::Finalizing => NodeStatus::Finalizing,
+                TransactionActivityState::Confirming => NodeStatus::Confirming,
+                TransactionActivityState::Recovering => NodeStatus::Recovering,
+            };
+            node.mining_deadline = None;
+        }
+        model.current_action = state.activities.first().map(|activity| {
+            let action = match activity.state {
+                TransactionActivityState::Finalizing => "Finalizing window...",
+                TransactionActivityState::Confirming => "Confirming transaction...",
+                TransactionActivityState::Recovering => "Recovering transaction...",
+            };
+            format!("Node {:02} • {action}", activity.node_id)
+        });
+    });
+}
+
+fn report_mining_info(dashboard: &Option<Dashboard>, message: impl Into<String>) {
+    let message = message.into();
+    if let Some(dashboard) = dashboard {
+        dashboard.diagnostics().push(message);
+    } else {
+        println!("{message}");
+    }
+}
+
+fn report_mining_warning(dashboard: &Option<Dashboard>, message: impl Into<String>) {
+    let message = message.into();
+    if let Some(dashboard) = dashboard {
+        dashboard.diagnostics().push(message);
+    } else {
+        eprintln!("{message}");
+    }
+}
+
+fn flush_dashboard_diagnostics(dashboard: &Dashboard) {
+    for message in dashboard.drain_diagnostics() {
+        eprintln!("astatine: {message}");
+    }
+}
+
+async fn wait_for_dashboard_event(signal: Option<DashboardSignal>) -> DashboardEventKind {
+    match signal {
+        Some(signal) => signal.wait().await,
+        None => std::future::pending().await,
+    }
 }
 
 fn print_startup(
@@ -1026,15 +1599,22 @@ fn network_label(network: crate::cli::Network) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        NodeSlot, NonceAllocator, next_poll_delay, next_scheduled_slot, selected_nodes,
-        should_unlock_recovered_wallet, worker_loop,
+        DashboardContext, NodeSlot, NonceAllocator, dashboard_model, dashboard_node_status,
+        next_poll_delay, next_scheduled_slot, selected_nodes, should_unlock_recovered_wallet,
+        worker_loop,
     };
     use crate::{
         cli::{MineArgs, Network},
         config::ConfigStore,
+        dashboard::NodeStatus,
         deployment::DeploymentManifest,
+        diagnostics::DiagnosticBuffer,
         protocol::{WorkContext, WorkHasher, meets_target},
-        rpc::{CandidateInfo, NodeState, WorkInfo},
+        rpc::{
+            BlockSnapshot, CandidateInfo, ContractPinStatus, NodeState, NodeView, ReadSnapshot,
+            WorkInfo,
+        },
+        transaction::TransactionActivityState,
     };
     use alloy_primitives::{Address, B256, Bytes, U256};
     use std::{
@@ -1072,6 +1652,128 @@ mod tests {
             finalizable: false,
             eligibility_reason: "eligible",
         }
+    }
+
+    #[test]
+    fn dashboard_node_status_requires_verified_live_work_and_respects_transactions() {
+        let mut state = eligible_state();
+        assert_eq!(
+            dashboard_node_status(Some(&state), true, true, None),
+            NodeStatus::Mining
+        );
+        assert_eq!(
+            dashboard_node_status(Some(&state), true, false, None),
+            NodeStatus::Waiting
+        );
+        assert_eq!(
+            dashboard_node_status(Some(&state), false, true, None),
+            NodeStatus::RpcError
+        );
+        assert_eq!(
+            dashboard_node_status(None, true, false, None),
+            NodeStatus::RpcError
+        );
+
+        state.mining_paused = true;
+        assert_eq!(
+            dashboard_node_status(Some(&state), true, true, None),
+            NodeStatus::Paused
+        );
+        state.mining_paused = false;
+        state.work.ended = true;
+        assert_eq!(
+            dashboard_node_status(Some(&state), true, true, None),
+            NodeStatus::Ended
+        );
+        state.work.ended = false;
+        state.finalizable = true;
+        state.eligible = false;
+        assert_eq!(
+            dashboard_node_status(Some(&state), true, false, None),
+            NodeStatus::Waiting
+        );
+
+        assert_eq!(
+            dashboard_node_status(
+                Some(&state),
+                true,
+                false,
+                Some(TransactionActivityState::Finalizing)
+            ),
+            NodeStatus::Finalizing
+        );
+        assert_eq!(
+            dashboard_node_status(
+                Some(&state),
+                true,
+                false,
+                Some(TransactionActivityState::Confirming)
+            ),
+            NodeStatus::Confirming
+        );
+        assert_eq!(
+            dashboard_node_status(
+                Some(&state),
+                true,
+                false,
+                Some(TransactionActivityState::Recovering)
+            ),
+            NodeStatus::Recovering
+        );
+    }
+
+    #[test]
+    fn dashboard_model_sorts_and_only_copies_selected_nodes() {
+        let slots = (1..=9).map(NodeSlot::new).collect::<Vec<_>>();
+        let selected = HashSet::from([7, 1, 3]);
+        let nodes = [7, 2, 3, 1]
+            .into_iter()
+            .map(|id| NodeView {
+                id,
+                address: Address::with_last_byte(id),
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(eligible_state()),
+                error: None,
+            })
+            .collect();
+        let snapshot = ReadSnapshot {
+            block: BlockSnapshot {
+                number: 123,
+                timestamp: 100,
+                hash: B256::with_last_byte(1),
+            },
+            native_balance: Some(U256::from(1_000)),
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes,
+        };
+        let context = DashboardContext {
+            network: Network::Testnet,
+            chain_id: 1439,
+            address: Address::with_last_byte(9),
+            threads: 2,
+            spending_limit: U256::ZERO,
+            transaction_mode: false,
+            compute_only: true,
+            workers_started: false,
+            selected: &selected,
+            slots: &slots,
+        };
+
+        let model = dashboard_model(&context, &snapshot, None, &DiagnosticBuffer::default());
+        assert_eq!(
+            model
+                .selected_nodes
+                .iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>(),
+            [1, 3, 7]
+        );
     }
 
     #[test]
