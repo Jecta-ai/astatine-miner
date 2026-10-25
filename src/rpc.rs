@@ -24,6 +24,25 @@ const MAX_LOG_QUERY_RANGE: u64 = 10_000;
 const SUBMISSION_FEE_WEI: u128 = 10_000_000_000_000_000;
 const ABI_PROBE_NONCE: u128 = u128::MAX - 7;
 
+#[cfg(test)]
+fn consume_counter(counter: &AtomicUsize) -> bool {
+    let mut remaining = counter.load(Ordering::Acquire);
+    loop {
+        if remaining == 0 {
+            return false;
+        }
+        match counter.compare_exchange_weak(
+            remaining,
+            remaining - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => remaining = observed,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkInfo {
     pub started: bool,
@@ -363,12 +382,7 @@ impl NetworkClient {
     ) -> Result<FeeQuote> {
         #[cfg(test)]
         if data.starts_with(&AstatineMinerRead::finalizeWindowCall::SELECTOR)
-            && self
-                .fail_next_finalization_fee_quote
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
+            && consume_counter(&self.fail_next_finalization_fee_quote)
         {
             return Err(anyhow::Error::new(TransientRpcFailure {
                 details: "test-injected HTTP 503 from fee quote provider".to_owned(),
