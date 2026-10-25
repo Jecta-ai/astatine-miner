@@ -7,6 +7,7 @@ use crate::{
     },
     deployment::DeploymentManifest,
     diagnostics::DiagnosticBuffer,
+    proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{BlockSnapshot, NetworkClient, NodeState, ReadSnapshot, is_transient_rpc_error},
     transaction::{
@@ -38,7 +39,8 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const IDLE_INTERVAL: Duration = Duration::from_millis(20);
 const NONCE_BATCH_SIZE: usize = 2_048;
-const PENDING_PROOF_QUEUE_CAPACITY: usize = 64;
+const PENDING_PROOF_CANDIDATE_CAPACITY: usize = 9;
+const PROOF_WAKE_CAPACITY: usize = 1;
 const WORK_EXPIRY_SAFETY_SECS: u64 = 2;
 const STALE_PREFLIGHT_RETRY: Duration = Duration::from_secs(1);
 const OBSERVER_STALL_TIMEOUT: Duration = Duration::from_secs(45);
@@ -87,6 +89,14 @@ struct WorkJob {
 
 struct NonceAllocator {
     next: Option<u128>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalBestUpdate {
+    NewBest,
+    NotBetter,
+    StaleGeneration,
+    ExpiredDeadline,
 }
 
 impl Default for NonceAllocator {
@@ -149,6 +159,20 @@ impl NodeSlot {
         self.completed_hashes.load(Ordering::Relaxed)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_nonce_start(&self, nonce: u128) {
+        *self
+            .nonces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            NonceAllocator { next: Some(nonce) };
+    }
+
     fn current_work_at(&self, now: Instant) -> Option<Arc<WorkJob>> {
         let work = self
             .work
@@ -209,6 +233,29 @@ impl NodeSlot {
         if self.is_generation_current(generation) {
             *best = None;
         }
+    }
+
+    fn update_local_best(
+        &self,
+        generation: u64,
+        valid_until: Instant,
+        hash: B256,
+    ) -> LocalBestUpdate {
+        let mut best = self
+            .local_best
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.is_generation_current(generation) {
+            return LocalBestUpdate::StaleGeneration;
+        }
+        if Instant::now() >= valid_until {
+            return LocalBestUpdate::ExpiredDeadline;
+        }
+        if best.is_some_and(|previous| hash >= previous) {
+            return LocalBestUpdate::NotBetter;
+        }
+        *best = Some(hash);
+        LocalBestUpdate::NewBest
     }
 
     fn set_work(
@@ -288,6 +335,10 @@ impl NodeSlot {
             };
             self.generation.fetch_add(1, Ordering::AcqRel);
             *self
+                .local_best
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *self
                 .suspended_work
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(previous);
@@ -331,6 +382,12 @@ impl NodeSlot {
                 return Ok(false);
             }
             let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            if existing.valid_until <= now && head_advanced {
+                *self
+                    .local_best
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
             *current = Some(Arc::new(WorkJob {
                 fingerprint,
                 generation,
@@ -390,10 +447,204 @@ impl NodeSlot {
 struct ProofFound {
     node_id: u8,
     generation: u64,
+    context: HashingContext,
     nonce: u128,
     hash: B256,
     target: U256,
     incumbent: Option<B256>,
+    queued_at: Instant,
+}
+
+#[derive(Clone)]
+struct ProofInboxSender {
+    pending: Arc<Mutex<[Option<ProofFound>; PENDING_PROOF_CANDIDATE_CAPACITY]>>,
+    wake: mpsc::Sender<()>,
+    attempts: Arc<ProofAttemptGuard>,
+}
+
+struct ProofInboxReceiver {
+    pending: Arc<Mutex<[Option<ProofFound>; PENDING_PROOF_CANDIDATE_CAPACITY]>>,
+    wake: mpsc::Receiver<()>,
+    paused: Arc<AtomicBool>,
+    sender: ProofInboxSender,
+}
+
+fn proof_inbox(
+    attempts: Arc<ProofAttemptGuard>,
+    initially_paused: bool,
+) -> (ProofInboxSender, ProofInboxReceiver) {
+    let pending = Arc::new(Mutex::new(std::array::from_fn(|_| None)));
+    let paused = Arc::new(AtomicBool::new(initially_paused));
+    let (wake, wake_receiver) = mpsc::channel(PROOF_WAKE_CAPACITY);
+    let sender = ProofInboxSender {
+        pending: Arc::clone(&pending),
+        wake,
+        attempts,
+    };
+    (
+        sender.clone(),
+        ProofInboxReceiver {
+            pending,
+            wake: wake_receiver,
+            paused,
+            sender,
+        },
+    )
+}
+
+impl ProofInboxSender {
+    fn deliver(&self, proof: ProofFound, telemetry: &ProofPipelineTelemetry) -> bool {
+        let Some(index) = proof
+            .node_id
+            .checked_sub(1)
+            .map(usize::from)
+            .filter(|index| *index < PENDING_PROOF_CANDIDATE_CAPACITY)
+        else {
+            return false;
+        };
+        if self
+            .attempts
+            .suppresses(proof.node_id, proof.context.window_id)
+        {
+            telemetry.record(proof.node_id, ProofMetric::SuppressedPriorAttempt);
+            return false;
+        }
+        if self.wake.is_closed() {
+            telemetry.record(proof.node_id, ProofMetric::QueueReceiverClosed);
+            return false;
+        }
+
+        let accepted = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match pending[index].as_ref() {
+                None => {
+                    pending[index] = Some(proof.clone());
+                    true
+                }
+                Some(existing) => {
+                    telemetry.record(proof.node_id, ProofMetric::QueueFullCoalesced);
+                    let replace = if existing.context == proof.context {
+                        let replace = proof.hash < existing.hash;
+                        telemetry.record(
+                            proof.node_id,
+                            if replace {
+                                ProofMetric::QueueReplacedByBetter
+                            } else {
+                                ProofMetric::QueueCandidateSuperseded
+                            },
+                        );
+                        replace
+                    } else {
+                        let replace = proof.generation > existing.generation;
+                        telemetry.record(
+                            proof.node_id,
+                            if replace {
+                                ProofMetric::QueueReplacedByNewContext
+                            } else {
+                                ProofMetric::QueueCandidateSuperseded
+                            },
+                        );
+                        replace
+                    };
+                    if replace {
+                        let mut proof = proof.clone();
+                        proof.queued_at = existing.queued_at;
+                        pending[index] = Some(proof);
+                    }
+                    replace
+                }
+            }
+        };
+        if !accepted {
+            return false;
+        }
+        telemetry.record(proof.node_id, ProofMetric::QueuedCandidates);
+        match self.wake.try_send(()) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(())) => {
+                telemetry.record(proof.node_id, ProofMetric::QueueWakeCoalesced);
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if pending[index].as_ref().is_some_and(|queued| {
+                    queued.node_id == proof.node_id && queued.nonce == proof.nonce
+                }) {
+                    pending[index] = None;
+                }
+                telemetry.record(proof.node_id, ProofMetric::QueueReceiverClosed);
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl ProofInboxReceiver {
+    fn has_pending(&self) -> bool {
+        !self.paused.load(Ordering::Acquire)
+            && self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(Option::is_some)
+    }
+
+    fn set_paused(&self, paused: bool) {
+        let was_paused = self.paused.swap(paused, Ordering::AcqRel);
+        if was_paused && !paused {
+            let _ = self.sender.wake.try_send(());
+        }
+    }
+
+    fn requeue(&self, proof: ProofFound, telemetry: &ProofPipelineTelemetry) -> bool {
+        self.sender.deliver(proof, telemetry)
+    }
+
+    fn take_next(&self) -> Option<ProofFound> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = pending
+            .iter()
+            .enumerate()
+            .filter_map(|(index, proof)| proof.as_ref().map(|proof| (index, proof.queued_at)))
+            .min_by_key(|(_, queued_at)| *queued_at)
+            .map(|(index, _)| index)?;
+        pending[index].take()
+    }
+
+    fn drain_pending(&self) -> Vec<ProofFound> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.iter_mut().filter_map(Option::take).collect()
+    }
+
+    fn discard_pending(&self, telemetry: &ProofPipelineTelemetry, reason: ProofMetric) {
+        for proof in self.drain_pending() {
+            telemetry.record(proof.node_id, reason);
+        }
+    }
+
+    async fn recv(&mut self) -> Option<ProofFound> {
+        loop {
+            if !self.paused.load(Ordering::Acquire)
+                && let Some(proof) = self.take_next()
+            {
+                return Some(proof);
+            }
+            self.wake.recv().await?;
+        }
+    }
 }
 
 fn should_unlock_recovered_wallet(
@@ -491,17 +742,43 @@ pub(crate) struct MiningProbe {
     pub(crate) slots: Arc<Vec<NodeSlot>>,
     pub(crate) schedule: Arc<RwLock<Vec<usize>>>,
     pub(crate) observer_updates: watch::Receiver<ObserverUpdate>,
+    pub(crate) observer_refresh: ObserverRefreshHandle,
     pub(crate) stop_signal: DashboardSignal,
+    pub(crate) proof_telemetry: Arc<ProofPipelineTelemetry>,
+    pub(crate) worker_threads: usize,
+    #[cfg(test)]
+    pub(crate) proof_processing_gate: watch::Sender<bool>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ObserverRefreshHandle {
+    sender: mpsc::Sender<()>,
+    epoch: Arc<AtomicU64>,
+    gate: Arc<Mutex<()>>,
+}
+
+impl ObserverRefreshHandle {
+    pub(crate) fn force_refresh(&self) {
+        let _commit = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        let _ = self.sender.try_send(());
+    }
 }
 
 impl ReadOnlyObserver {
     pub(crate) fn force_refresh(&self) {
-        let _commit = self
-            .refresh_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.refresh_epoch.fetch_add(1, Ordering::AcqRel);
-        let _ = self.force_refresh.try_send(());
+        self.refresh_handle().force_refresh();
+    }
+
+    fn refresh_handle(&self) -> ObserverRefreshHandle {
+        ObserverRefreshHandle {
+            sender: self.force_refresh.clone(),
+            epoch: Arc::clone(&self.refresh_epoch),
+            gate: Arc::clone(&self.refresh_gate),
+        }
     }
 
     pub(crate) fn latest_snapshot(&self) -> Option<ReadSnapshot> {
@@ -567,6 +844,15 @@ async fn run_runtime(
     probe_sender: Option<tokio::sync::oneshot::Sender<MiningProbe>>,
 ) -> Result<()> {
     let probe_stop_signal = probe_sender.as_ref().map(|_| DashboardSignal::default());
+    #[cfg(test)]
+    let (proof_processing_gate, mut proof_processing_gate_receiver) = if probe_sender.is_some() {
+        let (sender, receiver) = watch::channel(true);
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
+    let proof_telemetry = Arc::new(ProofPipelineTelemetry::default());
+    let proof_attempt_guard = Arc::new(ProofAttemptGuard::default());
     if !args.compute_only && config.network != crate::cli::Network::Testnet {
         bail!("autonomous transaction signing is disabled outside Injective Testnet");
     }
@@ -609,6 +895,14 @@ async fn run_runtime(
             .context("AST token pin is missing from the Testnet manifest")?;
         let ast_token = crate::deployment::parse_address(&token.address)?;
         let mut manager = TransactionManager::open(store, &config, address, ast_token)?;
+        manager.set_proof_telemetry(Arc::clone(&proof_telemetry));
+        manager.set_proof_attempt_guard(Arc::clone(&proof_attempt_guard));
+        for node in &client.manifest.nodes {
+            let contract = crate::deployment::parse_address(&node.address)?;
+            if let Some(window_id) = manager.proof_attempted_through(contract) {
+                proof_attempt_guard.record_attempt(node.id, window_id);
+            }
+        }
         manager.reconcile(&client).await?;
         Some(manager)
     } else {
@@ -703,6 +997,18 @@ async fn run_runtime(
         &selected,
         &snapshot,
     )?;
+    #[cfg(test)]
+    for slot in slots.iter() {
+        if let Some(work) = slot.current_work()
+            && let Some(nonce) = client.take_test_proof_nonce_start(
+                slot.id,
+                work.fingerprint.hashing_context.window_id,
+                work.fingerprint.hashing_context.seed,
+            )
+        {
+            slot.set_test_nonce_start(nonce);
+        }
+    }
     refresh_dashboard(dashboard_updater.as_ref(), &dashboard_context, &snapshot);
     let mut observer = start_read_only_observer(
         client.clone(),
@@ -738,7 +1044,13 @@ async fn run_runtime(
             &client, address, threads, &snapshot, &slots, &selected, changed,
         );
     }
-    let (proof_sender, mut proof_receiver) = mpsc::channel(PENDING_PROOF_QUEUE_CAPACITY);
+    let proof_delivery_paused = transaction_mode
+        && (signer.is_none()
+            || transactions
+                .as_ref()
+                .is_some_and(|manager| manager.journal.has_unresolved()));
+    let (proof_sender, mut proof_receiver) =
+        proof_inbox(Arc::clone(&proof_attempt_guard), proof_delivery_paused);
     let mut workers = Vec::with_capacity(threads);
     for worker_id in 0..threads {
         let slots = Arc::clone(&slots);
@@ -746,6 +1058,7 @@ async fn run_runtime(
         let worker_stop = Arc::clone(&stop);
         let cursor = Arc::clone(&cursor);
         let total_hashes = Arc::clone(&total_hashes);
+        let telemetry = Arc::clone(&proof_telemetry);
         let proof_sender = proof_sender.clone();
         let worker = thread::Builder::new()
             .name(format!("astatine-pow-{worker_id}"))
@@ -757,6 +1070,7 @@ async fn run_runtime(
                     cursor,
                     total_hashes,
                     proof_sender,
+                    telemetry,
                 )
             })
             .context("start CPU worker");
@@ -785,10 +1099,17 @@ async fn run_runtime(
             slots: Arc::clone(&slots),
             schedule: Arc::clone(&schedule),
             observer_updates: observer.updates.clone(),
+            observer_refresh: observer.refresh_handle(),
             stop_signal: probe_stop_signal
                 .as_ref()
                 .expect("test stop signal must be initialized")
                 .clone(),
+            proof_telemetry: Arc::clone(&proof_telemetry),
+            worker_threads: threads,
+            #[cfg(test)]
+            proof_processing_gate: proof_processing_gate
+                .clone()
+                .expect("test proof-processing gate must be initialized"),
         });
     }
 
@@ -836,13 +1157,43 @@ async fn run_runtime(
                 match update {
                     ObserverUpdate::Snapshot(snapshot) => {
                         let mut snapshot = observer.latest_snapshot().unwrap_or(snapshot);
+                        if proof_receiver.has_pending() {
+                            last_snapshot = snapshot;
+                            continue 'mining_loop;
+                        }
                         if let Some(manager) = transactions.as_mut()
-                            && let Err(error) = manager.monitor(&client, snapshot.block.number).await
+                            && let Err(error) = manager.monitor(&client).await
                         {
                             fatal_error = Some(error.context("monitor transaction finality and reorg state"));
                             break;
                         }
+                        if transaction_mode
+                            && let Some(manager) = transactions.as_ref()
+                        {
+                            match manager.budget_remaining() {
+                                Ok(remaining) => budget_exhausted |= remaining.is_zero(),
+                                Err(error) => {
+                                    fatal_error = Some(error);
+                                    break;
+                                }
+                            }
+                        }
+                        if budget_exhausted {
+                            proof_receiver
+                                .discard_pending(&proof_telemetry, ProofMetric::RefusedSpendingLimit);
+                        }
+                        proof_receiver.set_paused(
+                            transaction_mode
+                                && (signer.is_none()
+                                    || transactions
+                                        .as_ref()
+                                        .is_some_and(|manager| manager.journal.has_unresolved())),
+                        );
                         snapshot = observer.latest_snapshot().unwrap_or(snapshot);
+                        if proof_receiver.has_pending() {
+                            last_snapshot = snapshot;
+                            continue 'mining_loop;
+                        }
                         if let Some(manager) = transactions.as_ref()
                             && should_unlock_recovered_wallet(
                                 transaction_mode,
@@ -884,6 +1235,7 @@ async fn run_runtime(
                                 }
                             };
                             signer = Some(recovered_signer);
+                            proof_receiver.set_paused(false);
                             report_mining_info(
                                 &dashboard,
                                 "Transaction recovery settled; autonomous Testnet signing is resuming.",
@@ -932,7 +1284,19 @@ async fn run_runtime(
                                 }
                             }
                         }
+                        proof_receiver.set_paused(
+                            transaction_mode
+                                && (signer.is_none()
+                                    || transactions
+                                        .as_ref()
+                                        .is_some_and(|manager| manager.journal.has_unresolved())
+                                    || budget_exhausted),
+                        );
                         snapshot = observer.latest_snapshot().unwrap_or(snapshot);
+                        if proof_receiver.has_pending() {
+                            last_snapshot = snapshot;
+                            continue 'mining_loop;
+                        }
                         if let Some(manager) = transactions.as_mut()
                             && let Err(error) = manager.reconcile_rewards(&client, &snapshot).await
                         {
@@ -978,254 +1342,280 @@ async fn run_runtime(
                 }
             }
             proof = proof_receiver.recv() => {
-                        if let Some(proof) = proof {
-                    let slot = &slots[usize::from(proof.node_id - 1)];
-                    if slot.is_generation_current(proof.generation)
-                        && slot
-                            .current_work()
-                            .is_some_and(|work| work.generation == proof.generation)
-                    {
-                        let incumbent = proof.incumbent.map(|hash| format!("; beats incumbent {hash:#x}")).unwrap_or_default();
-                        if args.compute_only {
-                            report_mining_info(
-                                &dashboard,
-                                format!(
-                                    "valid local proof: node={} nonce={} hash={:#x} target={:#x}{}; not submitted",
-                                    proof.node_id, proof.nonce, proof.hash, proof.target, incumbent
-                                ),
-                            );
-                        } else if let (Some(manager), Some(signer)) =
-                            (transactions.as_mut(), signer.as_ref())
+                let Some(proof) = proof else {
+                    fatal_error = Some(anyhow!("CPU proof inbox closed while mining was active"));
+                    break;
+                };
+                proof_telemetry.record(proof.node_id, ProofMetric::MainLoopReceived);
+                #[cfg(test)]
+                if let Some(gate) = proof_processing_gate_receiver.as_mut() {
+                    while *gate.borrow() {
+                        if gate.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                let Some(slot) = slots.get(usize::from(proof.node_id.saturating_sub(1))) else {
+                    continue;
+                };
+                let work = match revalidate_queued_proof(slot, &proof, &proof_telemetry) {
+                    Ok(work) => work,
+                    Err(reason) => {
+                        record_proof_revalidation_drop(slot, &proof, reason, &proof_telemetry);
+                        continue;
+                    }
+                };
+                let incumbent = proof
+                    .incumbent
+                    .map(|hash| format!("; found against incumbent {hash:#x}"))
+                    .unwrap_or_default();
+                let contract = work.fingerprint.hashing_context.contract;
+                let window_id = work.fingerprint.hashing_context.window_id;
+                if args.compute_only {
+                    report_mining_info(
+                        &dashboard,
+                        format!(
+                            "valid local proof: node={} window={} nonce={} hash={:#x} target={:#x}{}; compute-only, not submitted",
+                            proof.node_id, window_id, proof.nonce, proof.hash, proof.target, incumbent
+                        ),
+                    );
+                    continue;
+                }
+                let (Some(manager), Some(signer)) =
+                    (transactions.as_mut(), signer.as_ref())
+                else {
+                    proof_telemetry.record(proof.node_id, ProofMetric::RefusedSigningDisabled);
+                    continue;
+                };
+                if manager.proof_attempted(contract, window_id) {
+                    proof_telemetry.record(proof.node_id, ProofMetric::SuppressedPriorAttempt);
+                    continue;
+                }
+                if manager.journal.has_unresolved() {
+                    proof_receiver.set_paused(true);
+                    let _ = proof_receiver.requeue(proof.clone(), &proof_telemetry);
+                    proof_telemetry.record(
+                        proof.node_id,
+                        ProofMetric::DeferredUnresolvedTransaction,
+                    );
+                    continue;
+                }
+                if budget_exhausted || manager.budget_remaining()?.is_zero() {
+                    budget_exhausted = true;
+                    proof_telemetry.record(proof.node_id, ProofMetric::RefusedSpendingLimit);
+                    proof_receiver.set_paused(true);
+                    proof_receiver
+                        .discard_pending(&proof_telemetry, ProofMetric::RefusedSpendingLimit);
+                    continue;
+                }
+                let header = work.fingerprint.hashing_context.header.clone();
+                mark_dashboard_nodes(
+                    &dashboard,
+                    [proof.node_id],
+                    NodeStatus::CheckingProof,
+                    Some(format!(
+                        "Node {:02} • Checking proof and transaction policy...",
+                        proof.node_id
+                    )),
+                );
+                let mut retry_attempts = 0_u8;
+                let submission_result = loop {
+                    proof_telemetry.record(proof.node_id, ProofMetric::PreflightStarted);
+                    let result = tokio::select! {
+                        result = manager.submit_proof(
+                            &client,
+                            signer,
+                            ProofSubmission {
+                                contract,
+                                node_id: proof.node_id,
+                                window_id,
+                                nonce: proof.nonce,
+                                header: header.clone(),
+                                work_hash: proof.hash,
+                            },
+                        ) => Some(result),
+                        signal = &mut ctrl_c => {
+                            if let Err(error) = signal {
+                                report_mining_warning(&dashboard, format!("Ctrl+C signal handler failed: {error}"));
+                            }
+                            None
+                        }
+                        event = wait_for_dashboard_event(dashboard_signal.clone()) => {
+                            if let DashboardEventKind::Failure(error) = event {
+                                fatal_error = Some(anyhow!("dashboard failed: {error}"));
+                            }
+                            None
+                        }
+                    };
+                    let Some(result) = result else {
+                        break 'mining_loop;
+                    };
+                    match result {
+                        Err(error)
+                            if is_transient_rpc_error(&error)
+                                && !manager.journal.has_unresolved()
+                                && !manager.journal.has_unverified_receipt() =>
                         {
-                            let Some(work) = slot.current_work() else {
-                                continue;
-                            };
-                            if work.generation != proof.generation
-                                || !slot.is_generation_current(proof.generation)
-                            {
-                                continue;
-                            }
-                            let contract = work.fingerprint.hashing_context.contract;
-                            let window_id = work.fingerprint.hashing_context.window_id;
-                            if manager.proof_attempted(contract, window_id) {
-                                continue;
-                            }
-                            if manager.journal.has_unresolved() {
-                                report_mining_info(
+                            proof_telemetry.record(
+                                proof.node_id,
+                                ProofMetric::PreflightRpcFailure,
+                            );
+                            retry_attempts = retry_attempts.saturating_add(1);
+                            if retry_attempts >= MAX_PROOF_PREFLIGHT_RETRIES {
+                                slot.reset_local_best_for_generation(work.generation);
+                                report_mining_warning(
                                     &dashboard,
-                                    format!("valid local proof for node {} was withheld while a previous transaction is under recovery", proof.node_id),
+                                    format!(
+                                        "transient proof RPC retry limit reached for node {:02} window {window_id}; returning to hashing with fresh nonces: {error:#}",
+                                        proof.node_id
+                                    ),
                                 );
-                                continue;
+                                break Err(anyhow!(
+                                    "transient proof preflight retry limit reached; resume local proof search"
+                                ));
                             }
-                            if budget_exhausted || manager.budget_remaining()?.is_zero() {
-                                budget_exhausted = true;
-                                report_mining_info(
+                            if retry_attempts == 1 || retry_attempts.is_multiple_of(5) {
+                                report_mining_warning(
                                     &dashboard,
-                                    format!("valid local proof for node {} was not submitted: session spending limit is exhausted", proof.node_id),
+                                    format!(
+                                        "proof preflight for node {:02} window {window_id} hit a transient RPC error; reserved nonce and proof attempt remain untouched, retry {retry_attempts} will revalidate: {error:#}",
+                                        proof.node_id
+                                    ),
                                 );
-                                continue;
                             }
-                            let header = work.fingerprint.hashing_context.header.clone();
+                            observer.force_refresh();
+                            let delay = finalization_retry_delay(retry_attempts);
                             mark_dashboard_nodes(
                                 &dashboard,
                                 [proof.node_id],
-                                NodeStatus::Confirming,
-                                Some(format!("Node {:02} • Confirming proof...", proof.node_id)),
+                                NodeStatus::CheckingProof,
+                                Some(format!(
+                                    "Node {:02} window #{window_id} • retrying proof preflight in {}s",
+                                    proof.node_id,
+                                    delay.as_secs()
+                                )),
                             );
-                            let mut retry_attempts = 0_u8;
-                            let submission_result = loop {
-                                let result = tokio::select! {
-                                    result = manager.submit_proof(
-                                        &client,
-                                        signer,
-                                        ProofSubmission {
-                                            contract,
-                                            node_id: proof.node_id,
-                                            window_id,
-                                            nonce: proof.nonce,
-                                            header: header.clone(),
-                                            work_hash: proof.hash,
-                                        },
-                                    ) => Some(result),
-                                    signal = &mut ctrl_c => {
-                                        if let Err(error) = signal {
-                                            report_mining_warning(&dashboard, format!("Ctrl+C signal handler failed: {error}"));
-                                        }
-                                        None
+                            tokio::select! {
+                                _ = time::sleep(delay) => {}
+                                signal = &mut ctrl_c => {
+                                    if let Err(error) = signal {
+                                        report_mining_warning(&dashboard, format!("Ctrl+C signal handler failed: {error}"));
                                     }
-                                    event = wait_for_dashboard_event(dashboard_signal.clone()) => {
-                                        if let DashboardEventKind::Failure(error) = event {
-                                            fatal_error = Some(anyhow!("dashboard failed: {error}"));
-                                        }
-                                        None
-                                    }
-                                };
-                                let Some(result) = result else {
                                     break 'mining_loop;
-                                };
-                                match result {
-                                    Err(error)
-                                        if is_transient_rpc_error(&error)
-                                            && !manager.journal.has_unresolved()
-                                            && !manager.journal.has_unverified_receipt() =>
-                                    {
-                                        retry_attempts = retry_attempts.saturating_add(1);
-                                        if retry_attempts >= MAX_PROOF_PREFLIGHT_RETRIES {
-                                            slot.reset_local_best_for_generation(proof.generation);
-                                            report_mining_warning(
-                                                &dashboard,
-                                                format!(
-                                                    "transient proof RPC retry limit reached for node {:02} window {window_id}; returning to hashing with fresh nonces: {error:#}",
-                                                    proof.node_id
-                                                ),
-                                            );
-                                            break Err(anyhow!(
-                                                "transient proof preflight retry limit reached; resume local proof search"
-                                            ));
-                                        }
-                                        if retry_attempts == 1 || retry_attempts.is_multiple_of(5) {
-                                            report_mining_warning(
-                                                &dashboard,
-                                                format!(
-                                                    "proof preflight for node {:02} window {window_id} hit a transient RPC error; reserved nonce and proof attempt remain untouched, retry {retry_attempts} will revalidate: {error:#}",
-                                                    proof.node_id
-                                                ),
-                                            );
-                                        }
-                                        observer.force_refresh();
-                                        let delay = finalization_retry_delay(retry_attempts);
-                                        mark_dashboard_nodes(
-                                            &dashboard,
-                                            [proof.node_id],
-                                            NodeStatus::Mining,
-                                            Some(format!(
-                                                "Node {:02} window #{window_id} • retrying proof preflight in {}s",
-                                                proof.node_id,
-                                                delay.as_secs()
-                                            )),
-                                        );
-                                        tokio::select! {
-                                            _ = time::sleep(delay) => {}
-                                            signal = &mut ctrl_c => {
-                                                if let Err(error) = signal {
-                                                    report_mining_warning(&dashboard, format!("Ctrl+C signal handler failed: {error}"));
-                                                }
-                                                break 'mining_loop;
-                                            }
-                                            event = wait_for_dashboard_event(dashboard_signal.clone()) => {
-                                                if let DashboardEventKind::Failure(error) = event {
-                                                    fatal_error = Some(anyhow!("dashboard failed: {error}"));
-                                                }
-                                                break 'mining_loop;
-                                            }
-                                        }
-                                        if !slot.current_work().is_some_and(|current| {
-                                            current.generation == proof.generation
-                                                && slot.is_generation_current(proof.generation)
-                                        }) {
-                                            break Err(anyhow!(
-                                                "local work generation changed before transient proof retry"
-                                            ));
-                                        }
+                                }
+                                event = wait_for_dashboard_event(dashboard_signal.clone()) => {
+                                    if let DashboardEventKind::Failure(error) = event {
+                                        fatal_error = Some(anyhow!("dashboard failed: {error}"));
                                     }
-                                    result => break result,
-                                }
-                            };
-                            match submission_result {
-                                Ok(action) => {
-                                    report_mining_info(
-                                        &dashboard,
-                                        confirmed_action_message("proof", &action),
-                                    );
-                                    dashboard_context
-                                        .pending_sync
-                                        .write()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .insert(
-                                            proof.node_id,
-                                            PendingDashboardSync {
-                                                window_id,
-                                                receipt_block: action.receipt.block_number,
-                                            },
-                                        );
-                                    mark_dashboard_nodes(
-                                        &dashboard,
-                                        [proof.node_id],
-                                        NodeStatus::Syncing,
-                                        Some(format!(
-                                            "Node {:02} • Syncing accepted proof...",
-                                            proof.node_id
-                                        )),
-                                    );
-                                    observer.force_refresh();
-                                }
-                                Err(error)
-                                    if manager.journal.has_unresolved()
-                                        || manager.journal.has_unverified_receipt() =>
-                                {
-                                    report_mining_warning(
-                                        &dashboard,
-                                        format!(
-                                            "proof outcome remains journaled as unresolved; no further transaction will be signed, but read-only recovery and mining observation will continue: {error:#}"
-                                        ),
-                                    );
-                                    mark_dashboard_nodes(
-                                        &dashboard,
-                                        [proof.node_id],
-                                        NodeStatus::Recovering,
-                                        Some(format!(
-                                            "Node {:02} • recovering journaled proof outcome...",
-                                            proof.node_id
-                                        )),
-                                    );
-                                    observer.force_refresh();
-                                }
-                                Err(error) if is_policy_refusal(&error) => {
-                                    budget_exhausted |= is_session_limit_refusal(&error);
-                                    report_mining_warning(
-                                        &dashboard,
-                                        format!("valid proof was not submitted: {error:#}"),
-                                    );
-                                    mark_dashboard_nodes(
-                                        &dashboard,
-                                        [proof.node_id],
-                                        NodeStatus::Mining,
-                                        None,
-                                    );
-                                }
-                                Err(error) if is_stale_proof(&error) => {
-                                    if stale_proof_warning_window.get(&proof.node_id)
-                                        != Some(&window_id)
-                                    {
-                                        stale_proof_warning_window
-                                            .insert(proof.node_id, window_id);
-                                        report_mining_warning(
-                                            &dashboard,
-                                            format!("discarded stale proof for node {} window {window_id}: {error:#}", proof.node_id),
-                                        );
-                                    }
-                                    mark_dashboard_nodes(
-                                        &dashboard,
-                                        [proof.node_id],
-                                        NodeStatus::Syncing,
-                                        Some(format!(
-                                            "Node {:02} window #{window_id} • revalidating after stale proof...",
-                                            proof.node_id
-                                        )),
-                                    );
-                                    observer.force_refresh();
-                                }
-                                Err(error) => {
-                                    fatal_error = Some(error);
-                                    break;
+                                    break 'mining_loop;
                                 }
                             }
-                        } else {
-                            report_mining_info(
+                            if let Err(reason) =
+                                revalidate_queued_proof(slot, &proof, &proof_telemetry)
+                            {
+                                record_proof_revalidation_drop(
+                                    slot,
+                                    &proof,
+                                    reason,
+                                    &proof_telemetry,
+                                );
+                                break Err(anyhow!(
+                                    "local proof failed canonical revalidation before transient retry: {reason:?}"
+                                ));
+                            }
+                        }
+                        result => break result,
+                    }
+                };
+                match submission_result {
+                    Ok(action) => {
+                        report_mining_info(
+                            &dashboard,
+                            confirmed_action_message("proof", &action),
+                        );
+                        dashboard_context
+                            .pending_sync
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(
+                                proof.node_id,
+                                PendingDashboardSync {
+                                    window_id,
+                                    receipt_block: action.receipt.block_number,
+                                },
+                            );
+                        mark_dashboard_nodes(
+                            &dashboard,
+                            [proof.node_id],
+                            NodeStatus::Syncing,
+                            Some(format!(
+                                "Node {:02} • Syncing accepted proof...",
+                                proof.node_id
+                            )),
+                        );
+                        observer.force_refresh();
+                    }
+                    Err(error)
+                        if manager.journal.has_unresolved()
+                            || manager.journal.has_unverified_receipt() =>
+                    {
+                        report_mining_warning(
+                            &dashboard,
+                            format!(
+                                "proof outcome remains journaled as unresolved; no further transaction will be signed, but read-only recovery and mining observation will continue: {error:#}"
+                            ),
+                        );
+                        proof_receiver.set_paused(true);
+                        mark_dashboard_nodes(
+                            &dashboard,
+                            [proof.node_id],
+                            NodeStatus::Recovering,
+                            Some(format!(
+                                "Node {:02} • recovering journaled proof outcome...",
+                                proof.node_id
+                            )),
+                        );
+                        observer.force_refresh();
+                    }
+                    Err(error) if is_policy_refusal(&error) => {
+                        proof_telemetry.record(proof.node_id, ProofMetric::PreflightPolicyRefusal);
+                        budget_exhausted |= is_session_limit_refusal(&error);
+                        if budget_exhausted {
+                            proof_receiver.set_paused(true);
+                        }
+                        report_mining_warning(
+                            &dashboard,
+                            format!("valid proof was not submitted: {error:#}"),
+                        );
+                        mark_dashboard_nodes(&dashboard, [proof.node_id], NodeStatus::Mining, None);
+                    }
+                    Err(error) if is_stale_proof(&error) => {
+                        proof_telemetry.record(proof.node_id, ProofMetric::PreflightStaleProof);
+                        if stale_proof_warning_window.get(&proof.node_id) != Some(&window_id) {
+                            stale_proof_warning_window.insert(proof.node_id, window_id);
+                            report_mining_warning(
                                 &dashboard,
-                                format!("valid local proof for node {} was not submitted: transaction signing is disabled", proof.node_id),
+                                format!(
+                                    "discarded stale proof for node {} window {window_id}: {error:#}",
+                                    proof.node_id
+                                ),
                             );
                         }
+                        mark_dashboard_nodes(
+                            &dashboard,
+                            [proof.node_id],
+                            NodeStatus::Syncing,
+                            Some(format!(
+                                "Node {:02} window #{window_id} • revalidating after stale proof...",
+                                proof.node_id
+                            )),
+                        );
+                        observer.force_refresh();
+                    }
+                    Err(error) => {
+                        proof_telemetry.record(proof.node_id, ProofMetric::PreflightOtherFailure);
+                        fatal_error = Some(error);
+                        break;
                     }
                 }
             }
@@ -1234,6 +1624,9 @@ async fn run_runtime(
 
     if worker_guard.stop_and_join() {
         report_mining_warning(&dashboard, "CPU worker stopped after an internal panic.");
+    }
+    for pending in proof_receiver.drain_pending() {
+        proof_telemetry.record(pending.node_id, ProofMetric::DroppedOnShutdown);
     }
     if let Err(error) = observer.stop().await
         && fatal_error.is_none()
@@ -1273,6 +1666,9 @@ async fn run_runtime(
             model.current_action = None;
         });
     }
+    for line in proof_telemetry.report_lines() {
+        report_mining_info(&dashboard, line);
+    }
     let restore_result = if let Some(dashboard) = dashboard.as_mut() {
         let result = dashboard.stop().await;
         flush_dashboard_diagnostics(dashboard);
@@ -1300,6 +1696,88 @@ async fn run_runtime(
 fn take_observer_update(updates: &mut watch::Receiver<ObserverUpdate>) -> ObserverUpdate {
     let borrowed = updates.borrow_and_update();
     (*borrowed).clone()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProofRevalidationFailure {
+    NoEligibleWork,
+    ExpiredDeadline,
+    WindowMismatch,
+    WorkContextMismatch,
+    HashMismatch,
+    CurrentTarget,
+    CurrentIncumbent,
+}
+
+fn revalidate_queued_proof(
+    slot: &NodeSlot,
+    proof: &ProofFound,
+    telemetry: &ProofPipelineTelemetry,
+) -> std::result::Result<Arc<WorkJob>, ProofRevalidationFailure> {
+    revalidate_queued_proof_at(slot, proof, telemetry, Instant::now())
+}
+
+fn revalidate_queued_proof_at(
+    slot: &NodeSlot,
+    proof: &ProofFound,
+    telemetry: &ProofPipelineTelemetry,
+    now: Instant,
+) -> std::result::Result<Arc<WorkJob>, ProofRevalidationFailure> {
+    let current = slot
+        .work
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .ok_or(ProofRevalidationFailure::NoEligibleWork)?;
+    if now >= current.valid_until {
+        return Err(ProofRevalidationFailure::ExpiredDeadline);
+    }
+    if proof.context.window_id != current.fingerprint.hashing_context.window_id {
+        return Err(ProofRevalidationFailure::WindowMismatch);
+    }
+    if proof.context != current.fingerprint.hashing_context {
+        return Err(ProofRevalidationFailure::WorkContextMismatch);
+    }
+    let recomputed = WorkHasher::new(&current.fingerprint.hashing_context.work_context())
+        .ok()
+        .map(|hasher| hasher.hash(proof.nonce));
+    if recomputed != Some(proof.hash) {
+        return Err(ProofRevalidationFailure::HashMismatch);
+    }
+    if !meets_target(proof.hash, current.target) {
+        return Err(ProofRevalidationFailure::CurrentTarget);
+    }
+    if current
+        .incumbent
+        .is_some_and(|incumbent| !beats_incumbent(proof.hash, incumbent))
+    {
+        return Err(ProofRevalidationFailure::CurrentIncumbent);
+    }
+    if proof.generation != current.generation {
+        telemetry.record(slot.id, ProofMetric::GenerationMismatchRevalidated);
+    }
+    Ok(current)
+}
+
+fn record_proof_revalidation_drop(
+    slot: &NodeSlot,
+    proof: &ProofFound,
+    failure: ProofRevalidationFailure,
+    telemetry: &ProofPipelineTelemetry,
+) {
+    if proof.generation != slot.generation.load(Ordering::Acquire) {
+        telemetry.record(slot.id, ProofMetric::GenerationMismatchDropped);
+    }
+    let metric = match failure {
+        ProofRevalidationFailure::NoEligibleWork => ProofMetric::DroppedNoEligibleWork,
+        ProofRevalidationFailure::ExpiredDeadline => ProofMetric::DroppedExpiredDeadline,
+        ProofRevalidationFailure::WindowMismatch => ProofMetric::DroppedWindowMismatch,
+        ProofRevalidationFailure::WorkContextMismatch => ProofMetric::DroppedWorkContextMismatch,
+        ProofRevalidationFailure::HashMismatch => ProofMetric::DroppedHashMismatch,
+        ProofRevalidationFailure::CurrentTarget => ProofMetric::DroppedCurrentTarget,
+        ProofRevalidationFailure::CurrentIncumbent => ProofMetric::DroppedCurrentIncumbent,
+    };
+    telemetry.record(slot.id, metric);
 }
 
 pub(crate) struct FinalizationOptions<'a> {
@@ -2272,6 +2750,7 @@ fn observer_rpc_error(
                 {
                     node.status = match activity.state {
                         TransactionActivityState::Finalizing => NodeStatus::Finalizing,
+                        TransactionActivityState::Signed => NodeStatus::Signed,
                         TransactionActivityState::Confirming => NodeStatus::Confirming,
                         TransactionActivityState::Recovering => NodeStatus::Recovering,
                     };
@@ -2518,6 +2997,7 @@ fn dashboard_node_status(
     if let Some(activity) = activity {
         return match activity {
             TransactionActivityState::Finalizing => NodeStatus::Finalizing,
+            TransactionActivityState::Signed => NodeStatus::Signed,
             TransactionActivityState::Confirming => NodeStatus::Confirming,
             TransactionActivityState::Recovering => NodeStatus::Recovering,
         };
@@ -2699,6 +3179,7 @@ fn apply_transaction_state_to_model(model: &mut DashboardModel, state: &Transact
         if node.window_id == Some(activity.window_id) {
             node.status = match activity.state {
                 TransactionActivityState::Finalizing => NodeStatus::Finalizing,
+                TransactionActivityState::Signed => NodeStatus::Signed,
                 TransactionActivityState::Confirming => NodeStatus::Confirming,
                 TransactionActivityState::Recovering => NodeStatus::Recovering,
             };
@@ -2707,6 +3188,7 @@ fn apply_transaction_state_to_model(model: &mut DashboardModel, state: &Transact
     let transaction_action = state.activities.first().map(|activity| {
         let action = match activity.state {
             TransactionActivityState::Finalizing => "Finalizing window",
+            TransactionActivityState::Signed => "Signed; awaiting RPC broadcast",
             TransactionActivityState::Confirming => "Confirming transaction",
             TransactionActivityState::Recovering => "Recovering transaction",
         };
@@ -2719,6 +3201,7 @@ fn apply_transaction_state_to_model(model: &mut DashboardModel, state: &Transact
         model.current_action = transaction_action;
     } else if model.current_action.as_deref().is_some_and(|action| {
         action.contains("Confirming transaction")
+            || action.contains("Signed; awaiting RPC broadcast")
             || action.contains("Finalizing window...")
             || action.contains("Recovering transaction")
     }) {
@@ -2875,8 +3358,10 @@ fn worker_loop(
     stop: Arc<AtomicBool>,
     cursor: Arc<AtomicUsize>,
     total_hashes: Arc<AtomicU64>,
-    proofs: mpsc::Sender<ProofFound>,
+    proofs: ProofInboxSender,
+    telemetry: Arc<ProofPipelineTelemetry>,
 ) {
+    let mut nonce_exhaustion_reported = false;
     while !stop.load(Ordering::Acquire) {
         let mut active = schedule
             .read()
@@ -2893,52 +3378,96 @@ fn worker_loop(
             continue;
         };
         if !slot.is_generation_current(work.generation) {
+            telemetry.record(slot.id, ProofMetric::WorkerStoppedGeneration);
             continue;
         }
         let Some((first_nonce, count)) = slot.reserve_nonces() else {
+            if !nonce_exhaustion_reported {
+                telemetry.record(slot.id, ProofMetric::WorkerNonceRangeExhausted);
+                nonce_exhaustion_reported = true;
+            }
             thread::sleep(IDLE_INTERVAL);
             continue;
         };
+        nonce_exhaustion_reported = false;
         let mut scratch = vec![0_u8; work.hasher.scratch_len()];
         let mut completed = 0_u64;
         for offset in 0..count {
-            if stop.load(Ordering::Relaxed)
-                || !slot.is_generation_current(work.generation)
-                || Instant::now() >= work.valid_until
-            {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if !slot.is_generation_current(work.generation) {
+                telemetry.record(slot.id, ProofMetric::WorkerStoppedGeneration);
+                break;
+            }
+            if Instant::now() >= work.valid_until {
+                telemetry.record(slot.id, ProofMetric::WorkerStoppedDeadline);
                 break;
             }
             let Some(nonce) = first_nonce.checked_add(offset as u128) else {
                 break;
             };
             let Ok(hash) = work.hasher.hash_into(nonce, &mut scratch) else {
+                telemetry.record(slot.id, ProofMetric::WorkerHashFailure);
                 break;
             };
             completed += 1;
-            if !meets_target(hash, work.target)
-                || work
-                    .incumbent
-                    .is_some_and(|incumbent| !beats_incumbent(hash, incumbent))
+            if !meets_target(hash, work.target) {
+                continue;
+            }
+            telemetry.record(slot.id, ProofMetric::TargetValidHashes);
+            if !slot.is_generation_current(work.generation) {
+                telemetry.record(slot.id, ProofMetric::WorkerStaleGenerationHash);
+                continue;
+            }
+            if Instant::now() >= work.valid_until {
+                telemetry.record(slot.id, ProofMetric::WorkerDeadlineHashDropped);
+                continue;
+            }
+            if work
+                .incumbent
+                .is_some_and(|incumbent| !beats_incumbent(hash, incumbent))
             {
+                telemetry.record(slot.id, ProofMetric::IncumbentRejectedHashes);
                 continue;
             }
-            let mut best = slot
-                .local_best
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if best.is_some_and(|previous| hash >= previous) {
+            telemetry.record(slot.id, ProofMetric::IncumbentPassedHashes);
+            match slot.update_local_best(work.generation, work.valid_until, hash) {
+                LocalBestUpdate::NewBest => {}
+                LocalBestUpdate::NotBetter => {
+                    telemetry.record(slot.id, ProofMetric::TargetValidNotNewLocalBest);
+                    continue;
+                }
+                LocalBestUpdate::StaleGeneration => {
+                    telemetry.record(slot.id, ProofMetric::WorkerStaleGenerationHash);
+                    continue;
+                }
+                LocalBestUpdate::ExpiredDeadline => {
+                    telemetry.record(slot.id, ProofMetric::WorkerDeadlineHashDropped);
+                    continue;
+                }
+            }
+            telemetry.record(slot.id, ProofMetric::NewLocalBestHashes);
+            if proofs
+                .attempts
+                .suppresses(slot.id, work.fingerprint.hashing_context.window_id)
+            {
+                telemetry.record(slot.id, ProofMetric::SuppressedPriorAttempt);
                 continue;
             }
-            *best = Some(hash);
-            drop(best);
-            let _ = proofs.try_send(ProofFound {
-                node_id: slot.id,
-                generation: work.generation,
-                nonce,
-                hash,
-                target: work.target,
-                incumbent: work.incumbent,
-            });
+            let _ = proofs.deliver(
+                ProofFound {
+                    node_id: slot.id,
+                    generation: work.generation,
+                    context: work.fingerprint.hashing_context.clone(),
+                    nonce,
+                    hash,
+                    target: work.target,
+                    incumbent: work.incumbent,
+                    queued_at: Instant::now(),
+                },
+                &telemetry,
+            );
         }
         total_hashes.fetch_add(completed, Ordering::Relaxed);
         slot.completed_hashes
@@ -2997,10 +3526,11 @@ fn network_label(network: crate::cli::Network) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        DashboardContext, FinalizationState, NodeSlot, NonceAllocator, ObserverUpdate,
-        PENDING_PROOF_QUEUE_CAPACITY, PendingDashboardSync, SnapshotFreshness,
-        compare_snapshot_freshness, dashboard_model, dashboard_node_status,
-        finalization_retry_delay, next_poll_delay, next_scheduled_slot, reconcile_head_progress,
+        DashboardContext, FinalizationState, HashingContext, NodeSlot, NonceAllocator,
+        ObserverUpdate, PENDING_PROOF_CANDIDATE_CAPACITY, PendingDashboardSync, ProofFound,
+        SnapshotFreshness, compare_snapshot_freshness, dashboard_model, dashboard_node_status,
+        finalization_retry_delay, next_poll_delay, next_scheduled_slot, proof_inbox,
+        reconcile_head_progress, revalidate_queued_proof, revalidate_queued_proof_at,
         selected_nodes, should_unlock_recovered_wallet, take_observer_update, update_slots,
         worker_loop,
     };
@@ -3009,6 +3539,7 @@ mod tests {
         config::ConfigStore,
         dashboard::{NodeStatus, hashes_per_second},
         deployment::DeploymentManifest,
+        proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
         protocol::{WorkContext, WorkHasher, meets_target},
         rpc::{
             BlockSnapshot, CandidateInfo, ContractPinStatus, NodeState, NodeView, ReadSnapshot,
@@ -3027,7 +3558,7 @@ mod tests {
         time::{Duration, Instant},
     };
     use tempfile::tempdir;
-    use tokio::sync::{mpsc, oneshot, watch};
+    use tokio::sync::{oneshot, watch};
     use tokio::time::timeout;
 
     fn eligible_state() -> NodeState {
@@ -3124,6 +3655,16 @@ mod tests {
                 Some(TransactionActivityState::Confirming)
             ),
             NodeStatus::Confirming
+        );
+        assert_eq!(
+            dashboard_node_status(
+                Some(&state),
+                true,
+                false,
+                false,
+                Some(TransactionActivityState::Signed)
+            ),
+            NodeStatus::Signed
         );
         assert_eq!(
             dashboard_node_status(
@@ -3690,6 +4231,52 @@ mod tests {
     }
 
     #[test]
+    fn old_worker_hash_cannot_poison_local_best_after_context_invalidation() {
+        let manifest = DeploymentManifest::load(Network::Testnet).unwrap();
+        let slot = NodeSlot::new(1);
+        let miner = Address::with_last_byte(8);
+        let contract = Address::with_last_byte(9);
+        let initial = eligible_state();
+        let block = test_block(1, 100);
+        slot.set_work(&manifest, miner, contract, Some(&initial), &block)
+            .unwrap();
+        let old_work = slot.current_work().unwrap();
+        let old_hash = old_work.hasher.hash(17);
+
+        let mut changed = initial;
+        changed.work.seed = B256::with_last_byte(4);
+        slot.set_work(&manifest, miner, contract, Some(&changed), &block)
+            .unwrap();
+        assert_eq!(
+            slot.update_local_best(old_work.generation, old_work.valid_until, old_hash),
+            super::LocalBestUpdate::StaleGeneration
+        );
+        assert_eq!(
+            *slot
+                .local_best
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            None
+        );
+        assert_eq!(
+            slot.update_local_best(
+                slot.current_work().unwrap().generation,
+                Instant::now() + Duration::from_secs(1),
+                B256::with_last_byte(1),
+            ),
+            super::LocalBestUpdate::NewBest
+        );
+        assert_eq!(
+            slot.update_local_best(
+                slot.current_work().unwrap().generation,
+                Instant::now() - Duration::from_secs(1),
+                B256::with_last_byte(0),
+            ),
+            super::LocalBestUpdate::ExpiredDeadline
+        );
+    }
+
+    #[test]
     fn scheduler_round_robins_across_only_the_active_nodes() {
         let active = [0, 8];
         let cursor = AtomicUsize::new(0);
@@ -3742,6 +4329,15 @@ mod tests {
                 .unwrap()
         );
         let initial_generation = slots[0].current_work_at(start).unwrap().generation;
+        let initial_job = slots[0].current_work_at(start).unwrap();
+        assert_eq!(
+            slots[0].update_local_best(
+                initial_generation,
+                initial_job.valid_until,
+                B256::with_last_byte(8),
+            ),
+            super::LocalBestUpdate::NewBest
+        );
         let local_deadline = start + Duration::from_secs(8);
         let after_local_deadline = local_deadline + Duration::from_secs(1);
         assert!(slots[0].current_work_at(after_local_deadline).is_none());
@@ -3776,6 +4372,14 @@ mod tests {
         let restarted = slots[0].current_work_at(after_local_deadline).unwrap();
         assert!(restarted.generation > initial_generation);
         assert_eq!(
+            *slots[0]
+                .local_best
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            None,
+            "rearmed work must allow a fresh candidate after the prior local deadline"
+        );
+        assert_eq!(
             restarted.fingerprint.hashing_context.window_id,
             state.work.window_id
         );
@@ -3809,12 +4413,14 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let cursor = Arc::new(AtomicUsize::new(0));
         let hashes = Arc::new(AtomicU64::new(0));
-        let (sender, mut receiver) = mpsc::channel(PENDING_PROOF_QUEUE_CAPACITY);
+        let telemetry = Arc::new(ProofPipelineTelemetry::default());
+        let (sender, mut receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
         let worker_slots = Arc::clone(&slots);
         let worker_schedule = Arc::clone(&schedule);
         let worker_stop = Arc::clone(&stop);
         let worker_cursor = Arc::clone(&cursor);
         let worker_hashes = Arc::clone(&hashes);
+        let worker_telemetry = Arc::clone(&telemetry);
         let worker = thread::spawn(move || {
             worker_loop(
                 worker_slots,
@@ -3823,6 +4429,7 @@ mod tests {
                 worker_cursor,
                 worker_hashes,
                 sender,
+                worker_telemetry,
             );
         });
         let proof = timeout(Duration::from_secs(2), receiver.recv())
@@ -3893,6 +4500,426 @@ mod tests {
             slot.current_work_at(shortened_deadline + Duration::from_secs(1))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn deadline_only_generation_change_revalidates_a_valid_queued_proof() {
+        let manifest = DeploymentManifest::load(Network::Testnet).unwrap();
+        let slot = NodeSlot::new(1);
+        let miner = Address::with_last_byte(8);
+        let contract = Address::with_last_byte(9);
+        let mut state = eligible_state();
+        state.work.window_expiry_time = 110;
+        let context = WorkContext {
+            chain_id: manifest.chain_id,
+            contract,
+            window_id: state.work.window_id,
+            seed: state.work.seed,
+            miner,
+            header: Vec::new(),
+        };
+        let proof_hash = WorkHasher::new(&context).unwrap().hash(0);
+        let target = U256::from_be_bytes(proof_hash.0);
+        state.work.target = target;
+        assert!(meets_target(proof_hash, target));
+
+        let start = Instant::now();
+        let first_head = test_block(100, 100);
+        slot.set_work_at(&manifest, miner, contract, Some(&state), &first_head, start)
+            .unwrap();
+        let original = slot.current_work_at(start).unwrap();
+        let queued_proof = ProofFound {
+            node_id: 1,
+            generation: original.generation,
+            context: original.fingerprint.hashing_context.clone(),
+            nonce: 0,
+            hash: proof_hash,
+            target: state.work.target,
+            incumbent: None,
+            queued_at: start,
+        };
+
+        let updated_at = start + Duration::from_secs(1);
+        let deadline_shortening_head = test_block(101, 103);
+        slot.set_work_at(
+            &manifest,
+            miner,
+            contract,
+            Some(&state),
+            &deadline_shortening_head,
+            updated_at,
+        )
+        .unwrap();
+        let current = slot.current_work_at(updated_at).unwrap();
+
+        assert_eq!(current.fingerprint, original.fingerprint);
+        assert!(current.valid_until < original.valid_until);
+        assert!(meets_target(queued_proof.hash, current.target));
+        assert_eq!(current.incumbent, queued_proof.incumbent);
+        assert_ne!(queued_proof.generation, current.generation);
+        let telemetry = ProofPipelineTelemetry::default();
+        let revalidated = revalidate_queued_proof(&slot, &queued_proof, &telemetry)
+            .expect("same-window proof remains valid after deadline-only generation change");
+        assert_eq!(revalidated.generation, current.generation);
+        assert_eq!(
+            telemetry.count(1, ProofMetric::GenerationMismatchRevalidated),
+            1
+        );
+    }
+
+    #[test]
+    fn queued_proof_revalidation_rejects_expiry_window_seed_target_and_incumbent_changes() {
+        let manifest = DeploymentManifest::load(Network::Testnet).unwrap();
+        let miner = Address::with_last_byte(8);
+        let contract = Address::with_last_byte(9);
+        let start = Instant::now();
+        let initial_block = test_block(1, 100);
+        let mut state = eligible_state();
+        state.work.window_expiry_time = 200;
+        let hashing_context = HashingContext {
+            chain_id: manifest.chain_id,
+            contract,
+            window_id: state.work.window_id,
+            seed: state.work.seed,
+            miner,
+            header: Vec::new(),
+        };
+        let work_hash = WorkHasher::new(&hashing_context.work_context())
+            .unwrap()
+            .hash(0);
+        let target = U256::from_be_bytes(work_hash.0);
+        state.work.target = target;
+        assert!(meets_target(work_hash, target));
+
+        let create_slot = |node_state: &NodeState, block: &BlockSnapshot| {
+            let slot = NodeSlot::new(1);
+            slot.set_work_at(&manifest, miner, contract, Some(node_state), block, start)
+                .unwrap();
+            slot
+        };
+        let make_proof = |slot: &NodeSlot| ProofFound {
+            node_id: 1,
+            generation: slot.current_work_at(start).unwrap().generation,
+            context: hashing_context.clone(),
+            nonce: 0,
+            hash: work_hash,
+            target,
+            incumbent: None,
+            queued_at: start,
+        };
+        let telemetry = ProofPipelineTelemetry::default();
+
+        let expired_slot = create_slot(&state, &initial_block);
+        let expired_proof = make_proof(&expired_slot);
+        let expiry = expired_slot.current_work_at(start).unwrap().valid_until;
+        assert_eq!(
+            revalidate_queued_proof_at(&expired_slot, &expired_proof, &telemetry, expiry)
+                .err()
+                .unwrap(),
+            super::ProofRevalidationFailure::ExpiredDeadline
+        );
+
+        let changed_window_slot = create_slot(&state, &initial_block);
+        let changed_window_proof = make_proof(&changed_window_slot);
+        let mut changed_window = state.clone();
+        changed_window.work.window_id += 1;
+        changed_window.work.window_expiry_time += 100;
+        let next_block = test_block(2, 101);
+        changed_window_slot
+            .set_work_at(
+                &manifest,
+                miner,
+                contract,
+                Some(&changed_window),
+                &next_block,
+                start + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            revalidate_queued_proof(&changed_window_slot, &changed_window_proof, &telemetry)
+                .err()
+                .unwrap(),
+            super::ProofRevalidationFailure::WindowMismatch
+        );
+
+        let changed_seed_slot = create_slot(&state, &initial_block);
+        let changed_seed_proof = make_proof(&changed_seed_slot);
+        let mut changed_seed = state.clone();
+        changed_seed.work.seed = B256::with_last_byte(0x77);
+        let seed_block = test_block(2, 101);
+        changed_seed_slot
+            .set_work_at(
+                &manifest,
+                miner,
+                contract,
+                Some(&changed_seed),
+                &seed_block,
+                start + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            revalidate_queued_proof(&changed_seed_slot, &changed_seed_proof, &telemetry)
+                .err()
+                .unwrap(),
+            super::ProofRevalidationFailure::WorkContextMismatch
+        );
+
+        let changed_target_slot = create_slot(&state, &initial_block);
+        let changed_target_proof = make_proof(&changed_target_slot);
+        let mut changed_target = state.clone();
+        changed_target.work.target = target.saturating_sub(U256::from(1));
+        let target_block = test_block(2, 101);
+        changed_target_slot
+            .set_work_at(
+                &manifest,
+                miner,
+                contract,
+                Some(&changed_target),
+                &target_block,
+                start + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            revalidate_queued_proof(&changed_target_slot, &changed_target_proof, &telemetry)
+                .err()
+                .unwrap(),
+            super::ProofRevalidationFailure::CurrentTarget
+        );
+
+        let changed_incumbent_slot = create_slot(&state, &initial_block);
+        let changed_incumbent_proof = make_proof(&changed_incumbent_slot);
+        let mut changed_incumbent = state;
+        changed_incumbent.candidate = Some(CandidateInfo {
+            miner: Address::with_last_byte(7),
+            nonce: 0,
+            work_hash,
+            submitted_at: 100,
+            header: Bytes::new(),
+            first_valid_solve_secs: 1,
+        });
+        let incumbent_block = test_block(2, 101);
+        changed_incumbent_slot
+            .set_work_at(
+                &manifest,
+                miner,
+                contract,
+                Some(&changed_incumbent),
+                &incumbent_block,
+                start + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            revalidate_queued_proof(
+                &changed_incumbent_slot,
+                &changed_incumbent_proof,
+                &telemetry,
+            )
+            .err()
+            .unwrap(),
+            super::ProofRevalidationFailure::CurrentIncumbent
+        );
+    }
+
+    #[test]
+    fn proof_inbox_saturation_preserves_the_best_undelivered_candidate() {
+        let manifest = DeploymentManifest::load(Network::Testnet).unwrap();
+        let miner = Address::with_last_byte(8);
+        let contract = Address::with_last_byte(9);
+        let mut state = eligible_state();
+        let context = WorkContext {
+            chain_id: manifest.chain_id,
+            contract,
+            window_id: state.work.window_id,
+            seed: state.work.seed,
+            miner,
+            header: Vec::new(),
+        };
+        state.work.target = U256::MAX / U256::from(1_000_u64);
+
+        let slot = NodeSlot::new(1);
+        slot.set_work(
+            &manifest,
+            miner,
+            contract,
+            Some(&state),
+            &test_block(1, 100),
+        )
+        .unwrap();
+        let slots = Arc::new(vec![slot]);
+        let schedule = Arc::new(RwLock::new(vec![0]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let hashes = Arc::new(AtomicU64::new(0));
+        let telemetry = Arc::new(ProofPipelineTelemetry::default());
+        let (sender, receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let work = slots[0].current_work().unwrap();
+        for node_id in 1..=PENDING_PROOF_CANDIDATE_CAPACITY as u8 {
+            let queued_context = if node_id == 1 {
+                work.fingerprint.hashing_context.clone()
+            } else {
+                HashingContext {
+                    chain_id: manifest.chain_id,
+                    contract: Address::with_last_byte(node_id),
+                    window_id: state.work.window_id,
+                    seed: state.work.seed,
+                    miner,
+                    header: Vec::new(),
+                }
+            };
+            let queued_hash = if node_id == 1 {
+                B256::from(U256::MAX.to_be_bytes::<32>())
+            } else {
+                B256::with_last_byte(2)
+            };
+            assert!(sender.deliver(
+                ProofFound {
+                    node_id,
+                    generation: work.generation,
+                    context: queued_context,
+                    nonce: u128::from(node_id),
+                    hash: queued_hash,
+                    target: state.work.target,
+                    incumbent: None,
+                    queued_at: Instant::now(),
+                },
+                &telemetry,
+            ));
+        }
+
+        let worker_slots = Arc::clone(&slots);
+        let worker_schedule = Arc::clone(&schedule);
+        let worker_stop = Arc::clone(&stop);
+        let worker_cursor = Arc::clone(&cursor);
+        let worker_hashes = Arc::clone(&hashes);
+        let worker_telemetry = Arc::clone(&telemetry);
+        let worker = thread::spawn(move || {
+            worker_loop(
+                worker_slots,
+                worker_schedule,
+                worker_stop,
+                worker_cursor,
+                worker_hashes,
+                sender,
+                worker_telemetry,
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while telemetry.count(1, ProofMetric::QueueFullCoalesced) == 0 && Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert!(telemetry.count(1, ProofMetric::QueueFullCoalesced) > 0);
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+
+        let mut node_one_candidate = None;
+        for _ in 0..PENDING_PROOF_CANDIDATE_CAPACITY {
+            let delivered = receiver
+                .take_next()
+                .expect("every bounded inbox slot is populated");
+            if delivered.node_id == 1 {
+                node_one_candidate = Some(delivered);
+            }
+        }
+        let delivered = node_one_candidate.expect("saturated inbox retains node 1");
+        let local_best = *slots[0]
+            .local_best
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .unwrap();
+        assert_eq!(delivered.hash, local_best);
+        assert_eq!(
+            WorkHasher::new(&context).unwrap().hash(delivered.nonce),
+            delivered.hash
+        );
+        assert!(meets_target(delivered.hash, delivered.target));
+        assert!(telemetry.count(1, ProofMetric::QueuedCandidates) >= 2);
+        assert!(
+            telemetry.count(1, ProofMetric::QueueWakeCoalesced) > 0,
+            "saturation coalesces bounded wakeups without losing inbox candidates"
+        );
+        assert!(hashes.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn proof_inbox_reports_receiver_closure_without_claiming_delivery() {
+        let telemetry = ProofPipelineTelemetry::default();
+        let (sender, receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        drop(receiver);
+        let proof = ProofFound {
+            node_id: 1,
+            generation: 1,
+            context: HashingContext {
+                chain_id: 1439,
+                contract: Address::with_last_byte(9),
+                window_id: 3,
+                seed: B256::with_last_byte(1),
+                miner: Address::with_last_byte(8),
+                header: Vec::new(),
+            },
+            nonce: 7,
+            hash: B256::with_last_byte(1),
+            target: U256::MAX,
+            incumbent: None,
+            queued_at: Instant::now(),
+        };
+
+        assert!(!sender.deliver(proof, &telemetry));
+        assert_eq!(telemetry.count(1, ProofMetric::QueueReceiverClosed), 1);
+        assert_eq!(telemetry.count(1, ProofMetric::QueuedCandidates), 0);
+    }
+
+    #[tokio::test]
+    async fn proof_inbox_defers_and_releases_best_candidate_across_unresolved_transaction() {
+        let telemetry = ProofPipelineTelemetry::default();
+        let (sender, mut receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), true);
+        let proof = ProofFound {
+            node_id: 1,
+            generation: 1,
+            context: HashingContext {
+                chain_id: 1439,
+                contract: Address::with_last_byte(9),
+                window_id: 3,
+                seed: B256::with_last_byte(1),
+                miner: Address::with_last_byte(8),
+                header: Vec::new(),
+            },
+            nonce: 7,
+            hash: B256::with_last_byte(1),
+            target: U256::MAX,
+            incumbent: None,
+            queued_at: Instant::now(),
+        };
+        assert!(sender.deliver(proof.clone(), &telemetry));
+        assert!(
+            timeout(Duration::from_millis(25), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        receiver.set_paused(false);
+        let first_delivery = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_delivery.nonce, proof.nonce);
+        receiver.set_paused(true);
+        assert!(receiver.requeue(first_delivery, &telemetry));
+        assert!(
+            timeout(Duration::from_millis(25), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        receiver.set_paused(false);
+        let deferred = timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred.hash, proof.hash);
+        assert_eq!(telemetry.count(1, ProofMetric::QueuedCandidates), 2);
     }
 
     #[test]
@@ -4029,12 +5056,14 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let cursor = Arc::new(AtomicUsize::new(0));
         let total_hashes = Arc::new(AtomicU64::new(0));
-        let (sender, mut receiver) = mpsc::channel(PENDING_PROOF_QUEUE_CAPACITY);
+        let telemetry = Arc::new(ProofPipelineTelemetry::default());
+        let (sender, mut receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
         let worker_slots = Arc::clone(&slots);
         let worker_schedule = Arc::clone(&schedule);
         let worker_stop = Arc::clone(&stop);
         let worker_cursor = Arc::clone(&cursor);
         let worker_hashes = Arc::clone(&total_hashes);
+        let worker_telemetry = Arc::clone(&telemetry);
         let worker = thread::spawn(move || {
             worker_loop(
                 worker_slots,
@@ -4043,6 +5072,7 @@ mod tests {
                 worker_cursor,
                 worker_hashes,
                 sender,
+                worker_telemetry,
             );
         });
 
@@ -4088,12 +5118,14 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let cursor = Arc::new(AtomicUsize::new(0));
         let hashes = Arc::new(AtomicU64::new(0));
-        let (sender, _receiver) = mpsc::channel(PENDING_PROOF_QUEUE_CAPACITY);
+        let telemetry = Arc::new(ProofPipelineTelemetry::default());
+        let (sender, _receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
         let worker_slots = Arc::clone(&slots);
         let worker_schedule = Arc::clone(&schedule);
         let worker_stop = Arc::clone(&stop);
         let worker_cursor = Arc::clone(&cursor);
         let worker_hashes = Arc::clone(&hashes);
+        let worker_telemetry = Arc::clone(&telemetry);
         let worker = thread::spawn(move || {
             worker_loop(
                 worker_slots,
@@ -4102,6 +5134,7 @@ mod tests {
                 worker_cursor,
                 worker_hashes,
                 sender,
+                worker_telemetry,
             );
         });
         timeout(Duration::from_secs(2), async {

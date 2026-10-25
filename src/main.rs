@@ -6,6 +6,7 @@ mod dashboard;
 mod deployment;
 mod diagnostics;
 mod mining;
+mod proof_telemetry;
 mod protocol;
 mod rpc;
 mod transaction;

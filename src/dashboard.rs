@@ -41,6 +41,8 @@ const LIGHT: Color = Color::Rgb(220, 226, 229);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeStatus {
     Mining,
+    CheckingProof,
+    Signed,
     Finalizing,
     Confirming,
     Syncing,
@@ -59,6 +61,8 @@ impl NodeStatus {
     pub fn label(self) -> &'static str {
         match self {
             Self::Mining => "● MINING",
+            Self::CheckingProof => "CHECKING",
+            Self::Signed => "SIGNED",
             Self::Finalizing => "FINALIZING",
             Self::Confirming => "CONFIRMING",
             Self::Syncing => "SYNCING",
@@ -78,6 +82,8 @@ impl NodeStatus {
         match self {
             Self::Mining => EMERALD,
             Self::Finalizing
+            | Self::CheckingProof
+            | Self::Signed
             | Self::Confirming
             | Self::Syncing
             | Self::WaitingForChain
@@ -159,7 +165,7 @@ impl WindowCountdown {
 
 impl DashboardNode {
     pub fn status_at(&self, now: Instant) -> NodeStatus {
-        if self.status == NodeStatus::Mining
+        if matches!(self.status, NodeStatus::Mining | NodeStatus::CheckingProof)
             && self.mining_deadline.is_none_or(|deadline| now >= deadline)
         {
             NodeStatus::WaitingForChain
@@ -171,7 +177,11 @@ impl DashboardNode {
     pub fn time_left(&self, now: Instant) -> Option<u64> {
         if !matches!(
             self.status_at(now),
-            NodeStatus::Mining | NodeStatus::Confirming | NodeStatus::Syncing
+            NodeStatus::Mining
+                | NodeStatus::CheckingProof
+                | NodeStatus::Signed
+                | NodeStatus::Confirming
+                | NodeStatus::Syncing
         ) || self.mining_deadline.is_none_or(|deadline| now >= deadline)
         {
             return None;

@@ -13,7 +13,13 @@ use std::{collections::HashMap, time::Duration};
 use tokio::task::JoinSet;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+#[cfg(test)]
+use std::sync::Mutex;
+
+#[cfg(test)]
+type TestProofNonceStarts = std::sync::Arc<Mutex<HashMap<(u8, u64, B256), u128>>>;
 
 #[cfg(test)]
 use crate::deployment::TokenPin;
@@ -230,6 +236,16 @@ pub struct NetworkClient {
     diagnostics: Option<DiagnosticBuffer>,
     #[cfg(test)]
     fail_next_finalization_fee_quote: std::sync::Arc<AtomicUsize>,
+    #[cfg(test)]
+    fail_next_proof_fee_quote: std::sync::Arc<AtomicUsize>,
+    #[cfg(test)]
+    delay_next_proof_fee_quote_ms: std::sync::Arc<AtomicU64>,
+    #[cfg(test)]
+    delay_next_finalization_fee_quote_ms: std::sync::Arc<AtomicU64>,
+    #[cfg(test)]
+    fee_quote_delays_started: std::sync::Arc<AtomicU64>,
+    #[cfg(test)]
+    proof_nonce_starts: TestProofNonceStarts,
 }
 
 impl NetworkClient {
@@ -276,6 +292,16 @@ impl NetworkClient {
             diagnostics: None,
             #[cfg(test)]
             fail_next_finalization_fee_quote: std::sync::Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_next_proof_fee_quote: std::sync::Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            delay_next_proof_fee_quote_ms: std::sync::Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            delay_next_finalization_fee_quote_ms: std::sync::Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            fee_quote_delays_started: std::sync::Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            proof_nonce_starts: std::sync::Arc::new(Mutex::new(HashMap::new())),
             verification: DeploymentVerification {
                 token_verified: false,
                 reference_snapshot_verified: false,
@@ -380,6 +406,31 @@ impl NetworkClient {
         value: U256,
         data: &[u8],
     ) -> Result<FeeQuote> {
+        #[cfg(test)]
+        if data.starts_with(&AstatineMinerRead::finalizeWindowCall::SELECTOR) {
+            let delay_ms = self
+                .delay_next_finalization_fee_quote_ms
+                .swap(0, Ordering::AcqRel);
+            if delay_ms > 0 {
+                self.fee_quote_delays_started
+                    .fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+        #[cfg(test)]
+        if data.starts_with(&AstatineMinerRead::submitSolutionCall::SELECTOR) {
+            let delay_ms = self.delay_next_proof_fee_quote_ms.swap(0, Ordering::AcqRel);
+            if delay_ms > 0 {
+                self.fee_quote_delays_started
+                    .fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            if consume_counter(&self.fail_next_proof_fee_quote) {
+                return Err(anyhow::Error::new(TransientRpcFailure {
+                    details: "test-injected HTTP 503 from proof fee quote provider".to_owned(),
+                }));
+            }
+        }
         #[cfg(test)]
         if data.starts_with(&AstatineMinerRead::finalizeWindowCall::SELECTOR)
             && consume_counter(&self.fail_next_finalization_fee_quote)
@@ -728,6 +779,16 @@ impl NetworkClient {
             diagnostics: None,
             #[cfg(test)]
             fail_next_finalization_fee_quote: std::sync::Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_next_proof_fee_quote: std::sync::Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            delay_next_proof_fee_quote_ms: std::sync::Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            delay_next_finalization_fee_quote_ms: std::sync::Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            fee_quote_delays_started: std::sync::Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            proof_nonce_starts: std::sync::Arc::new(Mutex::new(HashMap::new())),
             verification: DeploymentVerification {
                 token_verified: true,
                 reference_snapshot_verified: false,
@@ -752,6 +813,60 @@ impl NetworkClient {
     pub(crate) fn fail_next_finalization_fee_quote_once(&self) {
         self.fail_next_finalization_fee_quote
             .fetch_add(1, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_proof_fee_quote_once(&self) {
+        self.fail_next_proof_fee_quote
+            .fetch_add(1, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delay_next_proof_fee_quote(&self, delay: Duration) {
+        self.delay_next_proof_fee_quote_ms.store(
+            delay.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::Release,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delay_next_finalization_fee_quote(&self, delay: Duration) {
+        self.delay_next_finalization_fee_quote_ms.store(
+            delay.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::Release,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fee_quote_delays_started(&self) -> u64 {
+        self.fee_quote_delays_started.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_proof_nonce_start(
+        &self,
+        node_id: u8,
+        window_id: u64,
+        seed: B256,
+        nonce: u128,
+    ) {
+        self.proof_nonce_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((node_id, window_id, seed), nonce);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_test_proof_nonce_start(
+        &self,
+        node_id: u8,
+        window_id: u64,
+        seed: B256,
+    ) -> Option<u128> {
+        self.proof_nonce_starts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(node_id, window_id, seed))
     }
 
     async fn verify_deployment(&mut self) -> Result<()> {

@@ -3,10 +3,11 @@ use crate::{
     config::{AppConfig, ConfigStore, parse_inj_wei},
     contracts::{AstatineMinerRead, IERC20Read},
     diagnostics::DiagnosticBuffer,
+    proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{
         NetworkClient, ReadSnapshot, RpcLog, TransactionReceipt, is_transient_receipt_error,
-        is_window_expired_revert, is_window_not_expired_revert,
+        is_transient_rpc_error, is_window_expired_revert, is_window_not_expired_revert,
     },
     wallet::signer_address,
 };
@@ -1060,6 +1061,8 @@ pub struct TransactionManager {
     confirmations_required: u8,
     diagnostics: Option<DiagnosticBuffer>,
     dashboard_sink: Option<TransactionDashboardSink>,
+    proof_telemetry: Option<Arc<ProofPipelineTelemetry>>,
+    proof_attempt_guard: Option<Arc<ProofAttemptGuard>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1072,6 +1075,7 @@ pub struct ConfirmedAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransactionActivityState {
     Finalizing,
+    Signed,
     Confirming,
     Recovering,
 }
@@ -1182,7 +1186,23 @@ impl TransactionManager {
             confirmations_required: config.transaction_confirmations,
             diagnostics: None,
             dashboard_sink: None,
+            proof_telemetry: None,
+            proof_attempt_guard: None,
         })
+    }
+
+    pub(crate) fn set_proof_telemetry(&mut self, telemetry: Arc<ProofPipelineTelemetry>) {
+        self.proof_telemetry = Some(telemetry);
+    }
+
+    pub(crate) fn set_proof_attempt_guard(&mut self, guard: Arc<ProofAttemptGuard>) {
+        self.proof_attempt_guard = Some(guard);
+    }
+
+    fn record_proof_metric(&self, node_id: u8, metric: ProofMetric) {
+        if let Some(telemetry) = &self.proof_telemetry {
+            telemetry.record(node_id, metric);
+        }
     }
 
     pub fn set_diagnostics(&mut self, diagnostics: DiagnosticBuffer) {
@@ -1207,6 +1227,8 @@ impl TransactionManager {
                     TransactionActivityState::Recovering
                 } else if entry.status == TransactionStatus::Included {
                     TransactionActivityState::Confirming
+                } else if entry.status == TransactionStatus::Prepared {
+                    TransactionActivityState::Signed
                 } else if entry.action == TransactionAction::FinalizeWindow {
                     TransactionActivityState::Finalizing
                 } else {
@@ -1258,8 +1280,7 @@ impl TransactionManager {
         {
             bail!("transaction recovery is restricted to the verified Injective Testnet profile");
         }
-        let latest = client.latest_block_snapshot().await?;
-        self.monitor(client, latest.number).await?;
+        self.monitor(client).await?;
         for entry in self.journal.unresolved_entries() {
             let hash = entry_hash(&entry)?;
             let known = client.transaction_known(hash).await?;
@@ -1282,8 +1303,23 @@ impl TransactionManager {
         Ok(())
     }
 
-    pub async fn monitor(&mut self, client: &NetworkClient, latest_block: u64) -> Result<()> {
+    pub async fn monitor(&mut self, client: &NetworkClient) -> Result<()> {
         let entries = self.journal.state.entries.clone();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let latest_block = match client.latest_block_snapshot().await {
+            Ok(snapshot) => snapshot.number,
+            Err(error) if is_transient_rpc_error(&error) => {
+                self.report_warning(format!(
+                    "transaction monitoring deferred because the latest canonical head is temporarily unavailable; journal exposure remains reserved: {error:#}"
+                ));
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).context("read latest canonical head for transaction monitoring");
+            }
+        };
         for entry in entries {
             let hash = entry_hash(&entry)?;
             if entry.status.is_unresolved() {
@@ -1361,6 +1397,13 @@ impl TransactionManager {
                 .as_deref()
                 .context("settled transaction has no receipt block hash")
                 .and_then(|value| B256::from_str(value).context("invalid receipt block hash"))?;
+            if latest_block < block_number {
+                self.journal.mark_uncertain(hash)?;
+                self.report_warning(format!(
+                    "latest canonical head {latest_block} is behind settled receipt block {block_number} for {hash:#x}; exposure restored for read-only reorg recovery"
+                ));
+                continue;
+            }
             match client
                 .receipt_confirmations(block_number, block_hash, latest_block)
                 .await
@@ -1632,6 +1675,7 @@ impl TransactionManager {
         submission: ProofSubmission,
     ) -> Result<ConfirmedAction> {
         if signer_address(signer) != self.wallet {
+            self.record_proof_metric(submission.node_id, ProofMetric::SignerIdentityMismatch);
             bail!("unlocked signer does not match the configured wallet");
         }
         if submission.header.len() > crate::protocol::MAX_HEADER_LENGTH {
@@ -1703,11 +1747,16 @@ impl TransactionManager {
     }
 
     pub fn proof_attempted(&self, contract: Address, window_id: u64) -> bool {
+        self.proof_attempted_through(contract)
+            .is_some_and(|last_attempted| window_id <= last_attempted)
+    }
+
+    pub(crate) fn proof_attempted_through(&self, contract: Address) -> Option<u64> {
         self.journal
             .state
             .proof_attempted_through
             .get(&proof_attempt_key(contract))
-            .is_some_and(|last_attempted| window_id <= *last_attempted)
+            .copied()
     }
 
     pub fn session_exposure(&self) -> Result<Option<U256>> {
@@ -1841,6 +1890,9 @@ impl TransactionManager {
         let window_id = intent.window_id;
         let action = intent.action;
         let signed = sign_eip1559(signer, &request)?;
+        if action == TransactionAction::SubmitProof {
+            self.record_proof_metric(node_id, ProofMetric::Signed);
+        }
         self.journal.prepare(PreparedTransaction {
             request,
             tx_hash: signed.hash,
@@ -1850,6 +1902,11 @@ impl TransactionManager {
             confirmed_balance: spendable_balance,
             confirmations_required: self.confirmations_required,
         })?;
+        if action == TransactionAction::SubmitProof
+            && let Some(guard) = &self.proof_attempt_guard
+        {
+            guard.record_attempt(node_id, window_id);
+        }
         self.publish_dashboard_state();
         self.report_info(format!(
             "transaction prepared node={node_id:02} window={window_id} action={action:?} hash={:#x} maximum_exposure_wei={maximum_exposure}",
@@ -1860,6 +1917,9 @@ impl TransactionManager {
             Ok(returned_hash) if returned_hash == signed.hash => {
                 self.journal
                     .set_broadcast_state(signed.hash, TransactionStatus::Broadcast)?;
+                if action == TransactionAction::SubmitProof {
+                    self.record_proof_metric(node_id, ProofMetric::Broadcast);
+                }
                 self.report_info(format!(
                     "transaction broadcast node={node_id:02} window={window_id} action={action:?} hash={:#x}",
                     signed.hash
@@ -1868,6 +1928,9 @@ impl TransactionManager {
             Ok(returned_hash) => {
                 self.journal
                     .set_broadcast_state(signed.hash, TransactionStatus::Unknown)?;
+                if action == TransactionAction::SubmitProof {
+                    self.record_proof_metric(node_id, ProofMetric::BroadcastOutcomeUnknown);
+                }
                 self.publish_dashboard_state();
                 self.report_warning(format!(
                     "transaction broadcast hash mismatch node={node_id:02} window={window_id} action={action:?} expected={:#x} returned={returned_hash:#x}",
@@ -1881,6 +1944,9 @@ impl TransactionManager {
             Err(error) => {
                 self.journal
                     .set_broadcast_state(signed.hash, TransactionStatus::Unknown)?;
+                if action == TransactionAction::SubmitProof {
+                    self.record_proof_metric(node_id, ProofMetric::BroadcastOutcomeUnknown);
+                }
                 self.publish_dashboard_state();
                 self.report_warning(format!(
                     "transaction broadcast outcome unknown node={node_id:02} window={window_id} action={action:?} hash={:#x}: {error:#}",
@@ -1970,6 +2036,14 @@ impl TransactionManager {
                                 ),
                             }
                             .into());
+                        }
+                        if action == TransactionAction::SubmitProof {
+                            self.record_proof_metric(node_id, ProofMetric::ReceiptConfirmed);
+                            if outcome == "candidate-updated" {
+                                self.record_proof_metric(node_id, ProofMetric::CandidateUpdated);
+                            } else if outcome == "submission-rejected-fee-retained" {
+                                self.record_proof_metric(node_id, ProofMetric::CandidateRejected);
+                            }
                         }
                         return Ok(ConfirmedAction {
                             transaction_hash: signed.hash,
@@ -2720,6 +2794,7 @@ mod tests {
             DashboardContext, FinalizationOptions, MiningProbe, NodeSlot, ObserverUpdate,
             finalize_initial_expired_windows, start_read_only_observer, update_slots,
         },
+        proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
         protocol::{WorkContext, WorkHasher, meets_target},
         rpc::{NetworkClient, RpcLog, TransactionReceipt},
         wallet::signer_address,
@@ -2735,7 +2810,10 @@ mod tests {
         path::PathBuf,
         process::{Child, Command, Stdio},
         str::FromStr,
-        sync::{Arc, Mutex, RwLock, atomic::AtomicBool},
+        sync::{
+            Arc, Mutex, RwLock,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
     use tempfile::tempdir;
@@ -2859,8 +2937,23 @@ mod tests {
             [TransactionActivity {
                 node_id: 1,
                 window_id: 4,
-                state: TransactionActivityState::Confirming,
+                state: TransactionActivityState::Signed,
             }]
+        );
+
+        manager
+            .journal
+            .set_broadcast_state(tx_hash, TransactionStatus::Broadcast)
+            .unwrap();
+        manager.publish_dashboard_state();
+        assert_eq!(
+            latest.lock().unwrap().as_ref().unwrap().activities,
+            [TransactionActivity {
+                node_id: 1,
+                window_id: 4,
+                state: TransactionActivityState::Confirming,
+            }],
+            "CONFIRMING is shown only after the journal records an acknowledged broadcast"
         );
     }
 
@@ -3011,6 +3104,97 @@ mod tests {
             )
             .unwrap_err();
         assert!(format!("{error:#}").contains("paid proof attempt already journaled"));
+    }
+
+    #[test]
+    fn proof_attempt_guard_only_suppresses_the_same_contract_through_the_attempted_window() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = signer_address(&test_signer());
+        let contract = Address::with_last_byte(0x42);
+        let mut manager =
+            TransactionManager::open(&store, &config, wallet, Address::with_last_byte(0x88))
+                .unwrap();
+        let intent = TransactionIntent {
+            contract,
+            node_id: 1,
+            window_id: 4,
+            action: TransactionAction::SubmitProof,
+            proof: Some(ProofData {
+                nonce: 8,
+                work_hash: B256::with_last_byte(7),
+                header: b"header".to_vec(),
+            }),
+        };
+        let mut request = test_request();
+        request.to = contract;
+        let tx_hash = sign_eip1559(&test_signer(), &request).unwrap().hash;
+        manager
+            .journal
+            .prepare(PreparedTransaction {
+                request,
+                tx_hash,
+                intent: intent.clone(),
+                session_limit: U256::from(1_000_000_000_000_000_000_u128),
+                minimum_reserve: U256::ZERO,
+                confirmed_balance: U256::MAX,
+                confirmations_required: 1,
+            })
+            .unwrap();
+
+        assert!(manager.proof_attempted(contract, 4));
+        assert!(manager.proof_attempted(contract, 3));
+        assert!(!manager.proof_attempted(contract, 5));
+        assert!(!manager.proof_attempted(Address::with_last_byte(0x43), 4));
+    }
+
+    #[tokio::test]
+    async fn proof_submission_rejects_wrong_wallet_before_rpc_or_journal_attempt() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            wallet_address: Some(format!("{:#x}", Address::with_last_byte(0x99))),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x99);
+        let token = Address::with_last_byte(0x88);
+        let contract = Address::with_last_byte(1);
+        let network = NetworkClient::local_test_client(
+            "http://127.0.0.1:1",
+            contract,
+            B256::with_last_byte(2),
+            token,
+            B256::with_last_byte(3),
+            9,
+        )
+        .unwrap();
+        let mut manager = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        let telemetry = Arc::new(ProofPipelineTelemetry::default());
+        manager.set_proof_telemetry(Arc::clone(&telemetry));
+        let error = manager
+            .submit_proof(
+                &network,
+                &test_signer(),
+                ProofSubmission {
+                    contract,
+                    node_id: 1,
+                    window_id: 0,
+                    nonce: 1,
+                    header: Vec::new(),
+                    work_hash: B256::with_last_byte(4),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("does not match the configured wallet"));
+        assert_eq!(telemetry.count(1, ProofMetric::SignerIdentityMismatch), 1);
+        assert!(manager.journal.state.entries.is_empty());
+        assert!(!manager.proof_attempted(contract, 0));
     }
 
     #[test]
@@ -3581,6 +3765,8 @@ mod tests {
                 allocation,
                 reward,
                 miner_bytecode: &miner_bytecode,
+                initial_target: U256::MAX,
+                retarget_interval: 3,
             })
             .await;
             let approve = LocalMockAST::approveCall {
@@ -3843,6 +4029,8 @@ mod tests {
                     allocation,
                     reward,
                     miner_bytecode: &miner_bytecode,
+                    initial_target: U256::MAX,
+                    retarget_interval: 3,
                 })
                 .await;
                 let approve = LocalMockAST::approveCall {
@@ -3912,6 +4100,7 @@ mod tests {
             )
             .unwrap();
             network.fail_next_finalization_fee_quote_once();
+            network.delay_next_finalization_fee_quote(Duration::from_millis(250));
             let expired = network.snapshot(Some(account)).await.unwrap();
             assert_eq!(expired.nodes.len(), 9);
             assert!(
@@ -3943,7 +4132,7 @@ mod tests {
             let config = AppConfig {
                 network: Network::Testnet,
                 wallet_address: Some(format!("{account:#x}")),
-                cpu_threads: 1,
+                cpu_threads: 32,
                 minimum_reserve_inj: "0".to_owned(),
                 per_session_spending_limit_inj: "1".to_owned(),
                 transaction_confirmations: 1,
@@ -3956,7 +4145,7 @@ mod tests {
             let run_signer = clone_signer(&signer);
             let args = MineArgs {
                 compute_only: false,
-                threads: NonZeroUsize::new(1),
+                threads: NonZeroUsize::new(32),
                 nodes: vec![1, 3],
             };
             let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
@@ -3979,6 +4168,8 @@ mod tests {
                 ),
                 Err(_) => panic!("production mining runtime did not start within five seconds"),
             };
+            assert_eq!(probe.worker_threads, 32);
+            probe.proof_processing_gate.send_replace(false);
             let initial_finalization = tokio::select! {
                 entry = wait_for_journal_entry_for_window(
                     &store,
@@ -3990,6 +4181,7 @@ mod tests {
                 result = &mut runtime => panic!("production runtime exited before startup window finalized: {result:?}"),
             };
             assert_eq!(initial_finalization.window_id, 0);
+            assert!(network.fee_quote_delays_started() >= 1);
             let _node1_window1 = wait_for_eligible_window(&network, 1, 1).await;
             let node3_window0 = wait_for_eligible_window(&network, 3, 0).await;
             wait_for_active_probe(&probe, 1, 1).await;
@@ -4016,6 +4208,22 @@ mod tests {
             .await;
             assert_eq!(node3_proof.outcome.as_deref(), Some("candidate-updated"));
             let _node3_candidate = wait_for_candidate(&network, 3, 0, account).await;
+            for node_id in [1, 3] {
+                for metric in [
+                    ProofMetric::TargetValidHashes,
+                    ProofMetric::QueuedCandidates,
+                    ProofMetric::MainLoopReceived,
+                    ProofMetric::Signed,
+                    ProofMetric::Broadcast,
+                    ProofMetric::ReceiptConfirmed,
+                    ProofMetric::CandidateUpdated,
+                ] {
+                    assert!(
+                        probe.proof_telemetry.count(node_id, metric) > 0,
+                        "node {node_id:02} lifecycle metric {metric:?} must be recorded"
+                    );
+                }
+            }
             let node1_hashes = probe.slots[0].completed_hashes();
             assert!(!runtime.is_finished());
             wait_for_no_unresolved_transactions(&store).await;
@@ -4293,6 +4501,9 @@ mod tests {
                 .await
                 .expect("recovery runtime must start")
                 .expect("recovery runtime probe must remain connected");
+            recovery_probe
+                .proof_processing_gate
+                .send_replace(false);
             wait_for_active_probe(
                 &recovery_probe,
                 pending_proof.node_id,
@@ -4382,6 +4593,426 @@ mod tests {
         })
         .await
         .expect("autonomous miner must finalize, reopen, hash and submit across three windows");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Forge and Anvil; run with ASTATINE_EVM_ROOT set"]
+    async fn production_worker_submits_real_one_in_sixty_million_proof_after_head_updates() {
+        let root = std::env::var_os("ASTATINE_EVM_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .join("astatineEVM")
+                    .join("evm")
+            });
+        assert!(root.join("src/AstatineMiner.sol").is_file());
+        let build = Command::new("forge")
+            .args(["build", "--root"])
+            .arg(&root)
+            .output()
+            .expect("Forge must be installed for the high-difficulty worker test");
+        assert!(
+            build.status.success(),
+            "Forge build failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        tokio::time::timeout(Duration::from_secs(240), async {
+            let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = port_listener.local_addr().unwrap().port();
+            drop(port_listener);
+            let mut process = Command::new("anvil")
+                .args([
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &port.to_string(),
+                    "--chain-id",
+                    "1439",
+                    "--accounts",
+                    "3",
+                    "--silent",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("Anvil must be installed for the high-difficulty worker test");
+            let _process_guard = AnvilGuard(&mut process);
+            let endpoint = format!("http://127.0.0.1:{port}");
+            let rpc = reqwest::Client::new();
+            wait_for_anvil(&rpc, &endpoint).await;
+
+            let signer = test_signer();
+            let account = signer_address(&signer);
+            let accounts =
+                rpc_request_local(&rpc, &endpoint, "eth_accounts", serde_json::json!([]))
+                    .await
+                    .unwrap();
+            let deployment_wallet = Address::from_str(accounts[0].as_str().unwrap()).unwrap();
+            let funded_balance = U256::from(1_000_u64) * U256::from(10_u8).pow(U256::from(18));
+            rpc_request_local(
+                &rpc,
+                &endpoint,
+                "anvil_setBalance",
+                serde_json::json!([format!("{account:#x}"), format!("{funded_balance:#x}")]),
+            )
+            .await
+            .unwrap();
+
+            let token_artifact = read_artifact(&root.join("out/MockAST.sol/MockAST.json"));
+            let miner_artifact =
+                read_artifact(&root.join("out/AstatineMiner.sol/AstatineMiner.json"));
+            let miner_bytecode = artifact_bytecode(&miner_artifact);
+            let decimals = 9_u8;
+            let token_unit = U256::from(10_u8).pow(U256::from(decimals));
+            let allocation = U256::from(1_000_u64) * token_unit;
+            let total_allocation = allocation * U256::from(9_u8);
+            let reward = U256::from(100_u64) * token_unit;
+            let mut token_init = artifact_bytecode(&token_artifact);
+            token_init.extend_from_slice(&abi_uint8_word(decimals));
+            let token = deploy_unlocked(&rpc, &endpoint, deployment_wallet, &token_init).await;
+            let mint = LocalMockAST::mintCall {
+                account: deployment_wallet,
+                amount: total_allocation,
+            }
+            .abi_encode();
+            send_unlocked(
+                &rpc,
+                &endpoint,
+                deployment_wallet,
+                Some(token),
+                &mint,
+                U256::ZERO,
+            )
+            .await;
+
+            let target = U256::MAX / U256::from(60_000_000_u64);
+            let easier_target = U256::MAX / U256::from(50_000_000_u64);
+            let harder_target = U256::MAX / U256::from(70_000_000_u64);
+            assert!(target < easier_target && target > harder_target);
+            let mut miners = Vec::with_capacity(9);
+            for node_id in 1..=9_u8 {
+                let initial_target = if node_id == 1 { target } else { U256::MAX };
+                let miner = deploy_local_miner(LocalMinerDeployment {
+                    client: &rpc,
+                    endpoint: &endpoint,
+                    deployment_wallet,
+                    token,
+                    token_decimals: decimals,
+                    allocation,
+                    reward,
+                    miner_bytecode: &miner_bytecode,
+                    initial_target,
+                    retarget_interval: 100,
+                })
+                .await;
+                let approve = LocalMockAST::approveCall {
+                    spender: miner,
+                    amount: allocation,
+                }
+                .abi_encode();
+                send_unlocked(
+                    &rpc,
+                    &endpoint,
+                    deployment_wallet,
+                    Some(token),
+                    &approve,
+                    U256::ZERO,
+                )
+                .await;
+                let fund = LocalAstatineMiner::fundASTCall { amount: allocation }.abi_encode();
+                send_unlocked(
+                    &rpc,
+                    &endpoint,
+                    deployment_wallet,
+                    Some(miner),
+                    &fund,
+                    U256::ZERO,
+                )
+                .await;
+                miners.push((
+                    node_id,
+                    miner,
+                    local_code_hash(&rpc, &endpoint, miner).await,
+                ));
+            }
+            for (node_id, miner, _) in miners.iter().filter(|(node_id, _, _)| *node_id != 1) {
+                let activate = LocalAstatineMiner::activateGenesisCall {
+                    initialSeed: B256::with_last_byte(0x50 + *node_id),
+                }
+                .abi_encode();
+                send_unlocked(
+                    &rpc,
+                    &endpoint,
+                    deployment_wallet,
+                    Some(*miner),
+                    &activate,
+                    U256::ZERO,
+                )
+                .await;
+            }
+            let miner = miners
+                .iter()
+                .find(|(node_id, _, _)| *node_id == 1)
+                .unwrap()
+                .1;
+            let seed = B256::with_last_byte(0x51);
+            let activate =
+                LocalAstatineMiner::activateGenesisCall { initialSeed: seed }.abi_encode();
+            send_unlocked(
+                &rpc,
+                &endpoint,
+                deployment_wallet,
+                Some(miner),
+                &activate,
+                U256::ZERO,
+            )
+            .await;
+            let network = NetworkClient::local_test_client_with_nodes(
+                &endpoint,
+                &miners,
+                token,
+                local_code_hash(&rpc, &endpoint, token).await,
+                decimals,
+            )
+            .unwrap();
+            let initial = network.snapshot(Some(account)).await.unwrap();
+            let state = initial
+                .nodes
+                .iter()
+                .find(|node| node.id == 1)
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap();
+            assert!(state.eligible && !state.finalizable);
+            assert_eq!(state.work.target, target);
+            let context = WorkContext {
+                chain_id: network.manifest.chain_id,
+                contract: miner,
+                window_id: state.work.window_id,
+                seed: state.work.seed,
+                miner: account,
+                header: Vec::new(),
+            };
+            let (nonce, expected_hash) =
+                first_target_valid_nonce_parallel(&context, target, 32, 1_200_000_000)
+                    .expect("parallel deterministic fixture search should find 1-in-60M work");
+            assert_eq!(
+                WorkHasher::new(&context).unwrap().hash(nonce),
+                expected_hash
+            );
+            assert!(meets_target(expected_hash, target));
+            network.set_test_proof_nonce_start(1, state.work.window_id, state.work.seed, nonce);
+            network.delay_next_proof_fee_quote(Duration::from_secs(1));
+            network.fail_next_proof_fee_quote_once();
+
+            let temp = tempdir().unwrap();
+            let store = ConfigStore::at_root(temp.path().to_path_buf());
+            let config = AppConfig {
+                network: Network::Testnet,
+                wallet_address: Some(format!("{account:#x}")),
+                cpu_threads: 32,
+                minimum_reserve_inj: "0".to_owned(),
+                per_session_spending_limit_inj: "1".to_owned(),
+                transaction_confirmations: 1,
+                ..AppConfig::default()
+            };
+            store.save(&config).unwrap();
+            let run_store = store.clone();
+            let run_config = config.clone();
+            let run_network = network.clone();
+            let run_signer = clone_signer(&signer);
+            let args = MineArgs {
+                compute_only: false,
+                threads: NonZeroUsize::new(32),
+                nodes: vec![1],
+            };
+            let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+            let runtime = tokio::spawn(async move {
+                crate::mining::run_with_client(
+                    &run_store,
+                    run_config,
+                    args,
+                    run_network,
+                    Some(run_signer),
+                    Some(probe_tx),
+                )
+                .await
+            });
+            let probe = match tokio::time::timeout(Duration::from_secs(5), probe_rx).await {
+                Ok(Ok(probe)) => probe,
+                Ok(Err(_)) => panic!(
+                    "high-difficulty runtime exited before workers started: {:?}",
+                    runtime.await
+                ),
+                Err(_) => panic!("32-worker runtime must start within five seconds"),
+            };
+            assert_eq!(probe.worker_threads, 32);
+            let mut observed_updates = probe.observer_updates.clone();
+            let _ = observed_updates.borrow_and_update();
+            wait_for_proof_metric(&probe, 1, ProofMetric::TargetValidHashes, 1).await;
+            wait_for_proof_metric(&probe, 1, ProofMetric::QueuedCandidates, 1).await;
+            wait_for_proof_metric(&probe, 1, ProofMetric::MainLoopReceived, 1).await;
+            assert_eq!(
+                probe
+                    .proof_telemetry
+                    .count(1, ProofMetric::PreflightStarted),
+                0
+            );
+
+            let mut refreshed_block = initial.block.number;
+            let generation_before_head_updates = probe.slots[0].generation();
+            for _ in 0..3 {
+                rpc_request_local(&rpc, &endpoint, "evm_increaseTime", serde_json::json!([3]))
+                    .await
+                    .unwrap();
+                rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+                    .await
+                    .unwrap();
+                refreshed_block += 1;
+                probe.observer_refresh.force_refresh();
+                let refreshed =
+                    wait_for_observer_snapshot(&mut observed_updates, refreshed_block).await;
+                let refreshed_state = refreshed.nodes[0].state.as_ref().unwrap();
+                assert_eq!(refreshed_state.work.window_id, state.work.window_id);
+                assert!(refreshed_state.eligible && !refreshed_state.finalizable);
+                assert_eq!(refreshed_state.work.target, target);
+            }
+            assert!(
+                probe.slots[0].generation() > generation_before_head_updates,
+                "verified same-window deadline updates must invalidate old workers"
+            );
+            assert_eq!(
+                probe
+                    .proof_telemetry
+                    .count(1, ProofMetric::GenerationMismatchRevalidated),
+                0,
+                "the main-loop receive is deliberately held until after the verified heads"
+            );
+            probe.proof_processing_gate.send_replace(false);
+            wait_for_proof_metric(&probe, 1, ProofMetric::GenerationMismatchRevalidated, 1).await;
+            wait_for_proof_metric(&probe, 1, ProofMetric::PreflightStarted, 1).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while network.fee_quote_delays_started() == 0 {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("proof fee-quote delay hook must be reached");
+            rpc_request_local(&rpc, &endpoint, "evm_increaseTime", serde_json::json!([2]))
+                .await
+                .unwrap();
+            rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+                .await
+                .unwrap();
+            refreshed_block += 1;
+            probe.observer_refresh.force_refresh();
+            let after_preflight_head =
+                wait_for_observer_snapshot(&mut observed_updates, refreshed_block).await;
+            assert!(
+                after_preflight_head.nodes[0]
+                    .state
+                    .as_ref()
+                    .is_some_and(|state| state.work.window_id == 0 && state.eligible)
+            );
+
+            let accepted = wait_for_journal_entry_for_window(
+                &store,
+                1,
+                TransactionAction::SubmitProof,
+                0,
+                TransactionStatus::MinedSuccess,
+            )
+            .await;
+            assert_eq!(accepted.outcome.as_deref(), Some("candidate-updated"));
+            assert_eq!(accepted.value_wei, SUBMISSION_FEE_WEI.to_string());
+            let candidate = wait_for_candidate(&network, 1, 0, account).await;
+            assert!(
+                candidate.nodes[0]
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .candidate
+                    .is_some()
+            );
+            for metric in [
+                ProofMetric::Signed,
+                ProofMetric::Broadcast,
+                ProofMetric::ReceiptConfirmed,
+                ProofMetric::CandidateUpdated,
+            ] {
+                assert_eq!(probe.proof_telemetry.count(1, metric), 1, "{metric:?}");
+            }
+            assert_eq!(
+                probe
+                    .proof_telemetry
+                    .count(1, ProofMetric::PreflightStarted),
+                2
+            );
+            assert_eq!(
+                probe
+                    .proof_telemetry
+                    .count(1, ProofMetric::PreflightRpcFailure),
+                1
+            );
+            let journal: serde_json::Value =
+                serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                    .unwrap();
+            let proof_entries = journal["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| {
+                    entry["action"] == "submit_proof"
+                        && entry["node_id"] == 1
+                        && entry["window_id"] == 0
+                })
+                .count();
+            assert_eq!(
+                proof_entries, 1,
+                "one paid attempt is authorized per node/window"
+            );
+
+            probe.stop_signal.request_stop();
+            tokio::time::timeout(Duration::from_secs(5), runtime)
+                .await
+                .expect("high-difficulty runtime should stop cleanly")
+                .unwrap()
+                .unwrap();
+            let stopped_journal: super::JournalState =
+                serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                    .unwrap();
+            assert!(
+                stopped_journal
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.action == TransactionAction::SubmitProof
+                            && entry.node_id == 1
+                            && entry.window_id == 0
+                    })
+                    .all(|entry| entry.status == TransactionStatus::MinedSuccess)
+            );
+            assert!(
+                !stopped_journal
+                    .entries
+                    .iter()
+                    .any(|entry| entry.status.is_unresolved())
+            );
+            assert!(
+                stopped_journal
+                    .active_session
+                    .as_ref()
+                    .is_some_and(|session| session.closed)
+            );
+        })
+        .await
+        .expect("high-difficulty CPU-to-CandidateUpdated lifecycle must not hang");
     }
 
     #[tokio::test]
@@ -5022,8 +5653,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(reverted, serde_json::Value::Bool(true));
-        let latest = network.latest_block_snapshot().await.unwrap();
-        manager.monitor(&network, latest.number).await.unwrap();
+        manager.monitor(&network).await.unwrap();
         let finalization_entry = manager
             .journal
             .state
@@ -5119,6 +5749,8 @@ mod tests {
         allocation: U256,
         reward: U256,
         miner_bytecode: &'a [u8],
+        initial_target: U256,
+        retarget_interval: u64,
     }
 
     async fn deploy_local_miner(deployment: LocalMinerDeployment<'_>) -> Address {
@@ -5131,20 +5763,22 @@ mod tests {
             allocation,
             reward,
             miner_bytecode,
+            initial_target,
+            retarget_interval,
         } = deployment;
         let constructor = [
             token.abi_encode(),
             u64::from(token_decimals).abi_encode(),
             allocation.abi_encode(),
             reward.abi_encode(),
-            U256::MAX.abi_encode(),
+            initial_target.abi_encode(),
             U256::from(1).abi_encode(),
             U256::MAX.abi_encode(),
             60_u64.abi_encode(),
             60_u64.abi_encode(),
             200_u16.abi_encode(),
             100_u64.abi_encode(),
-            3_u64.abi_encode(),
+            retarget_interval.abi_encode(),
             2_u64.abi_encode(),
             256_u32.abi_encode(),
             120_u64.abi_encode(),
@@ -5385,6 +6019,23 @@ mod tests {
         .unwrap_or_else(|_| panic!("CPU worker hash counter for node {node_id:02} must increase"));
     }
 
+    async fn wait_for_proof_metric(
+        probe: &MiningProbe,
+        node_id: u8,
+        metric: ProofMetric,
+        minimum: u64,
+    ) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while probe.proof_telemetry.count(node_id, metric) < minimum {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("proof telemetry {metric:?} for node {node_id:02} did not reach {minimum}")
+        });
+    }
+
     async fn wait_for_active_probe(probe: &MiningProbe, node_id: u8, window_id: u64) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -5468,6 +6119,45 @@ mod tests {
         })
         .await
         .expect("journaled transaction should settle before the next test action");
+    }
+
+    fn first_target_valid_nonce_parallel(
+        context: &WorkContext,
+        target: U256,
+        worker_count: usize,
+        nonce_limit: u64,
+    ) -> Option<(u128, B256)> {
+        let found = std::sync::atomic::AtomicU64::new(u64::MAX);
+        std::thread::scope(|scope| {
+            for worker_id in 0..worker_count {
+                let context = context.clone();
+                let found = &found;
+                scope.spawn(move || {
+                    let hasher = WorkHasher::new(&context).unwrap();
+                    let mut nonce = worker_id as u64;
+                    while nonce < nonce_limit && found.load(Ordering::Acquire) == u64::MAX {
+                        let hash = hasher.hash(u128::from(nonce));
+                        if meets_target(hash, target) {
+                            let _ = found.compare_exchange(
+                                u64::MAX,
+                                nonce,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
+                            break;
+                        }
+                        nonce = nonce.saturating_add(worker_count as u64);
+                    }
+                });
+            }
+        });
+        let nonce = found.load(Ordering::Acquire);
+        if nonce == u64::MAX {
+            return None;
+        }
+        let nonce = u128::from(nonce);
+        let hash = WorkHasher::new(context).unwrap().hash(nonce);
+        Some((nonce, hash))
     }
 
     async fn advance_window_past_expiry(
