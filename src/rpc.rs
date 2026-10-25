@@ -200,7 +200,7 @@ pub struct DeploymentVerification {
     pub nodes: HashMap<u8, ContractPinStatus>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct NetworkClient {
     pub manifest: DeploymentManifest,
     endpoints: Vec<RpcEndpoint>,

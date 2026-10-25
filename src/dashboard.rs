@@ -1,5 +1,5 @@
 use crate::{cli::Network, diagnostics::DiagnosticBuffer};
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result, anyhow};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -31,6 +31,7 @@ use tokio::{
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(80);
+const SNAPSHOT_STALE_AFTER: Duration = Duration::from_secs(20);
 const EMERALD: Color = Color::Rgb(41, 242, 107);
 const AMBER: Color = Color::Rgb(245, 184, 72);
 const ERROR_RED: Color = Color::Rgb(239, 83, 80);
@@ -42,6 +43,7 @@ pub enum NodeStatus {
     Mining,
     Finalizing,
     Confirming,
+    Syncing,
     Waiting,
     Recovering,
     Paused,
@@ -55,6 +57,7 @@ impl NodeStatus {
             Self::Mining => "● MINING",
             Self::Finalizing => "FINALIZING",
             Self::Confirming => "CONFIRMING",
+            Self::Syncing => "SYNCING",
             Self::Waiting => "WAITING",
             Self::Recovering => "RECOVERING",
             Self::Paused => "PAUSED",
@@ -66,7 +69,7 @@ impl NodeStatus {
     fn color(self) -> Color {
         match self {
             Self::Mining => EMERALD,
-            Self::Finalizing | Self::Confirming | Self::Recovering => AMBER,
+            Self::Finalizing | Self::Confirming | Self::Syncing | Self::Recovering => AMBER,
             Self::RpcError => ERROR_RED,
             Self::Waiting | Self::Paused | Self::Ended => MUTED,
         }
@@ -76,11 +79,67 @@ impl NodeStatus {
 #[derive(Clone, Debug)]
 pub struct DashboardNode {
     pub id: u8,
+    pub window_id: Option<u64>,
     pub status: NodeStatus,
     pub expiry_timestamp: Option<u64>,
     pub mining_deadline: Option<Instant>,
+    pub countdown: Option<WindowCountdown>,
     pub candidate: Option<Address>,
     pub reward: Option<U256>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowCountdown {
+    window_id: u64,
+    pub(crate) expiry_timestamp: u64,
+    remaining_at_observed: u64,
+    observed_at: Instant,
+}
+
+impl WindowCountdown {
+    pub fn from_snapshot(
+        window_id: u64,
+        expiry_timestamp: u64,
+        chain_timestamp: u64,
+        observed_at: Instant,
+    ) -> Self {
+        Self {
+            window_id,
+            expiry_timestamp,
+            remaining_at_observed: expiry_timestamp.saturating_sub(chain_timestamp),
+            observed_at,
+        }
+    }
+
+    fn remaining_at(&self, now: Instant) -> u64 {
+        self.remaining_at_observed
+            .saturating_sub(now.saturating_duration_since(self.observed_at).as_secs())
+    }
+
+    pub(crate) fn reconcile_same_window(
+        &self,
+        expiry_timestamp: u64,
+        chain_timestamp: u64,
+        observed_at: Instant,
+    ) -> Self {
+        let old_remaining = self.remaining_at(observed_at);
+        let snapshot_remaining = expiry_timestamp.saturating_sub(chain_timestamp);
+        Self {
+            window_id: self.window_id,
+            expiry_timestamp,
+            remaining_at_observed: old_remaining.min(snapshot_remaining),
+            observed_at,
+        }
+    }
+
+    pub(crate) fn reanchor(&self, observed_at: Instant) -> Self {
+        Self {
+            window_id: self.window_id,
+            expiry_timestamp: self.expiry_timestamp,
+            remaining_at_observed: self.remaining_at(observed_at),
+            observed_at,
+        }
+    }
 }
 
 impl DashboardNode {
@@ -94,16 +153,19 @@ impl DashboardNode {
         }
     }
 
-    pub fn time_left(&self, model: &DashboardModel, now: Instant) -> Option<u64> {
-        if self.status_at(now) != NodeStatus::Mining {
+    pub fn time_left(&self, now: Instant) -> Option<u64> {
+        if !matches!(
+            self.status_at(now),
+            NodeStatus::Mining | NodeStatus::Confirming | NodeStatus::Syncing
+        ) || self.mining_deadline.is_none_or(|deadline| now >= deadline)
+        {
             return None;
         }
-        let expiry = self.expiry_timestamp?;
-        let elapsed = now
-            .saturating_duration_since(model.snapshot_observed_at)
-            .as_secs();
-        let estimated_chain_time = model.block_timestamp.saturating_add(elapsed);
-        let remaining = expiry.saturating_sub(estimated_chain_time);
+        let countdown = self.countdown.as_ref()?;
+        if Some(countdown.window_id) != self.window_id {
+            return None;
+        }
+        let remaining = countdown.remaining_at(now);
         (remaining > 0).then_some(remaining)
     }
 }
@@ -118,8 +180,9 @@ pub struct DashboardModel {
     pub session_limit: Option<U256>,
     pub session_exposure: Option<U256>,
     pub block_number: u64,
-    pub block_timestamp: u64,
+    pub block_hash: B256,
     pub snapshot_observed_at: Instant,
+    pub snapshot_ready: bool,
     pub selected_nodes: Vec<DashboardNode>,
     pub compute_only: bool,
     pub signing_enabled: bool,
@@ -139,10 +202,14 @@ impl DashboardModel {
             "RECOVERING"
         } else if self.connection_error.is_some() {
             "RPC ERROR"
+        } else if !self.snapshot_ready {
+            "CONNECTING"
+        } else if now.saturating_duration_since(self.snapshot_observed_at) > SNAPSHOT_STALE_AFTER {
+            "STALE DATA"
         } else if !self
             .selected_nodes
             .iter()
-            .any(|node| node.status_at(now) == NodeStatus::Mining)
+            .any(|node| node.status_at(now) == NodeStatus::Mining || node.time_left(now).is_some())
         {
             "WAITING FOR WORK"
         } else if self.compute_only || !self.signing_enabled {
@@ -925,8 +992,8 @@ fn render_column_labels(frame: &mut Frame<'_>, area: Rect, colors: bool) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(
-                "{:<6}{:<14}{:<10}{:<22}{}",
-                "NODE", "STATUS", "TIME LEFT", "BEST MINER", "WINDOW REWARD"
+                "{:<6}{:<8}{:<14}{:<10}{:<22}{}",
+                "NODE", "WINDOW", "STATUS", "TIME LEFT", "BEST MINER", "WINDOW REWARD"
             ),
             style(colors, MUTED, false),
         ))),
@@ -937,7 +1004,7 @@ fn render_column_labels(frame: &mut Frame<'_>, area: Rect, colors: bool) {
 fn render_compact_column_labels(frame: &mut Frame<'_>, area: Rect, colors: bool) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "ID  STATUS  TIME  BEST MINER  REWARD",
+            "ID WINDOW STATUS TIME BEST MINER REWARD",
             style(colors, MUTED, false),
         ))),
         area,
@@ -970,11 +1037,14 @@ fn render_narrow_rows(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel,
     for node in &model.selected_nodes {
         let status = node.status_at(now);
         let time = node
-            .time_left(model, now)
+            .time_left(now)
             .map(format_time_left)
             .unwrap_or_else(|| "--:--".to_owned());
         lines.push(Line::from(vec![
-            Span::styled(format!("{:02} ", node.id), style(colors, MUTED, false)),
+            Span::styled(
+                format!("{:02} {} ", node.id, format_window_id(node.window_id)),
+                style(colors, MUTED, false),
+            ),
             Span::styled(
                 format!("{} ", status.label()),
                 style(colors, status.color(), true),
@@ -994,13 +1064,17 @@ fn wide_node_line(
 ) -> Line<'static> {
     let status = node.status_at(now);
     let time = node
-        .time_left(model, now)
+        .time_left(now)
         .map(format_time_left)
         .unwrap_or_else(|| "--:--".to_owned());
     let candidate = candidate_spans(node.candidate, model.wallet, 22, colors);
     let reward = format_reward(node.reward);
     let mut spans = vec![
         Span::styled(format!("{:02}    ", node.id), style(colors, LIGHT, false)),
+        Span::styled(
+            format!("{:<8}", format_window_id(node.window_id)),
+            style(colors, LIGHT, false),
+        ),
         Span::styled(
             format!("{:<12}  ", status.label()),
             style(colors, status.color(), true),
@@ -1027,18 +1101,22 @@ fn compact_node_line(
 ) -> Line<'static> {
     let status = node.status_at(now);
     let time = node
-        .time_left(model, now)
+        .time_left(now)
         .map(format_time_left)
         .unwrap_or_else(|| "--:--".to_owned());
     let mut spans = vec![
         Span::styled(format!("{:02} ", node.id), style(colors, MUTED, false)),
+        Span::styled(
+            format!("{} ", format_window_id(node.window_id)),
+            style(colors, MUTED, false),
+        ),
         Span::styled(
             format!("{} ", status.label()),
             style(colors, status.color(), true),
         ),
         Span::styled(format!("{time} "), style(colors, LIGHT, false)),
     ];
-    spans.extend(candidate_spans(node.candidate, model.wallet, 16, colors));
+    spans.extend(candidate_spans(node.candidate, model.wallet, 11, colors));
     spans.push(Span::raw(" "));
     spans.push(Span::styled(
         format_reward(node.reward),
@@ -1072,8 +1150,7 @@ fn candidate_spans(
         return vec![Span::styled("None", style(colors, MUTED, false))];
     };
     let is_ours = candidate == wallet;
-    let address = short_address(candidate);
-    let address = fit_text(&address, max_chars);
+    let address = abbreviated_address(candidate, max_chars);
     if is_ours {
         vec![
             Span::styled(address, style(colors, EMERALD, true)),
@@ -1095,6 +1172,19 @@ fn render_footer(
         (format!("ERROR • {error}"), ERROR_RED)
     } else if let Some(error) = model.connection_error.as_deref() {
         (format!("RPC ERROR • {error}"), ERROR_RED)
+    } else if !model.snapshot_ready {
+        ("Connecting • Verifying Testnet state...".to_owned(), AMBER)
+    } else if Instant::now().saturating_duration_since(model.snapshot_observed_at)
+        > SNAPSHOT_STALE_AFTER
+    {
+        (
+            format!(
+                "STALE • Last verified block {} {} • Ctrl+C to stop",
+                format_block(model.block_number),
+                short_hash(model.block_hash)
+            ),
+            AMBER,
+        )
     } else if let Some(action) = model.current_action.as_deref() {
         (
             format!(
@@ -1154,6 +1244,7 @@ fn version_mode_line(model: &DashboardModel, colors: bool) -> Line<'static> {
         "LIVE MINING" => EMERALD,
         "RECOVERING" | "STOPPING" => AMBER,
         "RPC ERROR" => ERROR_RED,
+        "STALE DATA" => AMBER,
         _ => MUTED,
     };
     Line::from(vec![
@@ -1249,6 +1340,31 @@ fn short_address(address: Address) -> String {
     format!("{}...{}", &value[..6], &value[value.len() - 4..])
 }
 
+fn short_hash(hash: B256) -> String {
+    let value = format!("{hash:#x}");
+    format!("{}...{}", &value[..8], &value[value.len() - 6..])
+}
+
+fn abbreviated_address(address: Address, max_chars: usize) -> String {
+    let value = format!("{address:#x}");
+    if max_chars >= 13 {
+        return short_address(address);
+    }
+    if max_chars >= 11 {
+        return format!("{}...{}", &value[..4], &value[value.len() - 4..]);
+    }
+    if max_chars >= 8 {
+        return format!("{}..{}", &value[..2], &value[value.len() - 4..]);
+    }
+    fit_text(&value, max_chars)
+}
+
+fn format_window_id(window_id: Option<u64>) -> String {
+    window_id
+        .map(|window| format!("#{window}"))
+        .unwrap_or_else(|| "--".to_owned())
+}
+
 fn network_name(network: Network) -> &'static str {
     match network {
         Network::Testnet => "Injective Testnet",
@@ -1300,11 +1416,11 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        DashboardModel, DashboardNode, NodeStatus, format_hashrate, format_reward,
+        DashboardModel, DashboardNode, NodeStatus, WindowCountdown, format_hashrate, format_reward,
         format_time_left, format_units, hashes_per_second, render_dashboard,
     };
     use crate::cli::Network;
-    use alloy_primitives::{Address, U256};
+    use alloy_primitives::{Address, B256, U256};
     use ratatui::{Terminal, backend::TestBackend};
     use std::time::{Duration, Instant};
 
@@ -1322,8 +1438,9 @@ mod tests {
             session_limit: Some(U256::from(500_000_000_000_000_000_u128)),
             session_exposure: Some(U256::from(52_000_000_000_000_000_u128)),
             block_number: 144_123_456,
-            block_timestamp: 1_000,
+            block_hash: B256::with_last_byte(4),
             snapshot_observed_at: Instant::now(),
+            snapshot_ready: true,
             selected_nodes: nodes,
             compute_only: false,
             signing_enabled: true,
@@ -1337,11 +1454,20 @@ mod tests {
     }
 
     fn node(id: u8, status: NodeStatus, candidate: Option<Address>) -> DashboardNode {
+        let observed_at = Instant::now();
+        let window_id = 100 + u64::from(id);
         DashboardNode {
             id,
+            window_id: Some(window_id),
             status,
             expiry_timestamp: Some(1_160),
-            mining_deadline: Some(Instant::now() + Duration::from_secs(160)),
+            mining_deadline: Some(observed_at + Duration::from_secs(160)),
+            countdown: Some(WindowCountdown::from_snapshot(
+                window_id,
+                1_160,
+                1_000,
+                observed_at,
+            )),
             candidate,
             reward: Some(U256::from(900_000_000_u64)),
         }
@@ -1401,7 +1527,9 @@ mod tests {
         let text = buffer_text(&terminal);
         for id in 1..=9 {
             assert!(text.contains(&format!("{id:02}    ● MINING")));
+            assert!(text.contains(&format!("#{:03}", 100 + id)));
         }
+        assert!(text.contains("WINDOW"));
         assert!(text.contains("9 selected / 9 total"));
         assert!(!text.contains("10  "));
     }
@@ -1426,16 +1554,18 @@ mod tests {
         let observed = Instant::now();
         let mut view = model(vec![DashboardNode {
             id: 1,
+            window_id: Some(1),
             status: NodeStatus::Mining,
             expiry_timestamp: Some(1_060),
             mining_deadline: Some(observed + Duration::from_secs(60)),
+            countdown: Some(WindowCountdown::from_snapshot(1, 1_060, 1_000, observed)),
             candidate: None,
             reward: None,
         }]);
         view.snapshot_observed_at = observed;
-        assert_eq!(view.selected_nodes[0].time_left(&view, observed), Some(60));
+        assert_eq!(view.selected_nodes[0].time_left(observed), Some(60));
         assert_eq!(
-            view.selected_nodes[0].time_left(&view, observed + Duration::from_secs(1)),
+            view.selected_nodes[0].time_left(observed + Duration::from_secs(1)),
             Some(59)
         );
         assert_eq!(
@@ -1443,20 +1573,45 @@ mod tests {
             NodeStatus::Waiting
         );
         assert_eq!(
-            view.selected_nodes[0].time_left(&view, observed + Duration::from_secs(60)),
+            view.selected_nodes[0].time_left(observed + Duration::from_secs(60)),
             None
         );
         view.selected_nodes[0].status = NodeStatus::Paused;
         assert_eq!(
-            view.selected_nodes[0].time_left(&view, observed + Duration::from_secs(1)),
+            view.selected_nodes[0].time_left(observed + Duration::from_secs(1)),
             None
         );
+    }
+
+    #[test]
+    fn repeated_same_window_snapshots_cannot_extend_chain_time_countdown() {
+        let observed = Instant::now();
+        let initial = WindowCountdown::from_snapshot(184, 1_090, 1_000, observed);
+        assert_eq!(initial.remaining_at(observed), 90);
+
+        let after_sixty = observed + Duration::from_secs(60);
+        let repeated_stale_timestamp = initial.reconcile_same_window(1_090, 1_000, after_sixty);
+        assert_eq!(repeated_stale_timestamp.remaining_at(after_sixty), 30);
+
+        let after_another_snapshot = after_sixty + Duration::from_secs(1);
+        let repeated_again =
+            repeated_stale_timestamp.reconcile_same_window(1_090, 1_000, after_another_snapshot);
+        assert_eq!(repeated_again.remaining_at(after_another_snapshot), 29);
+
+        let next_window = WindowCountdown::from_snapshot(185, 2_200, 2_110, after_another_snapshot);
+        assert_eq!(next_window.remaining_at(after_another_snapshot), 90);
+        assert_ne!(next_window.window_id, repeated_again.window_id);
     }
 
     #[test]
     fn mode_distinguishes_signing_compute_only_waiting_recovery_and_stopping() {
         let mut view = model(vec![node(1, NodeStatus::Mining, None)]);
         assert_eq!(view.mode(Instant::now()), "LIVE MINING");
+        view.selected_nodes[0].status = NodeStatus::Confirming;
+        assert_eq!(view.mode(Instant::now()), "LIVE MINING");
+        view.selected_nodes[0].status = NodeStatus::Syncing;
+        assert_eq!(view.mode(Instant::now()), "LIVE MINING");
+        view.selected_nodes[0].status = NodeStatus::Mining;
         view.compute_only = true;
         assert_eq!(view.mode(Instant::now()), "COMPUTE ONLY");
         view.compute_only = false;
@@ -1468,6 +1623,9 @@ mod tests {
         view.connection_error = Some("RPC unavailable".to_owned());
         assert_eq!(view.mode(Instant::now()), "RPC ERROR");
         view.connection_error = None;
+        view.snapshot_observed_at = Instant::now() - Duration::from_secs(21);
+        assert_eq!(view.mode(Instant::now()), "STALE DATA");
+        view.snapshot_observed_at = Instant::now();
         view.recovering = true;
         assert_eq!(view.mode(Instant::now()), "RECOVERING");
         view.stopping = true;

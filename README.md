@@ -6,10 +6,10 @@ The protocol has nine independent mining nodes, each with its own work and windo
 
 ## Install
 
-On macOS, run this single command to download the matching Apple Silicon or Intel build, verify its SHA-256 checksum, and install it under `~/.local/bin`. It is a first-time installer and refuses to overwrite an existing `astatine` executable:
+On macOS, stop the running miner and run this single command to download the matching Apple Silicon or Intel build, verify its SHA-256 checksum, and replace only `~/.local/bin/astatine`. Configuration, wallets, and transaction journals are untouched:
 
 ```sh
-bash -c 'set -euo pipefail; case "$(uname -s)" in Darwin) ;; *) printf "%s\n" "macOS is required" >&2; exit 1;; esac; case "$(uname -m)" in arm64|aarch64) asset=astatine-macos-aarch64.tar.gz;; x86_64|amd64) asset=astatine-macos-x86_64.tar.gz;; *) printf "%s\n" "Unsupported macOS architecture" >&2; exit 1;; esac; version=v0.1.0-testnet.2; base="https://github.com/emyrinj/astatine-miner/releases/download/$version"; tmp="$(mktemp -d)"; trap "rm -rf \"$tmp\"" EXIT; curl -fsSL "$base/$asset" -o "$tmp/$asset"; curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"; (cd "$tmp"; grep -F "  $asset" SHA256SUMS | shasum -a 256 -c -); tar -xzf "$tmp/$asset" -C "$tmp"; mkdir -p "$HOME/.local/bin"; if [ -e "$HOME/.local/bin/astatine" ] || [ -L "$HOME/.local/bin/astatine" ]; then printf "%s\n" "astatine already exists; this first-time installer will not overwrite it" >&2; exit 1; fi; install -m 0755 "$tmp/astatine" "$HOME/.local/bin/astatine"; "$HOME/.local/bin/astatine" --version'
+bash -c 'set -euo pipefail; case "$(uname -s)" in Darwin) ;; *) printf "%s\n" "macOS is required" >&2; exit 1;; esac; case "$(uname -m)" in arm64|aarch64) asset=astatine-macos-aarch64.tar.gz;; x86_64|amd64) asset=astatine-macos-x86_64.tar.gz;; *) printf "%s\n" "Unsupported macOS architecture" >&2; exit 1;; esac; version=v0.1.0-testnet.3; base="https://github.com/emyrinj/astatine-miner/releases/download/$version"; tmp="$(mktemp -d)"; trap "rm -rf \"$tmp\"" EXIT; curl -fsSL "$base/$asset" -o "$tmp/$asset"; curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"; (cd "$tmp"; grep -F "  $asset" SHA256SUMS | shasum -a 256 -c -); tar -xzf "$tmp/$asset" -C "$tmp"; mkdir -p "$HOME/.local/bin"; install -m 0755 "$tmp/astatine" "$HOME/.local/bin/astatine"; "$HOME/.local/bin/astatine" --version'
 ```
 
 If `~/.local/bin` is not on your `PATH`, add it before running `astatine` from a new terminal.

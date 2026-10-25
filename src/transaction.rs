@@ -999,10 +999,11 @@ pub enum TransactionActivityState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransactionActivity {
     pub node_id: u8,
+    pub window_id: u64,
     pub state: TransactionActivityState,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TransactionDashboardState {
     pub session_exposure: Option<U256>,
     pub activities: Vec<TransactionActivity>,
@@ -1121,6 +1122,7 @@ impl TransactionManager {
             .filter(|entry| entry.status.is_unresolved())
             .map(|entry| TransactionActivity {
                 node_id: entry.node_id,
+                window_id: entry.window_id,
                 state: if entry.status == TransactionStatus::Unknown {
                     TransactionActivityState::Recovering
                 } else if entry.status == TransactionStatus::Included {
@@ -1414,9 +1416,17 @@ impl TransactionManager {
             .as_ref()
             .map(Clone::clone)
             .unwrap_or_else(|_| "receipt-event-unverified".to_owned());
+        let inclusion_changed =
+            entry.status != TransactionStatus::Included || entry.confirmations != confirmations;
         self.journal
             .record_included(hash, receipt, confirmations, stored_outcome)?;
         self.publish_dashboard_state();
+        if inclusion_changed {
+            self.report_info(format!(
+                "transaction included node={:02} window={} action={:?} hash={hash:#x} confirmations={confirmations}",
+                entry.node_id, entry.window_id, entry.action
+            ));
+        }
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -1447,6 +1457,10 @@ impl TransactionManager {
         self.journal
             .settle_receipt(hash, receipt, confirmations, actual_cost, outcome.clone())?;
         self.publish_dashboard_state();
+        self.report_info(format!(
+            "transaction confirmed node={:02} window={} action={:?} hash={hash:#x} outcome={outcome} cost_wei={actual_cost}",
+            entry.node_id, entry.window_id, entry.action
+        ));
         Ok(ReceiptProgress::Settled(outcome))
     }
 
@@ -1696,13 +1710,16 @@ impl TransactionManager {
             value,
             data,
         };
-        self.journal.validate_exposure(
+        let maximum_exposure = self.journal.validate_exposure(
             &request,
             &intent,
             self.session_limit,
             self.minimum_reserve,
             spendable_balance,
         )?;
+        let node_id = intent.node_id;
+        let window_id = intent.window_id;
+        let action = intent.action;
         let signed = sign_eip1559(signer, &request)?;
         self.journal.prepare(PreparedTransaction {
             request,
@@ -1714,16 +1731,28 @@ impl TransactionManager {
             confirmations_required: self.confirmations_required,
         })?;
         self.publish_dashboard_state();
+        self.report_info(format!(
+            "transaction prepared node={node_id:02} window={window_id} action={action:?} hash={:#x} maximum_exposure_wei={maximum_exposure}",
+            signed.hash
+        ));
 
         match client.broadcast_raw_transaction(&signed.raw).await {
             Ok(returned_hash) if returned_hash == signed.hash => {
                 self.journal
                     .set_broadcast_state(signed.hash, TransactionStatus::Broadcast)?;
+                self.report_info(format!(
+                    "transaction broadcast node={node_id:02} window={window_id} action={action:?} hash={:#x}",
+                    signed.hash
+                ));
             }
             Ok(returned_hash) => {
                 self.journal
                     .set_broadcast_state(signed.hash, TransactionStatus::Unknown)?;
                 self.publish_dashboard_state();
+                self.report_warning(format!(
+                    "transaction broadcast hash mismatch node={node_id:02} window={window_id} action={action:?} expected={:#x} returned={returned_hash:#x}",
+                    signed.hash
+                ));
                 bail!(
                     "RPC acknowledged unexpected transaction hash {returned_hash:#x}; recorded expected hash {:#x} and will not retry",
                     signed.hash
@@ -1733,6 +1762,10 @@ impl TransactionManager {
                 self.journal
                     .set_broadcast_state(signed.hash, TransactionStatus::Unknown)?;
                 self.publish_dashboard_state();
+                self.report_warning(format!(
+                    "transaction broadcast outcome unknown node={node_id:02} window={window_id} action={action:?} hash={:#x}: {error:#}",
+                    signed.hash
+                ));
                 return Err(error).context(format!(
                     "broadcast outcome is unknown for {:#x}; the journal prevents rebroadcast",
                     signed.hash
@@ -2540,9 +2573,13 @@ mod tests {
     };
     use crate::{
         cli::Network,
-        config::{AppConfig, ConfigStore},
+        config::{AppConfig, ConfigStore, parse_inj_wei},
         contracts::{AstatineMinerRead, IERC20Read},
-        mining::{FinalizationOptions, finalize_initial_expired_windows},
+        diagnostics::DiagnosticBuffer,
+        mining::{
+            DashboardContext, FinalizationOptions, NodeSlot, finalize_initial_expired_windows,
+            start_read_only_observer, update_slots,
+        },
         protocol::{WorkContext, WorkHasher, meets_target},
         rpc::{NetworkClient, RpcLog, TransactionReceipt},
         wallet::signer_address,
@@ -2552,12 +2589,12 @@ mod tests {
     use bip32::secp256k1::ecdsa::SigningKey;
     use rand::{RngCore, thread_rng};
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         net::TcpListener,
         path::PathBuf,
         process::{Child, Command, Stdio},
         str::FromStr,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, RwLock, atomic::AtomicBool},
         time::Duration,
     };
     use tempfile::tempdir;
@@ -2680,6 +2717,7 @@ mod tests {
             state.activities,
             [TransactionActivity {
                 node_id: 1,
+                window_id: 4,
                 state: TransactionActivityState::Confirming,
             }]
         );
@@ -3479,6 +3517,7 @@ mod tests {
         let mut manager = TransactionManager::open(&store, &config, account, token).unwrap();
         let selected = HashSet::from_iter(1..=9_u8);
         let mut blocked = HashSet::new();
+        let pending_sync = Arc::new(std::sync::RwLock::new(HashMap::new()));
         assert!(
             finalize_initial_expired_windows(
                 &network,
@@ -3490,6 +3529,7 @@ mod tests {
                 FinalizationOptions {
                     blocked: &mut blocked,
                     dashboard: &None,
+                    pending_sync: &pending_sync,
                 },
             )
             .await
@@ -3812,6 +3852,83 @@ mod tests {
             result = &mut submit_task => panic!("proof manager task ended before the broadcast could be observed: {result:?}"),
         };
         assert_eq!(broadcast_proof.confirmations, 0);
+        let observer_slots = Arc::new((1..=9).map(NodeSlot::new).collect::<Vec<_>>());
+        let observer_schedule = Arc::new(RwLock::new(Vec::new()));
+        let observer_selected = HashSet::from([1_u8, 3, 7]);
+        let observer_node_hash = local_code_hash(&client, &endpoint, miner).await;
+        let observer_token_hash = local_code_hash(&client, &endpoint, token).await;
+        let observer_network = NetworkClient::local_test_client_with_nodes(
+            &endpoint,
+            &[
+                (1, miner, observer_node_hash),
+                (3, miner, observer_node_hash),
+                (7, miner, observer_node_hash),
+            ],
+            token,
+            observer_token_hash,
+            token_decimals,
+        )
+        .unwrap();
+        let observer_context = DashboardContext {
+            network: Network::Testnet,
+            chain_id: 1439,
+            address: account,
+            threads: 2,
+            spending_limit: parse_inj_wei(&config.per_session_spending_limit_inj).unwrap(),
+            transaction_mode: true,
+            compute_only: false,
+            workers_started: Arc::new(AtomicBool::new(true)),
+            selected: observer_selected.clone(),
+            slots: Arc::clone(&observer_slots),
+            schedule: Arc::clone(&observer_schedule),
+            transaction_state: Arc::new(RwLock::new(TransactionDashboardState {
+                session_exposure: Some(
+                    parse_decimal_wei(&broadcast_proof.maximum_exposure_wei).unwrap(),
+                ),
+                activities: vec![TransactionActivity {
+                    node_id: 1,
+                    window_id: broadcast_proof.window_id,
+                    state: TransactionActivityState::Confirming,
+                }],
+            })),
+            pending_sync: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let observer_seed = observer_network.snapshot(Some(account)).await.unwrap();
+        update_slots(
+            &observer_slots,
+            &observer_schedule,
+            &observer_network.manifest,
+            account,
+            &observer_selected,
+            &observer_seed,
+        )
+        .unwrap();
+        let observer_seed_block = observer_seed.block.number;
+        let mut observer = start_read_only_observer(
+            observer_network.clone(),
+            observer_context,
+            observer_seed,
+            None,
+            DiagnosticBuffer::default(),
+        );
+        let mut observed_updates = observer.updates.clone();
+        let _ = observed_updates.borrow_and_update();
+        observer.force_refresh();
+        tokio::time::timeout(Duration::from_secs(5), observed_updates.changed())
+            .await
+            .expect("observer should refresh while transaction confirmation is pending")
+            .expect("observer update channel should remain open");
+        assert!(observer.latest_snapshot().unwrap().block.number >= observer_seed_block);
+        assert_eq!(
+            *observer_schedule
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            [0, 2, 6]
+        );
+        assert!(
+            !submit_task.is_finished(),
+            "read-only observation must progress while the proof receipt is pending"
+        );
         assert!(broadcast_proof.actual_cost_wei.is_none());
         assert!(
             parse_decimal_wei(&broadcast_proof.maximum_exposure_wei).unwrap()
@@ -3901,6 +4018,26 @@ mod tests {
                 .get(&format!("{miner:#x}")),
             Some(&0)
         );
+
+        observer.force_refresh();
+        tokio::time::timeout(Duration::from_secs(5), observed_updates.changed())
+            .await
+            .expect("observer should refresh the accepted candidate after receipt confirmation")
+            .expect("observer update channel should remain open");
+        let observed = observer.latest_snapshot().unwrap();
+        let observed_candidate = observed
+            .nodes
+            .iter()
+            .find(|node| node.id == 1)
+            .and_then(|node| node.state.as_ref())
+            .and_then(|state| state.candidate.as_ref())
+            .expect("verified snapshot should expose the accepted candidate");
+        assert_eq!(observed_candidate.miner, account);
+        assert_eq!(
+            observed.nodes[0].state.as_ref().unwrap().work.window_id,
+            work.2
+        );
+        observer.stop().await.unwrap();
 
         let mut replacement = None;
         for nonce in 1..10_000_u128 {

@@ -3,7 +3,7 @@ use crate::{
     config::{ConfigStore, parse_inj_wei},
     dashboard::{
         Dashboard, DashboardEventKind, DashboardModel, DashboardNode, DashboardSignal,
-        DashboardUpdater, NodeStatus,
+        DashboardUpdater, NodeStatus, WindowCountdown,
     },
     deployment::DeploymentManifest,
     diagnostics::DiagnosticBuffer,
@@ -18,7 +18,7 @@ use crate::{
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     num::NonZeroUsize,
     sync::{
         Arc, Mutex, RwLock,
@@ -27,7 +27,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tokio::{sync::mpsc, time};
+use tokio::{
+    sync::{mpsc, watch},
+    time,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -102,7 +105,7 @@ impl NonceAllocator {
     }
 }
 
-struct NodeSlot {
+pub(crate) struct NodeSlot {
     id: u8,
     generation: AtomicU64,
     work: RwLock<Option<Arc<WorkJob>>>,
@@ -111,7 +114,7 @@ struct NodeSlot {
 }
 
 impl NodeSlot {
-    fn new(id: u8) -> Self {
+    pub(crate) fn new(id: u8) -> Self {
         Self {
             id,
             generation: AtomicU64::new(0),
@@ -310,17 +313,78 @@ impl Drop for CpuWorkers {
     }
 }
 
-struct DashboardContext<'a> {
-    network: crate::cli::Network,
-    chain_id: u64,
-    address: Address,
-    threads: usize,
-    spending_limit: U256,
-    transaction_mode: bool,
-    compute_only: bool,
-    workers_started: bool,
-    selected: &'a HashSet<u8>,
-    slots: &'a [NodeSlot],
+#[derive(Clone)]
+pub(crate) struct DashboardContext {
+    pub(crate) network: crate::cli::Network,
+    pub(crate) chain_id: u64,
+    pub(crate) address: Address,
+    pub(crate) threads: usize,
+    pub(crate) spending_limit: U256,
+    pub(crate) transaction_mode: bool,
+    pub(crate) compute_only: bool,
+    pub(crate) workers_started: Arc<AtomicBool>,
+    pub(crate) selected: HashSet<u8>,
+    pub(crate) slots: Arc<Vec<NodeSlot>>,
+    pub(crate) schedule: Arc<RwLock<Vec<usize>>>,
+    pub(crate) transaction_state: Arc<RwLock<TransactionDashboardState>>,
+    pub(crate) pending_sync: Arc<RwLock<HashMap<u8, PendingDashboardSync>>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingDashboardSync {
+    window_id: u64,
+    receipt_block: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ObserverUpdate {
+    Snapshot(ReadSnapshot),
+    RpcError { message: String, report: bool },
+    Fatal(String),
+}
+
+pub(crate) struct ReadOnlyObserver {
+    shutdown: watch::Sender<bool>,
+    pub(crate) updates: watch::Receiver<ObserverUpdate>,
+    force_refresh: mpsc::Sender<()>,
+    refresh_epoch: Arc<AtomicU64>,
+    refresh_gate: Arc<Mutex<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ReadOnlyObserver {
+    pub(crate) fn force_refresh(&self) {
+        let _commit = self
+            .refresh_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refresh_epoch.fetch_add(1, Ordering::AcqRel);
+        let _ = self.force_refresh.try_send(());
+    }
+
+    pub(crate) fn latest_snapshot(&self) -> Option<ReadSnapshot> {
+        match &*self.updates.borrow() {
+            ObserverUpdate::Snapshot(snapshot) => Some(snapshot.clone()),
+            ObserverUpdate::RpcError { .. } | ObserverUpdate::Fatal(_) => None,
+        }
+    }
+
+    pub(crate) async fn stop(&mut self) -> Result<()> {
+        self.shutdown.send_replace(true);
+        self.task.abort();
+        match (&mut self.task).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(error).context("join read-only chain observer"),
+        }
+    }
+}
+
+impl Drop for ReadOnlyObserver {
+    fn drop(&mut self) {
+        self.shutdown.send_replace(true);
+        self.task.abort();
+    }
 }
 
 pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
@@ -397,7 +461,12 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
     }
     let slots = Arc::new((1..=9).map(NodeSlot::new).collect::<Vec<_>>());
     let schedule = Arc::new(RwLock::new(Vec::new()));
-    let mut dashboard_context = DashboardContext {
+    let diagnostics = DiagnosticBuffer::default();
+    let transaction_state = Arc::new(RwLock::new(initial_transaction_dashboard_state(
+        transactions.as_ref(),
+        &diagnostics,
+    )));
+    let dashboard_context = DashboardContext {
         network: client.manifest.network,
         chain_id: client.manifest.chain_id,
         address,
@@ -405,29 +474,21 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
         spending_limit,
         transaction_mode,
         compute_only: args.compute_only,
-        workers_started: false,
-        selected: &selected,
-        slots: slots.as_slice(),
+        workers_started: Arc::new(AtomicBool::new(false)),
+        selected: selected.clone(),
+        slots: Arc::clone(&slots),
+        schedule: Arc::clone(&schedule),
+        transaction_state: Arc::clone(&transaction_state),
+        pending_sync: Arc::new(RwLock::new(HashMap::new())),
     };
-    let mut snapshot = client.snapshot(Some(address)).await?;
-    let mut changed = update_slots(
-        &slots,
-        &schedule,
-        &client.manifest,
-        address,
-        &selected,
-        &snapshot,
-    )?;
     let stop = Arc::new(AtomicBool::new(false));
     let cursor = Arc::new(AtomicUsize::new(0));
     let total_hashes = Arc::new(AtomicU64::new(0));
-    let diagnostics = DiagnosticBuffer::default();
-    let model = dashboard_model(
-        &dashboard_context,
-        &snapshot,
-        transactions.as_ref(),
-        &diagnostics,
-    );
+    let initial_transaction_state = transaction_state
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let model = initial_dashboard_model(&dashboard_context, &initial_transaction_state);
     let mut dashboard = Dashboard::start(model, Arc::clone(&total_hashes), diagnostics.clone())?;
     if dashboard.is_none() {
         for message in diagnostics.drain() {
@@ -441,7 +502,31 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
             manager.set_diagnostics(diagnostics);
         }
     }
-    connect_transaction_dashboard(&mut transactions, &dashboard);
+    connect_transaction_dashboard(
+        &mut transactions,
+        &dashboard,
+        Arc::clone(&transaction_state),
+    );
+    let dashboard_updater = dashboard.as_ref().map(Dashboard::updater);
+    let mut snapshot = client.snapshot(Some(address)).await?;
+    let changed = update_slots(
+        &slots,
+        &schedule,
+        &client.manifest,
+        address,
+        &selected,
+        &snapshot,
+    )?;
+    refresh_dashboard(dashboard_updater.as_ref(), &dashboard_context, &snapshot);
+    let mut observer = start_read_only_observer(
+        client.clone(),
+        dashboard_context.clone(),
+        snapshot.clone(),
+        dashboard_updater.clone(),
+        diagnostics.clone(),
+    );
+    let mut observed_updates = observer.updates.clone();
+    let _ = observed_updates.borrow_and_update();
 
     let mut blocked_finalizations = HashSet::new();
     if let Some(manager) = transactions.as_mut()
@@ -473,7 +558,7 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                 Some("Finalizing expired windows...".to_owned()),
             );
         }
-        if finalize_initial_expired_windows(
+        let finalized = finalize_initial_expired_windows(
             &client,
             &selected,
             manager,
@@ -483,31 +568,22 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
             FinalizationOptions {
                 blocked: &mut blocked_finalizations,
                 dashboard: &dashboard,
+                pending_sync: &dashboard_context.pending_sync,
             },
         )
-        .await?
-            && let Err(error) = manager.reconcile_rewards(&client, &snapshot).await
-        {
-            report_mining_warning(
-                &dashboard,
-                format!("reward-event verification will retry after the next snapshot: {error:#}"),
-            );
+        .await?;
+        if finalized {
+            observer.force_refresh();
+            if let Err(error) = manager.reconcile_rewards(&client, &snapshot).await {
+                report_mining_warning(
+                    &dashboard,
+                    format!(
+                        "reward-event verification will retry after the next snapshot: {error:#}"
+                    ),
+                );
+            }
         }
     }
-    changed |= update_slots(
-        &slots,
-        &schedule,
-        &client.manifest,
-        address,
-        &selected,
-        &snapshot,
-    )?;
-    refresh_dashboard(
-        &dashboard,
-        &dashboard_context,
-        &snapshot,
-        transactions.as_ref(),
-    );
     if !client.verification.token_verified {
         report_mining_warning(
             &dashboard,
@@ -560,7 +636,10 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
         stop: Arc::clone(&stop),
         workers,
     };
-    dashboard_context.workers_started = true;
+    dashboard_context
+        .workers_started
+        .store(true, Ordering::Release);
+    observer.force_refresh();
 
     let mut progress_ticker = time::interval(PROGRESS_INTERVAL);
     progress_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -568,16 +647,7 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     let mut last_progress = time::Instant::now();
-    let mut consecutive_rpc_errors = 0_u8;
-    let mut poll_delay = POLL_INTERVAL;
-    let mut next_poll = time::Instant::now() + poll_delay;
-    let mut last_snapshot = snapshot;
-    refresh_dashboard(
-        &dashboard,
-        &dashboard_context,
-        &last_snapshot,
-        transactions.as_ref(),
-    );
+    let mut last_snapshot = observer.latest_snapshot().unwrap_or(snapshot);
     let mut fatal_error = None;
     let mut budget_exhausted = false;
     let dashboard_signal = dashboard.as_ref().map(Dashboard::signal);
@@ -602,24 +672,21 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                     }
                 }
             }
-            _ = time::sleep_until(next_poll) => {
-                match client.snapshot(Some(address)).await {
-                    Ok(snapshot) => {
-                        consecutive_rpc_errors = 0;
-                        poll_delay = POLL_INTERVAL;
-                        let mut snapshot = snapshot;
+            update = observed_updates.changed() => {
+                if update.is_err() {
+                    fatal_error = Some(anyhow!("read-only chain observer stopped unexpectedly"));
+                    break;
+                }
+                match observed_updates.borrow_and_update().clone() {
+                    ObserverUpdate::Snapshot(snapshot) => {
+                        let mut snapshot = observer.latest_snapshot().unwrap_or(snapshot);
                         if let Some(manager) = transactions.as_mut()
                             && let Err(error) = manager.monitor(&client, snapshot.block.number).await
                         {
                             fatal_error = Some(error.context("monitor transaction finality and reorg state"));
                             break;
                         }
-                        refresh_dashboard(
-                            &dashboard,
-                            &dashboard_context,
-                            &snapshot,
-                            transactions.as_ref(),
-                        );
+                        snapshot = observer.latest_snapshot().unwrap_or(snapshot);
                         if let Some(manager) = transactions.as_ref()
                             && should_unlock_recovered_wallet(
                                 transaction_mode,
@@ -666,6 +733,7 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                 "Transaction recovery settled; autonomous Testnet signing is resuming.",
                             );
                         }
+                        snapshot = observer.latest_snapshot().unwrap_or(snapshot);
                         if let (Some(manager), Some(signer)) =
                             (transactions.as_mut(), signer.as_ref())
                         {
@@ -695,7 +763,7 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                 if !finalizing.is_empty() {
                                     mark_dashboard_nodes(
                                         &dashboard,
-                                        finalizing.clone(),
+                                        finalizing,
                                         NodeStatus::Finalizing,
                                         Some("Finalizing expired windows...".to_owned()),
                                     );
@@ -710,17 +778,12 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                 FinalizationOptions {
                                     blocked: &mut blocked_finalizations,
                                     dashboard: &dashboard,
+                                    pending_sync: &dashboard_context.pending_sync,
                                 },
                             )
                             .await
                             {
-                                Ok(true) => match client.snapshot(Some(address)).await {
-                                    Ok(fresh) => snapshot = fresh,
-                                    Err(error) => {
-                                        fatal_error = Some(error.context("refresh after finalization"));
-                                        break;
-                                    }
-                                },
+                                Ok(true) => observer.force_refresh(),
                                 Ok(false) => {}
                                 Err(error) => {
                                     fatal_error = Some(error);
@@ -728,6 +791,7 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                 }
                             }
                         }
+                        snapshot = observer.latest_snapshot().unwrap_or(snapshot);
                         if let Some(manager) = transactions.as_mut()
                             && let Err(error) = manager.reconcile_rewards(&client, &snapshot).await
                         {
@@ -736,84 +800,21 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                 format!("reward-event verification will retry after the next snapshot: {error:#}"),
                             );
                         }
-                        let changed = update_slots(
-                            &slots,
-                            &schedule,
-                            &client.manifest,
-                            address,
-                            &selected,
-                            &snapshot,
-                        )?;
-                        last_snapshot = snapshot;
-                        refresh_dashboard(
-                            &dashboard,
-                            &dashboard_context,
-                            &last_snapshot,
-                            transactions.as_ref(),
-                        );
-                        if dashboard.is_none()
-                            && (changed || last_progress.elapsed() >= PROGRESS_INTERVAL)
-                        {
-                            let elapsed = last_progress.elapsed();
-                            print_progress(
-                                &last_snapshot,
-                                &slots,
-                                total_hashes.swap(0, Ordering::Relaxed),
-                                elapsed,
-                            );
-                            last_progress = time::Instant::now();
-                        }
+                        last_snapshot = observer.latest_snapshot().unwrap_or(snapshot);
                     }
-                    Err(error) => {
-                        consecutive_rpc_errors = consecutive_rpc_errors.saturating_add(1);
-                        if consecutive_rpc_errors == 1 || consecutive_rpc_errors.is_multiple_of(5) {
-                            report_mining_warning(
-                                &dashboard,
-                                format!("RPC refresh failed; stale work stopped: {error:#}"),
-                            );
+                    ObserverUpdate::RpcError { message, report } => {
+                        if report && dashboard.is_none() {
+                            report_mining_warning(&dashboard, message);
                         }
-                        for slot in slots.iter() {
-                            slot.set_work(
-                                &client.manifest,
-                                address,
-                                Address::ZERO,
-                                None,
-                                last_snapshot.block.timestamp,
-                            )?;
-                        }
-                        *schedule
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Vec::new();
-                        if let Some(dashboard) = &dashboard {
-                            let active_nodes = transactions
-                                .as_ref()
-                                .map(TransactionManager::dashboard_activities)
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|activity| (activity.node_id, activity.state))
-                                .collect::<std::collections::HashMap<_, _>>();
-                            dashboard.update(|model| {
-                                model.connection_error = Some(format!("{error:#}"));
-                                for node in &mut model.selected_nodes {
-                                    if let Some(activity) = active_nodes.get(&node.id) {
-                                        node.status = match activity {
-                                            TransactionActivityState::Finalizing => NodeStatus::Finalizing,
-                                            TransactionActivityState::Confirming => NodeStatus::Confirming,
-                                            TransactionActivityState::Recovering => NodeStatus::Recovering,
-                                        };
-                                    } else {
-                                        node.status = NodeStatus::RpcError;
-                                    }
-                                    node.mining_deadline = None;
-                                }
-                            });
-                        } else {
+                        if dashboard.is_none() {
                             total_hashes.store(0, Ordering::Relaxed);
                         }
-                        poll_delay = next_poll_delay(poll_delay);
+                    }
+                    ObserverUpdate::Fatal(error) => {
+                        fatal_error = Some(anyhow!("read-only observer failed: {error}"));
+                        break;
                     }
                 }
-                next_poll = time::Instant::now() + poll_delay;
             }
             _ = progress_ticker.tick() => {
                 let elapsed = last_progress.elapsed();
@@ -893,12 +894,27 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
                                         &dashboard,
                                         confirmed_action_message("proof", &action),
                                     );
+                                    dashboard_context
+                                        .pending_sync
+                                        .write()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .insert(
+                                            proof.node_id,
+                                            PendingDashboardSync {
+                                                window_id,
+                                                receipt_block: action.receipt.block_number,
+                                            },
+                                        );
                                     mark_dashboard_nodes(
                                         &dashboard,
                                         [proof.node_id],
-                                        NodeStatus::Waiting,
-                                        None,
+                                        NodeStatus::Syncing,
+                                        Some(format!(
+                                            "Node {:02} • Syncing accepted proof...",
+                                            proof.node_id
+                                        )),
                                     );
+                                    observer.force_refresh();
                                 }
                                 Err(error) if manager.journal.has_unresolved() => {
                                     fatal_error = Some(error);
@@ -952,6 +968,11 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
 
     if worker_guard.stop_and_join() {
         report_mining_warning(&dashboard, "CPU worker stopped after an internal panic.");
+    }
+    if let Err(error) = observer.stop().await
+        && fatal_error.is_none()
+    {
+        fatal_error = Some(error);
     }
 
     let mut stopped_message = None;
@@ -1010,6 +1031,7 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
 pub(crate) struct FinalizationOptions<'a> {
     pub blocked: &'a mut HashSet<(u8, u64)>,
     pub dashboard: &'a Option<Dashboard>,
+    pub pending_sync: &'a Arc<RwLock<HashMap<u8, PendingDashboardSync>>>,
 }
 
 async fn maybe_finalize_expired(
@@ -1055,7 +1077,23 @@ async fn maybe_finalize_expired(
                     options.dashboard,
                     confirmed_action_message("finalization", &action),
                 );
-                mark_dashboard_nodes(options.dashboard, [node.id], NodeStatus::Waiting, None);
+                options
+                    .pending_sync
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        node.id,
+                        PendingDashboardSync {
+                            window_id: state.work.window_id,
+                            receipt_block: action.receipt.block_number,
+                        },
+                    );
+                mark_dashboard_nodes(
+                    options.dashboard,
+                    [node.id],
+                    NodeStatus::Syncing,
+                    Some(format!("Node {:02} • Syncing finalized window...", node.id)),
+                );
                 finalized_any = true;
             }
             Err(error) if manager.journal.has_unresolved() => return Err(error),
@@ -1153,7 +1191,7 @@ fn selected_nodes(nodes: &[u8]) -> Result<HashSet<u8>> {
     Ok(selected)
 }
 
-fn update_slots(
+pub(crate) fn update_slots(
     slots: &[NodeSlot],
     schedule: &RwLock<Vec<usize>>,
     manifest: &DeploymentManifest,
@@ -1182,37 +1220,450 @@ fn update_slots(
     Ok(changed)
 }
 
-fn dashboard_model(
-    context: &DashboardContext<'_>,
-    snapshot: &ReadSnapshot,
-    transactions: Option<&TransactionManager>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotFreshness {
+    Current,
+    Reorg,
+}
+
+pub(crate) fn start_read_only_observer(
+    client: NetworkClient,
+    context: DashboardContext,
+    initial_snapshot: ReadSnapshot,
+    updater: Option<DashboardUpdater>,
+    diagnostics: DiagnosticBuffer,
+) -> ReadOnlyObserver {
+    let (updates_tx, updates_rx) =
+        watch::channel(ObserverUpdate::Snapshot(initial_snapshot.clone()));
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let (force_refresh, mut refresh_rx) = mpsc::channel(1);
+    let refresh_epoch = Arc::new(AtomicU64::new(0));
+    let refresh_gate = Arc::new(Mutex::new(()));
+    let observer_refresh_epoch = Arc::clone(&refresh_epoch);
+    let observer_refresh_gate = Arc::clone(&refresh_gate);
+    let task = tokio::spawn(async move {
+        let mut last_block = initial_snapshot.block.clone();
+        let mut last_snapshot = initial_snapshot;
+        let mut last_observed_at = Instant::now();
+        let mut delay = POLL_INTERVAL;
+        let mut consecutive_errors = 0_u8;
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                refresh = refresh_rx.recv() => {
+                    if refresh.is_none() {
+                        break;
+                    }
+                }
+                _ = time::sleep(delay) => {}
+            }
+
+            let request_epoch = observer_refresh_epoch.load(Ordering::Acquire);
+            let request_started = Instant::now();
+            let result = client.snapshot(Some(context.address)).await;
+            if observer_refresh_epoch.load(Ordering::Acquire) != request_epoch {
+                delay = Duration::ZERO;
+                continue;
+            }
+            match result {
+                Ok(snapshot) => {
+                    let freshness = snapshot_freshness(&client, &last_block, &snapshot.block).await;
+                    let freshness = match freshness {
+                        Ok(freshness) => freshness,
+                        Err(error) => {
+                            let commit = observer_refresh_gate
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if observer_refresh_epoch.load(Ordering::Acquire) != request_epoch {
+                                drop(commit);
+                                delay = Duration::ZERO;
+                                continue;
+                            }
+                            let message = format!("read-only snapshot rejected: {error:#}");
+                            clear_observed_work(
+                                &context,
+                                &client.manifest,
+                                last_snapshot.block.timestamp,
+                            );
+                            observer_rpc_error(
+                                &client,
+                                &context,
+                                &updater,
+                                &diagnostics,
+                                &last_snapshot,
+                                &message,
+                                &mut consecutive_errors,
+                            );
+                            let report =
+                                consecutive_errors == 1 || consecutive_errors.is_multiple_of(5);
+                            updates_tx.send_replace(ObserverUpdate::RpcError { message, report });
+                            drop(commit);
+                            delay = next_poll_delay(delay);
+                            continue;
+                        }
+                    };
+                    let commit = observer_refresh_gate
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if observer_refresh_epoch.load(Ordering::Acquire) != request_epoch {
+                        drop(commit);
+                        delay = Duration::ZERO;
+                        continue;
+                    }
+                    if freshness == SnapshotFreshness::Reorg {
+                        diagnostics.push(format!(
+                            "canonical chain head changed during observation at block {}",
+                            snapshot.block.number
+                        ));
+                    }
+
+                    if let Err(error) = update_slots(
+                        &context.slots,
+                        &context.schedule,
+                        &client.manifest,
+                        context.address,
+                        &context.selected,
+                        &snapshot,
+                    ) {
+                        let message = format!("update verified mining work: {error:#}");
+                        clear_observed_work(
+                            &context,
+                            &client.manifest,
+                            last_snapshot.block.timestamp,
+                        );
+                        if let Some(updater) = &updater {
+                            updater.update(|model| model.critical_error = Some(message.clone()));
+                        }
+                        diagnostics.push(message.clone());
+                        updates_tx.send_replace(ObserverUpdate::Fatal(message));
+                        drop(commit);
+                        break;
+                    }
+
+                    trace_snapshot_transitions(
+                        &context.selected,
+                        &last_snapshot,
+                        &snapshot,
+                        last_observed_at,
+                        request_started.elapsed(),
+                        updater.as_ref(),
+                        &diagnostics,
+                    );
+                    last_block = snapshot.block.clone();
+                    last_snapshot = snapshot.clone();
+                    last_observed_at = Instant::now();
+                    consecutive_errors = 0;
+                    delay = POLL_INTERVAL;
+                    refresh_dashboard(updater.as_ref(), &context, &snapshot);
+                    updates_tx.send_replace(ObserverUpdate::Snapshot(snapshot));
+                    drop(commit);
+                }
+                Err(error) => {
+                    let commit = observer_refresh_gate
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if observer_refresh_epoch.load(Ordering::Acquire) != request_epoch {
+                        drop(commit);
+                        delay = Duration::ZERO;
+                        continue;
+                    }
+                    let message = format!("RPC refresh failed; stale work stopped: {error:#}");
+                    clear_observed_work(&context, &client.manifest, last_snapshot.block.timestamp);
+                    observer_rpc_error(
+                        &client,
+                        &context,
+                        &updater,
+                        &diagnostics,
+                        &last_snapshot,
+                        &message,
+                        &mut consecutive_errors,
+                    );
+                    let report = consecutive_errors == 1 || consecutive_errors.is_multiple_of(5);
+                    updates_tx.send_replace(ObserverUpdate::RpcError { message, report });
+                    drop(commit);
+                    delay = next_poll_delay(delay);
+                }
+            }
+        }
+    });
+    ReadOnlyObserver {
+        shutdown: shutdown_tx,
+        updates: updates_rx,
+        force_refresh,
+        refresh_epoch,
+        refresh_gate,
+        task,
+    }
+}
+
+async fn snapshot_freshness(
+    client: &NetworkClient,
+    previous: &crate::rpc::BlockSnapshot,
+    next: &crate::rpc::BlockSnapshot,
+) -> Result<SnapshotFreshness> {
+    let previous_canonical = if next.number < previous.number {
+        Some(client.canonical_block_hash(previous.number).await?)
+    } else {
+        None
+    };
+    let next_canonical = if next.number == previous.number && next.hash != previous.hash {
+        Some(client.canonical_block_hash(next.number).await?)
+    } else {
+        None
+    };
+    let freshness = compare_snapshot_freshness(previous, next, previous_canonical, next_canonical)?;
+    if freshness == SnapshotFreshness::Reorg && next.number < previous.number {
+        if client.canonical_block_hash(next.number).await? != next.hash {
+            bail!(
+                "lower snapshot block {} is not the corroborated canonical block",
+                next.number
+            );
+        }
+        let current_head = client.latest_block_snapshot().await?;
+        if current_head.number != next.number || current_head.hash != next.hash {
+            bail!(
+                "lower snapshot block {} is not the current canonical head {}",
+                next.number,
+                current_head.number
+            );
+        }
+    }
+    Ok(freshness)
+}
+
+fn compare_snapshot_freshness(
+    previous: &crate::rpc::BlockSnapshot,
+    next: &crate::rpc::BlockSnapshot,
+    previous_canonical: Option<B256>,
+    next_canonical: Option<B256>,
+) -> Result<SnapshotFreshness> {
+    if next.number < previous.number {
+        match previous_canonical {
+            Some(hash) if hash == previous.hash => bail!(
+                "RPC returned block {} after verified block {} while the previous head remains canonical",
+                next.number,
+                previous.number
+            ),
+            Some(_) => return Ok(SnapshotFreshness::Reorg),
+            None => bail!("cannot establish whether the prior chain head remains canonical"),
+        }
+    }
+    if next.number == previous.number && next.hash != previous.hash {
+        if next_canonical != Some(next.hash) {
+            bail!(
+                "RPC snapshot hash at block {} is not the corroborated canonical hash",
+                next.number
+            );
+        }
+        return Ok(SnapshotFreshness::Reorg);
+    }
+    Ok(SnapshotFreshness::Current)
+}
+
+fn trace_snapshot_transitions(
+    selected: &HashSet<u8>,
+    previous: &ReadSnapshot,
+    current: &ReadSnapshot,
+    previous_observed_at: Instant,
+    request_elapsed: Duration,
+    updater: Option<&DashboardUpdater>,
     diagnostics: &DiagnosticBuffer,
+) {
+    for node_id in selected {
+        let before = previous.nodes.iter().find(|node| node.id == *node_id);
+        let after = current.nodes.iter().find(|node| node.id == *node_id);
+        let before_trusted =
+            before.is_some_and(|node| node.pin.runtime_verified && node.pin.abi_verified);
+        let after_trusted =
+            after.is_some_and(|node| node.pin.runtime_verified && node.pin.abi_verified);
+        let before_state = before
+            .filter(|_| before_trusted)
+            .and_then(|node| node.state.as_ref());
+        let after_state = after
+            .filter(|_| after_trusted)
+            .and_then(|node| node.state.as_ref());
+        let before_window = before_state.map(|state| state.work.window_id);
+        let after_window = after_state.map(|state| state.work.window_id);
+        let before_status = traced_node_status(before_state, before_trusted);
+        let after_status = traced_node_status(after_state, after_trusted);
+        let before_candidate = before_state
+            .and_then(|state| state.candidate.as_ref().map(|candidate| candidate.miner));
+        let after_candidate =
+            after_state.and_then(|state| state.candidate.as_ref().map(|candidate| candidate.miner));
+        let before_expiry = before_state.map(|state| state.work.window_expiry_time);
+        let after_expiry = after_state.map(|state| state.work.window_expiry_time);
+        if before_window == after_window
+            && before_status == after_status
+            && before_candidate == after_candidate
+            && before_expiry == after_expiry
+        {
+            continue;
+        }
+        let observation_interval_ms = Instant::now()
+            .saturating_duration_since(previous_observed_at)
+            .as_millis();
+        let message = format!(
+            "state-transition node={node_id:02} block={}..{} hash={:#x}->{:#x} window={before_window:?}->{after_window:?} status={before_status}->{after_status} candidate={}->{} expiry={before_expiry:?}->{after_expiry:?} chain_ts={} observation_interval_ms={} rpc_ms={}",
+            previous.block.number,
+            current.block.number,
+            previous.block.hash,
+            current.block.hash,
+            display_candidate(before_candidate),
+            display_candidate(after_candidate),
+            current.block.timestamp,
+            observation_interval_ms,
+            request_elapsed.as_millis(),
+        );
+        if updater.is_some() {
+            diagnostics.push(message);
+        } else {
+            eprintln!("astatine: {message}");
+        }
+    }
+}
+
+fn traced_node_status(state: Option<&NodeState>, trusted: bool) -> &'static str {
+    if !trusted || state.is_none() {
+        return "RPC ERROR";
+    }
+    let state = state.expect("checked above");
+    if state.mining_paused {
+        "PAUSED"
+    } else if !state.work.started || state.work.ended || state.work.remaining_allocation.is_zero() {
+        "ENDED"
+    } else if state.finalizable {
+        "FINALIZING"
+    } else if state.eligible {
+        "MINING"
+    } else {
+        "WAITING"
+    }
+}
+
+fn display_candidate(candidate: Option<Address>) -> String {
+    candidate
+        .map(|address| format!("{address:#x}"))
+        .unwrap_or_else(|| "None".to_owned())
+}
+
+fn clear_observed_work(
+    context: &DashboardContext,
+    manifest: &DeploymentManifest,
+    block_timestamp: u64,
+) {
+    for slot in context.slots.iter() {
+        let _ = slot.set_work(
+            manifest,
+            context.address,
+            Address::ZERO,
+            None,
+            block_timestamp,
+        );
+    }
+    *context
+        .schedule
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Vec::new();
+}
+
+fn observer_rpc_error(
+    _client: &NetworkClient,
+    context: &DashboardContext,
+    updater: &Option<DashboardUpdater>,
+    diagnostics: &DiagnosticBuffer,
+    last_snapshot: &ReadSnapshot,
+    message: &str,
+    consecutive_errors: &mut u8,
+) {
+    *consecutive_errors = consecutive_errors.saturating_add(1);
+    if *consecutive_errors == 1 || consecutive_errors.is_multiple_of(5) {
+        diagnostics.push(message.to_owned());
+    }
+    refresh_dashboard(updater.as_ref(), context, last_snapshot);
+    if let Some(updater) = updater {
+        let activities = context
+            .transaction_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .activities
+            .clone();
+        updater.update(|model| {
+            model.connection_error = Some(message.to_owned());
+            for node in &mut model.selected_nodes {
+                if let Some(activity) = activities
+                    .iter()
+                    .find(|item| item.node_id == node.id && node.window_id == Some(item.window_id))
+                {
+                    node.status = match activity.state {
+                        TransactionActivityState::Finalizing => NodeStatus::Finalizing,
+                        TransactionActivityState::Confirming => NodeStatus::Confirming,
+                        TransactionActivityState::Recovering => NodeStatus::Recovering,
+                    };
+                } else {
+                    node.status = NodeStatus::RpcError;
+                }
+            }
+        });
+    }
+}
+
+fn dashboard_model(
+    context: &DashboardContext,
+    snapshot: &ReadSnapshot,
+    observed_at: Instant,
 ) -> DashboardModel {
     let mut selected_ids = context.selected.iter().copied().collect::<Vec<_>>();
     selected_ids.sort_unstable();
-    let activities = transactions
-        .map(TransactionManager::dashboard_activities)
-        .unwrap_or_default();
+    let transaction_state = context
+        .transaction_state
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let pending_sync = context
+        .pending_sync
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let mut nodes = Vec::with_capacity(selected_ids.len());
     let mut first_error = None;
     for id in selected_ids {
         let view = snapshot.nodes.iter().find(|node| node.id == id);
         let trusted = view.is_some_and(|node| node.pin.runtime_verified && node.pin.abi_verified);
-        let state = view.and_then(|node| node.state.as_ref());
-        let activity = activities.iter().find(|activity| activity.node_id == id);
+        let state = view
+            .filter(|_| trusted)
+            .and_then(|node| node.state.as_ref());
+        let activity = transaction_state.activities.iter().find(|activity| {
+            activity.node_id == id
+                && state.is_some_and(|state| state.work.window_id == activity.window_id)
+        });
         let slot_work = context.slots[usize::from(id - 1)].current_work();
-        let status = dashboard_node_status(
+        let mut status = dashboard_node_status(
             state,
             trusted,
-            context.workers_started && slot_work.is_some(),
+            context.workers_started.load(Ordering::Acquire) && slot_work.is_some(),
             activity.map(|activity| activity.state),
         );
+        let pending = pending_sync.get(&id).copied();
+        let syncing = pending.is_some_and(|pending| {
+            activity.is_none()
+                && (snapshot.block.number < pending.receipt_block
+                    || !trusted
+                    || state.is_none()
+                    || state.is_some_and(|state| state.work.window_id < pending.window_id))
+        });
+        if syncing {
+            status = NodeStatus::Syncing;
+        }
         if first_error.is_none() {
             first_error = view
                 .and_then(|node| node.error.as_deref().or(node.pin.error.as_deref()))
                 .map(str::to_owned);
         }
-        let candidate = trusted
+        let candidate = (!syncing && trusted)
             .then(|| {
                 state.and_then(|state| state.candidate.as_ref().map(|candidate| candidate.miner))
             })
@@ -1222,24 +1673,22 @@ fn dashboard_model(
             .flatten();
         nodes.push(DashboardNode {
             id,
+            window_id: state.map(|state| state.work.window_id),
             status,
-            expiry_timestamp: state
-                .filter(|state| state.eligible)
-                .map(|state| state.work.window_expiry_time),
+            expiry_timestamp: state.map(|state| state.work.window_expiry_time),
             mining_deadline: slot_work.map(|work| work.valid_until),
+            countdown: state.map(|state| {
+                WindowCountdown::from_snapshot(
+                    state.work.window_id,
+                    state.work.window_expiry_time,
+                    snapshot.block.timestamp,
+                    observed_at,
+                )
+            }),
             candidate,
             reward,
         });
     }
-    let session_exposure = transactions.and_then(|manager| match manager.session_exposure() {
-        Ok(exposure) => exposure,
-        Err(error) => {
-            diagnostics.push(format!(
-                "dashboard could not read transaction session exposure: {error:#}"
-            ));
-            None
-        }
-    });
     DashboardModel {
         network: context.network,
         chain_id: context.chain_id,
@@ -1247,20 +1696,70 @@ fn dashboard_model(
         inj_balance: snapshot.native_balance,
         cpu_threads: context.threads,
         session_limit: Some(context.spending_limit),
-        session_exposure,
+        session_exposure: transaction_state.session_exposure,
         block_number: snapshot.block.number,
-        block_timestamp: snapshot.block.timestamp,
-        snapshot_observed_at: Instant::now(),
+        block_hash: snapshot.block.hash,
+        snapshot_observed_at: observed_at,
+        snapshot_ready: true,
         selected_nodes: nodes,
         compute_only: context.compute_only,
         signing_enabled: context.transaction_mode,
-        recovering: transactions.is_some_and(|manager| manager.journal.has_unresolved()),
+        recovering: transaction_state
+            .activities
+            .iter()
+            .any(|activity| activity.state == TransactionActivityState::Recovering),
         stopping: false,
         hashrate: 0.0,
         current_action: None,
         connection_error: first_error,
         critical_error: None,
     }
+}
+
+fn initial_dashboard_model(
+    context: &DashboardContext,
+    transaction_state: &TransactionDashboardState,
+) -> DashboardModel {
+    let mut selected_nodes = context
+        .selected
+        .iter()
+        .copied()
+        .map(|id| DashboardNode {
+            id,
+            window_id: None,
+            status: NodeStatus::Waiting,
+            expiry_timestamp: None,
+            mining_deadline: None,
+            countdown: None,
+            candidate: None,
+            reward: None,
+        })
+        .collect::<Vec<_>>();
+    selected_nodes.sort_by_key(|node| node.id);
+    let mut model = DashboardModel {
+        network: context.network,
+        chain_id: context.chain_id,
+        wallet: context.address,
+        inj_balance: None,
+        cpu_threads: context.threads,
+        session_limit: Some(context.spending_limit),
+        session_exposure: transaction_state.session_exposure,
+        block_number: 0,
+        block_hash: B256::ZERO,
+        snapshot_observed_at: Instant::now(),
+        snapshot_ready: false,
+        selected_nodes,
+        compute_only: context.compute_only,
+        signing_enabled: context.transaction_mode,
+        recovering: false,
+        stopping: false,
+        hashrate: 0.0,
+        current_action: None,
+        connection_error: None,
+        critical_error: None,
+    };
+    apply_transaction_state_to_model(&mut model, transaction_state);
+    model
 }
 
 fn dashboard_node_status(
@@ -1292,20 +1791,69 @@ fn dashboard_node_status(
 }
 
 fn refresh_dashboard(
-    dashboard: &Option<Dashboard>,
-    context: &DashboardContext<'_>,
+    updater: Option<&DashboardUpdater>,
+    context: &DashboardContext,
     snapshot: &ReadSnapshot,
-    transactions: Option<&TransactionManager>,
 ) {
-    let Some(dashboard) = dashboard else {
+    let Some(updater) = updater else {
         return;
     };
-    let diagnostics = dashboard.diagnostics();
-    let updated = dashboard_model(context, snapshot, transactions, &diagnostics);
-    dashboard.update(|model| {
+    let observed_at = Instant::now();
+    {
+        let mut pending = context
+            .pending_sync
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.retain(|node_id, action| {
+            snapshot.block.number < action.receipt_block
+                || !snapshot.nodes.iter().any(|node| {
+                    node.id == *node_id
+                        && node.pin.runtime_verified
+                        && node.pin.abi_verified
+                        && node
+                            .state
+                            .as_ref()
+                            .is_some_and(|state| state.work.window_id >= action.window_id)
+                })
+        });
+    }
+    let mut updated = dashboard_model(context, snapshot, observed_at);
+    let chain_timestamp = snapshot.block.timestamp;
+    updater.update(|model| {
         let hashrate = model.hashrate;
+        for node in &mut updated.selected_nodes {
+            let Some(previous) = model.selected_nodes.iter().find(|old| old.id == node.id) else {
+                continue;
+            };
+            if node.window_id.is_some() && node.window_id == previous.window_id {
+                if let (Some(previous_clock), Some(new_clock)) =
+                    (previous.countdown.as_ref(), node.countdown.as_ref())
+                {
+                    node.countdown = Some(previous_clock.reconcile_same_window(
+                        new_clock.expiry_timestamp,
+                        chain_timestamp,
+                        observed_at,
+                    ));
+                }
+            } else if node.status == NodeStatus::RpcError && node.window_id.is_none() {
+                node.window_id = previous.window_id;
+                node.expiry_timestamp = previous.expiry_timestamp;
+                node.countdown = previous
+                    .countdown
+                    .as_ref()
+                    .map(|countdown| countdown.reanchor(observed_at));
+                node.candidate = previous.candidate;
+                node.reward = previous.reward;
+            }
+        }
         *model = updated;
         model.hashrate = hashrate;
+        let transaction_state = context
+            .transaction_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        apply_transaction_state_to_model(model, &transaction_state);
     });
 }
 
@@ -1323,7 +1871,9 @@ fn mark_dashboard_nodes(
         for node in &mut model.selected_nodes {
             if node_ids.contains(&node.id) {
                 node.status = status;
-                node.mining_deadline = None;
+                if status == NodeStatus::Syncing {
+                    node.candidate = None;
+                }
             }
         }
         model.current_action = action;
@@ -1333,47 +1883,77 @@ fn mark_dashboard_nodes(
 fn connect_transaction_dashboard(
     transactions: &mut Option<TransactionManager>,
     dashboard: &Option<Dashboard>,
+    transaction_state: Arc<RwLock<TransactionDashboardState>>,
 ) {
-    let (Some(manager), Some(dashboard)) = (transactions.as_mut(), dashboard.as_ref()) else {
+    let Some(manager) = transactions.as_mut() else {
         return;
     };
-    let updater = dashboard.updater();
+    let updater = dashboard.as_ref().map(Dashboard::updater);
     manager.set_dashboard_sink(Arc::new(move |state| {
-        apply_transaction_dashboard_state(&updater, state);
+        *transaction_state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state.clone();
+        if let Some(updater) = &updater {
+            updater.update(|model| apply_transaction_state_to_model(model, &state));
+        }
     }));
 }
 
-fn apply_transaction_dashboard_state(updater: &DashboardUpdater, state: TransactionDashboardState) {
-    updater.update(|model| {
-        model.session_exposure = state.session_exposure;
-        model.recovering = state
-            .activities
-            .iter()
-            .any(|activity| activity.state == TransactionActivityState::Recovering);
-        for activity in &state.activities {
-            let Some(node) = model
-                .selected_nodes
-                .iter_mut()
-                .find(|node| node.id == activity.node_id)
-            else {
-                continue;
-            };
+fn apply_transaction_state_to_model(model: &mut DashboardModel, state: &TransactionDashboardState) {
+    model.session_exposure = state.session_exposure;
+    model.recovering = state
+        .activities
+        .iter()
+        .any(|activity| activity.state == TransactionActivityState::Recovering);
+    for activity in &state.activities {
+        let Some(node) = model
+            .selected_nodes
+            .iter_mut()
+            .find(|node| node.id == activity.node_id)
+        else {
+            continue;
+        };
+        if node.window_id == Some(activity.window_id) {
             node.status = match activity.state {
                 TransactionActivityState::Finalizing => NodeStatus::Finalizing,
                 TransactionActivityState::Confirming => NodeStatus::Confirming,
                 TransactionActivityState::Recovering => NodeStatus::Recovering,
             };
-            node.mining_deadline = None;
         }
-        model.current_action = state.activities.first().map(|activity| {
-            let action = match activity.state {
-                TransactionActivityState::Finalizing => "Finalizing window...",
-                TransactionActivityState::Confirming => "Confirming transaction...",
-                TransactionActivityState::Recovering => "Recovering transaction...",
-            };
-            format!("Node {:02} • {action}", activity.node_id)
-        });
+    }
+    model.current_action = state.activities.first().map(|activity| {
+        let action = match activity.state {
+            TransactionActivityState::Finalizing => "Finalizing window",
+            TransactionActivityState::Confirming => "Confirming transaction",
+            TransactionActivityState::Recovering => "Recovering transaction",
+        };
+        format!(
+            "Node {:02} window #{} • {action}...",
+            activity.node_id, activity.window_id
+        )
     });
+}
+
+fn initial_transaction_dashboard_state(
+    manager: Option<&TransactionManager>,
+    diagnostics: &DiagnosticBuffer,
+) -> TransactionDashboardState {
+    let Some(manager) = manager else {
+        return TransactionDashboardState::default();
+    };
+    let session_exposure = match manager.session_exposure() {
+        Ok(exposure) => exposure,
+        Err(error) => {
+            diagnostics.push(format!(
+                "dashboard could not read transaction session exposure: {error:#}"
+            ));
+            None
+        }
+    };
+    TransactionDashboardState {
+        session_exposure,
+        activities: manager.dashboard_activities(),
+    }
 }
 
 fn report_mining_info(dashboard: &Option<Dashboard>, message: impl Into<String>) {
@@ -1599,8 +2179,9 @@ fn network_label(network: crate::cli::Network) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        DashboardContext, NodeSlot, NonceAllocator, dashboard_model, dashboard_node_status,
-        next_poll_delay, next_scheduled_slot, selected_nodes, should_unlock_recovered_wallet,
+        DashboardContext, NodeSlot, NonceAllocator, PendingDashboardSync, SnapshotFreshness,
+        compare_snapshot_freshness, dashboard_model, dashboard_node_status, next_poll_delay,
+        next_scheduled_slot, selected_nodes, should_unlock_recovered_wallet, update_slots,
         worker_loop,
     };
     use crate::{
@@ -1608,23 +2189,22 @@ mod tests {
         config::ConfigStore,
         dashboard::NodeStatus,
         deployment::DeploymentManifest,
-        diagnostics::DiagnosticBuffer,
         protocol::{WorkContext, WorkHasher, meets_target},
         rpc::{
             BlockSnapshot, CandidateInfo, ContractPinStatus, NodeState, NodeView, ReadSnapshot,
             WorkInfo,
         },
-        transaction::TransactionActivityState,
+        transaction::{TransactionActivityState, TransactionDashboardState},
     };
     use alloy_primitives::{Address, B256, Bytes, U256};
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         sync::{
             Arc, RwLock,
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tempfile::tempdir;
     use tokio::sync::mpsc;
@@ -1724,8 +2304,9 @@ mod tests {
 
     #[test]
     fn dashboard_model_sorts_and_only_copies_selected_nodes() {
-        let slots = (1..=9).map(NodeSlot::new).collect::<Vec<_>>();
+        let slots = Arc::new((1..=9).map(NodeSlot::new).collect::<Vec<_>>());
         let selected = HashSet::from([7, 1, 3]);
+        let schedule = Arc::new(RwLock::new(Vec::new()));
         let nodes = [7, 2, 3, 1]
             .into_iter()
             .map(|id| NodeView {
@@ -1760,12 +2341,30 @@ mod tests {
             spending_limit: U256::ZERO,
             transaction_mode: false,
             compute_only: true,
-            workers_started: false,
-            selected: &selected,
-            slots: &slots,
+            workers_started: Arc::new(AtomicBool::new(true)),
+            selected: selected.clone(),
+            slots: Arc::clone(&slots),
+            schedule: Arc::clone(&schedule),
+            transaction_state: Arc::new(RwLock::new(TransactionDashboardState::default())),
+            pending_sync: Arc::new(RwLock::new(HashMap::new())),
         };
+        update_slots(
+            &slots,
+            &schedule,
+            &DeploymentManifest::load(Network::Testnet).unwrap(),
+            context.address,
+            &selected,
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            *schedule
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            [0, 2, 6]
+        );
 
-        let model = dashboard_model(&context, &snapshot, None, &DiagnosticBuffer::default());
+        let model = dashboard_model(&context, &snapshot, Instant::now());
         assert_eq!(
             model
                 .selected_nodes
@@ -1774,6 +2373,160 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 3, 7]
         );
+    }
+
+    #[test]
+    fn snapshot_freshness_rejects_stale_heads_and_accepts_corroborated_reorgs() {
+        let previous = BlockSnapshot {
+            number: 100,
+            timestamp: 1_000,
+            hash: B256::with_last_byte(1),
+        };
+        let same = previous.clone();
+        assert_eq!(
+            compare_snapshot_freshness(&previous, &same, None, None).unwrap(),
+            SnapshotFreshness::Current
+        );
+
+        let higher = BlockSnapshot {
+            number: 101,
+            timestamp: 1_001,
+            hash: B256::with_last_byte(2),
+        };
+        assert_eq!(
+            compare_snapshot_freshness(&previous, &higher, None, None).unwrap(),
+            SnapshotFreshness::Current
+        );
+
+        let stale = BlockSnapshot {
+            number: 99,
+            timestamp: 999,
+            hash: B256::with_last_byte(3),
+        };
+        assert!(compare_snapshot_freshness(&previous, &stale, Some(previous.hash), None).is_err());
+        assert_eq!(
+            compare_snapshot_freshness(&previous, &stale, Some(B256::with_last_byte(4)), None,)
+                .unwrap(),
+            SnapshotFreshness::Reorg
+        );
+
+        let same_height_reorg = BlockSnapshot {
+            number: previous.number,
+            timestamp: 1_000,
+            hash: B256::with_last_byte(5),
+        };
+        assert!(compare_snapshot_freshness(&previous, &same_height_reorg, None, None).is_err());
+        assert_eq!(
+            compare_snapshot_freshness(
+                &previous,
+                &same_height_reorg,
+                None,
+                Some(same_height_reorg.hash),
+            )
+            .unwrap(),
+            SnapshotFreshness::Reorg
+        );
+    }
+
+    #[test]
+    fn accepted_proof_waits_for_receipt_block_then_uses_only_verified_best_candidate() {
+        let wallet = Address::with_last_byte(9);
+        let selected = HashSet::from([1_u8]);
+        let slots = Arc::new((1..=9).map(NodeSlot::new).collect::<Vec<_>>());
+        let schedule = Arc::new(RwLock::new(Vec::new()));
+        let mut state = eligible_state();
+        let initial_view = NodeView {
+            id: 1,
+            address: Address::with_last_byte(1),
+            pin: ContractPinStatus {
+                runtime_verified: true,
+                abi_verified: true,
+                error: None,
+            },
+            state: Some(state.clone()),
+            error: None,
+        };
+        let mut snapshot = ReadSnapshot {
+            block: BlockSnapshot {
+                number: 9,
+                timestamp: 100,
+                hash: B256::with_last_byte(9),
+            },
+            native_balance: Some(U256::from(1_000)),
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![initial_view],
+        };
+        let manifest = DeploymentManifest::load(Network::Testnet).unwrap();
+        update_slots(&slots, &schedule, &manifest, wallet, &selected, &snapshot).unwrap();
+        let context = DashboardContext {
+            network: Network::Testnet,
+            chain_id: 1439,
+            address: wallet,
+            threads: 2,
+            spending_limit: U256::ZERO,
+            transaction_mode: false,
+            compute_only: false,
+            workers_started: Arc::new(AtomicBool::new(true)),
+            selected: selected.clone(),
+            slots: Arc::clone(&slots),
+            schedule: Arc::clone(&schedule),
+            transaction_state: Arc::new(RwLock::new(TransactionDashboardState::default())),
+            pending_sync: Arc::new(RwLock::new(HashMap::from([(
+                1,
+                PendingDashboardSync {
+                    window_id: state.work.window_id,
+                    receipt_block: 10,
+                },
+            )]))),
+        };
+
+        let syncing = dashboard_model(&context, &snapshot, Instant::now());
+        assert_eq!(syncing.selected_nodes[0].status, NodeStatus::Syncing);
+        assert_eq!(syncing.selected_nodes[0].candidate, None);
+        assert_eq!(
+            syncing.selected_nodes[0].window_id,
+            Some(state.work.window_id)
+        );
+
+        state.candidate = Some(CandidateInfo {
+            miner: wallet,
+            nonce: 17,
+            work_hash: B256::with_last_byte(3),
+            submitted_at: 101,
+            header: Bytes::new(),
+            first_valid_solve_secs: 1,
+        });
+        snapshot.block.number = 10;
+        snapshot.nodes[0].state = Some(state.clone());
+        let verified = dashboard_model(&context, &snapshot, Instant::now());
+        assert_eq!(verified.selected_nodes[0].status, NodeStatus::Mining);
+        assert_eq!(verified.selected_nodes[0].candidate, Some(wallet));
+
+        state.candidate.as_mut().unwrap().miner = Address::with_last_byte(8);
+        snapshot.block.number = 11;
+        snapshot.nodes[0].state = Some(state.clone());
+        let replaced = dashboard_model(&context, &snapshot, Instant::now());
+        assert_eq!(
+            replaced.selected_nodes[0].candidate,
+            Some(Address::with_last_byte(8))
+        );
+
+        state.work.window_id = 8;
+        state.work.window_expiry_time = 260;
+        state.candidate = None;
+        snapshot.block.number = 11;
+        snapshot.block.timestamp = 200;
+        snapshot.nodes[0].state = Some(state);
+        update_slots(&slots, &schedule, &manifest, wallet, &selected, &snapshot).unwrap();
+        let next_window = dashboard_model(&context, &snapshot, Instant::now());
+        assert_eq!(next_window.selected_nodes[0].window_id, Some(8));
+        assert_eq!(next_window.selected_nodes[0].candidate, None);
+        let next_window_time_left = next_window.selected_nodes[0]
+            .time_left(Instant::now())
+            .unwrap();
+        assert!((58..=60).contains(&next_window_time_left));
     }
 
     #[test]
