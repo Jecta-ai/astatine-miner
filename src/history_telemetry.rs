@@ -81,17 +81,13 @@ impl HistoryTelemetry {
 
     pub(crate) fn add(&self, counter: HistoryCounter, value: u64) {
         let counter = &self.counters[counter as usize];
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_add(value))
-        });
+        saturating_add(counter, value);
     }
 
     pub(crate) fn add_elapsed(&self, duration: HistoryDuration, elapsed: Duration) {
         let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
         let counter = &self.durations_micros[duration as usize];
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_add(micros))
-        });
+        saturating_add(counter, micros);
     }
 
     pub(crate) fn count(&self, counter: HistoryCounter) -> u64 {
@@ -141,6 +137,17 @@ impl HistoryTelemetry {
     }
 }
 
+fn saturating_add(counter: &AtomicU64, value: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_add(value);
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 impl Drop for HistoryTimer {
     fn drop(&mut self) {
         self.telemetry
@@ -150,7 +157,8 @@ impl Drop for HistoryTimer {
 
 #[cfg(test)]
 mod tests {
-    use super::{HistoryCounter, HistoryDuration, HistoryTelemetry};
+    use super::{HistoryCounter, HistoryDuration, HistoryTelemetry, saturating_add};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     #[test]
@@ -167,5 +175,13 @@ mod tests {
         assert!(line.contains("eth_getLogs=2"));
         assert!(line.contains("reward_reconciliation_ms=17.000"));
         assert!(!line.contains("0x"));
+    }
+
+    #[test]
+    fn telemetry_counters_saturate_without_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        saturating_add(&counter, 2);
+        saturating_add(&counter, 1);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }
