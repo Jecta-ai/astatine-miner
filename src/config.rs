@@ -102,6 +102,7 @@ impl ConfigStore {
     }
 
     pub fn prepare_wallet_dir(&self) -> Result<PathBuf> {
+        ensure_private_directory(&self.root)?;
         let directory = self.wallet_dir();
         ensure_private_directory(&directory)?;
         Ok(directory)
@@ -140,6 +141,7 @@ impl ConfigStore {
 
     pub fn read_keystore(&self, address: Address) -> Result<Vec<u8>> {
         let path = self.keystore_path(address);
+        ensure_private_directory(&self.root)?;
         ensure_private_directory(&self.wallet_dir())?;
         let contents = read_regular_limited(&path, MAX_KEYSTORE_BYTES, true)
             .context("read encrypted wallet file")?;
@@ -255,6 +257,7 @@ impl ConfigStore {
     }
 
     fn transaction_journal_path(&self) -> Result<PathBuf> {
+        ensure_private_directory(&self.root)?;
         let directory = self.root.join("transactions");
         ensure_private_directory(&directory)?;
         Ok(directory.join("journal.json"))
@@ -269,7 +272,10 @@ impl ConfigStore {
         {
             bail!("transaction archive name is invalid");
         }
-        let directory = self.root.join("transactions").join("archives");
+        ensure_private_directory(&self.root)?;
+        let transaction_dir = self.root.join("transactions");
+        ensure_private_directory(&transaction_dir)?;
+        let directory = transaction_dir.join("archives");
         ensure_private_directory(&directory)?;
         Ok(directory.join(name))
     }
@@ -278,10 +284,7 @@ impl ConfigStore {
 fn system_config_dir() -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        if let Some(app_data) = env::var_os("APPDATA").filter(|value| !value.is_empty()) {
-            return Ok(PathBuf::from(app_data).join("Astatine"));
-        }
-        bail!("APPDATA is not set; cannot locate the user configuration directory");
+        return windows_config_dir(env::var_os("APPDATA").as_deref());
     }
 
     #[cfg(target_os = "macos")]
@@ -297,17 +300,10 @@ fn system_config_dir() -> Result<PathBuf> {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if let Some(config_home) = env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
-        {
-            let config_home = PathBuf::from(config_home);
-            if config_home.is_absolute() {
-                return Ok(config_home.join("astatine"));
-            }
-        }
-        let home = env::var_os("HOME").filter(|value| !value.is_empty());
-        let home =
-            home.context("HOME is not set; cannot locate the user configuration directory")?;
-        Ok(PathBuf::from(home).join(".config").join("astatine"))
+        xdg_config_dir(
+            env::var_os("XDG_CONFIG_HOME").as_deref(),
+            env::var_os("HOME").as_deref(),
+        )
     }
 
     #[cfg(not(any(unix, target_os = "windows")))]
@@ -318,6 +314,35 @@ fn system_config_dir() -> Result<PathBuf> {
         let home = home.context("home directory is not set; cannot locate configuration")?;
         Ok(PathBuf::from(home).join(".astatine"))
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_config_dir(app_data: Option<&std::ffi::OsStr>) -> Result<PathBuf> {
+    let app_data = app_data
+        .filter(|value| !value.is_empty())
+        .context("APPDATA is not set; cannot locate the user configuration directory")?;
+    let app_data = PathBuf::from(app_data);
+    if !app_data.is_absolute() {
+        bail!("APPDATA must be an absolute user configuration directory");
+    }
+    Ok(app_data.join("Astatine"))
+}
+
+#[cfg(all(unix, any(not(target_os = "macos"), test)))]
+fn xdg_config_dir(
+    config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    if let Some(config_home) = config_home.filter(|value| !value.is_empty()) {
+        let config_home = PathBuf::from(config_home);
+        if config_home.is_absolute() {
+            return Ok(config_home.join("astatine"));
+        }
+    }
+    let home = home
+        .filter(|value| !value.is_empty())
+        .context("HOME is not set; cannot locate the user configuration directory")?;
+    Ok(PathBuf::from(home).join(".config").join("astatine"))
 }
 
 pub fn conservative_thread_budget() -> usize {
@@ -666,10 +691,14 @@ fn persist_error(error: PersistError, operation: &str) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::windows_config_dir;
+    #[cfg(unix)]
+    use super::xdg_config_dir;
     use super::{AppConfig, ConfigStore, parse_inj_wei, read_regular_limited};
     use crate::cli::Network;
     use alloy_primitives::U256;
-    use std::path::PathBuf;
+    use std::{ffi::OsStr, path::PathBuf};
 
     #[test]
     fn decimal_inj_conversion_is_exact() {
@@ -699,6 +728,94 @@ mod tests {
             ..config
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_config_directory_obeys_xdg_and_falls_back_for_relative_values() {
+        assert_eq!(
+            xdg_config_dir(
+                Some(OsStr::new("/tmp/xdg-config")),
+                Some(OsStr::new("/home/miner")),
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/xdg-config/astatine")
+        );
+        assert_eq!(
+            xdg_config_dir(
+                Some(OsStr::new("relative-config")),
+                Some(OsStr::new("/home/miner")),
+            )
+            .unwrap(),
+            PathBuf::from("/home/miner/.config/astatine")
+        );
+        assert!(xdg_config_dir(None, None).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_directory_requires_appdata() {
+        assert!(windows_config_dir(None).is_err());
+        assert!(windows_config_dir(Some(OsStr::new(""))).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_directory_uses_appdata_and_private_storage_handles_unicode_paths() {
+        let app_data = OsStr::new(r"C:\Users\miner\AppData\Roaming");
+        assert_eq!(
+            windows_config_dir(Some(app_data)).unwrap(),
+            PathBuf::from(r"C:\Users\miner\AppData\Roaming\Astatine")
+        );
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("Astatine ü data");
+        let store = ConfigStore::at_root(root);
+        let mut config = AppConfig::default();
+        config.network = Network::Testnet;
+        store.save(&config).unwrap();
+        assert_eq!(store.load().unwrap(), config);
+
+        let address = alloy_primitives::Address::with_last_byte(0x42);
+        store
+            .store_keystore(address, b"private-keystore-bytes")
+            .unwrap();
+        assert_eq!(
+            store.read_keystore(address).unwrap(),
+            b"private-keystore-bytes"
+        );
+
+        let first_lock = store.lock_transaction_journal().unwrap();
+        assert!(store.lock_transaction_journal().is_err());
+        drop(first_lock);
+        assert!(store.lock_transaction_journal().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_point_storage_roots_are_rejected() {
+        use std::process::Command;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target");
+        let junction = temporary.path().join("private-root-junction");
+        std::fs::create_dir(&target).unwrap();
+        let result = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "could not create test junction: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            ConfigStore::at_root(junction)
+                .save(&AppConfig::default())
+                .is_err()
+        );
     }
 
     #[test]
@@ -751,5 +868,19 @@ mod tests {
 
         assert!(read_regular_limited(&symlink, 1_024, false).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sensitive_storage_root_does_not_follow_symlinks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target");
+        let linked_root = temporary.path().join("linked-root");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &linked_root).unwrap();
+
+        let store = ConfigStore::at_root(linked_root);
+        assert!(store.prepare_wallet_dir().is_err());
+        assert!(!target.join("wallets").exists());
     }
 }

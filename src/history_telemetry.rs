@@ -4,7 +4,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-const COUNTER_COUNT: usize = 25;
+const COUNTER_COUNT: usize = 28;
 const DURATION_COUNT: usize = 7;
 
 #[derive(Clone, Copy)]
@@ -35,6 +35,9 @@ pub(crate) enum HistoryCounter {
     RewardCursorResets,
     RewardScanErrors,
     RewardEvidenceVerified,
+    RewardServiceCalls,
+    RewardCandidates,
+    RewardCandidatesWaitingForWindow,
 }
 
 #[derive(Clone, Copy)]
@@ -100,7 +103,7 @@ impl HistoryTelemetry {
 
     pub(crate) fn format_profile(&self) -> String {
         format!(
-            "history-profile canonical_block_requests={} receipt_requests={} transaction_lookups={} nonce_lookups={} historical_head_requests={} eth_getLogs={} block_ranges={} settled_canonical_checks={} deep_settled_skipped={} reward_scan_batches={} reward_scan_jobs={} reward_cursor_hits={} reward_cursor_resets={} reward_scan_errors={} reward_evidence_verified={} rpc_errors={} rpc_retries={} journal_writes={} journal_write_bytes={} journal_write_failures={} archive_files_validated={} archive_entries_validated={} archive_files_created={} archive_write_failures={} archive_validation_failures={} journal_open_ms={:.3} archive_validation_ms={:.3} receipt_recovery_ms={:.3} receipt_monitor_ms={:.3} reward_reconciliation_ms={:.3} journal_persist_ms={:.3} historical_rpc_ms={:.3}",
+            "history-profile canonical_block_requests={} receipt_requests={} transaction_lookups={} nonce_lookups={} historical_head_requests={} eth_getLogs={} block_ranges={} settled_canonical_checks={} deep_settled_skipped={} reward_scan_batches={} reward_scan_jobs={} reward_cursor_hits={} reward_cursor_resets={} reward_scan_errors={} reward_evidence_verified={} reward_service_calls={} reward_candidates={} reward_candidates_waiting_for_window={} rpc_errors={} rpc_retries={} journal_writes={} journal_write_bytes={} journal_write_failures={} archive_files_validated={} archive_entries_validated={} archive_files_created={} archive_write_failures={} archive_validation_failures={} journal_open_ms={:.3} archive_validation_ms={:.3} receipt_recovery_ms={:.3} receipt_monitor_ms={:.3} reward_reconciliation_ms={:.3} journal_persist_ms={:.3} historical_rpc_ms={:.3}",
             self.count(HistoryCounter::CanonicalBlockRequests),
             self.count(HistoryCounter::ReceiptRequests),
             self.count(HistoryCounter::TransactionLookupRequests),
@@ -116,6 +119,9 @@ impl HistoryTelemetry {
             self.count(HistoryCounter::RewardCursorResets),
             self.count(HistoryCounter::RewardScanErrors),
             self.count(HistoryCounter::RewardEvidenceVerified),
+            self.count(HistoryCounter::RewardServiceCalls),
+            self.count(HistoryCounter::RewardCandidates),
+            self.count(HistoryCounter::RewardCandidatesWaitingForWindow),
             self.count(HistoryCounter::RpcErrors),
             self.count(HistoryCounter::RpcRetries),
             self.count(HistoryCounter::JournalWrites),

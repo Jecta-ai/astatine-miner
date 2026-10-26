@@ -2247,7 +2247,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             read_http_request(&mut stream);
-            thread::sleep(Duration::from_millis(150));
+            thread::sleep(Duration::from_millis(1_500));
             let body = rpc_result(serde_json::json!("0x59f"));
             let _ = write!(
                 stream,
@@ -2259,7 +2259,7 @@ mod tests {
             name: "delayed-primary".to_owned(),
             url: Url::parse(&format!("http://{address}")).unwrap(),
             client: reqwest::Client::builder()
-                .timeout(Duration::from_millis(50))
+                .timeout(Duration::from_secs(1))
                 .build()
                 .unwrap(),
         };

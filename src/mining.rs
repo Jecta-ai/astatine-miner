@@ -754,6 +754,10 @@ pub(crate) struct MiningProbe {
     pub(crate) proof_telemetry: Arc<ProofPipelineTelemetry>,
     pub(crate) worker_threads: usize,
     #[cfg(test)]
+    pub(crate) transaction_state: Arc<RwLock<TransactionDashboardState>>,
+    #[cfg(test)]
+    pub(crate) history_telemetry: Arc<crate::history_telemetry::HistoryTelemetry>,
+    #[cfg(test)]
     pub(crate) proof_processing_gate: watch::Sender<bool>,
 }
 
@@ -910,6 +914,8 @@ async fn run_runtime(
         ctrl_c,
         progress: startup,
     } = startup_control;
+    let show_history_profile =
+        history_profile_enabled(std::env::var("ASTATINE_HISTORY_PROFILE").ok().as_deref());
     let probe_stop_signal = probe_sender.as_ref().map(|_| DashboardSignal::default());
     #[cfg(test)]
     let (proof_processing_gate, mut proof_processing_gate_receiver) = if probe_sender.is_some() {
@@ -1022,8 +1028,11 @@ async fn run_runtime(
         } else {
             startup.complete("No previous transactions to recover");
         }
-        if let Some(manager) = transactions.as_ref() {
-            startup.note(manager.history_profile_line());
+        if let Some(manager) = transactions.as_ref()
+            && let Some(profile) =
+                optional_history_profile(show_history_profile, || manager.history_profile_line())
+        {
+            startup.note(profile);
         }
     }
     let signing_ready = transactions
@@ -1335,6 +1344,10 @@ async fn run_runtime(
             proof_telemetry: Arc::clone(&proof_telemetry),
             worker_threads: threads,
             #[cfg(test)]
+            transaction_state: Arc::clone(&transaction_state),
+            #[cfg(test)]
+            history_telemetry: client.history_telemetry(),
+            #[cfg(test)]
             proof_processing_gate: proof_processing_gate
                 .clone()
                 .expect("test proof-processing gate must be initialized"),
@@ -1386,6 +1399,17 @@ async fn run_runtime(
                 match update {
                     ObserverUpdate::Snapshot(snapshot) => {
                         let mut snapshot = observer.latest_snapshot().unwrap_or(snapshot);
+                        // Reward reconciliation must remain live under proof-inbox pressure.
+                        // The service only harvests completed scans or schedules background work;
+                        // it does not wait on in-flight RPC requests.
+                        if let Some(manager) = transactions.as_mut()
+                            && let Err(error) = manager
+                                .service_reward_reconciliation(&client, &snapshot)
+                                .await
+                        {
+                            fatal_error = Some(error.context("service historical reward verification"));
+                            break 'mining_loop;
+                        }
                         if proof_receiver.has_pending() {
                             last_snapshot = snapshot;
                             continue 'mining_loop;
@@ -1524,10 +1548,9 @@ async fn run_runtime(
                                     || budget_exhausted),
                         );
                         snapshot = observer.latest_snapshot().unwrap_or(snapshot);
-                        if proof_receiver.has_pending() {
-                            last_snapshot = snapshot;
-                            continue 'mining_loop;
-                        }
+                        // Harvest completed reward batches even while proof work is queued. This
+                        // only awaits a scan task after it has finished; active RPC scans remain
+                        // in the background and never hold up live proof processing.
                         if let Some(manager) = transactions.as_mut()
                             && let Err(error) = manager
                                 .service_reward_reconciliation(&client, &snapshot)
@@ -1535,6 +1558,10 @@ async fn run_runtime(
                         {
                             fatal_error = Some(error.context("service historical reward verification"));
                             break 'mining_loop;
+                        }
+                        if proof_receiver.has_pending() {
+                            last_snapshot = snapshot;
+                            continue 'mining_loop;
                         }
                         last_snapshot = observer.latest_snapshot().unwrap_or(snapshot);
                     }
@@ -1573,8 +1600,7 @@ async fn run_runtime(
                 }
             }
             _ = reward_scan_ticker.tick(), if transactions.is_some() => {
-                if !proof_receiver.has_pending()
-                    && let Some(manager) = transactions.as_mut()
+                if let Some(manager) = transactions.as_mut()
                     && let Err(error) = manager
                         .service_reward_reconciliation(&client, &last_snapshot)
                         .await
@@ -1908,8 +1934,11 @@ async fn run_runtime(
             model.current_action = None;
         });
     }
-    if let Some(manager) = transactions.as_ref() {
-        report_mining_info(&dashboard, manager.history_profile_line());
+    if let Some(manager) = transactions.as_ref()
+        && let Some(profile) =
+            optional_history_profile(show_history_profile, || manager.history_profile_line())
+    {
+        report_mining_info(&dashboard, profile);
     }
     for line in proof_telemetry.report_lines() {
         report_mining_info(&dashboard, line);
@@ -3442,6 +3471,17 @@ fn report_mining_info(dashboard: &Option<Dashboard>, message: impl Into<String>)
     }
 }
 
+fn history_profile_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+pub(crate) fn optional_history_profile(
+    enabled: bool,
+    profile: impl FnOnce() -> String,
+) -> Option<String> {
+    enabled.then(profile)
+}
+
 fn report_mining_warning(dashboard: &Option<Dashboard>, message: impl Into<String>) {
     let message = message.into();
     if let Some(dashboard) = dashboard {
@@ -3731,8 +3771,8 @@ mod tests {
         DashboardContext, FinalizationState, HashingContext, NodeSlot, NonceAllocator,
         ObserverUpdate, PENDING_PROOF_CANDIDATE_CAPACITY, PendingDashboardSync, ProofFound,
         SnapshotFreshness, compare_snapshot_freshness, dashboard_model, dashboard_node_status,
-        finalization_retry_delay, next_poll_delay, next_scheduled_slot, proof_inbox,
-        reconcile_head_progress, revalidate_queued_proof, revalidate_queued_proof_at,
+        finalization_retry_delay, history_profile_enabled, next_poll_delay, next_scheduled_slot,
+        proof_inbox, reconcile_head_progress, revalidate_queued_proof, revalidate_queued_proof_at,
         selected_nodes, should_unlock_recovered_wallet, take_observer_update, update_slots,
         worker_loop,
     };
@@ -3793,6 +3833,14 @@ mod tests {
             timestamp,
             hash: B256::with_last_byte(number as u8),
         }
+    }
+
+    #[test]
+    fn aggregate_history_profile_requires_explicit_developer_opt_in() {
+        assert!(!history_profile_enabled(None));
+        assert!(!history_profile_enabled(Some("0")));
+        assert!(!history_profile_enabled(Some("true")));
+        assert!(history_profile_enabled(Some("1")));
     }
 
     #[test]

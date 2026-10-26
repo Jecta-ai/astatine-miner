@@ -28,7 +28,7 @@ use std::{
 };
 use tokio::{
     task::{JoinHandle, JoinSet},
-    time::{Instant, sleep},
+    time::{Instant, MissedTickBehavior, interval, sleep},
 };
 
 const JOURNAL_VERSION: u32 = 4;
@@ -1225,6 +1225,7 @@ pub struct TransactionManager {
     reward_scan_task: Option<JoinHandle<Result<RewardScanBatchOutput>>>,
     reward_scan_retry_at: Option<Instant>,
     reward_scan_retry_attempts: u8,
+    receipt_reward_service_errors: u64,
     current_process_proof_hashes: HashSet<B256>,
     mined_rewards_by_window: HashMap<MinedRewardKey, U256>,
     mined_rewards_total: U256,
@@ -1388,6 +1389,7 @@ impl TransactionManager {
             reward_scan_task: None,
             reward_scan_retry_at: None,
             reward_scan_retry_attempts: 0,
+            receipt_reward_service_errors: 0,
             current_process_proof_hashes: HashSet::new(),
             mined_rewards_by_window: HashMap::new(),
             mined_rewards_total: U256::ZERO,
@@ -2053,6 +2055,8 @@ impl TransactionManager {
         client: &NetworkClient,
         snapshot: &crate::rpc::ReadSnapshot,
     ) -> Result<bool> {
+        self.history_telemetry
+            .add(HistoryCounter::RewardServiceCalls, 1);
         if !client.verification.token_verified {
             return Ok(false);
         }
@@ -2101,6 +2105,112 @@ impl TransactionManager {
         self.schedule_reward_reconciliation(client, snapshot)
     }
 
+    async fn service_reward_reconciliation_while_receipt_pending(
+        &mut self,
+        client: &NetworkClient,
+    ) -> Result<()> {
+        if !client.verification.token_verified
+            || self
+                .reward_scan_task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+        {
+            return Ok(());
+        }
+        let has_candidates = match self.journal.reward_candidates() {
+            Ok(candidates) => !candidates.is_empty(),
+            Err(error) => {
+                self.report_receipt_wait_reward_warning(format!(
+                    "historical rewards remain pending during receipt confirmation: {error:#}"
+                ));
+                return Ok(());
+            }
+        };
+        let mut has_unsettled_session_reward = false;
+        for entry in &self.journal.state.entries {
+            if entry.action == TransactionAction::SubmitProof
+                && entry.outcome.as_deref() == Some("candidate-updated")
+                && entry.reward_block_hash.is_some()
+                && entry.reward_confirmations < ARCHIVE_AFTER_CONFIRMATIONS
+                && self
+                    .current_process_proof_hashes
+                    .contains(&entry_hash(entry)?)
+            {
+                has_unsettled_session_reward = true;
+                break;
+            }
+        }
+        if !has_candidates && !has_unsettled_session_reward {
+            return Ok(());
+        }
+        let snapshot = match client.snapshot(Some(self.wallet)).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.report_receipt_wait_reward_warning(format!(
+                    "historical reward snapshot failed during receipt confirmation: {error:#}"
+                ));
+                return Ok(());
+            }
+        };
+        if let Err(error) = self.service_reward_reconciliation(client, &snapshot).await {
+            self.report_receipt_wait_reward_warning(format!(
+                "historical reward reconciliation was deferred during receipt confirmation: {error:#}"
+            ));
+        }
+        if let Err(error) = self
+            .monitor_session_reward_evidence(client, &snapshot)
+            .await
+        {
+            self.report_receipt_wait_reward_warning(format!(
+                "session reward confirmation update was deferred during receipt confirmation: {error:#}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn report_receipt_wait_reward_warning(&mut self, message: String) {
+        self.receipt_reward_service_errors = self.receipt_reward_service_errors.saturating_add(1);
+        if self.receipt_reward_service_errors == 1
+            || self.receipt_reward_service_errors.is_multiple_of(5)
+        {
+            self.report_warning(message);
+        }
+    }
+
+    async fn monitor_session_reward_evidence(
+        &mut self,
+        client: &NetworkClient,
+        snapshot: &crate::rpc::ReadSnapshot,
+    ) -> Result<()> {
+        let entries = self.journal.state.entries.clone();
+        let mut canonical_blocks = HashMap::from([(snapshot.block.number, snapshot.block.hash)]);
+        let mut journal_dirty = false;
+        for entry in entries {
+            if entry.action != TransactionAction::SubmitProof
+                || !self
+                    .current_process_proof_hashes
+                    .contains(&entry_hash(&entry)?)
+                || entry.outcome.as_deref() != Some("candidate-updated")
+                || entry.reward_block_hash.is_none()
+                || entry.reward_confirmations >= ARCHIVE_AFTER_CONFIRMATIONS
+            {
+                continue;
+            }
+            journal_dirty |= self
+                .monitor_reward_evidence(client, &entry, &snapshot.block, &mut canonical_blocks)
+                .await?;
+        }
+        self.sync_all_mined_rewards()?;
+        if journal_dirty {
+            let archived = self.journal.archive_settled()?;
+            if archived == 0 {
+                self.journal.persist()?;
+            }
+        }
+        self.publish_dashboard_state();
+        Ok(())
+    }
+
     fn defer_reward_scan(&mut self) {
         self.reward_scan_retry_attempts = self.reward_scan_retry_attempts.saturating_add(1);
         let shift = u32::from(self.reward_scan_retry_attempts.saturating_sub(1).min(5));
@@ -2133,6 +2243,10 @@ impl TransactionManager {
             return Ok(false);
         }
         let mut candidates = self.journal.reward_candidates()?;
+        self.history_telemetry.add(
+            HistoryCounter::RewardCandidates,
+            u64::try_from(candidates.len()).unwrap_or(u64::MAX),
+        );
         candidates.sort_by_key(|candidate| {
             (
                 self.journal
@@ -2178,6 +2292,8 @@ impl TransactionManager {
                 continue;
             };
             if state.work.window_id <= candidate.window_id && !state.work.ended {
+                self.history_telemetry
+                    .add(HistoryCounter::RewardCandidatesWaitingForWindow, 1);
                 continue;
             }
             let key = reward_scan_key(candidate.contract, candidate.window_id);
@@ -2634,6 +2750,11 @@ impl TransactionManager {
         self.publish_dashboard_state();
 
         let deadline = Instant::now() + RECEIPT_WAIT;
+        // The mining coordinator awaits this send through receipt finality. Keep applying
+        // completed reward scans here so a later pending proof cannot freeze MINED at zero.
+        let mut reward_service_ticker = interval(RECEIPT_POLL_INTERVAL);
+        reward_service_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        reward_service_ticker.tick().await;
         let mut receipt_poll_errors = 0_u32;
         let mut last_receipt_error = None;
         loop {
@@ -2643,10 +2764,25 @@ impl TransactionManager {
                     last_receipt_error.as_deref(),
                 ));
             }
-            let (receipt, receipt_query_failed) = match client
-                .transaction_receipt(signed.hash)
-                .await
-            {
+            let receipt_query = client.transaction_receipt(signed.hash);
+            tokio::pin!(receipt_query);
+            let receipt_result = loop {
+                tokio::select! {
+                    result = &mut receipt_query => break result,
+                    _ = reward_service_ticker.tick(), if client.verification.token_verified => {
+                        if let Err(error) = self
+                            .service_reward_reconciliation_while_receipt_pending(client)
+                            .await
+                        {
+                            self.report_warning(format!(
+                                "session reward reconciliation is deferred while transaction {:#x} awaits receipt confirmation: {error:#}",
+                                signed.hash
+                            ));
+                        }
+                    }
+                }
+            };
+            let (receipt, receipt_query_failed) = match receipt_result {
                 Ok(receipt) => {
                     receipt_poll_errors = 0;
                     last_receipt_error = None;
@@ -2684,7 +2820,20 @@ impl TransactionManager {
                             ));
                         }
                         last_receipt_error = Some(details);
-                        sleep(RECEIPT_POLL_INTERVAL).await;
+                        tokio::select! {
+                            _ = sleep(RECEIPT_POLL_INTERVAL) => {}
+                            _ = reward_service_ticker.tick(), if client.verification.token_verified => {
+                                if let Err(error) = self
+                                    .service_reward_reconciliation_while_receipt_pending(client)
+                                    .await
+                                {
+                                    self.report_warning(format!(
+                                        "session reward reconciliation is deferred while transaction {:#x} awaits receipt confirmation: {error:#}",
+                                        signed.hash
+                                    ));
+                                }
+                            }
+                        }
                         continue;
                     }
                 };
@@ -2751,7 +2900,20 @@ impl TransactionManager {
                     signed.hash
                 );
             }
-            sleep(RECEIPT_POLL_INTERVAL).await;
+            tokio::select! {
+                _ = sleep(RECEIPT_POLL_INTERVAL) => {}
+                _ = reward_service_ticker.tick(), if client.verification.token_verified => {
+                    if let Err(error) = self
+                        .service_reward_reconciliation_while_receipt_pending(client)
+                        .await
+                    {
+                        self.report_warning(format!(
+                            "session reward reconciliation is deferred while transaction {:#x} awaits receipt confirmation: {error:#}",
+                            signed.hash
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -3671,12 +3833,13 @@ mod tests {
             finalize_initial_expired_windows, start_read_only_observer, update_slots,
         },
         proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
-        protocol::{WorkContext, WorkHasher, meets_target},
+        protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
         rpc::{NetworkClient, RpcLog, TransactionReceipt},
         wallet::signer_address,
     };
     use alloy_primitives::{Address, B256, Bytes, U256, hex, keccak256};
     use alloy_sol_types::{SolCall, SolEvent, SolValue};
+    use anyhow::Context;
     use bip32::secp256k1::ecdsa::SigningKey;
     use rand::{RngCore, thread_rng};
     use std::{
@@ -6483,6 +6646,7 @@ mod tests {
                 miner_bytecode: &miner_bytecode,
                 initial_target: U256::MAX,
                 retarget_interval: 3,
+                window_secs: 60,
             })
             .await;
             let approve = LocalMockAST::approveCall {
@@ -6747,6 +6911,7 @@ mod tests {
                     miner_bytecode: &miner_bytecode,
                     initial_target: U256::MAX,
                     retarget_interval: 3,
+                    window_secs: 60,
                 })
                 .await;
                 let approve = LocalMockAST::approveCall {
@@ -6885,6 +7050,15 @@ mod tests {
                 Err(_) => panic!("production mining runtime did not start within five seconds"),
             };
             assert_eq!(probe.worker_threads, 32);
+            assert_eq!(
+                probe
+                    .transaction_state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mined_rewards,
+                U256::ZERO,
+                "the session MINED total starts at zero"
+            );
             probe.proof_processing_gate.send_replace(false);
             let initial_finalization = tokio::select! {
                 entry = wait_for_journal_entry_for_window(
@@ -7026,7 +7200,10 @@ mod tests {
             )
             .await;
             assert!(first_rewarding_finalization.receipt_status.unwrap());
-            wait_for_verified_reward(&store, 1, 1).await;
+            wait_for_verified_reward(&store, 1, 1, &probe.history_telemetry).await;
+            let rewarded_snapshot = network.snapshot(Some(account)).await.unwrap();
+            assert!(rewarded_snapshot.ast_balance.is_some_and(|balance| balance >= reward));
+            wait_for_dashboard_mined_reward(&probe.transaction_state, reward).await;
             let second_window = wait_for_eligible_window(&network, 1, 2).await;
             wait_for_active_probe(&probe, 1, 2).await;
             wait_for_hash_increase(&probe, 1, node1_hashes).await;
@@ -7146,6 +7323,59 @@ mod tests {
             )
             .await;
             assert!(node3_second_finalization.receipt_status.unwrap());
+            wait_for_verified_reward(&store, 1, 2, &probe.history_telemetry).await;
+            wait_for_verified_reward(
+                &store,
+                3,
+                node3_finalization_window,
+                &probe.history_telemetry,
+            )
+            .await;
+            let rewarded_journal = store.read_transaction_journal().unwrap().unwrap();
+            let rewarded_journal: super::JournalState =
+                serde_json::from_slice(&rewarded_journal).unwrap();
+            let mut rewarded_windows = HashSet::new();
+            let expected_session_mined = rewarded_journal
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.action == TransactionAction::SubmitProof
+                        && entry.reward_confirmed
+                        && entry
+                            .reward_outcome
+                            .as_deref()
+                            .is_some_and(|outcome| outcome.starts_with("reward-paid:"))
+                })
+                .try_fold(U256::ZERO, |total, entry| {
+                    let key = (
+                        entry.contract.clone(),
+                        entry.window_id,
+                        entry.wallet.clone(),
+                    );
+                    if !rewarded_windows.insert(key) {
+                        return Ok(total);
+                    }
+                    let amount = entry
+                        .reward_outcome
+                        .as_deref()
+                        .and_then(|outcome| outcome.strip_prefix("reward-paid:"))
+                        .context("verified proof entry must retain its payout")
+                        .and_then(parse_decimal_wei)?;
+                    total
+                        .checked_add(amount)
+                        .context("local lifecycle reward total overflow")
+                })
+                .unwrap();
+            assert_eq!(rewarded_windows.len(), 4);
+            assert_eq!(expected_session_mined, reward * U256::from(4));
+            assert_eq!(
+                wait_for_dashboard_mined_reward(&probe.transaction_state, expected_session_mined)
+                    .await,
+                expected_session_mined,
+                "the live dashboard must show every verified winning window from this invocation"
+            );
+            let cumulative_balance = network.snapshot(Some(account)).await.unwrap();
+            assert_eq!(cumulative_balance.ast_balance, Some(expected_session_mined));
             let third_window = wait_for_eligible_window(&network, 1, 3).await;
             wait_for_active_probe(&probe, 1, 3).await;
             let node3_third_window =
@@ -7217,6 +7447,15 @@ mod tests {
                 .await
                 .expect("recovery runtime must start")
                 .expect("recovery runtime probe must remain connected");
+            assert_eq!(
+                recovery_probe
+                    .transaction_state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mined_rewards,
+                U256::ZERO,
+                "recovered rewards from a previous CLI invocation do not enter the new session total"
+            );
             recovery_probe
                 .proof_processing_gate
                 .send_replace(false);
@@ -7309,6 +7548,462 @@ mod tests {
         })
         .await
         .expect("autonomous miner must finalize, reopen, hash and submit across three windows");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Forge and Anvil; run with ASTATINE_EVM_ROOT set"]
+    async fn current_session_rewards_survive_external_finalization_and_exclude_losing_proofs() {
+        let root = std::env::var_os("ASTATINE_EVM_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .join("astatineEVM")
+                    .join("evm")
+            });
+        assert!(root.join("src/AstatineMiner.sol").is_file());
+        let build = Command::new("forge")
+            .args(["build", "--root"])
+            .arg(&root)
+            .output()
+            .expect("Forge must be installed for the verified session reward lifecycle test");
+        assert!(
+            build.status.success(),
+            "Forge build failed:\n{}\n{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut process = Command::new("anvil")
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--chain-id",
+                "1439",
+                "--accounts",
+                "3",
+                "--silent",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Anvil must be installed for the verified session reward lifecycle test");
+        let _process_guard = AnvilGuard(&mut process);
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let rpc = reqwest::Client::new();
+        wait_for_anvil(&rpc, &endpoint).await;
+
+        let signer = test_signer();
+        let wallet = signer_address(&signer);
+        let unlocked_accounts =
+            rpc_request_local(&rpc, &endpoint, "eth_accounts", serde_json::json!([]))
+                .await
+                .unwrap();
+        let deployment_wallet = Address::from_str(unlocked_accounts[0].as_str().unwrap()).unwrap();
+        let external_finalizer = Address::from_str(unlocked_accounts[2].as_str().unwrap()).unwrap();
+        assert_ne!(wallet, deployment_wallet);
+        assert_ne!(wallet, external_finalizer);
+
+        let funded_inj = U256::from(1_000_u64) * U256::from(10_u8).pow(U256::from(18));
+        rpc_request_local(
+            &rpc,
+            &endpoint,
+            "anvil_setBalance",
+            serde_json::json!([format!("{wallet:#x}"), format!("{funded_inj:#x}")]),
+        )
+        .await
+        .unwrap();
+
+        let token_artifact = read_artifact(&root.join("out/MockAST.sol/MockAST.json"));
+        let miner_artifact = read_artifact(&root.join("out/AstatineMiner.sol/AstatineMiner.json"));
+        let decimals = 9_u8;
+        let ast_unit = U256::from(10_u8).pow(U256::from(decimals));
+        let allocation = U256::from(1_000_u64) * ast_unit;
+        let reward = U256::from(100_u64) * ast_unit;
+        let mut token_init = artifact_bytecode(&token_artifact);
+        token_init.extend_from_slice(&abi_uint8_word(decimals));
+        let token = deploy_unlocked(&rpc, &endpoint, deployment_wallet, &token_init).await;
+        let mint = LocalMockAST::mintCall {
+            account: deployment_wallet,
+            amount: allocation,
+        }
+        .abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(token),
+            &mint,
+            U256::ZERO,
+        )
+        .await;
+        let miner = deploy_local_miner(LocalMinerDeployment {
+            client: &rpc,
+            endpoint: &endpoint,
+            deployment_wallet,
+            token,
+            token_decimals: decimals,
+            allocation,
+            reward,
+            miner_bytecode: &artifact_bytecode(&miner_artifact),
+            initial_target: U256::MAX,
+            retarget_interval: 3,
+            window_secs: 60,
+        })
+        .await;
+        let approve = LocalMockAST::approveCall {
+            spender: miner,
+            amount: allocation,
+        }
+        .abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(token),
+            &approve,
+            U256::ZERO,
+        )
+        .await;
+        let fund = LocalAstatineMiner::fundASTCall { amount: allocation }.abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &fund,
+            U256::ZERO,
+        )
+        .await;
+        let seed = B256::with_last_byte(0x91);
+        let activate = LocalAstatineMiner::activateGenesisCall { initialSeed: seed }.abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &activate,
+            U256::ZERO,
+        )
+        .await;
+
+        let network = NetworkClient::local_test_client(
+            &endpoint,
+            miner,
+            local_code_hash(&rpc, &endpoint, miner).await,
+            token,
+            local_code_hash(&rpc, &endpoint, token).await,
+            decimals,
+        )
+        .unwrap();
+        let root_dir = tempdir().unwrap();
+        let store = ConfigStore::at_root(root_dir.path().to_path_buf());
+        let config = AppConfig {
+            network: Network::Testnet,
+            minimum_reserve_inj: "0".to_owned(),
+            per_session_spending_limit_inj: "20".to_owned(),
+            transaction_confirmations: 2,
+            ..AppConfig::default()
+        };
+        let dashboard_state = Arc::new(RwLock::new(TransactionDashboardState::default()));
+        let dashboard_sink_state = Arc::clone(&dashboard_state);
+        let mut manager = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        manager.set_dashboard_sink(Arc::new(move |state| {
+            *dashboard_sink_state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+        }));
+        assert_eq!(manager.mined_rewards_total(), U256::ZERO);
+        assert_eq!(
+            network.snapshot(Some(wallet)).await.unwrap().ast_balance,
+            Some(U256::ZERO)
+        );
+
+        let first_snapshot = network.snapshot(Some(wallet)).await.unwrap();
+        let first_node = first_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == 1)
+            .unwrap();
+        let first_work = first_node.state.as_ref().unwrap();
+        let first_header = b"session-earned-by-cli-window-zero";
+        let first_context = WorkContext {
+            chain_id: network.manifest.chain_id,
+            contract: miner,
+            window_id: first_work.work.window_id,
+            seed: first_work.work.seed,
+            miner: wallet,
+            header: first_header.to_vec(),
+        };
+        let first_nonce = 0_u128;
+        let first_hash = WorkHasher::new(&first_context).unwrap().hash(first_nonce);
+        assert!(meets_target(first_hash, first_work.work.target));
+        let (next_manager, first_action) = submit_local_proof_with_confirmation(
+            manager,
+            network.clone(),
+            clone_signer(&signer),
+            ProofSubmission {
+                contract: miner,
+                node_id: 1,
+                window_id: first_work.work.window_id,
+                nonce: first_nonce,
+                header: first_header.to_vec(),
+                work_hash: first_hash,
+            },
+            &store,
+            &rpc,
+            &endpoint,
+        )
+        .await;
+        manager = next_manager;
+        assert_eq!(first_action.outcome, "candidate-updated");
+        assert_eq!(manager.mined_rewards_total(), U256::ZERO);
+
+        let expired_window_zero = network.snapshot(None).await.unwrap();
+        advance_window_past_expiry(&rpc, &endpoint, &network, 1, &expired_window_zero).await;
+        let finalize = AstatineMinerRead::finalizeWindowCall {}.abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &finalize,
+            U256::ZERO,
+        )
+        .await;
+        rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+            .await
+            .unwrap();
+        let paid_snapshot = network.snapshot(Some(wallet)).await.unwrap();
+        assert_eq!(paid_snapshot.ast_balance, Some(reward));
+        assert_eq!(manager.mined_rewards_total(), U256::ZERO);
+        assert_eq!(
+            service_until_mined_reward(&mut manager, &network, wallet, reward).await,
+            reward
+        );
+        assert_eq!(
+            dashboard_state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .mined_rewards,
+            reward,
+            "the current-run winning proof must be counted although a different account finalized it"
+        );
+        let first_reward_entry = manager
+            .journal
+            .state
+            .entries
+            .iter()
+            .find(|entry| entry.action == TransactionAction::SubmitProof && entry.window_id == 0)
+            .unwrap();
+        assert!(first_reward_entry.reward_confirmed);
+        assert!(
+            first_reward_entry
+                .reward_outcome
+                .as_deref()
+                .is_some_and(|outcome| outcome.starts_with("reward-paid:"))
+        );
+        assert_eq!(manager.mined_rewards_total(), reward);
+
+        let second_snapshot = network.snapshot(Some(wallet)).await.unwrap();
+        let second_work = second_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == 1)
+            .unwrap()
+            .state
+            .as_ref()
+            .unwrap();
+        assert_eq!(second_work.work.window_id, 1);
+        let second_header = b"session-losing-cli-window-one";
+        let second_context = WorkContext {
+            chain_id: network.manifest.chain_id,
+            contract: miner,
+            window_id: second_work.work.window_id,
+            seed: second_work.work.seed,
+            miner: wallet,
+            header: second_header.to_vec(),
+        };
+        let second_nonce = 0_u128;
+        let second_hash = WorkHasher::new(&second_context).unwrap().hash(second_nonce);
+        assert!(meets_target(second_hash, second_work.work.target));
+        let (next_manager, second_action) = submit_local_proof_with_confirmation(
+            manager,
+            network.clone(),
+            clone_signer(&signer),
+            ProofSubmission {
+                contract: miner,
+                node_id: 1,
+                window_id: second_work.work.window_id,
+                nonce: second_nonce,
+                header: second_header.to_vec(),
+                work_hash: second_hash,
+            },
+            &store,
+            &rpc,
+            &endpoint,
+        )
+        .await;
+        manager = next_manager;
+        assert_eq!(second_action.outcome, "candidate-updated");
+
+        let winner_snapshot = network.snapshot(None).await.unwrap();
+        let winner_state = winner_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == 1)
+            .and_then(|node| node.state.as_ref())
+            .unwrap();
+        let incumbent = winner_state.candidate.as_ref().unwrap().work_hash;
+        let challenger_header = b"external-contender-wins-window-one";
+        let challenger_context = WorkContext {
+            chain_id: network.manifest.chain_id,
+            contract: miner,
+            window_id: winner_state.work.window_id,
+            seed: winner_state.work.seed,
+            miner: deployment_wallet,
+            header: challenger_header.to_vec(),
+        };
+        let challenger_hasher = WorkHasher::new(&challenger_context).unwrap();
+        let (challenger_nonce, challenger_hash) = (0..10_000_u128)
+            .find_map(|nonce| {
+                let hash = challenger_hasher.hash(nonce);
+                (meets_target(hash, winner_state.work.target) && beats_incumbent(hash, incumbent))
+                    .then_some((nonce, hash))
+            })
+            .expect("local external wallet should find a proof better than the CLI incumbent");
+        let challenger_call = AstatineMinerRead::submitSolutionCall {
+            header: Bytes::copy_from_slice(challenger_header),
+            nonce: challenger_nonce,
+        }
+        .abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &challenger_call,
+            U256::from(SUBMISSION_FEE_WEI),
+        )
+        .await;
+        let replaced_candidate = network.snapshot(None).await.unwrap();
+        assert_eq!(
+            replaced_candidate
+                .nodes
+                .iter()
+                .find(|node| node.id == 1)
+                .and_then(|node| node.state.as_ref())
+                .and_then(|state| state.candidate.as_ref())
+                .map(|candidate| candidate.miner),
+            Some(deployment_wallet)
+        );
+        assert_eq!(
+            replaced_candidate
+                .nodes
+                .iter()
+                .find(|node| node.id == 1)
+                .and_then(|node| node.state.as_ref())
+                .and_then(|state| state.candidate.as_ref())
+                .map(|candidate| candidate.work_hash),
+            Some(challenger_hash)
+        );
+
+        let expired_window_one = network.snapshot(None).await.unwrap();
+        advance_window_past_expiry(&rpc, &endpoint, &network, 1, &expired_window_one).await;
+        let balance_before_losing_finalization = network
+            .snapshot(Some(deployment_wallet))
+            .await
+            .unwrap()
+            .ast_balance
+            .unwrap();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            external_finalizer,
+            Some(miner),
+            &finalize,
+            U256::ZERO,
+        )
+        .await;
+        rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let snapshot = network.snapshot(Some(wallet)).await.unwrap();
+                manager
+                    .service_reward_reconciliation(&network, &snapshot)
+                    .await
+                    .unwrap();
+                let losing_entry = manager.journal.state.entries.iter().find(|entry| {
+                    entry.action == TransactionAction::SubmitProof && entry.window_id == 1
+                });
+                if losing_entry.is_some_and(|entry| {
+                    entry.reward_confirmed
+                        && entry
+                            .reward_outcome
+                            .as_deref()
+                            .is_some_and(|outcome| outcome.starts_with("not-window-winner:"))
+                }) {
+                    return;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the CLI proof that lost to the external contender must be reconciled");
+
+        let current_wallet_balance = network.snapshot(Some(wallet)).await.unwrap();
+        assert_eq!(current_wallet_balance.ast_balance, Some(reward));
+        let external_winner_balance = network
+            .snapshot(Some(deployment_wallet))
+            .await
+            .unwrap()
+            .ast_balance
+            .unwrap();
+        assert_eq!(
+            external_winner_balance - balance_before_losing_finalization,
+            reward
+        );
+        assert_eq!(manager.mined_rewards_total(), reward);
+        assert_eq!(
+            dashboard_state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .mined_rewards,
+            reward,
+            "external transfers and losing proofs must not change the dashboard session total"
+        );
+
+        drop(manager);
+        let restarted = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        assert_eq!(restarted.mined_rewards_total(), U256::ZERO);
+        assert!(restarted.journal.state.entries.iter().any(|entry| {
+            entry.action == TransactionAction::SubmitProof
+                && entry.window_id == 0
+                && entry.reward_confirmed
+                && entry
+                    .reward_outcome
+                    .as_deref()
+                    .is_some_and(|outcome| outcome.starts_with("reward-paid:"))
+        }));
+        assert!(restarted.journal.state.entries.iter().any(|entry| {
+            entry.action == TransactionAction::SubmitProof
+                && entry.window_id == 1
+                && entry.reward_confirmed
+                && entry
+                    .reward_outcome
+                    .as_deref()
+                    .is_some_and(|outcome| outcome.starts_with("not-window-winner:"))
+        }));
     }
 
     #[tokio::test]
@@ -7424,6 +8119,7 @@ mod tests {
                     miner_bytecode: &miner_bytecode,
                     initial_target,
                     retarget_interval: 100,
+                    window_secs: 600,
                 })
                 .await;
                 let approve = LocalMockAST::approveCall {
@@ -8468,6 +9164,7 @@ mod tests {
         miner_bytecode: &'a [u8],
         initial_target: U256,
         retarget_interval: u64,
+        window_secs: u64,
     }
 
     async fn deploy_local_miner(deployment: LocalMinerDeployment<'_>) -> Address {
@@ -8482,6 +9179,7 @@ mod tests {
             miner_bytecode,
             initial_target,
             retarget_interval,
+            window_secs,
         } = deployment;
         let constructor = [
             token.abi_encode(),
@@ -8491,14 +9189,14 @@ mod tests {
             initial_target.abi_encode(),
             U256::from(1).abi_encode(),
             U256::MAX.abi_encode(),
-            60_u64.abi_encode(),
+            window_secs.abi_encode(),
             60_u64.abi_encode(),
             200_u16.abi_encode(),
             100_u64.abi_encode(),
             retarget_interval.abi_encode(),
             2_u64.abi_encode(),
             256_u32.abi_encode(),
-            120_u64.abi_encode(),
+            window_secs.saturating_add(60).abi_encode(),
             deployment_wallet.abi_encode(),
             Address::with_last_byte(0x22).abi_encode(),
             Address::with_last_byte(0x33).abi_encode(),
@@ -8923,8 +9621,13 @@ mod tests {
         );
     }
 
-    async fn wait_for_verified_reward(store: &ConfigStore, node_id: u8, window_id: u64) {
-        tokio::time::timeout(Duration::from_secs(20), async {
+    async fn wait_for_verified_reward(
+        store: &ConfigStore,
+        node_id: u8,
+        window_id: u64,
+        telemetry: &HistoryTelemetry,
+    ) {
+        let verified = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 if let Some(contents) = store.read_transaction_journal().unwrap() {
                     let journal: super::JournalState = serde_json::from_slice(&contents).unwrap();
@@ -8944,8 +9647,115 @@ mod tests {
                 sleep(Duration::from_millis(25)).await;
             }
         })
+        .await;
+        if verified.is_err() {
+            let journal = store.read_transaction_journal().unwrap().unwrap();
+            let journal: super::JournalState = serde_json::from_slice(&journal).unwrap();
+            let entry = journal.entries.iter().find(|entry| {
+                entry.action == TransactionAction::SubmitProof
+                    && entry.node_id == node_id
+                    && entry.window_id == window_id
+            });
+            let cursor = entry
+                .and_then(|entry| Address::from_str(&entry.contract).ok())
+                .and_then(|contract| {
+                    journal
+                        .reward_scan_cursors
+                        .get(&super::reward_scan_key(contract, window_id))
+                });
+            panic!(
+                "reward event for node {node_id} window {window_id} must be verified: entry={:?}, cursor={cursor:?}, anchor={:?}, {}",
+                entry.map(|entry| (
+                    entry.status,
+                    entry.confirmations,
+                    entry.reward_outcome.as_deref(),
+                    entry.reward_confirmations,
+                    entry.reward_block_hash.is_some(),
+                )),
+                journal.reward_scan_anchor,
+                telemetry.format_profile(),
+            )
+        }
+    }
+
+    async fn wait_for_dashboard_mined_reward(
+        transaction_state: &Arc<RwLock<TransactionDashboardState>>,
+        minimum: U256,
+    ) -> U256 {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let mined = transaction_state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mined_rewards;
+                if mined >= minimum {
+                    return mined;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
         .await
-        .expect("reward event must be verified and recorded in the journal");
+        .expect("verified current-session rewards must reach the live dashboard state")
+    }
+
+    async fn service_until_mined_reward(
+        manager: &mut TransactionManager,
+        client: &NetworkClient,
+        wallet: Address,
+        minimum: U256,
+    ) -> U256 {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let snapshot = client.snapshot(Some(wallet)).await.unwrap();
+                manager
+                    .service_reward_reconciliation(client, &snapshot)
+                    .await
+                    .unwrap();
+                let mined = manager.mined_rewards_total();
+                if mined >= minimum {
+                    return mined;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("background reward reconciliation must update the current session total")
+    }
+
+    async fn submit_local_proof_with_confirmation(
+        manager: TransactionManager,
+        network: NetworkClient,
+        signer: SigningKey,
+        submission: ProofSubmission,
+        store: &ConfigStore,
+        rpc: &reqwest::Client,
+        endpoint: &str,
+    ) -> (TransactionManager, super::ConfirmedAction) {
+        let node_id = submission.node_id;
+        let window_id = submission.window_id;
+        let submission_task = tokio::spawn(async move {
+            let mut manager = manager;
+            let result = manager.submit_proof(&network, &signer, submission).await;
+            (manager, result)
+        });
+        let _included = wait_for_journal_entry_for_window(
+            store,
+            node_id,
+            TransactionAction::SubmitProof,
+            window_id,
+            TransactionStatus::Included,
+        )
+        .await;
+        rpc_request_local(rpc, endpoint, "evm_mine", serde_json::json!([]))
+            .await
+            .unwrap();
+        let (manager, result) = submission_task
+            .await
+            .expect("proof submission task should join after confirmation");
+        (
+            manager,
+            result.expect("local winning proof should be confirmed"),
+        )
     }
 
     async fn rpc_request_local(

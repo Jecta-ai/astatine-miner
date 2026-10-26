@@ -3,6 +3,7 @@ name: Rust CI
 on:
   push:
     branches: [main]
+    tags: ["v0.1.0-testnet.8"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -11,21 +12,110 @@ permissions:
   contents: read
 
 jobs:
-  checks:
-    name: Build, test, lint, and verify licenses
-    runs-on: ubuntu-latest
+  native-checks:
+    name: Native checks (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            binary: astatine
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            binary: astatine
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            binary: astatine
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            binary: astatine
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            binary: astatine.exe
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install stable Rust components
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Verify native runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | awk '$1 == "host:" { print $2 }')"
+          echo "Rust host: $host"
+          test "$host" = "${{ matrix.target }}"
       - name: Format check
         run: cargo fmt --all -- --check
-      - name: Test
+      - name: Check
+        run: cargo check --locked
+      - name: Unit tests
         run: cargo test --locked
-      - name: Release build
-        run: cargo build --locked --release
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Native release build
+        run: cargo build --locked --release
+      - name: Native executable smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          "$binary" --version
+          "$binary" --help >/dev/null
+          "$binary" mine --help >/dev/null
+          if [[ "${{ matrix.target }}" == *linux* ]]; then
+            file "$binary"
+            ldd "$binary"
+          elif [[ "${{ matrix.target }}" == *apple* ]]; then
+            file "$binary"
+            otool -L "$binary"
+          fi
+      - name: Validate documented Windows installer syntax
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $Readme = Get-Content README.md -Raw
+          $Match = [regex]::Match($Readme, '(?s)```powershell\s*(.*?)\s*```')
+          if (-not $Match.Success) { throw 'Windows PowerShell install instructions were not found' }
+          $Tokens = $null
+          $Errors = $null
+          [System.Management.Automation.Language.Parser]::ParseInput($Match.Groups[1].Value, [ref]$Tokens, [ref]$Errors) | Out-Null
+          if ($Errors.Count -ne 0) { throw ($Errors | Out-String) }
+      - name: Build Windows password prompt smoke
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo build --locked --release --example windows_password_prompt
+      - name: Windows hidden-password console smoke
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $GitExe = (Get-Command git).Source
+          $GitRoot = Split-Path (Split-Path $GitExe -Parent) -Parent
+          $Winpty = Join-Path $GitRoot 'usr\bin\winpty.exe'
+          if (-not (Test-Path $Winpty)) { throw "winpty is unavailable at $Winpty" }
+          $PromptExe = Join-Path $env:GITHUB_WORKSPACE 'target\x86_64-pc-windows-msvc\release\examples\windows_password_prompt.exe'
+          $Password = 'Testnet8-Windows-NoEcho-Password'
+          $SmokeOutput = ($Password + "`n") | & $Winpty $PromptExe 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'Windows hidden-password smoke failed' }
+          if ($SmokeOutput.Contains($Password)) { throw 'Password prompt echoed secret input to terminal output' }
+          if (-not $SmokeOutput.Contains('WINDOWS_PASSWORD_PROMPT_OK')) { throw 'Windows hidden-password prompt did not complete' }
+      - name: Upload native release executable
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: astatine-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 14
+
+  dependency-policy:
+    name: Dependency, advisory, and license checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable Rust components
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: Install pinned dependency validation tools
         run: |
           cargo install cargo-deny --locked --version 0.20.2
@@ -34,11 +124,173 @@ jobs:
       - name: Validate dependency policies
         run: cargo deny check
       - name: Audit locked dependencies
-        run: |
-          # RUSTSEC-2026-0387 is only present through Alloy's inactive optional k256 0.13 lock entry.
-          # cargo-deny checks every configured target's active graph without advisory ignores.
-          cargo audit --ignore RUSTSEC-2026-0387
+        run: cargo audit --ignore RUSTSEC-2026-0387
       - name: Regenerate third-party license notices
         run: |
           cargo about generate --locked about.hbs --output-file "$RUNNER_TEMP/THIRD_PARTY_LICENSES.md"
           cmp THIRD_PARTY_LICENSES.md "$RUNNER_TEMP/THIRD_PARTY_LICENSES.md"
+
+  anvil-integration:
+    name: Proof, finalization, reorg, and reward integration tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install stable Rust components
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Checkout pinned Astatine EVM test contracts
+        env:
+          ASTATINE_EVM_COMMIT: eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30
+        run: |
+          git clone --no-checkout https://github.com/emyrinj/astatineEVM.git "$RUNNER_TEMP/astatineEVM"
+          git -C "$RUNNER_TEMP/astatineEVM" checkout "$ASTATINE_EVM_COMMIT"
+          git -C "$RUNNER_TEMP/astatineEVM" submodule update --init --recursive evm/lib/forge-std evm/lib/openzeppelin-contracts
+          forge build --root "$RUNNER_TEMP/astatineEVM/evm"
+      - name: Run all local Anvil lifecycle tests
+        env:
+          ASTATINE_EVM_ROOT: ${{ runner.temp }}/astatineEVM/evm
+        run: cargo test --locked -- --ignored --test-threads=1
+
+  package-release:
+    name: Package five native releases
+    if: github.ref == 'refs/tags/v0.1.0-testnet.8'
+    needs: [native-checks, dependency-policy, anvil-integration]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: ${{ runner.temp }}/native-binaries
+      - name: Assemble reproducible archives and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          native="$RUNNER_TEMP/native-binaries"
+          package="$RUNNER_TEMP/testnet8-package"
+          mkdir -p \
+            "$package/stage/macos-aarch64" \
+            "$package/stage/macos-x86_64" \
+            "$package/stage/linux-x86_64" \
+            "$package/stage/linux-aarch64" \
+            "$package/stage/windows-x86_64"
+
+          install -m 0755 "$native/astatine-aarch64-apple-darwin/astatine" "$package/stage/macos-aarch64/astatine"
+          install -m 0755 "$native/astatine-x86_64-apple-darwin/astatine" "$package/stage/macos-x86_64/astatine"
+          install -m 0755 "$native/astatine-x86_64-unknown-linux-gnu/astatine" "$package/stage/linux-x86_64/astatine"
+          install -m 0755 "$native/astatine-aarch64-unknown-linux-gnu/astatine" "$package/stage/linux-aarch64/astatine"
+          install -m 0644 "$native/astatine-x86_64-pc-windows-msvc/astatine.exe" "$package/stage/windows-x86_64/astatine.exe"
+          for stage in "$package"/stage/*; do
+            install -m 0644 LICENSE-MIT THIRD_PARTY_LICENSES.md "$stage/"
+          done
+
+          source_date_epoch="$(git show -s --format=%ct "$GITHUB_SHA")"
+          for staged_file in "$package"/stage/*/*; do
+            touch -m -d "@$source_date_epoch" "$staged_file"
+          done
+          tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner -cf - -C "$package/stage/macos-aarch64" astatine LICENSE-MIT THIRD_PARTY_LICENSES.md | gzip -n > "$package/astatine-macos-aarch64.tar.gz"
+          tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner -cf - -C "$package/stage/macos-x86_64" astatine LICENSE-MIT THIRD_PARTY_LICENSES.md | gzip -n > "$package/astatine-macos-x86_64.tar.gz"
+          tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner -cf - -C "$package/stage/linux-x86_64" astatine LICENSE-MIT THIRD_PARTY_LICENSES.md | gzip -n > "$package/astatine-linux-x86_64.tar.gz"
+          tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner -cf - -C "$package/stage/linux-aarch64" astatine LICENSE-MIT THIRD_PARTY_LICENSES.md | gzip -n > "$package/astatine-linux-aarch64.tar.gz"
+          (cd "$package/stage/windows-x86_64" && zip -X "$package/astatine-windows-x86_64.zip" astatine.exe LICENSE-MIT THIRD_PARTY_LICENSES.md)
+
+          cd "$package"
+          sha256sum \
+            astatine-macos-aarch64.tar.gz \
+            astatine-macos-x86_64.tar.gz \
+            astatine-linux-x86_64.tar.gz \
+            astatine-linux-aarch64.tar.gz \
+            astatine-windows-x86_64.zip > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          file stage/macos-aarch64/astatine stage/macos-x86_64/astatine \
+            stage/linux-x86_64/astatine stage/linux-aarch64/astatine stage/windows-x86_64/astatine.exe
+          tar -tzf astatine-macos-aarch64.tar.gz
+          tar -tzf astatine-macos-x86_64.tar.gz
+          tar -tzf astatine-linux-x86_64.tar.gz
+          tar -tzf astatine-linux-aarch64.tar.gz
+          unzip -l astatine-windows-x86_64.zip
+          python3 - "$package" <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+          import tarfile
+          import zipfile
+
+          root = pathlib.Path(sys.argv[1])
+          expected = {"LICENSE-MIT", "THIRD_PARTY_LICENSES.md"}
+          architectures = {
+              "macos-aarch64": ("astatine", "Mach-O 64-bit executable arm64"),
+              "macos-x86_64": ("astatine", "Mach-O 64-bit executable x86_64"),
+              "linux-x86_64": ("astatine", "ELF 64-bit LSB pie executable, x86-64"),
+              "linux-aarch64": ("astatine", "ELF 64-bit LSB pie executable, ARM aarch64"),
+              "windows-x86_64": ("astatine.exe", "PE32+ executable (console) x86-64"),
+          }
+          for stage, (binary_name, architecture) in architectures.items():
+              binary = root / "stage" / stage / binary_name
+              description = subprocess.check_output(["file", str(binary)], text=True)
+              assert architecture in description, f"{binary}: {description}"
+          for name in (
+              "astatine-macos-aarch64.tar.gz",
+              "astatine-macos-x86_64.tar.gz",
+              "astatine-linux-x86_64.tar.gz",
+              "astatine-linux-aarch64.tar.gz",
+          ):
+              with tarfile.open(root / name, "r:gz") as archive:
+                  members = archive.getmembers()
+                  assert {member.name for member in members} == expected | {"astatine"}, name
+                  binary = next(member for member in members if member.name == "astatine")
+                  assert binary.mode & 0o111, f"{name}: binary is not executable"
+                  for filename in expected:
+                      assert archive.extractfile(filename).read() == (pathlib.Path.cwd() / filename).read_bytes()
+          with zipfile.ZipFile(root / "astatine-windows-x86_64.zip") as archive:
+              assert set(archive.namelist()) == expected | {"astatine.exe"}
+              for filename in expected:
+                  assert archive.read(filename) == (pathlib.Path.cwd() / filename).read_bytes()
+          PY
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: astatine-testnet8-release-packages
+          path: |
+            ${{ runner.temp }}/testnet8-package/astatine-macos-aarch64.tar.gz
+            ${{ runner.temp }}/testnet8-package/astatine-macos-x86_64.tar.gz
+            ${{ runner.temp }}/testnet8-package/astatine-linux-x86_64.tar.gz
+            ${{ runner.temp }}/testnet8-package/astatine-linux-aarch64.tar.gz
+            ${{ runner.temp }}/testnet8-package/astatine-windows-x86_64.zip
+            ${{ runner.temp }}/testnet8-package/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-package-smoke:
+    name: Install and execute packaged Windows release
+    if: github.ref == 'refs/tags/v0.1.0-testnet.8'
+    needs: [package-release]
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: astatine-testnet8-release-packages
+          path: ${{ runner.temp }}/testnet8-package
+      - name: Verify and install the Windows archive without administrator access
+        shell: pwsh
+        run: |
+          $Package = Join-Path $env:RUNNER_TEMP 'testnet8-package'
+          $Archive = Join-Path $Package 'astatine-windows-x86_64.zip'
+          $Line = Get-Content (Join-Path $Package 'SHA256SUMS') | Where-Object { $_ -match '\s+astatine-windows-x86_64\.zip$' } | Select-Object -First 1
+          if (-not $Line) { throw 'Windows archive checksum is missing' }
+          $Expected = ($Line -split '\s+')[0].ToLowerInvariant()
+          $Actual = (Get-FileHash -Path $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($Actual -ne $Expected) { throw 'Packaged Windows executable checksum does not match SHA256SUMS' }
+
+          $ExtractDir = Join-Path $env:RUNNER_TEMP 'astatine-windows-extracted'
+          $InstallDir = Join-Path $env:RUNNER_TEMP 'astatine-windows-install\bin'
+          Expand-Archive -Path $Archive -DestinationPath $ExtractDir
+          New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $InstallDir 'licenses') -Force | Out-Null
+          Copy-Item (Join-Path $ExtractDir 'astatine.exe') (Join-Path $InstallDir 'astatine.exe')
+          Copy-Item (Join-Path $ExtractDir 'LICENSE-MIT') (Join-Path $InstallDir 'licenses\LICENSE-MIT')
+          Copy-Item (Join-Path $ExtractDir 'THIRD_PARTY_LICENSES.md') (Join-Path $InstallDir 'licenses\THIRD_PARTY_LICENSES.md')
+          & (Join-Path $InstallDir 'astatine.exe') --version
+          & (Join-Path $InstallDir 'astatine.exe') --help | Out-Null
+          & (Join-Path $InstallDir 'astatine.exe') mine --help | Out-Null

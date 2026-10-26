@@ -516,6 +516,7 @@ fn progress_ticker_once(inner: &Arc<ProgressInner>) {
 #[cfg(test)]
 mod tests {
     use super::{CtrlCSignal, PLAIN_HEARTBEAT_INTERVAL, StartupProgress, race_with_ctrl_c};
+    use crate::mining::optional_history_profile;
     use std::{
         io::{self, Write},
         sync::{Arc, Mutex},
@@ -627,6 +628,33 @@ mod tests {
         let rendered = captured_output(&output);
         assert!(rendered.contains("Node 4 verification failed"));
         assert!(rendered.contains("runtime hash mismatch"));
+    }
+
+    #[test]
+    fn ordinary_startup_hides_history_profile_but_keeps_reward_warnings() {
+        let (progress, output) = plain_progress();
+        progress.begin("Scheduling historical reward verification");
+        let mut profile_computed = false;
+        if let Some(profile) = optional_history_profile(false, || {
+            profile_computed = true;
+            "history-profile eth_getLogs=600".to_owned()
+        }) {
+            progress.note(profile);
+        }
+        progress.note(
+            "Historical reward verification deferred after transient RPC 503; retrying in background",
+        );
+        progress.complete("Historical reward verification scheduled; mining continues");
+
+        let rendered = captured_output(&output);
+        assert!(!profile_computed);
+        assert!(!rendered.contains("history-profile"));
+        assert!(rendered.contains("transient RPC 503"));
+        assert!(rendered.contains("Historical reward verification scheduled"));
+        assert_eq!(
+            optional_history_profile(true, || "history-profile eth_getLogs=600".to_owned()),
+            Some("history-profile eth_getLogs=600".to_owned())
+        );
     }
 
     #[test]
