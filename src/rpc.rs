@@ -2,6 +2,7 @@ use crate::{
     contracts::{AstatineMinerRead, IERC20Read},
     deployment::{DeploymentManifest, NodePin, parse_address, parse_hash},
     diagnostics::DiagnosticBuffer,
+    history_telemetry::{HistoryCounter, HistoryDuration, HistoryTelemetry},
     protocol::{WorkContext, WorkHasher, meets_target, work_domain_v2},
     startup::StartupProgress,
 };
@@ -10,7 +11,11 @@ use alloy_sol_types::{SolCall, SolError, SolEvent, SolType, SolValue};
 use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use serde::{Deserialize, de::DeserializeOwned};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::task::JoinSet;
 
 #[cfg(test)]
@@ -235,6 +240,7 @@ pub struct NetworkClient {
     endpoints: Vec<RpcEndpoint>,
     pub verification: DeploymentVerification,
     diagnostics: Option<DiagnosticBuffer>,
+    history_telemetry: Arc<HistoryTelemetry>,
     #[cfg(test)]
     fail_next_finalization_fee_quote: std::sync::Arc<AtomicUsize>,
     #[cfg(test)]
@@ -334,6 +340,7 @@ impl NetworkClient {
             manifest,
             endpoints,
             diagnostics: None,
+            history_telemetry: Arc::new(HistoryTelemetry::default()),
             #[cfg(test)]
             fail_next_finalization_fee_quote: std::sync::Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -358,6 +365,10 @@ impl NetworkClient {
 
     pub fn set_diagnostics(&mut self, diagnostics: DiagnosticBuffer) {
         self.diagnostics = Some(diagnostics);
+    }
+
+    pub(crate) fn history_telemetry(&self) -> Arc<HistoryTelemetry> {
+        Arc::clone(&self.history_telemetry)
     }
 
     fn report_diagnostic(&self, message: impl Into<String>) {
@@ -434,12 +445,23 @@ impl NetworkClient {
     }
 
     pub async fn pending_nonce(&self, address: Address) -> Result<u64> {
+        self.history_telemetry.add(HistoryCounter::NonceRequests, 1);
+        let started = Instant::now();
         let result = rpc_request::<String>(
             self.primary_endpoint()?,
             "eth_getTransactionCount",
             serde_json::json!([format!("{address:#x}"), "pending"]),
         )
-        .await?;
+        .await;
+        self.history_telemetry
+            .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
+                return Err(error);
+            }
+        };
         parse_hex_quantity(&result)
     }
 
@@ -556,17 +578,30 @@ impl NetworkClient {
     pub async fn transaction_known(&self, hash: B256) -> Result<bool> {
         let mut saw_pending = false;
         let mut errors = Vec::new();
+        let mut retrying_after_error = false;
         for endpoint in &self.endpoints {
-            match rpc_request::<Option<serde_json::Value>>(
+            if retrying_after_error {
+                self.history_telemetry.add(HistoryCounter::RpcRetries, 1);
+            }
+            self.history_telemetry
+                .add(HistoryCounter::TransactionLookupRequests, 1);
+            let started = Instant::now();
+            let result = rpc_request::<Option<serde_json::Value>>(
                 endpoint,
                 "eth_getTransactionByHash",
                 serde_json::json!([format!("{hash:#x}")]),
             )
-            .await
-            {
+            .await;
+            self.history_telemetry
+                .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
+            match result {
                 Ok(Some(_)) => return Ok(true),
                 Ok(None) => saw_pending = true,
-                Err(error) => errors.push(format!("{}: {error:#}", endpoint.name)),
+                Err(error) => {
+                    self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
+                    retrying_after_error = true;
+                    errors.push(format!("{}: {error:#}", endpoint.name));
+                }
             }
         }
         if !saw_pending && !errors.is_empty() {
@@ -581,14 +616,23 @@ impl NetworkClient {
     pub async fn transaction_sender(&self, hash: B256) -> Result<Option<Address>> {
         let mut sender = None;
         let mut last_error = None;
+        let mut retrying_after_error = false;
         for endpoint in &self.endpoints {
-            match rpc_request::<Option<TransactionSenderJson>>(
+            if retrying_after_error {
+                self.history_telemetry.add(HistoryCounter::RpcRetries, 1);
+            }
+            self.history_telemetry
+                .add(HistoryCounter::TransactionLookupRequests, 1);
+            let started = Instant::now();
+            let result = rpc_request::<Option<TransactionSenderJson>>(
                 endpoint,
                 "eth_getTransactionByHash",
                 serde_json::json!([format!("{hash:#x}")]),
             )
-            .await
-            {
+            .await;
+            self.history_telemetry
+                .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
+            match result {
                 Ok(Some(transaction)) => {
                     if parse_hash(&transaction.hash)? != hash {
                         bail!("RPC returned a different transaction while recovering sender");
@@ -600,7 +644,11 @@ impl NetworkClient {
                     sender = Some(observed);
                 }
                 Ok(None) => {}
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
+                    retrying_after_error = true;
+                    last_error = Some(error);
+                }
             }
         }
         if sender.is_some() {
@@ -616,14 +664,23 @@ impl NetworkClient {
         let mut endpoint_errors = Vec::new();
         let mut verified_receipt = None;
         let mut saw_pending = false;
+        let mut retrying_after_error = false;
         for endpoint in &self.endpoints {
-            match rpc_request::<Option<ReceiptJson>>(
+            if retrying_after_error {
+                self.history_telemetry.add(HistoryCounter::RpcRetries, 1);
+            }
+            self.history_telemetry
+                .add(HistoryCounter::ReceiptRequests, 1);
+            let started = Instant::now();
+            let result = rpc_request::<Option<ReceiptJson>>(
                 endpoint,
                 "eth_getTransactionReceipt",
                 serde_json::json!([format!("{hash:#x}")]),
             )
-            .await
-            {
+            .await;
+            self.history_telemetry
+                .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
+            match result {
                 Ok(Some(receipt)) => {
                     let receipt = TransactionReceipt::try_from(receipt).with_context(|| {
                         format!("decode transaction receipt from {}", endpoint.name)
@@ -642,7 +699,11 @@ impl NetworkClient {
                     }
                 }
                 Ok(None) => saw_pending = true,
-                Err(error) => endpoint_errors.push(format!("{}: {error:#}", endpoint.name)),
+                Err(error) => {
+                    self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
+                    retrying_after_error = true;
+                    endpoint_errors.push(format!("{}: {error:#}", endpoint.name));
+                }
             }
         }
         if let Some(receipt) = verified_receipt {
@@ -665,21 +726,44 @@ impl NetworkClient {
         Ok(None)
     }
 
-    pub async fn window_finalization_logs(
+    pub(crate) async fn window_finalization_logs_range(
         &self,
         address: Address,
         token: Address,
         window_id: u64,
         from_block: u64,
+        to_block: u64,
     ) -> Result<Vec<RpcLog>> {
+        if from_block > to_block {
+            return Ok(Vec::new());
+        }
+        if to_block.saturating_sub(from_block) >= MAX_LOG_QUERY_RANGE {
+            bail!("reward history range exceeds the bounded RPC log-query size");
+        }
         let mut errors = Vec::new();
         let mut found_empty = false;
+        let mut retrying_after_error = false;
         for endpoint in &self.endpoints {
-            match window_finalization_logs_at(endpoint, address, token, window_id, from_block).await
+            if retrying_after_error {
+                self.history_telemetry.add(HistoryCounter::RpcRetries, 1);
+            }
+            match window_finalization_logs_range_at(
+                endpoint,
+                address,
+                token,
+                window_id,
+                from_block,
+                to_block,
+                &self.history_telemetry,
+            )
+            .await
             {
                 Ok(logs) if !logs.is_empty() => return Ok(logs),
                 Ok(_) => found_empty = true,
-                Err(error) => errors.push(format!("{}: {error:#}", endpoint.name)),
+                Err(error) => {
+                    retrying_after_error = true;
+                    errors.push(format!("{}: {error:#}", endpoint.name));
+                }
             }
         }
         if found_empty && errors.is_empty() {
@@ -692,12 +776,23 @@ impl NetworkClient {
     }
 
     pub async fn primary_nonce(&self, address: Address, block_tag: &str) -> Result<u64> {
+        self.history_telemetry.add(HistoryCounter::NonceRequests, 1);
+        let started = Instant::now();
         let result = rpc_request::<String>(
             self.primary_endpoint()?,
             "eth_getTransactionCount",
             serde_json::json!([format!("{address:#x}"), block_tag]),
         )
-        .await?;
+        .await;
+        self.history_telemetry
+            .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
+                return Err(error);
+            }
+        };
         parse_hex_quantity(&result)
     }
 
@@ -707,21 +802,49 @@ impl NetworkClient {
 
     pub async fn canonical_block_hash(&self, block_number: u64) -> Result<B256> {
         let primary = self.primary_endpoint()?;
-        let canonical = block_at(primary, block_number).await?.hash;
+        self.history_telemetry
+            .add(HistoryCounter::CanonicalBlockRequests, 1);
+        let started = Instant::now();
+        let primary_block = block_at(primary, block_number).await;
+        self.history_telemetry
+            .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
+        let canonical = match primary_block {
+            Ok(block) => block.hash,
+            Err(error) => {
+                self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
+                return Err(error);
+            }
+        };
         for endpoint in &self.endpoints {
             if endpoint.name == "primary" {
                 continue;
             }
+            self.history_telemetry
+                .add(HistoryCounter::CanonicalBlockRequests, 1);
+            let started = Instant::now();
             match block_at(endpoint, block_number).await {
-                Ok(block) if block.hash == canonical => {}
-                Ok(_) => bail!(
-                    "RPC {} disagrees with the primary block hash at {block_number}; refusing to settle the receipt",
-                    endpoint.name
-                ),
-                Err(error) => self.report_diagnostic(format!(
-                    "RPC {} cannot corroborate block {block_number}: {error:#}",
-                    endpoint.name
-                )),
+                Ok(block) if block.hash == canonical => {
+                    self.history_telemetry
+                        .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
+                }
+                Ok(_) => {
+                    self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
+                    self.history_telemetry
+                        .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
+                    bail!(
+                        "RPC {} disagrees with the primary block hash at {block_number}; refusing to settle the receipt",
+                        endpoint.name
+                    );
+                }
+                Err(error) => {
+                    self.history_telemetry.add(HistoryCounter::RpcErrors, 1);
+                    self.history_telemetry
+                        .add_elapsed(HistoryDuration::HistoricalRpc, started.elapsed());
+                    self.report_diagnostic(format!(
+                        "RPC {} cannot corroborate block {block_number}: {error:#}",
+                        endpoint.name
+                    ));
+                }
             }
         }
         Ok(canonical)
@@ -746,6 +869,34 @@ impl NetworkClient {
         }
         Ok(Some(
             latest_block_number
+                .saturating_sub(block_number)
+                .saturating_add(1),
+        ))
+    }
+
+    pub(crate) async fn receipt_confirmations_at_snapshot(
+        &self,
+        block_number: u64,
+        block_hash: B256,
+        snapshot: &BlockSnapshot,
+        canonical_blocks: &mut HashMap<u64, B256>,
+    ) -> Result<Option<u64>> {
+        if snapshot.number < block_number {
+            return Ok(Some(0));
+        }
+        let canonical_hash = if let Some(hash) = canonical_blocks.get(&block_number) {
+            *hash
+        } else {
+            let hash = self.canonical_block_hash(block_number).await?;
+            canonical_blocks.insert(block_number, hash);
+            hash
+        };
+        if canonical_hash != block_hash {
+            return Ok(None);
+        }
+        Ok(Some(
+            snapshot
+                .number
                 .saturating_sub(block_number)
                 .saturating_add(1),
         ))
@@ -821,6 +972,7 @@ impl NetworkClient {
             manifest,
             endpoints: vec![endpoint],
             diagnostics: None,
+            history_telemetry: Arc::new(HistoryTelemetry::default()),
             #[cfg(test)]
             fail_next_finalization_fee_quote: std::sync::Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -1354,18 +1506,17 @@ fn parse_rpc_log(log: ReceiptLogJson) -> Result<RpcLog> {
     })
 }
 
-async fn window_finalization_logs_at(
+async fn window_finalization_logs_range_at(
     endpoint: &RpcEndpoint,
     address: Address,
     token: Address,
     window_id: u64,
     from_block: u64,
+    to_block: u64,
+    telemetry: &HistoryTelemetry,
 ) -> Result<Vec<RpcLog>> {
-    let latest = rpc_request::<String>(endpoint, "eth_blockNumber", serde_json::json!([]))
-        .await
-        .and_then(|value| parse_hex_quantity(&value))?;
-    if latest < from_block {
-        return Ok(Vec::new());
+    if from_block > to_block || to_block.saturating_sub(from_block) >= MAX_LOG_QUERY_RANGE {
+        bail!("reward history range is outside the bounded RPC log-query size");
     }
     let window_topic = B256::from(U256::from(window_id).to_be_bytes::<32>());
     let topics = serde_json::json!([
@@ -1381,52 +1532,63 @@ async fn window_finalization_logs_at(
         format!("{:#x}", IERC20Read::Transfer::SIGNATURE_HASH),
         format!("{:#x}", B256::from(from_topic)),
     ]);
+    telemetry.add(HistoryCounter::BlockRangesScanned, 1);
     let mut results = Vec::new();
-    let mut start = from_block;
-    loop {
-        let end = start.saturating_add(MAX_LOG_QUERY_RANGE - 1).min(latest);
-        let logs = rpc_request::<Vec<ReceiptLogJson>>(
-            endpoint,
-            "eth_getLogs",
-            serde_json::json!([{
-                "address": format!("{address:#x}"),
-                "fromBlock": format!("0x{start:x}"),
-                "toBlock": format!("0x{end:x}"),
-                "topics": topics,
-            }]),
-        )
-        .await
-        .with_context(|| format!("query finalization logs for node window {window_id}"))?;
-        results.extend(
-            logs.into_iter()
-                .map(parse_rpc_log)
-                .collect::<Result<Vec<_>>>()?,
-        );
-        let transfers = rpc_request::<Vec<ReceiptLogJson>>(
-            endpoint,
-            "eth_getLogs",
-            serde_json::json!([{
-                "address": format!("{token:#x}"),
-                "fromBlock": format!("0x{start:x}"),
-                "toBlock": format!("0x{end:x}"),
-                "topics": transfer_topics,
-            }]),
-        )
-        .await
-        .with_context(|| format!("query AST Transfer logs for node window {window_id}"))?;
-        results.extend(
-            transfers
-                .into_iter()
-                .map(parse_rpc_log)
-                .collect::<Result<Vec<_>>>()?,
-        );
-        if end == latest {
-            break;
+    telemetry.add(HistoryCounter::GetLogsRequests, 1);
+    let logs_started = Instant::now();
+    let logs_result = rpc_request::<Vec<ReceiptLogJson>>(
+        endpoint,
+        "eth_getLogs",
+        serde_json::json!([{
+            "address": format!("{address:#x}"),
+            "fromBlock": format!("0x{from_block:x}"),
+            "toBlock": format!("0x{to_block:x}"),
+            "topics": topics,
+        }]),
+    )
+    .await
+    .with_context(|| format!("query finalization logs for node window {window_id}"));
+    telemetry.add_elapsed(HistoryDuration::HistoricalRpc, logs_started.elapsed());
+    let logs = match logs_result {
+        Ok(logs) => logs,
+        Err(error) => {
+            telemetry.add(HistoryCounter::RpcErrors, 1);
+            return Err(error);
         }
-        start = end
-            .checked_add(1)
-            .context("log query block range overflow")?;
-    }
+    };
+    results.extend(
+        logs.into_iter()
+            .map(parse_rpc_log)
+            .collect::<Result<Vec<_>>>()?,
+    );
+    telemetry.add(HistoryCounter::GetLogsRequests, 1);
+    let transfers_started = Instant::now();
+    let transfers_result = rpc_request::<Vec<ReceiptLogJson>>(
+        endpoint,
+        "eth_getLogs",
+        serde_json::json!([{
+            "address": format!("{token:#x}"),
+            "fromBlock": format!("0x{from_block:x}"),
+            "toBlock": format!("0x{to_block:x}"),
+            "topics": transfer_topics,
+        }]),
+    )
+    .await
+    .with_context(|| format!("query AST Transfer logs for node window {window_id}"));
+    telemetry.add_elapsed(HistoryDuration::HistoricalRpc, transfers_started.elapsed());
+    let transfers = match transfers_result {
+        Ok(transfers) => transfers,
+        Err(error) => {
+            telemetry.add(HistoryCounter::RpcErrors, 1);
+            return Err(error);
+        }
+    };
+    results.extend(
+        transfers
+            .into_iter()
+            .map(parse_rpc_log)
+            .collect::<Result<Vec<_>>>()?,
+    );
     Ok(results)
 }
 

@@ -38,6 +38,7 @@ use tokio::{
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const REWARD_SCAN_SERVICE_INTERVAL: Duration = Duration::from_millis(250);
 const IDLE_INTERVAL: Duration = Duration::from_millis(20);
 const NONCE_BATCH_SIZE: usize = 2_048;
 const PENDING_PROOF_CANDIDATE_CAPACITY: usize = 9;
@@ -971,7 +972,13 @@ async fn run_runtime(
             .as_ref()
             .context("AST token pin is missing from the Testnet manifest")?;
         let ast_token = crate::deployment::parse_address(&token.address)?;
-        let mut manager = match TransactionManager::open(store, &config, address, ast_token) {
+        let mut manager = match TransactionManager::open_with_history_telemetry(
+            store,
+            &config,
+            address,
+            ast_token,
+            client.history_telemetry(),
+        ) {
             Ok(manager) => manager,
             Err(error) => {
                 if let Some(startup) = startup {
@@ -1014,6 +1021,9 @@ async fn run_runtime(
             startup.complete("Transaction recovery complete");
         } else {
             startup.complete("No previous transactions to recover");
+        }
+        if let Some(manager) = transactions.as_ref() {
+            startup.note(manager.history_profile_line());
         }
     }
     let signing_ready = transactions
@@ -1159,33 +1169,32 @@ async fn run_runtime(
             snapshot.block.number
         ));
         if transactions.is_some() {
-            startup.begin("Reconciling reward history");
+            startup.begin("Scheduling historical reward verification");
         }
     }
     if let Some(manager) = transactions.as_mut() {
-        match race_with_ctrl_c(manager.reconcile_rewards(&client, &snapshot), ctrl_c).await? {
-            Some(Ok(())) => {
+        match manager
+            .service_reward_reconciliation(&client, &snapshot)
+            .await
+        {
+            Ok(scheduled) => {
                 if let Some(startup) = startup {
-                    startup.complete("Reward history reconciled");
+                    startup.complete(if !client.verification.token_verified {
+                        "Reward history waits for verified AST token"
+                    } else if scheduled {
+                        "Historical reward verification scheduled; mining continues"
+                    } else {
+                        "No pending historical reward evidence"
+                    });
                 }
             }
-            Some(Err(error)) => {
-                let detail = format!(
-                    "reward-event verification will retry after the next snapshot: {error:#}"
-                );
+            Err(error) => {
                 if let Some(startup) = startup {
-                    startup.note(&detail);
-                    startup.warn(
-                        "Reward history check deferred; it will retry after a later snapshot",
-                    );
+                    startup.fail(format!(
+                        "Reward reconciliation scheduling failed: {error:#}"
+                    ));
                 }
-                diagnostics.push(detail);
-            }
-            None => {
-                if let Some(startup) = startup {
-                    startup.cancel();
-                }
-                return Ok(());
+                return Err(error).context("schedule historical reward verification");
             }
         }
     }
@@ -1335,6 +1344,9 @@ async fn run_runtime(
     let mut progress_ticker = time::interval(PROGRESS_INTERVAL);
     progress_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     progress_ticker.tick().await;
+    let mut reward_scan_ticker = time::interval(REWARD_SCAN_SERVICE_INTERVAL);
+    reward_scan_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    reward_scan_ticker.tick().await;
     let mut last_progress = time::Instant::now();
     let mut last_snapshot = observer.latest_snapshot().unwrap_or(snapshot);
     let mut fatal_error = None;
@@ -1379,7 +1391,9 @@ async fn run_runtime(
                             continue 'mining_loop;
                         }
                         if let Some(manager) = transactions.as_mut()
-                            && let Err(error) = manager.monitor(&client).await
+                            && let Err(error) = manager
+                                .monitor_at_snapshot(&client, &snapshot.block)
+                                .await
                         {
                             fatal_error = Some(error.context("monitor transaction finality and reorg state"));
                             break;
@@ -1515,12 +1529,12 @@ async fn run_runtime(
                             continue 'mining_loop;
                         }
                         if let Some(manager) = transactions.as_mut()
-                            && let Err(error) = manager.reconcile_rewards(&client, &snapshot).await
+                            && let Err(error) = manager
+                                .service_reward_reconciliation(&client, &snapshot)
+                                .await
                         {
-                            report_mining_warning(
-                                &dashboard,
-                                format!("reward-event verification will retry after the next snapshot: {error:#}"),
-                            );
+                            fatal_error = Some(error.context("service historical reward verification"));
+                            break 'mining_loop;
                         }
                         last_snapshot = observer.latest_snapshot().unwrap_or(snapshot);
                     }
@@ -1556,6 +1570,17 @@ async fn run_runtime(
                         elapsed,
                     );
                     last_progress = time::Instant::now();
+                }
+            }
+            _ = reward_scan_ticker.tick(), if transactions.is_some() => {
+                if !proof_receiver.has_pending()
+                    && let Some(manager) = transactions.as_mut()
+                    && let Err(error) = manager
+                        .service_reward_reconciliation(&client, &last_snapshot)
+                        .await
+                {
+                    fatal_error = Some(error.context("service historical reward verification"));
+                    break 'mining_loop;
                 }
             }
             proof = proof_receiver.recv() => {
@@ -1882,6 +1907,9 @@ async fn run_runtime(
             model.critical_error = Some(format!("{error:#}"));
             model.current_action = None;
         });
+    }
+    if let Some(manager) = transactions.as_ref() {
+        report_mining_info(&dashboard, manager.history_profile_line());
     }
     for line in proof_telemetry.report_lines() {
         report_mining_info(&dashboard, line);
@@ -3134,6 +3162,8 @@ fn dashboard_model(
         chain_id: context.chain_id,
         wallet: context.address,
         inj_balance: snapshot.native_balance,
+        ast_balance: snapshot.ast_balance,
+        mined_rewards: transaction_state.mined_rewards,
         cpu_threads: context.threads,
         session_limit: Some(context.spending_limit),
         session_exposure: transaction_state.session_exposure,
@@ -3334,6 +3364,7 @@ fn connect_transaction_dashboard(
 
 fn apply_transaction_state_to_model(model: &mut DashboardModel, state: &TransactionDashboardState) {
     model.session_exposure = state.session_exposure;
+    model.mined_rewards = state.mined_rewards;
     model.recovering = state
         .activities
         .iter()
@@ -3397,6 +3428,7 @@ fn initial_transaction_dashboard_state(
     };
     TransactionDashboardState {
         session_exposure,
+        mined_rewards: manager.mined_rewards_total(),
         activities: manager.dashboard_activities(),
     }
 }
@@ -3875,7 +3907,7 @@ mod tests {
             },
             native_balance: Some(U256::from(1_000)),
             native_balance_error: None,
-            ast_balance: None,
+            ast_balance: Some(U256::from(39_000_000_000_000_u128)),
             ast_balance_error: None,
             nodes,
         };
@@ -3892,7 +3924,11 @@ mod tests {
             selected: selected.clone(),
             slots: Arc::clone(&slots),
             schedule: Arc::clone(&schedule),
-            transaction_state: Arc::new(RwLock::new(TransactionDashboardState::default())),
+            transaction_state: Arc::new(RwLock::new(TransactionDashboardState {
+                session_exposure: None,
+                mined_rewards: U256::from(26_000_000_000_000_u128),
+                activities: Vec::new(),
+            })),
             pending_sync: Arc::new(RwLock::new(HashMap::new())),
             finalization_state: Arc::new(RwLock::new(HashMap::new())),
         };
@@ -3913,6 +3949,8 @@ mod tests {
         );
 
         let model = dashboard_model(&context, &snapshot, Instant::now());
+        assert_eq!(model.ast_balance, Some(U256::from(39_000_000_000_000_u128)));
+        assert_eq!(model.mined_rewards, U256::from(26_000_000_000_000_u128));
         assert_eq!(
             model
                 .selected_nodes

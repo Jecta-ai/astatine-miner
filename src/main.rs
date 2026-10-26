@@ -5,6 +5,7 @@ mod contracts;
 mod dashboard;
 mod deployment;
 mod diagnostics;
+mod history_telemetry;
 mod mining;
 mod proof_telemetry;
 mod protocol;

@@ -3,6 +3,7 @@ use crate::{
     config::{AppConfig, ConfigStore, parse_inj_wei},
     contracts::{AstatineMinerRead, IERC20Read},
     diagnostics::DiagnosticBuffer,
+    history_telemetry::{HistoryCounter, HistoryDuration, HistoryTelemetry},
     proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{
@@ -25,16 +26,26 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::time::{Instant, sleep};
+use tokio::{
+    task::{JoinHandle, JoinSet},
+    time::{Instant, sleep},
+};
 
-const JOURNAL_VERSION: u32 = 3;
+const JOURNAL_VERSION: u32 = 4;
 const ARCHIVE_VERSION: u32 = 1;
 const MAX_JOURNAL_ENTRIES: usize = 4_096;
-const ARCHIVE_TRIGGER_ENTRIES: usize = 256;
+const ARCHIVE_TRIGGER_ENTRIES: usize = 64;
 const ARCHIVE_BATCH_SIZE: usize = 128;
 const ARCHIVE_AFTER_CONFIRMATIONS: u64 = 64;
 const RECEIPT_WAIT: Duration = Duration::from_secs(90);
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const REWARD_SCAN_JOBS_PER_BATCH: usize = 256;
+const REWARD_SCAN_CONCURRENCY: usize = 4;
+const REWARD_SCAN_BLOCK_RANGE: u64 = 10_000;
+const REWARD_SCAN_RETRY_BASE: Duration = Duration::from_secs(1);
+const REWARD_SCAN_RETRY_MAX: Duration = Duration::from_secs(30);
+const REWARD_EMPTY_SCAN_RETRY_BASE_SECS: u64 = 60;
+const REWARD_EMPTY_SCAN_RETRY_MAX_SECS: u64 = 3_600;
 const SUBMISSION_FEE_WEI: u128 = 10_000_000_000_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,6 +229,47 @@ struct ArchiveMeta {
     entry_count: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RewardScanCursor {
+    scanned_through: u64,
+    retry_after_unix_secs: u64,
+    retry_backoff_secs: u64,
+    rescan_active: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RewardScanAnchor {
+    block_number: u64,
+    block_hash: String,
+}
+
+#[derive(Clone, Debug)]
+struct RewardScanJob {
+    key: String,
+    candidate: RewardCandidate,
+    from_block: u64,
+    to_block: u64,
+    rescan_active: bool,
+    retry_after_unix_secs: u64,
+    retry_backoff_secs: u64,
+}
+
+struct RewardScanJobOutput {
+    key: String,
+    cursor: Option<RewardScanCursor>,
+    evidence: Vec<RewardEvidence>,
+}
+
+enum RewardScanBatchOutput {
+    ReorgDetected,
+    Scanned {
+        snapshot: crate::rpc::BlockSnapshot,
+        results: Vec<Result<RewardScanJobOutput>>,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct JournalArchive {
@@ -241,6 +293,10 @@ struct JournalState {
     archived_total_spending_wei: String,
     #[serde(default)]
     next_archive_sequence: u64,
+    #[serde(default)]
+    reward_scan_cursors: HashMap<String, RewardScanCursor>,
+    #[serde(default)]
+    reward_scan_anchor: Option<RewardScanAnchor>,
 }
 
 impl Default for JournalState {
@@ -254,6 +310,8 @@ impl Default for JournalState {
             archived_session_spending: HashMap::new(),
             archived_total_spending_wei: "0".to_owned(),
             next_archive_sequence: 0,
+            reward_scan_cursors: HashMap::new(),
+            reward_scan_anchor: None,
         }
     }
 }
@@ -269,6 +327,10 @@ fn migrate_journal(
 ) -> Result<(JournalState, bool)> {
     if state.version == JOURNAL_VERSION {
         return Ok((state, false));
+    }
+    if state.version == 3 {
+        state.version = JOURNAL_VERSION;
+        return Ok((state, true));
     }
     if !matches!(state.version, 1 | 2) {
         bail!(
@@ -326,14 +388,35 @@ fn proof_attempt_key(contract: Address) -> String {
     format!("{contract:#x}")
 }
 
+fn reward_scan_key(contract: Address, window_id: u64) -> String {
+    format!("{contract:#x}:{window_id}")
+}
+
 pub struct TransactionJournal {
     store: ConfigStore,
     state: JournalState,
     _lock: File,
+    history_telemetry: Arc<HistoryTelemetry>,
 }
 
 impl TransactionJournal {
+    #[cfg(test)]
     pub fn open(store: &ConfigStore, config: &AppConfig, wallet: Address) -> Result<Self> {
+        Self::open_with_history_telemetry(
+            store,
+            config,
+            wallet,
+            Arc::new(HistoryTelemetry::default()),
+        )
+    }
+
+    fn open_with_history_telemetry(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        history_telemetry: Arc<HistoryTelemetry>,
+    ) -> Result<Self> {
+        let _open_timer = history_telemetry.timer(HistoryDuration::JournalOpen);
         if config.network != Network::Testnet {
             bail!("transaction signing is disabled outside Injective Testnet");
         }
@@ -346,12 +429,21 @@ impl TransactionJournal {
         };
         let (state, migrated) = migrate_journal(state, wallet, config.transaction_confirmations)?;
         validate_journal(&state)?;
-        validate_archive_ledger(store, &state)?;
+        let archive_validation = {
+            let _archive_validation_timer =
+                history_telemetry.timer(HistoryDuration::ArchiveValidation);
+            validate_archive_ledger(store, &state, Some(&history_telemetry))
+        };
+        if let Err(error) = archive_validation {
+            history_telemetry.add(HistoryCounter::ArchiveValidationFailures, 1);
+            return Err(error);
+        }
 
         let mut journal = Self {
             store: store.clone(),
             state,
             _lock: lock,
+            history_telemetry: Arc::clone(&history_telemetry),
         };
         let has_unresolved = journal.has_unresolved();
         let has_active_entries = journal
@@ -414,9 +506,22 @@ impl TransactionJournal {
     }
 
     fn persist(&self) -> Result<()> {
+        let _persist_timer = self
+            .history_telemetry
+            .timer(HistoryDuration::JournalPersistence);
         let contents =
             serde_json::to_vec_pretty(&self.state).context("serialize transaction journal")?;
-        self.store.write_transaction_journal(&contents)
+        if let Err(error) = self.store.write_transaction_journal(&contents) {
+            self.history_telemetry
+                .add(HistoryCounter::JournalWriteFailures, 1);
+            return Err(error);
+        }
+        self.history_telemetry.add(HistoryCounter::JournalWrites, 1);
+        self.history_telemetry.add(
+            HistoryCounter::JournalWriteBytes,
+            u64::try_from(contents.len()).unwrap_or(u64::MAX),
+        );
+        Ok(())
     }
 
     pub fn has_unresolved(&self) -> bool {
@@ -665,13 +770,16 @@ impl TransactionJournal {
     ) -> Result<()> {
         let entry = self.entry_mut(hash)?;
         let block_hash = format!("{:#x}", receipt.block_hash);
-        let changed = entry.status != TransactionStatus::Included
+        let receipt_changed = entry.status != TransactionStatus::Included
             || entry.outcome.as_deref() != Some(outcome.as_str())
             || entry.receipt_block != Some(receipt.block_number)
             || entry.receipt_block_hash.as_deref() != Some(block_hash.as_str())
             || entry.receipt_status != Some(receipt.status)
-            || entry.confirmations != confirmations
             || entry.actual_cost_wei.is_some();
+        let confirmations_changed = entry.confirmations != confirmations;
+        let crossed_required_confirmations = entry.confirmations
+            < u64::from(entry.confirmations_required)
+            && confirmations >= u64::from(entry.confirmations_required);
         entry.status = TransactionStatus::Included;
         entry.actual_cost_wei = None;
         entry.outcome = Some(outcome);
@@ -679,7 +787,7 @@ impl TransactionJournal {
         entry.receipt_block_hash = Some(block_hash);
         entry.receipt_status = Some(receipt.status);
         entry.confirmations = confirmations;
-        if changed {
+        if receipt_changed || (confirmations_changed && crossed_required_confirmations) {
             self.persist()?;
         }
         Ok(())
@@ -715,29 +823,42 @@ impl TransactionJournal {
         self.persist()
     }
 
-    fn update_confirmations(&mut self, hash: B256, confirmations: u64) -> Result<()> {
+    fn update_confirmations(&mut self, hash: B256, confirmations: u64) -> Result<bool> {
         let entry = self.entry_mut(hash)?;
-        if entry.confirmations != confirmations {
+        let changed = entry.confirmations != confirmations;
+        if changed {
             entry.confirmations = confirmations;
-            self.persist()?;
         }
-        Ok(())
+        Ok(changed)
     }
 
-    fn update_reward_confirmations(&mut self, hash: B256, confirmations: u64) -> Result<bool> {
+    fn update_reward_confirmations(
+        &mut self,
+        hash: B256,
+        confirmations: u64,
+    ) -> Result<(bool, bool)> {
         let entry = self.entry_mut(hash)?;
         if entry.reward_block_hash.is_none() {
-            return Ok(false);
+            return Ok((false, false));
         }
+        let previously_confirmed = entry.reward_confirmed;
+        let previously_at_archive_threshold =
+            entry.reward_confirmations >= ARCHIVE_AFTER_CONFIRMATIONS;
         let newly_confirmed =
             !entry.reward_confirmed && confirmations >= u64::from(entry.confirmations_required);
         let confirmed = confirmations >= u64::from(entry.confirmations_required);
-        if entry.reward_confirmations != confirmations || entry.reward_confirmed != confirmed {
+        let crossed_archive_threshold =
+            !previously_at_archive_threshold && confirmations >= ARCHIVE_AFTER_CONFIRMATIONS;
+        let changed =
+            entry.reward_confirmations != confirmations || entry.reward_confirmed != confirmed;
+        if changed {
             entry.reward_confirmations = confirmations;
             entry.reward_confirmed = confirmed;
-            self.persist()?;
         }
-        Ok(newly_confirmed)
+        Ok((
+            newly_confirmed,
+            changed || previously_confirmed != confirmed || crossed_archive_threshold,
+        ))
     }
 
     fn clear_reward_block_hash(&mut self, hash: B256) -> Result<()> {
@@ -762,6 +883,8 @@ impl TransactionJournal {
             entry.confirmations = 0;
             data
         };
+        let contract_address =
+            Address::from_str(&contract).context("uncertain transaction contract is invalid")?;
         if action == TransactionAction::SubmitProof
             && let Some(entry) = self.state.entries.iter_mut().find(|entry| {
                 entry
@@ -772,6 +895,9 @@ impl TransactionJournal {
             entry.reward_block_hash = None;
             entry.reward_confirmations = 0;
             entry.reward_confirmed = false;
+            self.state
+                .reward_scan_cursors
+                .remove(&reward_scan_key(contract_address, window_id));
         }
         if action == TransactionAction::FinalizeWindow {
             for entry in &mut self.state.entries {
@@ -784,6 +910,9 @@ impl TransactionJournal {
                     entry.reward_confirmed = false;
                 }
             }
+            self.state
+                .reward_scan_cursors
+                .remove(&reward_scan_key(contract_address, window_id));
         }
         self.persist()
     }
@@ -867,7 +996,12 @@ impl TransactionJournal {
                 .entry((contract, entry.node_id, entry.window_id))
                 .and_modify(|(block, wallets)| {
                     *block = (*block).min(entry.receipt_block.unwrap_or_default());
-                    wallets.insert(wallet, entry.confirmations_required);
+                    wallets
+                        .entry(wallet)
+                        .and_modify(|required| {
+                            *required = (*required).max(entry.confirmations_required)
+                        })
+                        .or_insert(entry.confirmations_required);
                 })
                 .or_insert_with(|| {
                     (
@@ -890,7 +1024,7 @@ impl TransactionJournal {
             .collect())
     }
 
-    fn record_reward_outcome(&mut self, evidence: RewardEvidence) -> Result<()> {
+    fn record_reward_outcome_in_memory(&mut self, evidence: RewardEvidence) -> Result<bool> {
         let RewardEvidence {
             contract,
             window_id,
@@ -901,6 +1035,7 @@ impl TransactionJournal {
             outcome,
         } = evidence;
         let contract = format!("{contract:#x}");
+        let mut changed = false;
         for entry in &mut self.state.entries {
             if entry.action == TransactionAction::SubmitProof
                 && entry.status == TransactionStatus::MinedSuccess
@@ -909,14 +1044,32 @@ impl TransactionJournal {
                 && entry.wallet.eq_ignore_ascii_case(&format!("{wallet:#x}"))
                 && entry.window_id == window_id
             {
-                entry.reward_outcome = Some(outcome.clone());
-                entry.reward_block = Some(block);
-                entry.reward_block_hash = Some(format!("{block_hash:#x}"));
-                entry.reward_confirmations = confirmations;
-                entry.reward_confirmed = confirmations >= u64::from(entry.confirmations_required);
+                let reward_block_hash = format!("{block_hash:#x}");
+                let reward_confirmed = confirmations >= u64::from(entry.confirmations_required);
+                if entry.reward_outcome.as_deref() != Some(outcome.as_str())
+                    || entry.reward_block != Some(block)
+                    || entry.reward_block_hash.as_deref() != Some(reward_block_hash.as_str())
+                    || entry.reward_confirmations != confirmations
+                    || entry.reward_confirmed != reward_confirmed
+                {
+                    changed = true;
+                    entry.reward_outcome = Some(outcome.clone());
+                    entry.reward_block = Some(block);
+                    entry.reward_block_hash = Some(reward_block_hash);
+                    entry.reward_confirmations = confirmations;
+                    entry.reward_confirmed = reward_confirmed;
+                }
             }
         }
-        self.persist()
+        if self
+            .state
+            .reward_scan_cursors
+            .remove(&reward_scan_key(Address::from_str(&contract)?, window_id))
+            .is_some()
+        {
+            changed = true;
+        }
+        Ok(changed)
     }
 
     fn archive_settled(&mut self) -> Result<usize> {
@@ -958,8 +1111,13 @@ impl TransactionJournal {
             serde_json::to_vec_pretty(&record).context("serialize transaction archive")?;
         let content_hash = format!("{:#x}", keccak256(&contents));
         let file_name = format!("archive-{}.json", &content_hash[2..]);
-        self.store
-            .write_transaction_archive(&file_name, &contents)?;
+        if let Err(error) = self.store.write_transaction_archive(&file_name, &contents) {
+            self.history_telemetry
+                .add(HistoryCounter::ArchiveWriteFailures, 1);
+            return Err(error);
+        }
+        self.history_telemetry
+            .add(HistoryCounter::ArchiveFilesCreated, 1);
 
         let mut total_spending = parse_decimal_wei(&self.state.archived_total_spending_wei)?;
         for entry in &entries {
@@ -1063,6 +1221,13 @@ pub struct TransactionManager {
     dashboard_sink: Option<TransactionDashboardSink>,
     proof_telemetry: Option<Arc<ProofPipelineTelemetry>>,
     proof_attempt_guard: Option<Arc<ProofAttemptGuard>>,
+    history_telemetry: Arc<HistoryTelemetry>,
+    reward_scan_task: Option<JoinHandle<Result<RewardScanBatchOutput>>>,
+    reward_scan_retry_at: Option<Instant>,
+    reward_scan_retry_attempts: u8,
+    current_process_proof_hashes: HashSet<B256>,
+    mined_rewards_by_window: HashMap<MinedRewardKey, U256>,
+    mined_rewards_total: U256,
 }
 
 #[derive(Clone, Debug)]
@@ -1090,6 +1255,7 @@ pub struct TransactionActivity {
 #[derive(Clone, Debug, Default)]
 pub struct TransactionDashboardState {
     pub session_exposure: Option<U256>,
+    pub mined_rewards: U256,
     pub activities: Vec<TransactionActivity>,
 }
 
@@ -1140,12 +1306,20 @@ struct PreparedTransaction {
     confirmations_required: u8,
 }
 
+#[derive(Clone, Debug)]
 struct RewardCandidate {
     contract: Address,
     node_id: u8,
     window_id: u64,
     from_block: u64,
     wallets: Vec<(Address, u8)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct MinedRewardKey {
+    contract: Address,
+    window_id: u64,
+    wallet: Address,
 }
 
 struct RewardEvidence {
@@ -1169,13 +1343,35 @@ pub struct ProofSubmission {
 }
 
 impl TransactionManager {
+    #[cfg(test)]
     pub fn open(
         store: &ConfigStore,
         config: &AppConfig,
         wallet: Address,
         ast_token: Address,
     ) -> Result<Self> {
-        let journal = TransactionJournal::open(store, config, wallet)?;
+        Self::open_with_history_telemetry(
+            store,
+            config,
+            wallet,
+            ast_token,
+            Arc::new(HistoryTelemetry::default()),
+        )
+    }
+
+    pub(crate) fn open_with_history_telemetry(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        ast_token: Address,
+        history_telemetry: Arc<HistoryTelemetry>,
+    ) -> Result<Self> {
+        let journal = TransactionJournal::open_with_history_telemetry(
+            store,
+            config,
+            wallet,
+            Arc::clone(&history_telemetry),
+        )?;
         Ok(Self {
             journal,
             wallet,
@@ -1188,7 +1384,169 @@ impl TransactionManager {
             dashboard_sink: None,
             proof_telemetry: None,
             proof_attempt_guard: None,
+            history_telemetry,
+            reward_scan_task: None,
+            reward_scan_retry_at: None,
+            reward_scan_retry_attempts: 0,
+            current_process_proof_hashes: HashSet::new(),
+            mined_rewards_by_window: HashMap::new(),
+            mined_rewards_total: U256::ZERO,
         })
+    }
+
+    pub(crate) fn history_profile_line(&self) -> String {
+        let mut prepared = 0_u64;
+        let mut broadcast = 0_u64;
+        let mut unknown = 0_u64;
+        let mut included = 0_u64;
+        let mut settled_success = 0_u64;
+        let mut reverted = 0_u64;
+        let mut unresolved = 0_u64;
+        let mut settled_canonical_pending = 0_u64;
+        let mut reward_pending = 0_u64;
+        for entry in &self.journal.state.entries {
+            match entry.status {
+                TransactionStatus::Prepared => prepared += 1,
+                TransactionStatus::Broadcast => broadcast += 1,
+                TransactionStatus::Unknown => unknown += 1,
+                TransactionStatus::Included => included += 1,
+                TransactionStatus::MinedSuccess => settled_success += 1,
+                TransactionStatus::MinedReverted => reverted += 1,
+            }
+            if entry.status.is_unresolved() {
+                unresolved += 1;
+            } else if entry.confirmations < ARCHIVE_AFTER_CONFIRMATIONS
+                || (entry.action == TransactionAction::SubmitProof
+                    && entry.outcome.as_deref() == Some("candidate-updated")
+                    && (!entry.reward_confirmed
+                        || entry.reward_block_hash.is_none()
+                        || entry.reward_confirmations < ARCHIVE_AFTER_CONFIRMATIONS))
+            {
+                settled_canonical_pending += 1;
+            }
+            if entry.action == TransactionAction::SubmitProof
+                && entry.outcome.as_deref() == Some("candidate-updated")
+                && !entry.reward_confirmed
+            {
+                reward_pending += 1;
+            }
+        }
+        let archived_entries = self
+            .journal
+            .state
+            .archives
+            .iter()
+            .map(|archive| u64::from(archive.entry_count))
+            .sum::<u64>();
+        format!(
+            "history entries={} prepared={} broadcast={} unknown={} included={} settled_success={} reverted={} unresolved={} settled_canonical_pending={} reward_pending={} archives={} archived_entries={} {}",
+            self.journal.state.entries.len(),
+            prepared,
+            broadcast,
+            unknown,
+            included,
+            settled_success,
+            reverted,
+            unresolved,
+            settled_canonical_pending,
+            reward_pending,
+            self.journal.state.archives.len(),
+            archived_entries,
+            self.history_telemetry.format_profile(),
+        )
+    }
+
+    pub(crate) fn mined_rewards_total(&self) -> U256 {
+        self.mined_rewards_total
+    }
+
+    fn set_mined_reward(&mut self, key: MinedRewardKey, payout: Option<U256>) -> Result<()> {
+        let previous = self.mined_rewards_by_window.get(&key).copied();
+        if previous == payout {
+            return Ok(());
+        }
+        let total_without_previous = match previous {
+            Some(previous) => self
+                .mined_rewards_total
+                .checked_sub(previous)
+                .context("per-session mined reward total underflow")?,
+            None => self.mined_rewards_total,
+        };
+        let total = match payout {
+            Some(payout) => total_without_previous
+                .checked_add(payout)
+                .context("per-session mined reward total overflow")?,
+            None => total_without_previous,
+        };
+        match payout {
+            Some(payout) if !payout.is_zero() => {
+                self.mined_rewards_by_window.insert(key, payout);
+            }
+            _ => {
+                self.mined_rewards_by_window.remove(&key);
+            }
+        }
+        self.mined_rewards_total = total;
+        Ok(())
+    }
+
+    fn sync_all_mined_rewards(&mut self) -> Result<()> {
+        let mut matching_keys = HashSet::new();
+        let mut verified_payouts = HashMap::<MinedRewardKey, U256>::new();
+        for entry in &self.journal.state.entries {
+            if entry.action != TransactionAction::SubmitProof
+                || !self
+                    .current_process_proof_hashes
+                    .contains(&entry_hash(entry)?)
+            {
+                continue;
+            }
+            let key = MinedRewardKey {
+                contract: Address::from_str(&entry.contract)
+                    .context("journal proof contract address is invalid")?,
+                window_id: entry.window_id,
+                wallet: Address::from_str(&entry.wallet)
+                    .context("journal proof wallet address is invalid")?,
+            };
+            matching_keys.insert(key);
+            if entry.status != TransactionStatus::MinedSuccess
+                || entry.outcome.as_deref() != Some("candidate-updated")
+                || !entry.reward_confirmed
+                || entry.reward_block_hash.is_none()
+            {
+                continue;
+            }
+            let Some(payout) = entry
+                .reward_outcome
+                .as_deref()
+                .and_then(|outcome| outcome.strip_prefix("reward-paid:"))
+            else {
+                continue;
+            };
+            let payout = parse_decimal_wei(payout)?;
+            if payout.is_zero() {
+                continue;
+            }
+            if verified_payouts
+                .get(&key)
+                .is_some_and(|previous| *previous != payout)
+            {
+                bail!("verified reward entries disagree on payout for one contract window");
+            }
+            verified_payouts.insert(key, payout);
+        }
+        let mut keys = self
+            .mined_rewards_by_window
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        keys.extend(matching_keys.iter().copied());
+        for key in keys {
+            if matching_keys.contains(&key) {
+                self.set_mined_reward(key, verified_payouts.get(&key).copied())?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn set_proof_telemetry(&mut self, telemetry: Arc<ProofPipelineTelemetry>) {
@@ -1271,6 +1629,7 @@ impl TransactionManager {
         };
         sink(TransactionDashboardState {
             session_exposure,
+            mined_rewards: self.mined_rewards_total,
             activities: self.dashboard_activities(),
         });
     }
@@ -1281,6 +1640,9 @@ impl TransactionManager {
             bail!("transaction recovery is restricted to the verified Injective Testnet profile");
         }
         self.monitor(client).await?;
+        let _recovery_timer = self
+            .history_telemetry
+            .timer(HistoryDuration::ReceiptRecovery);
         for entry in self.journal.unresolved_entries() {
             let hash = entry_hash(&entry)?;
             let known = client.transaction_known(hash).await?;
@@ -1304,12 +1666,13 @@ impl TransactionManager {
     }
 
     pub async fn monitor(&mut self, client: &NetworkClient) -> Result<()> {
-        let entries = self.journal.state.entries.clone();
-        if entries.is_empty() {
+        if self.journal.state.entries.is_empty() {
             return Ok(());
         }
-        let latest_block = match client.latest_block_snapshot().await {
-            Ok(snapshot) => snapshot.number,
+        self.history_telemetry
+            .add(HistoryCounter::HistoricalHeadRequests, 1);
+        let latest_snapshot = match client.latest_block_snapshot().await {
+            Ok(snapshot) => snapshot,
             Err(error) if is_transient_rpc_error(&error) => {
                 self.report_warning(format!(
                     "transaction monitoring deferred because the latest canonical head is temporarily unavailable; journal exposure remains reserved: {error:#}"
@@ -1320,6 +1683,24 @@ impl TransactionManager {
                 return Err(error).context("read latest canonical head for transaction monitoring");
             }
         };
+        self.monitor_at_snapshot(client, &latest_snapshot).await
+    }
+
+    pub async fn monitor_at_snapshot(
+        &mut self,
+        client: &NetworkClient,
+        latest_snapshot: &crate::rpc::BlockSnapshot,
+    ) -> Result<()> {
+        let _monitor_timer = self
+            .history_telemetry
+            .timer(HistoryDuration::ReceiptMonitoring);
+        let entries = self.journal.state.entries.clone();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let latest_block = latest_snapshot.number;
+        let mut canonical_blocks = HashMap::from([(latest_block, latest_snapshot.hash)]);
+        let mut journal_dirty = false;
         for entry in entries {
             let hash = entry_hash(&entry)?;
             if entry.status.is_unresolved() {
@@ -1389,6 +1770,32 @@ impl TransactionManager {
                 continue;
             }
 
+            if entry.confirmations >= ARCHIVE_AFTER_CONFIRMATIONS {
+                // The existing archive policy treats settled receipts with 64 canonical
+                // confirmations as deeply settled. Keep probing a known reward event until
+                // it reaches the same threshold, but do not re-fetch old receipts forever.
+                if entry.action == TransactionAction::SubmitProof
+                    && entry.outcome.as_deref() == Some("candidate-updated")
+                    && entry.reward_block_hash.is_some()
+                    && entry.reward_confirmations < ARCHIVE_AFTER_CONFIRMATIONS
+                {
+                    journal_dirty |= self
+                        .monitor_reward_evidence(
+                            client,
+                            &entry,
+                            latest_snapshot,
+                            &mut canonical_blocks,
+                        )
+                        .await?;
+                }
+                self.history_telemetry
+                    .add(HistoryCounter::DeepSettledEntriesSkipped, 1);
+                continue;
+            }
+
+            self.history_telemetry
+                .add(HistoryCounter::SettledCanonicalChecks, 1);
+
             let Some(block_number) = entry.receipt_block else {
                 bail!("settled transaction has no receipt block in the journal");
             };
@@ -1405,14 +1812,25 @@ impl TransactionManager {
                 continue;
             }
             match client
-                .receipt_confirmations(block_number, block_hash, latest_block)
+                .receipt_confirmations_at_snapshot(
+                    block_number,
+                    block_hash,
+                    latest_snapshot,
+                    &mut canonical_blocks,
+                )
                 .await
             {
                 Ok(Some(confirmations))
                     if confirmations >= u64::from(entry.confirmations_required) =>
                 {
-                    self.journal.update_confirmations(hash, confirmations)?;
-                    self.monitor_reward_evidence(client, &entry, latest_block)
+                    journal_dirty |= self.journal.update_confirmations(hash, confirmations)?;
+                    journal_dirty |= self
+                        .monitor_reward_evidence(
+                            client,
+                            &entry,
+                            latest_snapshot,
+                            &mut canonical_blocks,
+                        )
                         .await?;
                 }
                 Ok(Some(_)) | Ok(None) => match client.transaction_receipt(hash).await {
@@ -1441,7 +1859,11 @@ impl TransactionManager {
                 }
             }
         }
-        self.journal.archive_settled()?;
+        self.sync_all_mined_rewards()?;
+        let archived = self.journal.archive_settled()?;
+        if journal_dirty && archived == 0 {
+            self.journal.persist()?;
+        }
         if !self.journal.has_unresolved() && !self.session_limit.is_zero() {
             self.journal
                 .ensure_wallet_session(self.wallet, self.session_limit)?;
@@ -1454,25 +1876,31 @@ impl TransactionManager {
         &mut self,
         client: &NetworkClient,
         entry: &TransactionEntry,
-        latest_block: u64,
-    ) -> Result<()> {
+        latest_snapshot: &crate::rpc::BlockSnapshot,
+        canonical_blocks: &mut HashMap<u64, B256>,
+    ) -> Result<bool> {
         let (Some(reward_block), Some(block_hash)) =
             (entry.reward_block, entry.reward_block_hash.as_deref())
         else {
-            return Ok(());
+            return Ok(false);
         };
         let block_hash =
             B256::from_str(block_hash).context("journal reward block hash is invalid")?;
         match client
-            .receipt_confirmations(reward_block, block_hash, latest_block)
+            .receipt_confirmations_at_snapshot(
+                reward_block,
+                block_hash,
+                latest_snapshot,
+                canonical_blocks,
+            )
             .await
         {
             Ok(Some(0)) => {
                 self.journal.clear_reward_block_hash(entry_hash(entry)?)?;
-                Ok(())
+                Ok(false)
             }
             Ok(Some(confirmations)) => {
-                let newly_confirmed = self
+                let (newly_confirmed, changed) = self
                     .journal
                     .update_reward_confirmations(entry_hash(entry)?, confirmations)?;
                 if newly_confirmed {
@@ -1484,7 +1912,7 @@ impl TransactionManager {
                         entry.reward_outcome.as_deref().unwrap_or("unknown")
                     ));
                 }
-                Ok(())
+                Ok(changed)
             }
             Ok(None) => {
                 self.journal.clear_reward_block_hash(entry_hash(entry)?)?;
@@ -1492,14 +1920,14 @@ impl TransactionManager {
                     "reward event for node {} window {} is no longer canonical; reward evidence is pending revalidation",
                     entry.node_id, entry.window_id
                 ));
-                Ok(())
+                Ok(false)
             }
             Err(error) => {
                 self.journal.clear_reward_block_hash(entry_hash(entry)?)?;
                 self.report_warning(format!(
                     "reward event canonicality check failed; reward evidence is pending revalidation: {error:#}"
                 ));
-                Ok(())
+                Ok(false)
             }
         }
     }
@@ -1587,6 +2015,7 @@ impl TransactionManager {
         Ok(ReceiptProgress::Settled(outcome))
     }
 
+    #[cfg(test)]
     pub async fn reconcile_rewards(
         &mut self,
         client: &NetworkClient,
@@ -1597,7 +2026,149 @@ impl TransactionManager {
                 "AST token runtime is not verified; reward events will not be reported as verified"
             );
         }
-        for candidate in self.journal.reward_candidates()? {
+        loop {
+            if self.reward_scan_task.is_none()
+                && !self.schedule_reward_reconciliation(client, snapshot)?
+            {
+                break;
+            }
+            let task = self
+                .reward_scan_task
+                .take()
+                .context("reward reconciliation batch was not scheduled")?;
+            let batch = task
+                .await
+                .context("join bounded reward reconciliation batch")??;
+            if self.apply_reward_scan_batch(batch)? {
+                bail!("one or more historical reward windows could not be verified");
+            }
+        }
+        self.sync_all_mined_rewards()?;
+        self.publish_dashboard_state();
+        Ok(())
+    }
+
+    pub(crate) async fn service_reward_reconciliation(
+        &mut self,
+        client: &NetworkClient,
+        snapshot: &crate::rpc::ReadSnapshot,
+    ) -> Result<bool> {
+        if !client.verification.token_verified {
+            return Ok(false);
+        }
+        if self
+            .reward_scan_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return Ok(true);
+        }
+        let mut deferred = false;
+        if let Some(task) = self.reward_scan_task.take() {
+            match task.await {
+                Ok(Ok(batch)) => {
+                    if self.apply_reward_scan_batch(batch)? {
+                        self.defer_reward_scan();
+                        deferred = true;
+                    } else {
+                        self.reward_scan_retry_attempts = 0;
+                        self.reward_scan_retry_at = None;
+                    }
+                }
+                Ok(Err(error)) => {
+                    self.history_telemetry
+                        .add(HistoryCounter::RewardScanErrors, 1);
+                    self.report_warning(format!(
+                        "historical reward verification is deferred; its scan cursor is preserved: {error:#}"
+                    ));
+                    self.defer_reward_scan();
+                    deferred = true;
+                }
+                Err(error) => {
+                    self.history_telemetry
+                        .add(HistoryCounter::RewardScanErrors, 1);
+                    self.report_warning(format!(
+                        "historical reward verification task stopped; its scan cursor is preserved: {error}"
+                    ));
+                    self.defer_reward_scan();
+                    deferred = true;
+                }
+            }
+        }
+        if deferred {
+            return Ok(false);
+        }
+        self.schedule_reward_reconciliation(client, snapshot)
+    }
+
+    fn defer_reward_scan(&mut self) {
+        self.reward_scan_retry_attempts = self.reward_scan_retry_attempts.saturating_add(1);
+        let shift = u32::from(self.reward_scan_retry_attempts.saturating_sub(1).min(5));
+        let delay = REWARD_SCAN_RETRY_BASE
+            .saturating_mul(1_u32 << shift)
+            .min(REWARD_SCAN_RETRY_MAX);
+        self.reward_scan_retry_at = Some(Instant::now() + delay);
+        if self.reward_scan_retry_attempts == 1 || self.reward_scan_retry_attempts.is_multiple_of(5)
+        {
+            self.report_warning(format!(
+                "historical reward evidence is pending; bounded verification will retry in {}s",
+                delay.as_secs()
+            ));
+        }
+    }
+
+    fn schedule_reward_reconciliation(
+        &mut self,
+        client: &NetworkClient,
+        snapshot: &crate::rpc::ReadSnapshot,
+    ) -> Result<bool> {
+        if self.reward_scan_task.is_some()
+            || self
+                .reward_scan_retry_at
+                .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
+            return Ok(false);
+        }
+        if !client.verification.token_verified {
+            return Ok(false);
+        }
+        let mut candidates = self.journal.reward_candidates()?;
+        candidates.sort_by_key(|candidate| {
+            (
+                self.journal
+                    .state
+                    .reward_scan_cursors
+                    .get(&reward_scan_key(candidate.contract, candidate.window_id))
+                    .map(|cursor| cursor.scanned_through)
+                    .unwrap_or(candidate.from_block),
+                candidate.from_block,
+                candidate.node_id,
+                candidate.window_id,
+            )
+        });
+        let pending_keys = candidates
+            .iter()
+            .map(|candidate| reward_scan_key(candidate.contract, candidate.window_id))
+            .collect::<HashSet<_>>();
+        let cursor_count = self.journal.state.reward_scan_cursors.len();
+        self.journal
+            .state
+            .reward_scan_cursors
+            .retain(|key, _| pending_keys.contains(key));
+        let mut changed = cursor_count != self.journal.state.reward_scan_cursors.len();
+        if self.journal.state.reward_scan_cursors.is_empty()
+            && self.journal.state.reward_scan_anchor.is_some()
+        {
+            self.journal.state.reward_scan_anchor = None;
+            changed = true;
+        }
+        if changed {
+            self.journal.persist()?;
+        }
+
+        let now = unix_time_secs();
+        let mut jobs = Vec::new();
+        for candidate in candidates {
             let Some(state) = snapshot
                 .nodes
                 .iter()
@@ -1609,63 +2180,162 @@ impl TransactionManager {
             if state.work.window_id <= candidate.window_id && !state.work.ended {
                 continue;
             }
-            let logs = client
-                .window_finalization_logs(
-                    candidate.contract,
-                    self.ast_token,
-                    candidate.window_id,
-                    candidate.from_block,
-                )
-                .await?;
-            if logs.is_empty() {
-                continue;
+            let key = reward_scan_key(candidate.contract, candidate.window_id);
+            let cursor = self.journal.state.reward_scan_cursors.get(&key);
+            if cursor.is_some() {
+                self.history_telemetry
+                    .add(HistoryCounter::RewardCursorHits, 1);
             }
-            let (winner, payout) = verify_finalization_events(
-                &logs,
-                candidate.contract,
-                self.ast_token,
-                candidate.window_id,
-            )?;
-            let (reward_block, reward_block_hash) =
-                finalization_log_position(&logs, candidate.contract, candidate.window_id)?;
-            let Some(reward_confirmations) = client
-                .receipt_confirmations(reward_block, reward_block_hash, snapshot.block.number)
-                .await?
-            else {
-                continue;
+            let retry_due = cursor.is_some_and(|cursor| {
+                cursor.retry_after_unix_secs > 0
+                    && now >= cursor.retry_after_unix_secs
+                    && cursor.scanned_through >= snapshot.block.number
+            });
+            let rescan_active = cursor.is_none_or(|cursor| cursor.rescan_active) || retry_due;
+            let start = if retry_due {
+                candidate.from_block
+            } else if let Some(cursor) = cursor {
+                cursor.scanned_through.saturating_add(1)
+            } else {
+                candidate.from_block
             };
-            if reward_confirmations == 0 {
+            if start > snapshot.block.number {
                 continue;
             }
-            for (wallet, proof_confirmations_required) in candidate.wallets {
-                let outcome = if winner == wallet && !payout.is_zero() {
-                    format!("reward-paid:{payout}")
-                } else {
-                    format!("not-window-winner:{winner}:payout:{payout}")
-                };
-                self.journal.record_reward_outcome(RewardEvidence {
-                    contract: candidate.contract,
-                    window_id: candidate.window_id,
-                    wallet,
-                    block: reward_block,
-                    block_hash: reward_block_hash,
-                    confirmations: reward_confirmations,
-                    outcome: outcome.clone(),
-                })?;
-                if reward_confirmations >= u64::from(proof_confirmations_required) {
-                    self.report_info(format!(
-                        "node {} window {} wallet {wallet:#x} reward evidence confirmed: {outcome}",
-                        candidate.node_id, candidate.window_id
-                    ));
-                } else {
-                    self.report_info(format!(
-                        "node {} window {} wallet {wallet:#x} reward event observed; awaiting {} block confirmations",
-                        candidate.node_id, candidate.window_id, proof_confirmations_required
-                    ));
-                }
+            let retry_backoff_secs = match (cursor, retry_due) {
+                (Some(cursor), true) => cursor.retry_backoff_secs.saturating_mul(2).clamp(
+                    REWARD_EMPTY_SCAN_RETRY_BASE_SECS,
+                    REWARD_EMPTY_SCAN_RETRY_MAX_SECS,
+                ),
+                (Some(cursor), false) => cursor.retry_backoff_secs.clamp(
+                    REWARD_EMPTY_SCAN_RETRY_BASE_SECS,
+                    REWARD_EMPTY_SCAN_RETRY_MAX_SECS,
+                ),
+                (None, _) => REWARD_EMPTY_SCAN_RETRY_BASE_SECS,
+            };
+            let end = start
+                .saturating_add(REWARD_SCAN_BLOCK_RANGE - 1)
+                .min(snapshot.block.number);
+            jobs.push(RewardScanJob {
+                key,
+                candidate,
+                from_block: start,
+                to_block: end,
+                rescan_active,
+                retry_after_unix_secs: cursor
+                    .map(|cursor| cursor.retry_after_unix_secs)
+                    .unwrap_or_default(),
+                retry_backoff_secs,
+            });
+            if jobs.len() == REWARD_SCAN_JOBS_PER_BATCH {
+                break;
             }
         }
-        Ok(())
+
+        let previous_anchor = self.journal.state.reward_scan_anchor.clone();
+        let anchor_needs_check = previous_anchor.as_ref().is_some_and(|anchor| {
+            anchor.block_number != snapshot.block.number
+                || B256::from_str(&anchor.block_hash).ok() != Some(snapshot.block.hash)
+        });
+        if jobs.is_empty() && !anchor_needs_check {
+            return Ok(false);
+        }
+        self.history_telemetry
+            .add(HistoryCounter::RewardScanBatches, 1);
+        self.history_telemetry.add(
+            HistoryCounter::RewardScanJobs,
+            u64::try_from(jobs.len()).unwrap_or(u64::MAX),
+        );
+        self.reward_scan_task = Some(tokio::spawn(run_reward_scan_batch(
+            client.clone(),
+            snapshot.block.clone(),
+            previous_anchor,
+            jobs,
+        )));
+        Ok(true)
+    }
+
+    fn apply_reward_scan_batch(&mut self, batch: RewardScanBatchOutput) -> Result<bool> {
+        match batch {
+            RewardScanBatchOutput::ReorgDetected => {
+                if !self.journal.state.reward_scan_cursors.is_empty()
+                    || self.journal.state.reward_scan_anchor.is_some()
+                {
+                    self.journal.state.reward_scan_cursors.clear();
+                    self.journal.state.reward_scan_anchor = None;
+                    self.journal.persist()?;
+                    self.history_telemetry
+                        .add(HistoryCounter::RewardCursorResets, 1);
+                }
+                Ok(false)
+            }
+            RewardScanBatchOutput::Scanned { snapshot, results } => {
+                let mut changed = false;
+                let mut errors = 0_u64;
+                let mut has_evidence = false;
+                let mut successful_jobs = 0_u64;
+                for result in results {
+                    let output = match result {
+                        Ok(output) => output,
+                        Err(_) => {
+                            errors = errors.saturating_add(1);
+                            continue;
+                        }
+                    };
+                    successful_jobs = successful_jobs.saturating_add(1);
+                    if !output.evidence.is_empty() {
+                        for evidence in output.evidence {
+                            changed |= self.journal.record_reward_outcome_in_memory(evidence)?;
+                            has_evidence = true;
+                            self.history_telemetry
+                                .add(HistoryCounter::RewardEvidenceVerified, 1);
+                        }
+                        if self
+                            .journal
+                            .state
+                            .reward_scan_cursors
+                            .remove(&output.key)
+                            .is_some()
+                        {
+                            changed = true;
+                        }
+                    } else if let Some(cursor) = output.cursor {
+                        if self.journal.state.reward_scan_cursors.get(&output.key) != Some(&cursor)
+                        {
+                            self.journal
+                                .state
+                                .reward_scan_cursors
+                                .insert(output.key, cursor);
+                            changed = true;
+                        }
+                    } else {
+                        errors = errors.saturating_add(1);
+                    }
+                }
+                if errors > 0 {
+                    self.history_telemetry
+                        .add(HistoryCounter::RewardScanErrors, errors);
+                }
+                if successful_jobs > 0 {
+                    let anchor = RewardScanAnchor {
+                        block_number: snapshot.number,
+                        block_hash: format!("{:#x}", snapshot.hash),
+                    };
+                    if self.journal.state.reward_scan_anchor.as_ref() != Some(&anchor) {
+                        self.journal.state.reward_scan_anchor = Some(anchor);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.journal.persist()?;
+                    if has_evidence {
+                        self.sync_all_mined_rewards()?;
+                        self.publish_dashboard_state();
+                    }
+                }
+                Ok(errors > 0)
+            }
+        }
     }
 
     pub async fn submit_proof(
@@ -1902,6 +2572,9 @@ impl TransactionManager {
             confirmed_balance: spendable_balance,
             confirmations_required: self.confirmations_required,
         })?;
+        if action == TransactionAction::SubmitProof {
+            self.current_process_proof_hashes.insert(signed.hash);
+        }
         if action == TransactionAction::SubmitProof
             && let Some(guard) = &self.proof_attempt_guard
         {
@@ -2137,6 +2810,164 @@ impl TransactionManager {
             }
         }
     }
+}
+
+impl Drop for TransactionManager {
+    fn drop(&mut self) {
+        if let Some(task) = self.reward_scan_task.take() {
+            task.abort();
+        }
+    }
+}
+
+async fn run_reward_scan_batch(
+    client: NetworkClient,
+    snapshot: crate::rpc::BlockSnapshot,
+    previous_anchor: Option<RewardScanAnchor>,
+    jobs: Vec<RewardScanJob>,
+) -> Result<RewardScanBatchOutput> {
+    let telemetry = client.history_telemetry();
+    let _reconciliation_timer = telemetry.timer(HistoryDuration::RewardReconciliation);
+    if let Some(anchor) = previous_anchor {
+        let previous_hash = B256::from_str(&anchor.block_hash)
+            .context("persisted reward scan anchor hash is invalid")?;
+        if snapshot.number < anchor.block_number {
+            bail!(
+                "verified head {} is behind the persisted reward scan anchor {}",
+                snapshot.number,
+                anchor.block_number
+            );
+        }
+        let canonical_hash = if snapshot.number == anchor.block_number {
+            snapshot.hash
+        } else {
+            client.canonical_block_hash(anchor.block_number).await?
+        };
+        if canonical_hash != previous_hash {
+            return Ok(RewardScanBatchOutput::ReorgDetected);
+        }
+    }
+
+    let mut jobs = jobs.into_iter();
+    let mut workers = JoinSet::new();
+    for _ in 0..REWARD_SCAN_CONCURRENCY {
+        let Some(job) = jobs.next() else {
+            break;
+        };
+        let client = client.clone();
+        let snapshot = snapshot.clone();
+        workers.spawn(async move { scan_reward_job(client, snapshot, job).await });
+    }
+    let mut results = Vec::new();
+    while let Some(joined) = workers.join_next().await {
+        match joined {
+            Ok(result) => results.push(result),
+            Err(error) => results.push(Err(anyhow!("reward scan worker failed: {error}"))),
+        }
+        if let Some(job) = jobs.next() {
+            let client = client.clone();
+            let snapshot = snapshot.clone();
+            workers.spawn(async move { scan_reward_job(client, snapshot, job).await });
+        }
+    }
+    Ok(RewardScanBatchOutput::Scanned { snapshot, results })
+}
+
+async fn scan_reward_job(
+    client: NetworkClient,
+    snapshot: crate::rpc::BlockSnapshot,
+    job: RewardScanJob,
+) -> Result<RewardScanJobOutput> {
+    let logs = client
+        .window_finalization_logs_range(
+            job.candidate.contract,
+            client
+                .manifest
+                .ast_token
+                .as_ref()
+                .map(|token| crate::deployment::parse_address(&token.address))
+                .transpose()?
+                .context("AST token pin is unavailable for reward scan")?,
+            job.candidate.window_id,
+            job.from_block,
+            job.to_block,
+        )
+        .await?;
+    if logs.is_empty() {
+        let (retry_after_unix_secs, retry_backoff_secs, rescan_active) =
+            if job.to_block < snapshot.number {
+                (0, job.retry_backoff_secs, job.rescan_active)
+            } else if job.rescan_active {
+                (
+                    unix_time_secs().saturating_add(job.retry_backoff_secs),
+                    job.retry_backoff_secs,
+                    false,
+                )
+            } else if job.retry_after_unix_secs > 0 {
+                (job.retry_after_unix_secs, job.retry_backoff_secs, false)
+            } else {
+                (
+                    unix_time_secs().saturating_add(REWARD_EMPTY_SCAN_RETRY_BASE_SECS),
+                    REWARD_EMPTY_SCAN_RETRY_BASE_SECS,
+                    false,
+                )
+            };
+        return Ok(RewardScanJobOutput {
+            key: job.key,
+            cursor: Some(RewardScanCursor {
+                scanned_through: job.to_block,
+                retry_after_unix_secs,
+                retry_backoff_secs,
+                rescan_active,
+            }),
+            evidence: Vec::new(),
+        });
+    }
+
+    let (winner, payout) = verify_finalization_events(
+        &logs,
+        job.candidate.contract,
+        client
+            .manifest
+            .ast_token
+            .as_ref()
+            .map(|token| crate::deployment::parse_address(&token.address))
+            .transpose()?
+            .context("AST token pin is unavailable for reward verification")?,
+        job.candidate.window_id,
+    )?;
+    let (reward_block, reward_block_hash) =
+        finalization_log_position(&logs, job.candidate.contract, job.candidate.window_id)?;
+    let reward_confirmations = client
+        .receipt_confirmations(reward_block, reward_block_hash, snapshot.number)
+        .await?
+        .context("finalization reward event is not canonical at the verified snapshot")?;
+    if reward_confirmations == 0 {
+        bail!("finalization reward event has no verified canonical confirmation");
+    }
+    let evidence = job
+        .candidate
+        .wallets
+        .into_iter()
+        .map(|(wallet, _)| RewardEvidence {
+            contract: job.candidate.contract,
+            window_id: job.candidate.window_id,
+            wallet,
+            block: reward_block,
+            block_hash: reward_block_hash,
+            confirmations: reward_confirmations,
+            outcome: if winner == wallet && !payout.is_zero() {
+                format!("reward-paid:{payout}")
+            } else {
+                format!("not-window-winner:{winner}:payout:{payout}")
+            },
+        })
+        .collect();
+    Ok(RewardScanJobOutput {
+        key: job.key,
+        cursor: None,
+        evidence,
+    })
 }
 
 fn validate_fresh_state(
@@ -2515,6 +3346,34 @@ fn validate_journal(state: &JournalState) -> Result<()> {
         Address::from_str(contract).context("journal proof-attempt contract is invalid")?;
         let _ = window_id;
     }
+    if let Some(anchor) = &state.reward_scan_anchor {
+        B256::from_str(&anchor.block_hash).context("journal reward-scan anchor hash is invalid")?;
+    }
+    for (key, cursor) in &state.reward_scan_cursors {
+        let (contract, window_id) = key
+            .rsplit_once(':')
+            .context("journal reward-scan key is invalid")?;
+        let contract = Address::from_str(contract)
+            .context("journal reward-scan contract address is invalid")?;
+        let window_id = window_id
+            .parse::<u64>()
+            .context("journal reward-scan window ID is invalid")?;
+        if key != &reward_scan_key(contract, window_id) {
+            bail!("journal reward-scan key is not canonical");
+        }
+        if state
+            .reward_scan_anchor
+            .as_ref()
+            .is_none_or(|anchor| cursor.scanned_through > anchor.block_number)
+        {
+            bail!("journal reward-scan cursor is beyond its canonical anchor");
+        }
+        if !(REWARD_EMPTY_SCAN_RETRY_BASE_SECS..=REWARD_EMPTY_SCAN_RETRY_MAX_SECS)
+            .contains(&cursor.retry_backoff_secs)
+        {
+            bail!("journal reward-scan retry interval is outside supported bounds");
+        }
+    }
     for amount in state.archived_session_spending.values() {
         parse_decimal_wei(amount).context("archived session spending total is invalid")?;
     }
@@ -2667,11 +3526,18 @@ fn validate_journal(state: &JournalState) -> Result<()> {
     Ok(())
 }
 
-fn validate_archive_ledger(store: &ConfigStore, state: &JournalState) -> Result<()> {
+fn validate_archive_ledger(
+    store: &ConfigStore,
+    state: &JournalState,
+    telemetry: Option<&HistoryTelemetry>,
+) -> Result<()> {
     let mut file_names = HashSet::new();
     let mut session_totals = HashMap::<String, U256>::new();
     let mut grand_total = U256::ZERO;
     for meta in &state.archives {
+        if let Some(telemetry) = telemetry {
+            telemetry.add(HistoryCounter::ArchiveFilesValidated, 1);
+        }
         if !file_names.insert(meta.file_name.clone()) {
             bail!("transaction journal references a duplicate archive file");
         }
@@ -2690,6 +3556,12 @@ fn validate_archive_ledger(store: &ConfigStore, state: &JournalState) -> Result<
         {
             bail!("transaction archive metadata does not match its contents");
         }
+        if let Some(telemetry) = telemetry {
+            telemetry.add(
+                HistoryCounter::ArchiveEntriesValidated,
+                u64::try_from(archive.entries.len()).unwrap_or(u64::MAX),
+            );
+        }
         let archive_state = JournalState {
             version: JOURNAL_VERSION,
             active_session: None,
@@ -2699,6 +3571,8 @@ fn validate_archive_ledger(store: &ConfigStore, state: &JournalState) -> Result<
             archived_session_spending: HashMap::new(),
             archived_total_spending_wei: "0".to_owned(),
             next_archive_sequence: 0,
+            reward_scan_cursors: HashMap::new(),
+            reward_scan_anchor: None,
         };
         validate_journal(&archive_state)?;
         for entry in archive.entries {
@@ -2777,13 +3651,15 @@ fn unix_time_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Eip1559Request, PreparedTransaction, ProofData, ProofSubmission, SUBMISSION_FEE_WEI,
-        TransactionAction, TransactionActivity, TransactionActivityState,
-        TransactionDashboardState, TransactionEntry, TransactionIntent, TransactionJournal,
-        TransactionManager, TransactionPolicyRefusalKind, TransactionStatus, encode_rlp_list,
-        entry_hash, parse_decimal_wei, rlp_bytes, rlp_u64, rlp_u256, sign_eip1559,
-        transaction_policy_refusal, validate_archive_ledger, verify_finalization_events,
-        verify_submission_events,
+        ARCHIVE_AFTER_CONFIRMATIONS, ARCHIVE_TRIGGER_ENTRIES, Eip1559Request, HistoryCounter,
+        HistoryTelemetry, JOURNAL_VERSION, PreparedTransaction, ProofData, ProofSubmission,
+        REWARD_EMPTY_SCAN_RETRY_BASE_SECS, RewardScanAnchor, RewardScanBatchOutput,
+        RewardScanCursor, SUBMISSION_FEE_WEI, TransactionAction, TransactionActivity,
+        TransactionActivityState, TransactionDashboardState, TransactionEntry, TransactionIntent,
+        TransactionJournal, TransactionManager, TransactionPolicyRefusalKind, TransactionStatus,
+        encode_rlp_list, entry_hash, parse_decimal_wei, reward_scan_key, rlp_bytes, rlp_u64,
+        rlp_u256, run_reward_scan_batch, sign_eip1559, transaction_policy_refusal, unix_time_secs,
+        validate_archive_ledger, verify_finalization_events, verify_submission_events,
     };
     use crate::{
         cli::{MineArgs, Network},
@@ -2805,7 +3681,8 @@ mod tests {
     use rand::{RngCore, thread_rng};
     use std::{
         collections::{HashMap, HashSet},
-        net::TcpListener,
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
         num::NonZeroUsize,
         path::PathBuf,
         process::{Child, Command, Stdio},
@@ -2814,7 +3691,7 @@ mod tests {
             Arc, Mutex, RwLock,
             atomic::{AtomicBool, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tempfile::tempdir;
     use tokio::time::sleep;
@@ -2856,6 +3733,62 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn settled_history_entry(
+        contract: Address,
+        node_id: u8,
+        wallet: Address,
+        session_id: &str,
+        window_id: u64,
+        hash: B256,
+        action: TransactionAction,
+        outcome: &str,
+        reward_outcome: Option<String>,
+        reward_confirmations: u64,
+    ) -> TransactionEntry {
+        let accepted_proof = action == TransactionAction::SubmitProof;
+        let has_reward_evidence = reward_outcome.is_some();
+        let reward_block_hash =
+            has_reward_evidence.then(|| format!("{:#x}", B256::with_last_byte(0x20)));
+        TransactionEntry {
+            chain_id: 1439,
+            contract: format!("{contract:#x}"),
+            node_id,
+            window_id,
+            action,
+            session_id: session_id.to_owned(),
+            wallet: format!("{wallet:#x}"),
+            nonce: window_id,
+            transaction_hash: format!("{hash:#x}"),
+            value_wei: if accepted_proof {
+                SUBMISSION_FEE_WEI.to_string()
+            } else {
+                "0".to_owned()
+            },
+            max_fee_per_gas_wei: "1".to_owned(),
+            gas_limit: 21_000,
+            maximum_exposure_wei: "1000".to_owned(),
+            status: TransactionStatus::MinedSuccess,
+            actual_cost_wei: Some("100".to_owned()),
+            last_known_cost_wei: None,
+            outcome: Some(outcome.to_owned()),
+            reward_outcome,
+            reward_block: has_reward_evidence.then_some(20),
+            reward_block_hash,
+            reward_confirmations,
+            reward_confirmed: has_reward_evidence && reward_confirmations >= 2,
+            proof_nonce: accepted_proof.then_some(window_id as u128),
+            proof_hash: accepted_proof.then(|| format!("{hash:#x}")),
+            header_hex: accepted_proof.then(|| "01".to_owned()),
+            receipt_block: Some(10),
+            receipt_block_hash: Some(format!("{:#x}", B256::with_last_byte(0x10))),
+            receipt_status: Some(true),
+            confirmations: ARCHIVE_AFTER_CONFIRMATIONS,
+            confirmations_required: 2,
+            created_unix_secs: window_id,
+        }
+    }
+
     fn prepared_test_transaction(
         request: &Eip1559Request,
         tx_hash: B256,
@@ -2879,6 +3812,1670 @@ mod tests {
             confirmed_balance,
             confirmations_required: 2,
         }
+    }
+
+    #[test]
+    fn mined_rewards_count_verified_current_process_windows_once_and_correct_reorgs() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x77);
+        let contract_one = Address::with_last_byte(1);
+        let contract_two = Address::with_last_byte(2);
+        let mut manager =
+            TransactionManager::open(&store, &config, wallet, Address::with_last_byte(0x88))
+                .unwrap();
+        let session_id = manager
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        let old_hash = B256::with_last_byte(1);
+        let current_hash = B256::with_last_byte(2);
+        let pending_hash = B256::with_last_byte(3);
+        let losing_hash = B256::with_last_byte(4);
+        let second_node_hash = B256::with_last_byte(5);
+        let unpaid_hash = B256::with_last_byte(6);
+        let payout_26k = U256::from(26_000_000_000_000_u128);
+        let payout_1k = U256::from(1_000_000_000_000_u128);
+        let payout_500 = U256::from(500_000_000_000_u128);
+        manager.journal.state.entries = vec![
+            settled_history_entry(
+                contract_one,
+                1,
+                wallet,
+                &session_id,
+                1,
+                old_hash,
+                TransactionAction::SubmitProof,
+                "candidate-updated",
+                Some(format!("reward-paid:{payout_1k}")),
+                ARCHIVE_AFTER_CONFIRMATIONS,
+            ),
+            settled_history_entry(
+                contract_one,
+                1,
+                wallet,
+                &session_id,
+                2,
+                current_hash,
+                TransactionAction::SubmitProof,
+                "candidate-updated",
+                Some(format!("reward-paid:{payout_26k}")),
+                ARCHIVE_AFTER_CONFIRMATIONS,
+            ),
+            settled_history_entry(
+                contract_one,
+                1,
+                wallet,
+                &session_id,
+                3,
+                pending_hash,
+                TransactionAction::SubmitProof,
+                "candidate-updated",
+                Some(format!("reward-paid:{payout_1k}")),
+                1,
+            ),
+            settled_history_entry(
+                contract_one,
+                1,
+                wallet,
+                &session_id,
+                4,
+                losing_hash,
+                TransactionAction::SubmitProof,
+                "candidate-updated",
+                Some(format!(
+                    "not-window-winner:{:#x}:payout:{payout_26k}",
+                    Address::with_last_byte(0x55)
+                )),
+                ARCHIVE_AFTER_CONFIRMATIONS,
+            ),
+            settled_history_entry(
+                contract_two,
+                2,
+                wallet,
+                &session_id,
+                5,
+                second_node_hash,
+                TransactionAction::SubmitProof,
+                "candidate-updated",
+                Some(format!("reward-paid:{payout_500}")),
+                ARCHIVE_AFTER_CONFIRMATIONS,
+            ),
+            settled_history_entry(
+                contract_two,
+                2,
+                wallet,
+                &session_id,
+                6,
+                unpaid_hash,
+                TransactionAction::SubmitProof,
+                "candidate-updated",
+                None,
+                0,
+            ),
+        ];
+        manager
+            .journal
+            .state
+            .proof_attempted_through
+            .insert(format!("{contract_one:#x}"), 4);
+        manager
+            .journal
+            .state
+            .proof_attempted_through
+            .insert(format!("{contract_two:#x}"), 6);
+        manager.current_process_proof_hashes.extend([
+            current_hash,
+            pending_hash,
+            losing_hash,
+            second_node_hash,
+            unpaid_hash,
+        ]);
+
+        manager.sync_all_mined_rewards().unwrap();
+        assert_eq!(manager.mined_rewards_total(), payout_26k + payout_500);
+        manager.sync_all_mined_rewards().unwrap();
+        assert_eq!(manager.mined_rewards_total(), payout_26k + payout_500);
+
+        let pending_entry = manager
+            .journal
+            .state
+            .entries
+            .iter_mut()
+            .find(|entry| entry_hash(entry).unwrap() == pending_hash)
+            .unwrap();
+        pending_entry.reward_confirmations = 2;
+        pending_entry.reward_confirmed = true;
+        manager.sync_all_mined_rewards().unwrap();
+        assert_eq!(
+            manager.mined_rewards_total(),
+            payout_26k + payout_500 + payout_1k
+        );
+
+        let current_entry = manager
+            .journal
+            .state
+            .entries
+            .iter_mut()
+            .find(|entry| entry_hash(entry).unwrap() == current_hash)
+            .unwrap();
+        current_entry.reward_block_hash = None;
+        current_entry.reward_confirmed = false;
+        current_entry.reward_confirmations = 0;
+        manager.sync_all_mined_rewards().unwrap();
+        assert_eq!(manager.mined_rewards_total(), payout_500 + payout_1k);
+    }
+
+    #[tokio::test]
+    async fn reward_reorg_removes_current_process_mined_total() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x77);
+        let token = Address::with_last_byte(0x88);
+        let contract = Address::with_last_byte(1);
+        let (url, rpc_counts, stop_server, server) = history_rpc_server(100, Duration::ZERO);
+        let client = NetworkClient::local_test_client(
+            &url,
+            contract,
+            B256::with_last_byte(1),
+            token,
+            B256::with_last_byte(2),
+            9,
+        )
+        .unwrap();
+        let mut manager = TransactionManager::open_with_history_telemetry(
+            &store,
+            &config,
+            wallet,
+            token,
+            client.history_telemetry(),
+        )
+        .unwrap();
+        let session_id = manager
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        let proof_hash = B256::with_last_byte(0x52);
+        let entry = settled_history_entry(
+            contract,
+            1,
+            wallet,
+            &session_id,
+            7,
+            proof_hash,
+            TransactionAction::SubmitProof,
+            "candidate-updated",
+            Some("reward-paid:26000000000000".to_owned()),
+            3,
+        );
+        manager.journal.state.entries.push(entry);
+        manager
+            .journal
+            .state
+            .proof_attempted_through
+            .insert(format!("{contract:#x}"), 7);
+        manager.current_process_proof_hashes.insert(proof_hash);
+        manager.sync_all_mined_rewards().unwrap();
+        assert_eq!(
+            manager.mined_rewards_total(),
+            U256::from(26_000_000_000_000_u128)
+        );
+
+        manager
+            .monitor_at_snapshot(
+                &client,
+                &crate::rpc::BlockSnapshot {
+                    number: 100,
+                    timestamp: 100,
+                    hash: B256::with_last_byte(0xaa),
+                },
+            )
+            .await
+            .unwrap();
+        stop_server.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert_eq!(manager.mined_rewards_total(), U256::ZERO);
+        assert_eq!(
+            manager.journal.state.entries[0].reward_block_hash, None,
+            "noncanonical reward evidence is cleared and must be rescanned"
+        );
+        assert_eq!(
+            rpc_counts.lock().unwrap().get("eth_getBlockByNumber"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn mined_rewards_survive_archive_in_process_but_reset_after_cli_restart() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x77);
+        let contract = Address::with_last_byte(1);
+        let mut manager =
+            TransactionManager::open(&store, &config, wallet, Address::with_last_byte(0x88))
+                .unwrap();
+        let session_id = manager
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        let reward_payout = U256::from(26_000_000_000_000_u128);
+        let current_hash = B256::with_last_byte(1);
+        let mut entries = vec![settled_history_entry(
+            contract,
+            1,
+            wallet,
+            &session_id,
+            1,
+            current_hash,
+            TransactionAction::SubmitProof,
+            "candidate-updated",
+            Some(format!("reward-paid:{reward_payout}")),
+            ARCHIVE_AFTER_CONFIRMATIONS,
+        )];
+        entries.extend((1..ARCHIVE_TRIGGER_ENTRIES).map(|index| {
+            settled_history_entry(
+                Address::with_last_byte((index % 9 + 1) as u8),
+                (index % 9 + 1) as u8,
+                wallet,
+                &session_id,
+                index as u64 + 1,
+                B256::from(U256::from(index + 1)),
+                TransactionAction::FinalizeWindow,
+                "window-finalized",
+                None,
+                0,
+            )
+        }));
+        manager.journal.state.entries = entries;
+        manager
+            .journal
+            .state
+            .proof_attempted_through
+            .insert(format!("{contract:#x}"), 1);
+        manager.current_process_proof_hashes.insert(current_hash);
+        manager.sync_all_mined_rewards().unwrap();
+        assert_eq!(manager.mined_rewards_total(), reward_payout);
+
+        let archived = manager.journal.archive_settled().unwrap();
+        assert_eq!(archived, ARCHIVE_TRIGGER_ENTRIES);
+        assert!(manager.journal.state.entries.is_empty());
+        manager.sync_all_mined_rewards().unwrap();
+        assert_eq!(manager.mined_rewards_total(), reward_payout);
+        drop(manager);
+
+        let restarted =
+            TransactionManager::open(&store, &config, wallet, Address::with_last_byte(0x88))
+                .unwrap();
+        assert_eq!(restarted.mined_rewards_total(), U256::ZERO);
+        assert_eq!(restarted.journal.state.archives.len(), 1);
+        assert_eq!(
+            restarted.journal.state.archives[0].entry_count,
+            archived as u32
+        );
+    }
+
+    #[test]
+    fn testnet6_v3_journal_migrates_without_resetting_receipts_or_reward_history() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x77);
+        let contract = Address::with_last_byte(1);
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        let hash = B256::with_last_byte(0x52);
+        journal
+            .state
+            .proof_attempted_through
+            .insert(format!("{contract:#x}"), 42);
+        journal.state.entries.push(settled_history_entry(
+            contract,
+            1,
+            wallet,
+            &session_id,
+            42,
+            hash,
+            TransactionAction::SubmitProof,
+            "candidate-updated",
+            Some("reward-paid:123000000000".to_owned()),
+            ARCHIVE_AFTER_CONFIRMATIONS,
+        ));
+        journal.persist().unwrap();
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        legacy["version"] = serde_json::Value::from(3_u64);
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("reward_scan_cursors");
+        legacy.as_object_mut().unwrap().remove("reward_scan_anchor");
+        drop(journal);
+        store
+            .write_transaction_journal(&serde_json::to_vec(&legacy).unwrap())
+            .unwrap();
+
+        let migrated = TransactionJournal::open(&store, &config, wallet).unwrap();
+        assert_eq!(migrated.state.version, JOURNAL_VERSION);
+        assert!(migrated.state.reward_scan_cursors.is_empty());
+        assert!(migrated.state.reward_scan_anchor.is_none());
+        assert_eq!(migrated.state.entries.len(), 1);
+        assert_eq!(entry_hash(&migrated.state.entries[0]).unwrap(), hash);
+        assert_eq!(
+            migrated.state.entries[0].reward_outcome.as_deref(),
+            Some("reward-paid:123000000000")
+        );
+        assert_eq!(
+            migrated
+                .state
+                .proof_attempted_through
+                .get(&format!("{contract:#x}")),
+            Some(&42)
+        );
+    }
+
+    type HistoryRpcCounts = Arc<Mutex<HashMap<String, u64>>>;
+    type HistoryRpcServer = (
+        String,
+        HistoryRpcCounts,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    );
+
+    fn history_rpc_server(latest_block: u64, response_delay: Duration) -> HistoryRpcServer {
+        history_rpc_server_with_log_failures(latest_block, response_delay, 0)
+    }
+
+    fn history_rpc_server_with_log_failures(
+        latest_block: u64,
+        response_delay: Duration,
+        log_failures: usize,
+    ) -> HistoryRpcServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+        let server_counts = Arc::clone(&counts);
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop_server);
+        let thread = std::thread::spawn(move || {
+            let mut log_failures = log_failures;
+            loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if server_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("accept history RPC request: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let request = read_history_http_request(&mut stream);
+                let method = request["method"].as_str().unwrap().to_owned();
+                *server_counts
+                    .lock()
+                    .unwrap()
+                    .entry(method.clone())
+                    .or_insert(0) += 1;
+                if method == "eth_getLogs" {
+                    let range_start = request["params"][0]["fromBlock"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    *server_counts
+                        .lock()
+                        .unwrap()
+                        .entry(format!("eth_getLogs_from_{range_start}"))
+                        .or_insert(0) += 1;
+                }
+                let result = match method.as_str() {
+                    "eth_blockNumber" => serde_json::Value::String(format!("0x{latest_block:x}")),
+                    "eth_getBlockByNumber" => {
+                        let tag = request["params"][0].as_str().unwrap();
+                        let number = if tag == "latest" {
+                            latest_block
+                        } else {
+                            u64::from_str_radix(tag.trim_start_matches("0x"), 16).unwrap()
+                        };
+                        serde_json::json!({
+                            "number": format!("0x{number:x}"),
+                            "timestamp": "0x1",
+                            "hash": format!("{:#x}", B256::with_last_byte(0xaa)),
+                        })
+                    }
+                    "eth_getLogs" => serde_json::Value::Array(Vec::new()),
+                    other => panic!("unexpected history RPC method {other}"),
+                };
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result,
+                })
+                .to_string();
+                if !response_delay.is_zero() {
+                    std::thread::sleep(response_delay);
+                }
+                let status = if method == "eth_getLogs" && log_failures > 0 {
+                    log_failures -= 1;
+                    503
+                } else {
+                    200
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .unwrap();
+            }
+        });
+        (format!("http://{address}"), counts, stop_server, thread)
+    }
+
+    fn read_history_http_request(stream: &mut TcpStream) -> serde_json::Value {
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let count = match stream.read(&mut chunk) {
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => panic!("read history RPC request: {error}"),
+            };
+            assert_ne!(count, 0, "history RPC client closed before request body");
+            bytes.extend_from_slice(&chunk[..count]);
+            let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let body_len = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if bytes.len() >= header_end + 4 + body_len {
+                return serde_json::from_slice(&bytes[header_end + 4..header_end + 4 + body_len])
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_receipt_monitor_skips_deep_settled_history() {
+        for count in [10_usize, 100, 1_000] {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(PathBuf::from(root.path()));
+            let config = AppConfig {
+                per_session_spending_limit_inj: "1".to_owned(),
+                ..AppConfig::default()
+            };
+            let wallet = Address::with_last_byte(0x77);
+            let token = Address::with_last_byte(0x88);
+            let contract = Address::with_last_byte(0x99);
+            let (url, rpc_counts, stop_server, server) = history_rpc_server(100, Duration::ZERO);
+            let client = NetworkClient::local_test_client(
+                &url,
+                contract,
+                B256::with_last_byte(0x01),
+                token,
+                B256::with_last_byte(0x02),
+                9,
+            )
+            .unwrap();
+            let mut manager = TransactionManager::open_with_history_telemetry(
+                &store,
+                &config,
+                wallet,
+                token,
+                client.history_telemetry(),
+            )
+            .unwrap();
+            let session_id = manager
+                .journal
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .id
+                .clone();
+            manager.journal.state.entries = (0..count)
+                .map(|index| TransactionEntry {
+                    chain_id: 1439,
+                    contract: format!("{contract:#x}"),
+                    node_id: 1,
+                    window_id: index as u64,
+                    action: TransactionAction::FinalizeWindow,
+                    session_id: session_id.clone(),
+                    wallet: format!("{wallet:#x}"),
+                    nonce: index as u64,
+                    transaction_hash: format!("{:#x}", B256::from(U256::from(index + 1))),
+                    value_wei: "0".to_owned(),
+                    max_fee_per_gas_wei: "1".to_owned(),
+                    gas_limit: 21_000,
+                    maximum_exposure_wei: "0".to_owned(),
+                    status: TransactionStatus::MinedSuccess,
+                    actual_cost_wei: Some("0".to_owned()),
+                    last_known_cost_wei: None,
+                    outcome: Some("window-finalized".to_owned()),
+                    reward_outcome: None,
+                    reward_block: None,
+                    reward_block_hash: None,
+                    reward_confirmations: 0,
+                    reward_confirmed: false,
+                    proof_nonce: None,
+                    proof_hash: None,
+                    header_hex: None,
+                    receipt_block: Some(1),
+                    receipt_block_hash: Some(format!("{:#x}", B256::with_last_byte(0xaa))),
+                    receipt_status: Some(true),
+                    confirmations: 100,
+                    confirmations_required: 2,
+                    created_unix_secs: index as u64,
+                })
+                .collect();
+            manager.journal.persist().unwrap();
+
+            let started = Instant::now();
+            let monitor_result = manager.monitor(&client).await;
+            let elapsed = started.elapsed();
+            stop_server.store(true, Ordering::Release);
+            monitor_result.unwrap();
+            server.join().unwrap();
+            let counts = rpc_counts.lock().unwrap();
+            assert_eq!(counts.get("eth_blockNumber"), Some(&1));
+            assert_eq!(counts.get("eth_getBlockByNumber"), Some(&1));
+            eprintln!(
+                "history-monitor-optimized entries={count} elapsed_ms={} eth_getBlockByNumber={} profile={}",
+                elapsed.as_millis(),
+                counts
+                    .get("eth_getBlockByNumber")
+                    .copied()
+                    .unwrap_or_default(),
+                manager.history_profile_line()
+            );
+            drop(counts);
+            drop(manager);
+            if count >= super::ARCHIVE_TRIGGER_ENTRIES {
+                let started = Instant::now();
+                let reopened = TransactionManager::open_with_history_telemetry(
+                    &store,
+                    &config,
+                    wallet,
+                    token,
+                    client.history_telemetry(),
+                )
+                .unwrap();
+                eprintln!(
+                    "history-archive-open entries={count} elapsed_ms={} profile={}",
+                    started.elapsed().as_millis(),
+                    reopened.history_profile_line()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn settled_confirmation_updates_are_persisted_as_one_archive_safe_batch() {
+        let count = 100_usize;
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x77);
+        let token = Address::with_last_byte(0x88);
+        let contract = Address::with_last_byte(1);
+        let (url, rpc_counts, stop_server, server) = history_rpc_server(100, Duration::ZERO);
+        let client = NetworkClient::local_test_client(
+            &url,
+            contract,
+            B256::with_last_byte(1),
+            token,
+            B256::with_last_byte(2),
+            9,
+        )
+        .unwrap();
+        let telemetry = client.history_telemetry();
+        let mut manager = TransactionManager::open_with_history_telemetry(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::clone(&telemetry),
+        )
+        .unwrap();
+        let session_id = manager
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        manager.journal.state.entries = (0..count)
+            .map(|index| {
+                let mut entry = settled_history_entry(
+                    contract,
+                    1,
+                    wallet,
+                    &session_id,
+                    index as u64,
+                    B256::from(U256::from(index + 1)),
+                    TransactionAction::FinalizeWindow,
+                    "window-finalized",
+                    None,
+                    0,
+                );
+                entry.confirmations = 2;
+                entry.receipt_block = Some(10);
+                entry.receipt_block_hash = Some(format!("{:#x}", B256::with_last_byte(0xaa)));
+                entry
+            })
+            .collect();
+        manager.journal.persist().unwrap();
+        let writes_before_monitor = telemetry.count(HistoryCounter::JournalWrites);
+
+        manager.monitor(&client).await.unwrap();
+        stop_server.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert_eq!(
+            telemetry.count(HistoryCounter::JournalWrites),
+            writes_before_monitor + 1
+        );
+        assert_eq!(
+            telemetry.count(HistoryCounter::SettledCanonicalChecks),
+            count as u64
+        );
+        assert_eq!(
+            rpc_counts.lock().unwrap().get("eth_getBlockByNumber"),
+            Some(&2)
+        );
+        assert!(manager.journal.state.entries.is_empty());
+        assert_eq!(manager.journal.state.archives.len(), 1);
+        assert_eq!(manager.journal.state.archives[0].entry_count, count as u32);
+    }
+
+    #[tokio::test]
+    async fn reward_scan_cursor_prevents_repeated_historical_log_ranges() {
+        for count in [10_usize, 100, 1_000] {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(PathBuf::from(root.path()));
+            let config = AppConfig {
+                per_session_spending_limit_inj: "1".to_owned(),
+                ..AppConfig::default()
+            };
+            let wallet = Address::with_last_byte(0x77);
+            let token = Address::with_last_byte(0x88);
+            let contract = Address::with_last_byte(0x99);
+            let latest = 25_000_u64;
+            let (url, rpc_counts, stop_server, server) = history_rpc_server(latest, Duration::ZERO);
+            let client = NetworkClient::local_test_client(
+                &url,
+                contract,
+                B256::with_last_byte(0x01),
+                token,
+                B256::with_last_byte(0x02),
+                9,
+            )
+            .unwrap();
+            let mut manager = TransactionManager::open_with_history_telemetry(
+                &store,
+                &config,
+                wallet,
+                token,
+                client.history_telemetry(),
+            )
+            .unwrap();
+            let session_id = manager
+                .journal
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .id
+                .clone();
+            manager.journal.state.entries = (0..count)
+                .map(|index| TransactionEntry {
+                    chain_id: 1439,
+                    contract: format!("{contract:#x}"),
+                    node_id: 1,
+                    window_id: index as u64,
+                    action: TransactionAction::SubmitProof,
+                    session_id: session_id.clone(),
+                    wallet: format!("{wallet:#x}"),
+                    nonce: index as u64,
+                    transaction_hash: format!("{:#x}", B256::from(U256::from(index + 1))),
+                    value_wei: SUBMISSION_FEE_WEI.to_string(),
+                    max_fee_per_gas_wei: "1".to_owned(),
+                    gas_limit: 21_000,
+                    maximum_exposure_wei: "1".to_owned(),
+                    status: TransactionStatus::MinedSuccess,
+                    actual_cost_wei: Some("1".to_owned()),
+                    last_known_cost_wei: None,
+                    outcome: Some("candidate-updated".to_owned()),
+                    reward_outcome: None,
+                    reward_block: None,
+                    reward_block_hash: None,
+                    reward_confirmations: 0,
+                    reward_confirmed: false,
+                    proof_nonce: Some(index as u128),
+                    proof_hash: Some(format!("{:#x}", B256::from(U256::from(index + 1)))),
+                    header_hex: Some("01".to_owned()),
+                    receipt_block: Some(1),
+                    receipt_block_hash: Some(format!("{:#x}", B256::with_last_byte(0xaa))),
+                    receipt_status: Some(true),
+                    confirmations: 100,
+                    confirmations_required: 2,
+                    created_unix_secs: index as u64,
+                })
+                .collect();
+            manager
+                .journal
+                .state
+                .proof_attempted_through
+                .insert(format!("{contract:#x}"), count.saturating_sub(1) as u64);
+            manager.journal.persist().unwrap();
+            let snapshot = crate::rpc::ReadSnapshot {
+                block: crate::rpc::BlockSnapshot {
+                    number: latest,
+                    timestamp: 25_000,
+                    hash: B256::with_last_byte(0xaa),
+                },
+                native_balance: None,
+                native_balance_error: None,
+                ast_balance: None,
+                ast_balance_error: None,
+                nodes: vec![crate::rpc::NodeView {
+                    id: 1,
+                    address: contract,
+                    pin: crate::rpc::ContractPinStatus {
+                        runtime_verified: true,
+                        abi_verified: true,
+                        error: None,
+                    },
+                    state: Some(crate::rpc::NodeState {
+                        work: crate::rpc::WorkInfo {
+                            started: true,
+                            ended: false,
+                            window_id: count as u64,
+                            window_start_time: 1,
+                            window_expiry_time: 50_000,
+                            seed: B256::with_last_byte(1),
+                            prev_hash: B256::ZERO,
+                            target: U256::MAX,
+                            reward_per_window: U256::ZERO,
+                            remaining_allocation: U256::from(1),
+                            max_header_length: 128,
+                            submission_fee: U256::from(SUBMISSION_FEE_WEI),
+                        },
+                        candidate: None,
+                        mining_paused: false,
+                        eligible: true,
+                        finalizable: false,
+                        eligibility_reason: "eligible",
+                    }),
+                    error: None,
+                }],
+            };
+
+            let started = Instant::now();
+            let reconcile_result = manager.reconcile_rewards(&client, &snapshot).await;
+            let elapsed = started.elapsed();
+            reconcile_result.unwrap();
+            {
+                let counts = rpc_counts.lock().unwrap();
+                assert_eq!(
+                    counts.get("eth_blockNumber").copied().unwrap_or_default(),
+                    0
+                );
+                assert_eq!(counts.get("eth_getLogs"), Some(&(count as u64 * 6)));
+                assert_eq!(
+                    manager
+                        .history_telemetry
+                        .count(super::HistoryCounter::BlockRangesScanned),
+                    count as u64 * 3
+                );
+                eprintln!(
+                    "reward-reconcile-initial-scan candidates={count} elapsed_ms={} eth_getLogs={} ranges={} profile={}",
+                    elapsed.as_millis(),
+                    counts.get("eth_getLogs").copied().unwrap_or_default(),
+                    count as u64 * 3,
+                    manager.history_profile_line()
+                );
+            }
+            let log_calls_before_repeat = manager
+                .history_telemetry
+                .count(super::HistoryCounter::GetLogsRequests);
+            manager.reconcile_rewards(&client, &snapshot).await.unwrap();
+            assert_eq!(
+                manager
+                    .history_telemetry
+                    .count(super::HistoryCounter::GetLogsRequests),
+                log_calls_before_repeat,
+                "a repeated reconcile at the same verified head must not rescan completed ranges"
+            );
+            if count == 10 {
+                let key = reward_scan_key(contract, 0);
+                manager
+                    .journal
+                    .state
+                    .reward_scan_cursors
+                    .get_mut(&key)
+                    .unwrap()
+                    .retry_after_unix_secs = unix_time_secs().saturating_sub(1);
+                manager.journal.persist().unwrap();
+                manager.reconcile_rewards(&client, &snapshot).await.unwrap();
+                assert_eq!(
+                    manager
+                        .history_telemetry
+                        .count(super::HistoryCounter::GetLogsRequests),
+                    log_calls_before_repeat + 6,
+                    "an empty historical scan must be revisited after its bounded retry interval"
+                );
+            }
+            stop_server.store(true, Ordering::Release);
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn background_reward_scan_returns_without_blocking_live_work() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x77);
+        let token = Address::with_last_byte(0x88);
+        let contract = Address::with_last_byte(0x99);
+        let latest = 25_000_u64;
+        let (url, rpc_counts, stop_server, server) =
+            history_rpc_server(latest, Duration::from_millis(150));
+        let client = NetworkClient::local_test_client(
+            &url,
+            contract,
+            B256::with_last_byte(0x01),
+            token,
+            B256::with_last_byte(0x02),
+            9,
+        )
+        .unwrap();
+        let mut manager = TransactionManager::open_with_history_telemetry(
+            &store,
+            &config,
+            wallet,
+            token,
+            client.history_telemetry(),
+        )
+        .unwrap();
+        let session_id = manager
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        manager
+            .journal
+            .state
+            .proof_attempted_through
+            .insert(format!("{contract:#x}"), 0);
+        manager.journal.state.entries.push(TransactionEntry {
+            chain_id: 1439,
+            contract: format!("{contract:#x}"),
+            node_id: 1,
+            window_id: 0,
+            action: TransactionAction::SubmitProof,
+            session_id,
+            wallet: format!("{wallet:#x}"),
+            nonce: 1,
+            transaction_hash: format!("{:#x}", B256::with_last_byte(0x11)),
+            value_wei: SUBMISSION_FEE_WEI.to_string(),
+            max_fee_per_gas_wei: "1".to_owned(),
+            gas_limit: 21_000,
+            maximum_exposure_wei: "1".to_owned(),
+            status: TransactionStatus::MinedSuccess,
+            actual_cost_wei: Some("1".to_owned()),
+            last_known_cost_wei: None,
+            outcome: Some("candidate-updated".to_owned()),
+            reward_outcome: None,
+            reward_block: None,
+            reward_block_hash: None,
+            reward_confirmations: 0,
+            reward_confirmed: false,
+            proof_nonce: Some(1),
+            proof_hash: Some(format!("{:#x}", B256::with_last_byte(0x12))),
+            header_hex: Some("01".to_owned()),
+            receipt_block: Some(1),
+            receipt_block_hash: Some(format!("{:#x}", B256::with_last_byte(0xaa))),
+            receipt_status: Some(true),
+            confirmations: 100,
+            confirmations_required: 2,
+            created_unix_secs: 1,
+        });
+        manager.journal.persist().unwrap();
+        let snapshot = crate::rpc::ReadSnapshot {
+            block: crate::rpc::BlockSnapshot {
+                number: latest,
+                timestamp: latest,
+                hash: B256::with_last_byte(0xaa),
+            },
+            native_balance: None,
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![crate::rpc::NodeView {
+                id: 1,
+                address: contract,
+                pin: crate::rpc::ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(crate::rpc::NodeState {
+                    work: crate::rpc::WorkInfo {
+                        started: true,
+                        ended: false,
+                        window_id: 1,
+                        window_start_time: 1,
+                        window_expiry_time: latest + 10,
+                        seed: B256::with_last_byte(1),
+                        prev_hash: B256::ZERO,
+                        target: U256::MAX,
+                        reward_per_window: U256::ZERO,
+                        remaining_allocation: U256::from(1),
+                        max_header_length: 128,
+                        submission_fee: U256::from(SUBMISSION_FEE_WEI),
+                    },
+                    candidate: None,
+                    mining_paused: false,
+                    eligible: true,
+                    finalizable: false,
+                    eligibility_reason: "eligible",
+                }),
+                error: None,
+            }],
+        };
+
+        let started = Instant::now();
+        assert!(
+            manager
+                .service_reward_reconciliation(&client, &snapshot)
+                .await
+                .unwrap()
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(
+            manager
+                .reward_scan_task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            manager
+                .service_reward_reconciliation(&client, &snapshot)
+                .await
+                .unwrap();
+            if manager.reward_scan_task.is_none()
+                && manager
+                    .journal
+                    .state
+                    .reward_scan_cursors
+                    .get(&reward_scan_key(contract, 0))
+                    .is_some_and(|cursor| cursor.scanned_through == latest)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(manager.reward_scan_task.is_none());
+        assert_eq!(
+            manager.journal.state.reward_scan_cursors[&reward_scan_key(contract, 0)]
+                .scanned_through,
+            latest
+        );
+        let log_requests = client
+            .history_telemetry()
+            .count(HistoryCounter::GetLogsRequests);
+        assert_eq!(log_requests, 6);
+        assert!(
+            !manager
+                .service_reward_reconciliation(&client, &snapshot)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            client
+                .history_telemetry()
+                .count(HistoryCounter::GetLogsRequests),
+            log_requests
+        );
+        stop_server.store(true, Ordering::Release);
+        server.join().unwrap();
+        assert_eq!(rpc_counts.lock().unwrap().get("eth_getLogs"), Some(&6));
+    }
+
+    #[tokio::test]
+    async fn reward_scan_http_503_keeps_cursor_and_retries_the_same_range() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x77);
+        let token = Address::with_last_byte(0x88);
+        let contract = Address::with_last_byte(0x99);
+        let latest = 100_u64;
+        let (url, rpc_counts, stop_server, server) =
+            history_rpc_server_with_log_failures(latest, Duration::ZERO, 1);
+        let client = NetworkClient::local_test_client(
+            &url,
+            contract,
+            B256::with_last_byte(0x01),
+            token,
+            B256::with_last_byte(0x02),
+            9,
+        )
+        .unwrap();
+        let mut manager = TransactionManager::open_with_history_telemetry(
+            &store,
+            &config,
+            wallet,
+            token,
+            client.history_telemetry(),
+        )
+        .unwrap();
+        let session_id = manager
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        manager.journal.state.entries.push(settled_history_entry(
+            contract,
+            1,
+            wallet,
+            &session_id,
+            0,
+            B256::with_last_byte(0x61),
+            TransactionAction::SubmitProof,
+            "candidate-updated",
+            None,
+            0,
+        ));
+        manager
+            .journal
+            .state
+            .proof_attempted_through
+            .insert(format!("{contract:#x}"), 0);
+        manager.journal.persist().unwrap();
+        let snapshot = crate::rpc::ReadSnapshot {
+            block: crate::rpc::BlockSnapshot {
+                number: latest,
+                timestamp: latest,
+                hash: B256::with_last_byte(0xaa),
+            },
+            native_balance: None,
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![crate::rpc::NodeView {
+                id: 1,
+                address: contract,
+                pin: crate::rpc::ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(crate::rpc::NodeState {
+                    work: crate::rpc::WorkInfo {
+                        started: true,
+                        ended: false,
+                        window_id: 1,
+                        window_start_time: 1,
+                        window_expiry_time: latest + 10,
+                        seed: B256::with_last_byte(1),
+                        prev_hash: B256::ZERO,
+                        target: U256::MAX,
+                        reward_per_window: U256::ZERO,
+                        remaining_allocation: U256::from(1),
+                        max_header_length: 128,
+                        submission_fee: U256::from(SUBMISSION_FEE_WEI),
+                    },
+                    candidate: None,
+                    mining_paused: false,
+                    eligible: true,
+                    finalizable: false,
+                    eligibility_reason: "eligible",
+                }),
+                error: None,
+            }],
+        };
+
+        assert!(
+            manager
+                .service_reward_reconciliation(&client, &snapshot)
+                .await
+                .unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while manager.reward_scan_retry_attempts == 0 && Instant::now() < deadline {
+            manager
+                .service_reward_reconciliation(&client, &snapshot)
+                .await
+                .unwrap();
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(manager.reward_scan_retry_attempts, 1);
+        assert!(manager.journal.state.reward_scan_cursors.is_empty());
+        assert_eq!(
+            client
+                .history_telemetry()
+                .count(HistoryCounter::RewardScanErrors),
+            1
+        );
+
+        manager.reward_scan_retry_at = Some(tokio::time::Instant::now() - Duration::from_secs(1));
+        assert!(
+            manager
+                .service_reward_reconciliation(&client, &snapshot)
+                .await
+                .unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while manager.reward_scan_task.is_some() && Instant::now() < deadline {
+            manager
+                .service_reward_reconciliation(&client, &snapshot)
+                .await
+                .unwrap();
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(manager.reward_scan_task.is_none());
+        assert_eq!(
+            manager.journal.state.reward_scan_cursors[&reward_scan_key(contract, 0)]
+                .scanned_through,
+            latest
+        );
+        stop_server.store(true, Ordering::Release);
+        server.join().unwrap();
+        let counts = rpc_counts.lock().unwrap();
+        assert_eq!(counts.get("eth_getLogs"), Some(&3));
+        assert_eq!(counts.get("eth_getLogs_from_0xa"), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn reward_scan_restart_resumes_after_the_durable_range_cursor() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x77);
+        let token = Address::with_last_byte(0x88);
+        let contract = Address::with_last_byte(1);
+        let latest = 25_000_u64;
+        let snapshot = crate::rpc::ReadSnapshot {
+            block: crate::rpc::BlockSnapshot {
+                number: latest,
+                timestamp: latest,
+                hash: B256::with_last_byte(0xaa),
+            },
+            native_balance: None,
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![crate::rpc::NodeView {
+                id: 1,
+                address: contract,
+                pin: crate::rpc::ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(crate::rpc::NodeState {
+                    work: crate::rpc::WorkInfo {
+                        started: true,
+                        ended: false,
+                        window_id: 1,
+                        window_start_time: 1,
+                        window_expiry_time: latest + 10,
+                        seed: B256::with_last_byte(1),
+                        prev_hash: B256::ZERO,
+                        target: U256::MAX,
+                        reward_per_window: U256::ZERO,
+                        remaining_allocation: U256::from(1),
+                        max_header_length: 128,
+                        submission_fee: U256::from(SUBMISSION_FEE_WEI),
+                    },
+                    candidate: None,
+                    mining_paused: false,
+                    eligible: true,
+                    finalizable: false,
+                    eligibility_reason: "eligible",
+                }),
+                error: None,
+            }],
+        };
+        let (first_url, first_counts, first_stop, first_server) =
+            history_rpc_server(latest, Duration::ZERO);
+        let first_client = NetworkClient::local_test_client(
+            &first_url,
+            contract,
+            B256::with_last_byte(1),
+            token,
+            B256::with_last_byte(2),
+            9,
+        )
+        .unwrap();
+        let mut manager = TransactionManager::open_with_history_telemetry(
+            &store,
+            &config,
+            wallet,
+            token,
+            first_client.history_telemetry(),
+        )
+        .unwrap();
+        let session_id = manager
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        manager.journal.state.entries.push(settled_history_entry(
+            contract,
+            1,
+            wallet,
+            &session_id,
+            0,
+            B256::with_last_byte(0x61),
+            TransactionAction::SubmitProof,
+            "candidate-updated",
+            None,
+            0,
+        ));
+        manager
+            .journal
+            .state
+            .proof_attempted_through
+            .insert(format!("{contract:#x}"), 0);
+        manager.journal.persist().unwrap();
+        assert!(
+            manager
+                .schedule_reward_reconciliation(&first_client, &snapshot)
+                .unwrap()
+        );
+        let first_batch = manager
+            .reward_scan_task
+            .take()
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        manager.apply_reward_scan_batch(first_batch).unwrap();
+        assert_eq!(
+            manager.journal.state.reward_scan_cursors[&reward_scan_key(contract, 0)]
+                .scanned_through,
+            10 + super::REWARD_SCAN_BLOCK_RANGE - 1
+        );
+        first_stop.store(true, Ordering::Release);
+        first_server.join().unwrap();
+        assert_eq!(first_counts.lock().unwrap().get("eth_getLogs"), Some(&2));
+        drop(manager);
+
+        let (second_url, second_counts, second_stop, second_server) =
+            history_rpc_server(latest, Duration::ZERO);
+        let second_client = NetworkClient::local_test_client(
+            &second_url,
+            contract,
+            B256::with_last_byte(1),
+            token,
+            B256::with_last_byte(2),
+            9,
+        )
+        .unwrap();
+        let mut recovered = TransactionManager::open_with_history_telemetry(
+            &store,
+            &config,
+            wallet,
+            token,
+            second_client.history_telemetry(),
+        )
+        .unwrap();
+        assert!(
+            recovered
+                .service_reward_reconciliation(&second_client, &snapshot)
+                .await
+                .unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !recovered
+            .reward_scan_task
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+            && Instant::now() < deadline
+        {
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            recovered
+                .reward_scan_task
+                .as_ref()
+                .is_some_and(|task| task.is_finished())
+        );
+        second_stop.store(true, Ordering::Release);
+        second_server.join().unwrap();
+        let counts = second_counts.lock().unwrap();
+        assert_eq!(counts.get("eth_getLogs"), Some(&2));
+        assert_eq!(counts.get("eth_getLogs_from_0x271a"), Some(&2));
+        drop(counts);
+    }
+
+    #[tokio::test]
+    async fn reward_scan_anchor_reorg_resets_only_scan_cursors() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x77);
+        let token = Address::with_last_byte(0x88);
+        let contract = Address::with_last_byte(1);
+        let client = NetworkClient::local_test_client(
+            "http://127.0.0.1:8545",
+            contract,
+            B256::with_last_byte(1),
+            token,
+            B256::with_last_byte(2),
+            9,
+        )
+        .unwrap();
+        let mut manager = TransactionManager::open_with_history_telemetry(
+            &store,
+            &config,
+            wallet,
+            token,
+            client.history_telemetry(),
+        )
+        .unwrap();
+        manager.journal.state.reward_scan_anchor = Some(RewardScanAnchor {
+            block_number: 100,
+            block_hash: format!("{:#x}", B256::with_last_byte(0xaa)),
+        });
+        manager.journal.state.reward_scan_cursors.insert(
+            reward_scan_key(contract, 7),
+            RewardScanCursor {
+                scanned_through: 90,
+                retry_after_unix_secs: unix_time_secs() + 60,
+                retry_backoff_secs: REWARD_EMPTY_SCAN_RETRY_BASE_SECS,
+                rescan_active: false,
+            },
+        );
+        let historical_entry = settled_history_entry(
+            contract,
+            1,
+            wallet,
+            &manager.journal.state.active_session.as_ref().unwrap().id,
+            7,
+            B256::with_last_byte(0x77),
+            TransactionAction::SubmitProof,
+            "candidate-updated",
+            None,
+            0,
+        );
+        manager.journal.state.entries.push(historical_entry);
+        manager
+            .journal
+            .state
+            .proof_attempted_through
+            .insert(format!("{contract:#x}"), 7);
+        manager.journal.persist().unwrap();
+
+        let batch = run_reward_scan_batch(
+            client,
+            crate::rpc::BlockSnapshot {
+                number: 100,
+                timestamp: 100,
+                hash: B256::with_last_byte(0xbb),
+            },
+            manager.journal.state.reward_scan_anchor.clone(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(batch, RewardScanBatchOutput::ReorgDetected));
+        manager.apply_reward_scan_batch(batch).unwrap();
+        assert!(manager.journal.state.reward_scan_cursors.is_empty());
+        assert!(manager.journal.state.reward_scan_anchor.is_none());
+        assert_eq!(manager.journal.state.entries.len(), 1);
+        assert_eq!(manager.journal.state.entries[0].window_id, 7);
+        assert_eq!(
+            manager
+                .journal
+                .state
+                .proof_attempted_through
+                .get(&format!("{contract:#x}")),
+            Some(&7)
+        );
+    }
+
+    #[tokio::test]
+    async fn reward_scan_restart_resumes_from_persisted_block_cursor() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x77);
+        let token = Address::with_last_byte(0x88);
+        let contract = Address::with_last_byte(1);
+        let latest = 25_000_u64;
+        let snapshot = crate::rpc::ReadSnapshot {
+            block: crate::rpc::BlockSnapshot {
+                number: latest,
+                timestamp: latest,
+                hash: B256::with_last_byte(0xaa),
+            },
+            native_balance: None,
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![crate::rpc::NodeView {
+                id: 1,
+                address: contract,
+                pin: crate::rpc::ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(crate::rpc::NodeState {
+                    work: crate::rpc::WorkInfo {
+                        started: true,
+                        ended: false,
+                        window_id: 1,
+                        window_start_time: 1,
+                        window_expiry_time: latest + 10,
+                        seed: B256::with_last_byte(1),
+                        prev_hash: B256::ZERO,
+                        target: U256::MAX,
+                        reward_per_window: U256::ZERO,
+                        remaining_allocation: U256::from(1),
+                        max_header_length: 128,
+                        submission_fee: U256::from(SUBMISSION_FEE_WEI),
+                    },
+                    candidate: None,
+                    mining_paused: false,
+                    eligible: true,
+                    finalizable: false,
+                    eligibility_reason: "eligible",
+                }),
+                error: None,
+            }],
+        };
+        let (first_url, first_counts, first_stop, first_server) =
+            history_rpc_server(latest, Duration::ZERO);
+        let first_client = NetworkClient::local_test_client(
+            &first_url,
+            contract,
+            B256::with_last_byte(1),
+            token,
+            B256::with_last_byte(2),
+            9,
+        )
+        .unwrap();
+        let mut first_manager = TransactionManager::open_with_history_telemetry(
+            &store,
+            &config,
+            wallet,
+            token,
+            first_client.history_telemetry(),
+        )
+        .unwrap();
+        let session_id = first_manager
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        let proof_hash = B256::with_last_byte(0x71);
+        first_manager
+            .journal
+            .state
+            .entries
+            .push(settled_history_entry(
+                contract,
+                1,
+                wallet,
+                &session_id,
+                0,
+                proof_hash,
+                TransactionAction::SubmitProof,
+                "candidate-updated",
+                None,
+                0,
+            ));
+        first_manager
+            .journal
+            .state
+            .proof_attempted_through
+            .insert(format!("{contract:#x}"), 0);
+        first_manager.journal.persist().unwrap();
+
+        assert!(
+            first_manager
+                .schedule_reward_reconciliation(&first_client, &snapshot)
+                .unwrap()
+        );
+        let first_batch = first_manager
+            .reward_scan_task
+            .take()
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        first_manager.apply_reward_scan_batch(first_batch).unwrap();
+        first_stop.store(true, Ordering::Release);
+        first_server.join().unwrap();
+        assert_eq!(first_counts.lock().unwrap().get("eth_getLogs"), Some(&2));
+        assert_eq!(
+            first_manager.journal.state.reward_scan_cursors[&reward_scan_key(contract, 0)]
+                .scanned_through,
+            10 + super::REWARD_SCAN_BLOCK_RANGE - 1
+        );
+        drop(first_manager);
+
+        let (second_url, second_counts, second_stop, second_server) =
+            history_rpc_server(latest, Duration::ZERO);
+        let second_client = NetworkClient::local_test_client(
+            &second_url,
+            contract,
+            B256::with_last_byte(1),
+            token,
+            B256::with_last_byte(2),
+            9,
+        )
+        .unwrap();
+        let mut recovered = TransactionManager::open_with_history_telemetry(
+            &store,
+            &config,
+            wallet,
+            token,
+            second_client.history_telemetry(),
+        )
+        .unwrap();
+        assert!(
+            recovered
+                .service_reward_reconciliation(&second_client, &snapshot)
+                .await
+                .unwrap()
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !recovered
+            .reward_scan_task
+            .as_ref()
+            .is_some_and(|task| task.is_finished())
+            && Instant::now() < deadline
+        {
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            recovered
+                .reward_scan_task
+                .as_ref()
+                .is_some_and(|task| task.is_finished())
+        );
+        second_stop.store(true, Ordering::Release);
+        second_server.join().unwrap();
+        let counts = second_counts.lock().unwrap();
+        assert_eq!(counts.get("eth_getLogs"), Some(&2));
+        assert_eq!(counts.get("eth_getLogs_from_0x271a"), Some(&2));
+        drop(counts);
     }
 
     #[test]
@@ -3348,7 +5945,10 @@ mod tests {
             })
             .collect();
         let archived = journal.archive_settled().unwrap();
-        assert_eq!(archived, super::ARCHIVE_BATCH_SIZE);
+        assert_eq!(
+            archived,
+            super::ARCHIVE_TRIGGER_ENTRIES.min(super::ARCHIVE_BATCH_SIZE)
+        );
         assert_eq!(
             journal.state.entries.len(),
             super::ARCHIVE_TRIGGER_ENTRIES - archived
@@ -3362,7 +5962,7 @@ mod tests {
             journal.session_spent_or_reserved().unwrap(),
             U256::from((super::ARCHIVE_TRIGGER_ENTRIES as u64) * 100)
         );
-        validate_archive_ledger(&store, &journal.state).unwrap();
+        validate_archive_ledger(&store, &journal.state, None).unwrap();
         drop(journal);
         let reopened = TransactionJournal::open(&store, &config, wallet).unwrap();
         assert_eq!(
@@ -3373,6 +5973,122 @@ mod tests {
             reopened.session_spent_or_reserved().unwrap(),
             U256::from((super::ARCHIVE_TRIGGER_ENTRIES as u64) * 100)
         );
+    }
+
+    #[test]
+    fn corrupted_archive_is_rejected_without_discarding_journal_history() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x99);
+        let contract = Address::with_last_byte(1);
+        let telemetry = Arc::new(HistoryTelemetry::default());
+        let mut journal = TransactionJournal::open_with_history_telemetry(
+            &store,
+            &config,
+            wallet,
+            Arc::clone(&telemetry),
+        )
+        .unwrap();
+        let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        journal.state.entries = (0..ARCHIVE_TRIGGER_ENTRIES)
+            .map(|index| {
+                settled_history_entry(
+                    contract,
+                    1,
+                    wallet,
+                    &session_id,
+                    index as u64,
+                    B256::from(U256::from(index + 1)),
+                    TransactionAction::FinalizeWindow,
+                    "window-finalized",
+                    None,
+                    0,
+                )
+            })
+            .collect();
+        assert_eq!(journal.archive_settled().unwrap(), ARCHIVE_TRIGGER_ENTRIES);
+        let archive = journal.state.archives[0].file_name.clone();
+        drop(journal);
+
+        let archive_path = root
+            .path()
+            .join("transactions")
+            .join("archives")
+            .join(archive);
+        let mut contents = std::fs::read(&archive_path).unwrap();
+        contents[0] ^= 1;
+        std::fs::write(&archive_path, contents).unwrap();
+        let open_error = match TransactionJournal::open_with_history_telemetry(
+            &store,
+            &config,
+            wallet,
+            Arc::clone(&telemetry),
+        ) {
+            Ok(_) => panic!("modified archive should fail digest validation"),
+            Err(error) => error,
+        };
+        assert!(open_error.to_string().contains("failed its journal digest"));
+        assert_eq!(
+            telemetry.count(HistoryCounter::ArchiveValidationFailures),
+            1
+        );
+        assert!(store.read_transaction_journal().unwrap().is_some());
+    }
+
+    #[test]
+    fn journal_and_archive_write_failures_are_reported_without_losing_active_entries() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x99);
+        let contract = Address::with_last_byte(1);
+        let telemetry = Arc::new(HistoryTelemetry::default());
+        let mut journal = TransactionJournal::open_with_history_telemetry(
+            &store,
+            &config,
+            wallet,
+            Arc::clone(&telemetry),
+        )
+        .unwrap();
+        let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        journal.state.entries = (0..ARCHIVE_TRIGGER_ENTRIES)
+            .map(|index| {
+                settled_history_entry(
+                    contract,
+                    1,
+                    wallet,
+                    &session_id,
+                    index as u64,
+                    B256::from(U256::from(index + 1)),
+                    TransactionAction::FinalizeWindow,
+                    "window-finalized",
+                    None,
+                    0,
+                )
+            })
+            .collect();
+
+        let archives_path = root.path().join("transactions").join("archives");
+        std::fs::write(&archives_path, b"blocking archive directory").unwrap();
+        let before_entries = journal.state.entries.len();
+        assert!(journal.archive_settled().is_err());
+        assert_eq!(journal.state.entries.len(), before_entries);
+        assert_eq!(telemetry.count(HistoryCounter::ArchiveWriteFailures), 1);
+
+        std::fs::remove_file(archives_path).unwrap();
+        let journal_path = root.path().join("transactions").join("journal.json");
+        std::fs::remove_file(&journal_path).unwrap();
+        std::fs::create_dir(&journal_path).unwrap();
+        assert!(journal.persist().is_err());
+        assert_eq!(telemetry.count(HistoryCounter::JournalWriteFailures), 1);
+        assert_eq!(journal.state.entries.len(), before_entries);
     }
 
     #[test]
@@ -5312,6 +8028,7 @@ mod tests {
                 session_exposure: Some(
                     parse_decimal_wei(&broadcast_proof.maximum_exposure_wei).unwrap(),
                 ),
+                mined_rewards: U256::ZERO,
                 activities: vec![TransactionActivity {
                     node_id: 1,
                     window_id: broadcast_proof.window_id,

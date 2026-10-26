@@ -201,6 +201,8 @@ pub struct DashboardModel {
     pub chain_id: u64,
     pub wallet: Address,
     pub inj_balance: Option<U256>,
+    pub ast_balance: Option<U256>,
+    pub mined_rewards: U256,
     pub cpu_threads: usize,
     pub session_limit: Option<U256>,
     pub session_exposure: Option<U256>,
@@ -779,7 +781,7 @@ fn render_wide(
     latest_diagnostic: Option<&str>,
     colors: bool,
 ) {
-    let top_height = 8.min(area.height.saturating_sub(7));
+    let top_height = 9.min(area.height.saturating_sub(7));
     let header_area = Rect::new(area.x, area.y, area.width, top_height);
     render_wide_header(frame, header_area, model, colors);
 
@@ -873,7 +875,17 @@ fn render_wide_header(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel,
         metadata_line("NETWORK", network_name(model.network), colors),
         metadata_line("CHAIN ID", &model.chain_id.to_string(), colors),
         metadata_line("WALLET", &short_address(model.wallet), colors),
-        metadata_line("BALANCE", &format_optional_inj(model.inj_balance), colors),
+        metadata_line(
+            "INJ BALANCE",
+            &format_optional_inj_value(model.inj_balance),
+            colors,
+        ),
+        metadata_line(
+            "AST BALANCE",
+            &format_optional_ast(model.ast_balance),
+            colors,
+        ),
+        metadata_line("MINED", &format_mined(model.mined_rewards), colors),
         metadata_line("CPU", &format!("{} Threads", model.cpu_threads), colors),
         metadata_line("HASHRATE", &format_hashrate(model.hashrate), colors),
         metadata_line("SESSION", &format_session(model), colors),
@@ -889,7 +901,7 @@ fn render_compact(
     latest_diagnostic: Option<&str>,
     colors: bool,
 ) {
-    let header_height = 5.min(area.height.saturating_sub(5));
+    let header_height = 7.min(area.height.saturating_sub(5));
     let mut lines = vec![
         Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
         version_mode_line(model, colors),
@@ -898,10 +910,15 @@ fn render_compact(
             network_name(model.network),
             model.chain_id
         ))),
+        Line::from(Span::raw(format!("Wallet {}", short_address(model.wallet)))),
         Line::from(Span::raw(format!(
-            "Wallet {} • INJ {}",
-            short_address(model.wallet),
-            format_optional_inj(model.inj_balance)
+            "INJ BALANCE {} • AST BALANCE {}",
+            format_optional_inj_value(model.inj_balance),
+            format_optional_ast(model.ast_balance)
+        ))),
+        Line::from(Span::raw(format!(
+            "MINED {}",
+            format_mined(model.mined_rewards)
         ))),
         Line::from(Span::raw(format!(
             "CPU {} • {} • Session {}",
@@ -981,18 +998,25 @@ fn render_narrow(
     colors: bool,
 ) {
     let header_height = 4.min(area.height.saturating_sub(2));
+    let ast_balance = model
+        .ast_balance
+        .map(|balance| format_units(balance, 9))
+        .unwrap_or_else(|| "--".to_owned());
+    let mined = format_units(model.mined_rewards, 9);
     let lines = vec![
         Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
-        version_mode_line(model, colors),
         Line::from(Span::raw(format!(
-            "{} · {}",
+            "{} • {}",
             network_name(model.network),
-            model.chain_id
+            model.mode(Instant::now())
         ))),
         Line::from(Span::raw(format!(
-            "{} · {} INJ",
+            "{} · INJ {}",
             short_address(model.wallet),
-            format_optional_inj(model.inj_balance)
+            format_optional_inj_value(model.inj_balance),
+        ))),
+        Line::from(Span::raw(format!(
+            "AST BALANCE {ast_balance} AST • MINED +{mined} AST"
         ))),
     ];
     frame.render_widget(
@@ -1288,7 +1312,7 @@ fn render_rule(frame: &mut Frame<'_>, area: Rect, colors: bool) {
 
 fn metadata_line(label: &str, value: &str, colors: bool) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<9}"), style(colors, MUTED, false)),
+        Span::styled(format!("{label:<12}"), style(colors, MUTED, false)),
         Span::styled(value.to_owned(), style(colors, LIGHT, false)),
     ])
 }
@@ -1353,10 +1377,28 @@ pub fn format_units(value: U256, decimals: u8) -> String {
     format!("{whole}.{}", fractional.trim_end_matches('0'))
 }
 
-fn format_optional_inj(value: Option<U256>) -> String {
+fn format_optional_inj_value(value: Option<U256>) -> String {
     value
         .map(|value| format!("{} INJ", format_units(value, 18)))
         .unwrap_or_else(|| "-- INJ".to_owned())
+}
+
+fn format_optional_ast_value(value: Option<U256>) -> String {
+    value
+        .map(|value| format!("{} AST", format_units(value, 9)))
+        .unwrap_or_else(|| "-- AST".to_owned())
+}
+
+fn format_optional_ast(value: Option<U256>) -> String {
+    format_optional_ast_value(value)
+}
+
+fn format_mined_value(value: U256) -> String {
+    format!("+{} AST", format_units(value, 9))
+}
+
+fn format_mined(value: U256) -> String {
+    format_mined_value(value)
 }
 
 fn format_session(model: &DashboardModel) -> String {
@@ -1476,8 +1518,9 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        DashboardModel, DashboardNode, NodeStatus, WindowCountdown, format_hashrate, format_reward,
-        format_time_left, format_units, hashes_per_second, render_dashboard,
+        DashboardModel, DashboardNode, NodeStatus, WindowCountdown, format_hashrate,
+        format_mined_value, format_optional_ast_value, format_reward, format_time_left,
+        format_units, hashes_per_second, render_dashboard,
     };
     use crate::cli::Network;
     use alloy_primitives::{Address, B256, U256};
@@ -1494,6 +1537,8 @@ mod tests {
             chain_id: 1439,
             wallet: wallet(1),
             inj_balance: Some(U256::from(2_948_000_000_000_000_000_u128)),
+            ast_balance: Some(U256::from(39_000_000_000_000_u128)),
+            mined_rewards: U256::from(26_000_000_000_000_u128),
             cpu_threads: 6,
             session_limit: Some(U256::from(500_000_000_000_000_000_u128)),
             session_exposure: Some(U256::from(52_000_000_000_000_000_u128)),
@@ -1593,6 +1638,79 @@ mod tests {
         assert!(text.contains("WINDOW"));
         assert!(text.contains("9 selected / 9 total"));
         assert!(!text.contains("10  "));
+    }
+
+    #[test]
+    fn ast_balance_and_mined_are_exact_and_visible_across_dashboard_widths() {
+        assert_eq!(
+            format_optional_ast_value(Some(U256::from(39_000_000_001_u64))),
+            "39.000000001 AST"
+        );
+        assert_eq!(format_optional_ast_value(None), "-- AST");
+        assert_eq!(
+            format_mined_value(U256::from(26_000_000_000_000_u128)),
+            "+26000 AST"
+        );
+
+        let nodes = (1..=9)
+            .map(|id| node(id, NodeStatus::Mining, None))
+            .collect::<Vec<_>>();
+        for (width, expected_balance_label) in [
+            (100, "AST BALANCE"),
+            (60, "AST BALANCE"),
+            (40, "AST BALANCE"),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| render_dashboard(frame, &model(nodes.clone()), None, false))
+                .unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains(expected_balance_label), "{width}x24: {text}");
+            assert!(text.contains("MINED"), "{width}x24: {text}");
+            assert!(text.contains("+26000 AST"), "{width}x24: {text}");
+            assert!(text.contains("39000 AST"), "{width}x24: {text}");
+            if width >= 78 {
+                assert!(text.contains("INJ BALANCE 2.948 INJ"), "{text}");
+                assert!(text.contains("AST BALANCE 39000 AST"), "{text}");
+            }
+            assert!(
+                text.contains("INJ BALANCE") || text.contains("INJ "),
+                "{width}x24: {text}"
+            );
+            assert!(text.contains("9 selected / 9 total"), "{width}x24: {text}");
+            for id in 1..=9 {
+                assert!(text.contains(&format!("{id:02}")), "{width}x24: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_ast_balance_changes_do_not_change_the_session_mined_total() {
+        let initial = model(Vec::new());
+        let mut after_external_ast_transfer = initial.clone();
+        after_external_ast_transfer.ast_balance =
+            Some(initial.ast_balance.unwrap() + U256::from(7_000_000_000_u64));
+        assert_ne!(initial.ast_balance, after_external_ast_transfer.ast_balance);
+        assert_eq!(initial.mined_rewards, U256::from(26_000_000_000_000_u128));
+        assert_eq!(
+            after_external_ast_transfer.mined_rewards, initial.mined_rewards,
+            "wallet balance deltas are not mined-session accounting"
+        );
+    }
+
+    #[test]
+    fn unavailable_ast_balance_remains_explicitly_unavailable() {
+        let mut view = model(Vec::new());
+        view.ast_balance = None;
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &view, None, false))
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("AST BALANCE"));
+        assert!(text.contains("-- AST"));
+        assert!(text.contains("MINED"));
+        assert!(text.contains("+26000 AST"));
     }
 
     #[test]
