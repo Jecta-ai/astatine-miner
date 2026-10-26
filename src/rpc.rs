@@ -3,6 +3,7 @@ use crate::{
     deployment::{DeploymentManifest, NodePin, parse_address, parse_hash},
     diagnostics::DiagnosticBuffer,
     protocol::{WorkContext, WorkHasher, meets_target, work_domain_v2},
+    startup::StartupProgress,
 };
 use alloy_primitives::{Address, B256, Bytes, U256, hex, keccak256};
 use alloy_sol_types::{SolCall, SolError, SolEvent, SolType, SolValue};
@@ -250,7 +251,22 @@ pub struct NetworkClient {
 
 impl NetworkClient {
     pub async fn connect(network: crate::cli::Network) -> Result<Self> {
-        let manifest = DeploymentManifest::load(network)?;
+        Self::connect_with_progress(network, None).await
+    }
+
+    pub(crate) async fn connect_with_progress(
+        network: crate::cli::Network,
+        progress: Option<&StartupProgress>,
+    ) -> Result<Self> {
+        let manifest = match DeploymentManifest::load(network) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                if let Some(progress) = progress {
+                    progress.fail(format!("Deployment configuration failed: {error:#}"));
+                }
+                return Err(error);
+            }
+        };
         let configured = std::iter::once(("primary", manifest.primary_rpc.as_str())).chain(
             manifest
                 .archival_rpc
@@ -258,8 +274,12 @@ impl NetworkClient {
                 .map(|url| ("archival", url)),
         );
         let mut endpoints = Vec::new();
+        let mut endpoint_errors = Vec::new();
 
         for (name, url) in configured {
+            if let Some(progress) = progress {
+                progress.update(format!("Connecting to {name} RPC · validating Chain ID"));
+            }
             match connect_endpoint(name, url).await {
                 Ok(endpoint) => {
                     match rpc_request::<String>(&endpoint, "eth_chainId", serde_json::json!([]))
@@ -267,23 +287,47 @@ impl NetworkClient {
                         .and_then(|chain| parse_hex_quantity(&chain))
                     {
                         Ok(chain_id) if chain_id == manifest.chain_id => endpoints.push(endpoint),
-                        Ok(chain_id) => eprintln!(
-                            "RPC {} reports chain ID {}; expected {}. Ignoring endpoint.",
+                        Ok(chain_id) => endpoint_errors.push(format!(
+                            "RPC {} reports chain ID {}; expected {}",
                             endpoint.name, chain_id, manifest.chain_id
-                        ),
+                        )),
                         Err(error) => {
-                            eprintln!("RPC {} chain-ID check failed: {error:#}", endpoint.name)
+                            endpoint_errors.push(format!(
+                                "RPC {} Chain ID check failed: {error:#}",
+                                endpoint.name
+                            ));
                         }
                     }
                 }
-                Err(error) => eprintln!("RPC {name} unavailable: {error:#}"),
+                Err(error) => endpoint_errors.push(format!("RPC {name} unavailable: {error:#}")),
             }
         }
         if endpoints.is_empty() {
-            bail!(
+            let error = anyhow::anyhow!(
                 "no configured RPC endpoint reports the expected chain ID {}",
                 manifest.chain_id
             );
+            let details = if endpoint_errors.is_empty() {
+                format!("{error:#}")
+            } else {
+                format!("{error:#}: {}", endpoint_errors.join("; "))
+            };
+            if let Some(progress) = progress {
+                progress.fail(format!(
+                    "RPC connection or Chain ID validation failed: {details}"
+                ));
+            }
+            return Err(anyhow::anyhow!(details));
+        }
+        if let Some(progress) = progress {
+            progress.complete(format!("RPC verified · Chain ID {}", manifest.chain_id));
+            for error in endpoint_errors {
+                progress.note(error);
+            }
+        } else {
+            for error in endpoint_errors {
+                eprintln!("{error}");
+            }
         }
 
         let mut client = Self {
@@ -308,7 +352,7 @@ impl NetworkClient {
                 nodes: HashMap::new(),
             },
         };
-        client.verify_deployment().await?;
+        client.verify_deployment(progress).await?;
         Ok(client)
     }
 
@@ -869,28 +913,115 @@ impl NetworkClient {
             .remove(&(node_id, window_id, seed))
     }
 
-    async fn verify_deployment(&mut self) -> Result<()> {
-        let (endpoints, block) = self.best_block().await?;
+    async fn verify_deployment(&mut self, progress: Option<&StartupProgress>) -> Result<()> {
+        if let Some(progress) = progress {
+            progress.begin("Selecting a consistent deployment block");
+        }
+        let (endpoints, block) = match self.best_block().await {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(progress) = progress {
+                    progress.fail(format!(
+                        "Could not select a verified deployment block: {error:#}"
+                    ));
+                }
+                return Err(error).context("select a consistent deployment verification block");
+            }
+        };
+        if let Some(progress) = progress {
+            progress.complete(format!("Deployment block selected · #{}", block.number));
+            progress.begin("Verifying deployment reference snapshot");
+        }
         let endpoint = &endpoints[0];
-        self.verification.reference_snapshot_verified = self.verify_reference_snapshot().await;
-        if self.manifest.reference_snapshot.is_some()
-            && !self.verification.reference_snapshot_verified
-        {
-            self.report_diagnostic(
-                "Historical reference block was unavailable or did not match; live runtime pins are still required."
-                    .to_owned(),
-            );
+        if self.manifest.reference_snapshot.is_some() {
+            self.verification.reference_snapshot_verified = self.verify_reference_snapshot().await;
+            if !self.verification.reference_snapshot_verified {
+                let message = "Historical reference block was unavailable or did not match; live runtime pins are still required.";
+                if let Some(progress) = progress {
+                    progress.warn(message);
+                } else {
+                    self.report_diagnostic(message.to_owned());
+                }
+            } else if let Some(progress) = progress {
+                progress.complete("Deployment reference snapshot verified");
+            }
+        } else {
+            self.verification.reference_snapshot_verified = false;
+            if let Some(progress) = progress {
+                progress.complete("No pinned reference snapshot configured");
+            }
         }
 
         if let Some(token) = &self.manifest.ast_token {
-            self.verification.token_verified =
-                self.verify_token_pin(endpoint, block.number, token).await;
+            if let Some(progress) = progress {
+                progress.begin("Verifying AST token");
+            }
+            match self.verify_token_pin(endpoint, block.number, token).await {
+                Ok(()) => {
+                    self.verification.token_verified = true;
+                    if let Some(progress) = progress {
+                        progress.complete("AST token verified");
+                    }
+                }
+                Err(error) => {
+                    self.verification.token_verified = false;
+                    let message = format!("AST token is unverified: {error:#}");
+                    if let Some(progress) = progress {
+                        progress.warn(&message);
+                    } else {
+                        self.report_diagnostic(message);
+                    }
+                }
+            }
         }
 
-        for pin in self.manifest.nodes.clone() {
-            self.verification
-                .nodes
-                .insert(pin.id, self.verify_node_pin(endpoint, &block, &pin).await);
+        let total = self.manifest.nodes.len();
+        if total == 0 {
+            if let Some(progress) = progress {
+                progress.complete("No mining contracts configured for this network");
+            }
+        } else {
+            if let Some(progress) = progress {
+                progress.begin(format!("Verifying mining contracts · 0/{total}"));
+            }
+            let mut verified = 0;
+            for (index, pin) in self.manifest.nodes.clone().into_iter().enumerate() {
+                let status = self.verify_node_pin(endpoint, &block, &pin).await;
+                if status.runtime_verified && status.abi_verified {
+                    verified += 1;
+                } else {
+                    let message = format!(
+                        "Node {} verification failed: {}",
+                        pin.id,
+                        status
+                            .error
+                            .as_deref()
+                            .unwrap_or("runtime or ABI pin did not verify")
+                    );
+                    if let Some(progress) = progress {
+                        progress.note(message);
+                    } else {
+                        self.report_diagnostic(message);
+                    }
+                }
+                self.verification.nodes.insert(pin.id, status);
+                if let Some(progress) = progress {
+                    progress.update(format!(
+                        "Verifying mining contracts · {}/{}",
+                        index + 1,
+                        total
+                    ));
+                }
+            }
+            if let Some(progress) = progress {
+                if verified == total {
+                    progress.complete(format!("Mining contracts verified · {verified}/{total}"));
+                } else {
+                    progress.warn(format!(
+                        "Mining contracts checked · {verified}/{total} verified"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -917,8 +1048,8 @@ impl NetworkClient {
         endpoint: &RpcEndpoint,
         block: u64,
         token: &crate::deployment::TokenPin,
-    ) -> bool {
-        let check = async {
+    ) -> Result<()> {
+        async {
             let address = parse_address(&token.address)?;
             let expected_hash = parse_hash(&token.runtime_code_hash)?;
             let code = get_code(endpoint, address, block).await?;
@@ -932,14 +1063,7 @@ impl NetworkClient {
             }
             Ok::<(), anyhow::Error>(())
         }
-        .await;
-        match check {
-            Ok(()) => true,
-            Err(error) => {
-                self.report_diagnostic(format!("AST token is unverified: {error:#}"));
-                false
-            }
-        }
+        .await
     }
 
     async fn verify_node_pin(
@@ -1952,6 +2076,37 @@ mod tests {
                 .unwrap(),
         };
         (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn slow_rpc_chain_id_request_times_out_and_remains_retryable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream);
+            thread::sleep(Duration::from_millis(150));
+            let body = rpc_result(serde_json::json!("0x59f"));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        let endpoint = RpcEndpoint {
+            name: "delayed-primary".to_owned(),
+            url: Url::parse(&format!("http://{address}")).unwrap(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap(),
+        };
+
+        let error = rpc_request::<String>(&endpoint, "eth_chainId", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(is_transient_rpc_error(&error));
+        server.join().unwrap();
     }
 
     fn read_http_request(stream: &mut TcpStream) {

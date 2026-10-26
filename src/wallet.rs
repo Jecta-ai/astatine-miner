@@ -1,6 +1,7 @@
 use crate::{
     cli::ImportArgs,
     config::{AppConfig, ConfigStore, read_regular_limited},
+    startup::StartupProgress,
 };
 use aes::{
     Aes128,
@@ -27,7 +28,8 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 const DEFAULT_DERIVATION_PATH: &str = "m/44'/60'/0'/0/0";
-const NEW_WALLET_PASSWORD_MIN_CHARS: usize = 16;
+const NEW_WALLET_PASSWORD_MIN_CHARS: usize = 4;
+const SHORT_WALLET_PASSWORD_WARNING_CHARS: usize = 12;
 const MAX_PASSWORD_BYTES: usize = 1_024;
 const MAX_KEYSTORE_BYTES: u64 = 64 * 1024;
 const MAX_SCRYPT_N: u64 = 262_144;
@@ -100,14 +102,36 @@ pub(crate) fn unlock_selected_interactive(
     store: &ConfigStore,
     config: &AppConfig,
 ) -> Result<SigningKey> {
+    unlock_selected_interactive_inner(store, config, None)
+}
+
+pub(crate) fn unlock_selected_interactive_with_progress(
+    store: &ConfigStore,
+    config: &AppConfig,
+    progress: &StartupProgress,
+) -> Result<SigningKey> {
+    unlock_selected_interactive_inner(store, config, Some(progress))
+}
+
+fn unlock_selected_interactive_inner(
+    store: &ConfigStore,
+    config: &AppConfig,
+    progress: Option<&StartupProgress>,
+) -> Result<SigningKey> {
     let address = selected_address(config)?;
     let keyfile = store.read_keystore(address)?;
     if validate_v3_keystore(&keyfile)? != address {
         bail!("selected wallet keyfile address does not match configuration");
     }
+    if let Some(progress) = progress {
+        progress.pause_for_prompt("Unlock wallet");
+    }
     let password = Zeroizing::new(rpassword::prompt_password(
         "Ethereum V3 keystore password (input hidden): ",
     )?);
+    if let Some(progress) = progress {
+        progress.resume_after_prompt("Decrypting Ethereum V3 keystore");
+    }
     let private_key = decrypt_v3_keystore(&keyfile, password.as_bytes())?;
     let signer = SigningKey::from_slice(private_key.as_slice())
         .context("decrypted V3 keyfile does not contain a valid secp256k1 private key")?;
@@ -460,23 +484,45 @@ pub(crate) fn validate_v3_keystore(contents: &[u8]) -> Result<Address> {
 
 fn prompt_new_password() -> Result<Zeroizing<String>> {
     let password = Zeroizing::new(rpassword::prompt_password(
-        "Create keystore password (input hidden; use at least 16 characters): ",
+        "Create keystore password (input hidden; use at least 4 characters): ",
     )?);
     validate_new_password(&password)?;
+    if should_warn_short_password(&password) {
+        eprintln!(
+            "Security note: short passwords are accepted; a longer, unique password better protects this wallet."
+        );
+    }
     let confirmation = Zeroizing::new(rpassword::prompt_password(
         "Confirm keystore password (input hidden): ",
     )?);
-    if *password != *confirmation {
-        bail!("password confirmation did not match");
-    }
+    validate_password_confirmation(&password, &confirmation)?;
     Ok(password)
+}
+
+fn should_warn_short_password(password: &str) -> bool {
+    password.chars().count() < SHORT_WALLET_PASSWORD_WARNING_CHARS
+}
+
+pub(crate) fn is_password_prompt_interrupted(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.kind() == io::ErrorKind::Interrupted)
 }
 
 fn validate_new_password(password: &str) -> Result<()> {
     if password.chars().count() < NEW_WALLET_PASSWORD_MIN_CHARS
         || password.len() > MAX_PASSWORD_BYTES
     {
-        bail!("keystore password must be at least 16 characters and no more than 1024 bytes");
+        bail!(
+            "keystore password must be at least 4 Unicode characters and no more than 1024 bytes"
+        );
+    }
+    Ok(())
+}
+
+fn validate_password_confirmation(password: &str, confirmation: &str) -> Result<()> {
+    if password != confirmation {
+        bail!("password confirmation did not match");
     }
     Ok(())
 }
@@ -506,15 +552,16 @@ fn confirm_backup() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Aes128Ctr, DEFAULT_DERIVATION_PATH, decrypt_v3_keystore, derive_signer, signer_address,
-        store_signer, validate_v3_keystore,
+        Aes128Ctr, DEFAULT_DERIVATION_PATH, MAX_PASSWORD_BYTES, decrypt_v3_keystore, derive_signer,
+        should_warn_short_password, signer_address, store_signer, validate_import_password,
+        validate_new_password, validate_password_confirmation, validate_v3_keystore,
     };
     use crate::config::{AppConfig, ConfigStore};
     use aes::cipher::{KeyIvInit, StreamCipher};
     use alloy_primitives::{Address, hex, keccak256};
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha256;
-    use std::{path::PathBuf, str::FromStr};
+    use std::{io, path::PathBuf, str::FromStr};
     use tempfile::tempdir;
 
     // Standard public BIP-39 test vector; it is not a user or funded wallet.
@@ -588,6 +635,79 @@ mod tests {
     }
 
     #[test]
+    fn new_wallet_password_accepts_only_four_or_more_unicode_characters() {
+        for (password, expected) in [
+            ("", false),
+            ("abc", false),
+            ("abcd", true),
+            ("abcde", true),
+            ("abcdefghijklmnop", true),
+        ] {
+            assert_eq!(
+                validate_new_password(password).is_ok(),
+                expected,
+                "unexpected result for a {}-character password",
+                password.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn new_wallet_password_counts_unicode_characters_and_limits_encoded_bytes() {
+        let unicode_password = "🔐🔐🔐🔐";
+        assert_eq!(unicode_password.chars().count(), 4);
+        assert!(unicode_password.len() > unicode_password.chars().count());
+        assert!(validate_new_password(unicode_password).is_ok());
+
+        assert!(validate_new_password(&"x".repeat(MAX_PASSWORD_BYTES)).is_ok());
+        assert!(validate_new_password(&"x".repeat(MAX_PASSWORD_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn incorrect_new_wallet_password_confirmation_is_rejected() {
+        assert!(validate_password_confirmation("abcd", "abce").is_err());
+        assert!(validate_password_confirmation("abcd", "abcd").is_ok());
+    }
+
+    #[test]
+    fn short_password_warning_is_non_blocking_and_uses_unicode_characters() {
+        assert!(should_warn_short_password("aB3!"));
+        assert!(!should_warn_short_password("aB3!with-a-longer-passphrase"));
+        assert!(should_warn_short_password("🔐🔐🔐🔐"));
+    }
+
+    #[test]
+    fn interrupted_hidden_password_prompt_is_identified_as_cancellation() {
+        let error = anyhow::Error::new(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
+        assert!(super::is_password_prompt_interrupted(&error));
+        assert!(!super::is_password_prompt_interrupted(&anyhow::anyhow!(
+            "bad password"
+        )));
+    }
+
+    #[test]
+    fn four_character_password_round_trips_through_ethereum_v3_keystore() {
+        let temp = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(temp.path()));
+        let signer = derive_signer(TEST_PHRASE, "", DEFAULT_DERIVATION_PATH).unwrap();
+        let address = signer_address(&signer);
+        let mut config = AppConfig::default();
+        let password = "aB3!";
+        validate_new_password(password).unwrap();
+        store_signer(&store, &mut config, &signer, password.as_bytes()).unwrap();
+
+        let keyfile = store.read_keystore(address).unwrap();
+        let decrypted = decrypt_v3_keystore(&keyfile, password.as_bytes()).unwrap();
+        assert_eq!(decrypted.as_slice(), signer.to_bytes().as_slice());
+        assert_eq!(validate_v3_keystore(&keyfile).unwrap(), address);
+    }
+
+    #[test]
+    fn existing_v3_import_passwords_are_not_subject_to_new_wallet_minimum() {
+        assert!(validate_import_password("x").is_ok());
+    }
+
+    #[test]
     fn imports_a_standard_pbkdf2_v3_keyfile() {
         let signer = derive_signer(TEST_PHRASE, "", DEFAULT_DERIVATION_PATH).unwrap();
         let address = signer_address(&signer);
@@ -624,6 +744,50 @@ mod tests {
         let keyfile = serde_json::to_vec(&keyfile).unwrap();
         let decrypted = decrypt_v3_keystore(&keyfile, TEST_PASSWORD.as_bytes()).unwrap();
         assert_eq!(decrypted.as_slice(), signer.to_bytes().as_slice());
+        assert!(decrypt_v3_keystore(&keyfile, b"wrong").is_err());
+    }
+
+    #[test]
+    fn imports_existing_ethereum_v3_keyfile_with_its_three_character_password() {
+        let signer = derive_signer(TEST_PHRASE, "", DEFAULT_DERIVATION_PATH).unwrap();
+        let address = signer_address(&signer);
+        let password = "old";
+        let mut derived_key = [0_u8; 32];
+        let salt = [0x61_u8; 32];
+        let iv = [0x37_u8; 16];
+        pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, 2_048, &mut derived_key);
+        let mut ciphertext = signer.to_bytes().to_vec();
+        Aes128Ctr::new_from_slices(&derived_key[..16], &iv)
+            .unwrap()
+            .apply_keystream(&mut ciphertext);
+        let mut mac_input = derived_key[16..].to_vec();
+        mac_input.extend_from_slice(&ciphertext);
+        let mac = keccak256(mac_input);
+        let address = format!("{address:#x}");
+        let keyfile = serde_json::json!({
+            "version": 3,
+            "id": "f0e1d2c3-b4a5-4678-89ab-cdef01234567",
+            "address": address.strip_prefix("0x").unwrap(),
+            "crypto": {
+                "cipher": "aes-128-ctr",
+                "cipherparams": { "iv": hex::encode(iv) },
+                "ciphertext": hex::encode(ciphertext),
+                "kdf": "pbkdf2",
+                "kdfparams": {
+                    "c": 2_048,
+                    "dklen": 32,
+                    "prf": "hmac-sha256",
+                    "salt": hex::encode(salt)
+                },
+                "mac": hex::encode(mac)
+            }
+        });
+        let keyfile = serde_json::to_vec(&keyfile).unwrap();
+
+        validate_import_password(password).unwrap();
+        let decrypted = decrypt_v3_keystore(&keyfile, password.as_bytes()).unwrap();
+        assert_eq!(decrypted.as_slice(), signer.to_bytes().as_slice());
+        assert!(decrypt_v3_keystore(&keyfile, b"bad").is_err());
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::{
     proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{BlockSnapshot, NetworkClient, NodeState, ReadSnapshot, is_transient_rpc_error},
+    startup::{CtrlCSignal, StartupProgress, race_with_ctrl_c},
     transaction::{
         ConfirmedAction, ProofSubmission, TransactionAction, TransactionActivityState,
         TransactionDashboardState, TransactionManager, TransactionPolicyRefusalKind,
@@ -664,6 +665,11 @@ struct CpuWorkers {
     workers: Vec<thread::JoinHandle<()>>,
 }
 
+struct StartupControl<'a> {
+    ctrl_c: &'a mut CtrlCSignal,
+    progress: Option<&'a StartupProgress>,
+}
+
 impl CpuWorkers {
     fn stop_and_join(&mut self) -> bool {
         self.stop.store(true, Ordering::Release);
@@ -814,13 +820,55 @@ impl Drop for ReadOnlyObserver {
 }
 
 pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
-    let config = store.load()?;
+    let progress = StartupProgress::start();
+    let mut ctrl_c: CtrlCSignal = Box::pin(tokio::signal::ctrl_c());
+    progress.begin("Loading configuration");
+    let config = match store.load() {
+        Ok(config) => config,
+        Err(error) => {
+            progress.fail(format!("Configuration loading failed: {error:#}"));
+            return Err(error);
+        }
+    };
+    progress.complete("Configuration loaded");
+    progress.set_network(match config.network {
+        crate::cli::Network::Testnet => "Injective EVM Testnet",
+        crate::cli::Network::Mainnet => "Injective EVM Mainnet",
+    });
     if !args.compute_only && config.network != crate::cli::Network::Testnet {
+        progress.fail("Autonomous transaction signing is disabled outside Injective Testnet");
         bail!("autonomous transaction signing is disabled outside Injective Testnet");
     }
-    selected_address(&config)?;
-    let client = NetworkClient::connect(config.network).await?;
-    run_runtime(store, config, args, client, None, None).await
+    progress.begin("Checking selected wallet");
+    if let Err(error) = selected_address(&config) {
+        progress.fail(format!("Selected wallet check failed: {error:#}"));
+        return Err(error);
+    }
+    progress.complete("Selected wallet checked");
+    progress.begin("Connecting to RPC · validating Chain ID");
+    let connected = race_with_ctrl_c(
+        NetworkClient::connect_with_progress(config.network, Some(&progress)),
+        &mut ctrl_c,
+    )
+    .await?;
+    let Some(client) = connected else {
+        progress.cancel();
+        return Ok(());
+    };
+    let client = client?;
+    run_runtime(
+        store,
+        config,
+        args,
+        client,
+        None,
+        None,
+        StartupControl {
+            ctrl_c: &mut ctrl_c,
+            progress: Some(&progress),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -832,7 +880,20 @@ pub(crate) async fn run_with_client(
     supplied_signer: Option<bip32::secp256k1::ecdsa::SigningKey>,
     probe_sender: Option<tokio::sync::oneshot::Sender<MiningProbe>>,
 ) -> Result<()> {
-    run_runtime(store, config, args, client, supplied_signer, probe_sender).await
+    let mut ctrl_c: CtrlCSignal = Box::pin(tokio::signal::ctrl_c());
+    run_runtime(
+        store,
+        config,
+        args,
+        client,
+        supplied_signer,
+        probe_sender,
+        StartupControl {
+            ctrl_c: &mut ctrl_c,
+            progress: None,
+        },
+    )
+    .await
 }
 
 async fn run_runtime(
@@ -842,7 +903,12 @@ async fn run_runtime(
     mut client: NetworkClient,
     supplied_signer: Option<bip32::secp256k1::ecdsa::SigningKey>,
     probe_sender: Option<tokio::sync::oneshot::Sender<MiningProbe>>,
+    startup_control: StartupControl<'_>,
 ) -> Result<()> {
+    let StartupControl {
+        ctrl_c,
+        progress: startup,
+    } = startup_control;
     let probe_stop_signal = probe_sender.as_ref().map(|_| DashboardSignal::default());
     #[cfg(test)]
     let (proof_processing_gate, mut proof_processing_gate_receiver) = if probe_sender.is_some() {
@@ -859,11 +925,6 @@ async fn run_runtime(
     let address = selected_address(&config)?;
     let spending_limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
     let transaction_mode = !args.compute_only && !spending_limit.is_zero();
-    let readonly_recovery = !args.compute_only
-        && config.network == crate::cli::Network::Testnet
-        && spending_limit.is_zero()
-        && store.read_transaction_journal()?.is_some();
-    let transaction_manager_mode = transaction_mode || readonly_recovery;
     let threads = args
         .threads
         .map(NonZeroUsize::get)
@@ -887,6 +948,22 @@ async fn run_runtime(
     if transaction_mode && !client.verification.token_verified {
         bail!("AST token runtime is not verified; refusing autonomous transaction signing");
     }
+    if let Some(startup) = startup {
+        startup.begin("Recovering previous transactions");
+    }
+    let readonly_recovery = !args.compute_only
+        && config.network == crate::cli::Network::Testnet
+        && spending_limit.is_zero()
+        && match store.read_transaction_journal() {
+            Ok(journal) => journal.is_some(),
+            Err(error) => {
+                if let Some(startup) = startup {
+                    startup.fail(format!("Transaction journal could not be read: {error:#}"));
+                }
+                return Err(error).context("check for a read-only transaction recovery journal");
+            }
+        };
+    let transaction_manager_mode = transaction_mode || readonly_recovery;
     let mut transactions = if transaction_manager_mode {
         let token = client
             .manifest
@@ -894,7 +971,17 @@ async fn run_runtime(
             .as_ref()
             .context("AST token pin is missing from the Testnet manifest")?;
         let ast_token = crate::deployment::parse_address(&token.address)?;
-        let mut manager = TransactionManager::open(store, &config, address, ast_token)?;
+        let mut manager = match TransactionManager::open(store, &config, address, ast_token) {
+            Ok(manager) => manager,
+            Err(error) => {
+                if let Some(startup) = startup {
+                    startup.fail(format!(
+                        "Transaction journal could not be opened: {error:#}"
+                    ));
+                }
+                return Err(error).context("open transaction journal for startup recovery");
+            }
+        };
         manager.set_proof_telemetry(Arc::clone(&proof_telemetry));
         manager.set_proof_attempt_guard(Arc::clone(&proof_attempt_guard));
         for node in &client.manifest.nodes {
@@ -903,11 +990,32 @@ async fn run_runtime(
                 proof_attempt_guard.record_attempt(node.id, window_id);
             }
         }
-        manager.reconcile(&client).await?;
+        match race_with_ctrl_c(manager.reconcile(&client), ctrl_c).await? {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                if let Some(startup) = startup {
+                    startup.fail(format!("Transaction recovery failed: {error:#}"));
+                }
+                return Err(error).context("recover previous Testnet transactions");
+            }
+            None => {
+                if let Some(startup) = startup {
+                    startup.cancel();
+                }
+                return Ok(());
+            }
+        }
         Some(manager)
     } else {
         None
     };
+    if let Some(startup) = startup {
+        if transaction_manager_mode {
+            startup.complete("Transaction recovery complete");
+        } else {
+            startup.complete("No previous transactions to recover");
+        }
+    }
     let signing_ready = transactions
         .as_ref()
         .is_some_and(|manager| !manager.journal.has_unresolved());
@@ -924,17 +1032,46 @@ async fn run_runtime(
         if let Some(signer) = supplied_signer.take() {
             Some(signer)
         } else if signing_ready {
-            Some(unlock_selected_interactive(store, &config)?)
+            if let Some(startup) = startup {
+                startup.begin("Unlocking wallet");
+                match crate::wallet::unlock_selected_interactive_with_progress(
+                    store, &config, startup,
+                ) {
+                    Ok(signer) => {
+                        startup.complete("Wallet unlocked");
+                        Some(signer)
+                    }
+                    Err(error) if crate::wallet::is_password_prompt_interrupted(&error) => {
+                        startup.cancel();
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        startup.fail(format!("Wallet unlock failed: {error:#}"));
+                        return Err(error).context("unlock selected wallet for mining");
+                    }
+                }
+            } else {
+                Some(unlock_selected_interactive(store, &config)?)
+            }
         } else {
+            if let Some(startup) = startup {
+                startup.note("Wallet unlock deferred until previous transaction recovery settles.");
+            }
             None
         }
     } else {
+        if let Some(startup) = startup {
+            startup.note("Wallet unlock skipped because transaction signing is disabled.");
+        }
         None
     };
     if signer
         .as_ref()
         .is_some_and(|signer| crate::wallet::signer_address(signer) != address)
     {
+        if let Some(startup) = startup {
+            startup.fail("Unlocked signer does not match the selected wallet");
+        }
         bail!("unlocked signer does not match the selected wallet");
     }
     let slots = Arc::new((1..=9).map(NodeSlot::new).collect::<Vec<_>>());
@@ -964,39 +1101,46 @@ async fn run_runtime(
         pending_sync: Arc::new(RwLock::new(HashMap::new())),
         finalization_state: Arc::new(RwLock::new(HashMap::new())),
     };
-    let initial_transaction_state = transaction_state
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    let model = initial_dashboard_model(&dashboard_context, &initial_transaction_state);
-    let mut dashboard = Dashboard::start(model, Arc::clone(&total_hashes), diagnostics.clone())?;
-    if dashboard.is_none() {
-        for message in diagnostics.drain() {
-            eprintln!("astatine: {message}");
-        }
+    client.set_diagnostics(diagnostics.clone());
+    if let Some(manager) = transactions.as_mut() {
+        manager.set_diagnostics(diagnostics.clone());
     }
-    if let Some(dashboard) = &dashboard {
-        let diagnostics = dashboard.diagnostics();
-        client.set_diagnostics(diagnostics.clone());
-        if let Some(manager) = transactions.as_mut() {
-            manager.set_diagnostics(diagnostics);
-        }
+    if let Some(startup) = startup {
+        startup.begin("Loading latest mining work");
     }
-    connect_transaction_dashboard(
-        &mut transactions,
-        &dashboard,
-        Arc::clone(&transaction_state),
-    );
-    let dashboard_updater = dashboard.as_ref().map(Dashboard::updater);
-    let snapshot = client.snapshot(Some(address)).await?;
-    let changed = update_slots(
+    let snapshot = match race_with_ctrl_c(client.snapshot(Some(address)), ctrl_c).await? {
+        Some(Ok(snapshot)) => snapshot,
+        Some(Err(error)) => {
+            if let Some(startup) = startup {
+                startup.fail(format!("Initial mining snapshot failed: {error:#}"));
+            }
+            return Err(error).context("load initial verified mining snapshot");
+        }
+        None => {
+            if let Some(startup) = startup {
+                startup.cancel();
+            }
+            return Ok(());
+        }
+    };
+    let changed = match update_slots(
         &slots,
         &schedule,
         &client.manifest,
         address,
         &selected,
         &snapshot,
-    )?;
+    ) {
+        Ok(changed) => changed,
+        Err(error) => {
+            if let Some(startup) = startup {
+                startup.fail(format!(
+                    "Initial mining work could not be scheduled: {error:#}"
+                ));
+            }
+            return Err(error).context("schedule initial verified mining work");
+        }
+    };
     #[cfg(test)]
     for slot in slots.iter() {
         if let Some(work) = slot.current_work()
@@ -1009,40 +1153,44 @@ async fn run_runtime(
             slot.set_test_nonce_start(nonce);
         }
     }
-    refresh_dashboard(dashboard_updater.as_ref(), &dashboard_context, &snapshot);
-    let mut observer = start_read_only_observer(
-        client.clone(),
-        dashboard_context.clone(),
-        snapshot.clone(),
-        dashboard_updater.clone(),
-        diagnostics.clone(),
-    );
-    let mut observed_updates = observer.updates.clone();
-    let _ = observed_updates.borrow_and_update();
-
-    if let Some(manager) = transactions.as_mut()
-        && let Err(error) = manager.reconcile_rewards(&client, &snapshot).await
-    {
-        report_mining_warning(
-            &dashboard,
-            format!("reward-event verification will retry after the next snapshot: {error:#}"),
-        );
-    }
-    if !client.verification.token_verified {
-        report_mining_warning(
-            &dashboard,
-            "AST token runtime pin is unavailable; mining proofs can still be computed, but AST balance is not trusted.",
-        );
-    }
-    if dashboard.is_none() {
-        if !args.compute_only && spending_limit.is_zero() {
-            println!(
-                "Per-session spending limit is zero; autonomous signing is disabled. Hashing continues without submissions or finalizations."
-            );
+    if let Some(startup) = startup {
+        startup.complete(format!(
+            "Latest mining work loaded · block #{}",
+            snapshot.block.number
+        ));
+        if transactions.is_some() {
+            startup.begin("Reconciling reward history");
         }
-        print_startup(
-            &client, address, threads, &snapshot, &slots, &selected, changed,
-        );
+    }
+    if let Some(manager) = transactions.as_mut() {
+        match race_with_ctrl_c(manager.reconcile_rewards(&client, &snapshot), ctrl_c).await? {
+            Some(Ok(())) => {
+                if let Some(startup) = startup {
+                    startup.complete("Reward history reconciled");
+                }
+            }
+            Some(Err(error)) => {
+                let detail = format!(
+                    "reward-event verification will retry after the next snapshot: {error:#}"
+                );
+                if let Some(startup) = startup {
+                    startup.note(&detail);
+                    startup.warn(
+                        "Reward history check deferred; it will retry after a later snapshot",
+                    );
+                }
+                diagnostics.push(detail);
+            }
+            None => {
+                if let Some(startup) = startup {
+                    startup.cancel();
+                }
+                return Ok(());
+            }
+        }
+    }
+    if let Some(startup) = startup {
+        startup.begin("Preparing mining workers");
     }
     let proof_delivery_paused = transaction_mode
         && (signer.is_none()
@@ -1051,6 +1199,9 @@ async fn run_runtime(
                 .is_some_and(|manager| manager.journal.has_unresolved()));
     let (proof_sender, mut proof_receiver) =
         proof_inbox(Arc::clone(&proof_attempt_guard), proof_delivery_paused);
+    if let Some(startup) = startup {
+        startup.update(format!("Preparing mining workers · 0/{threads}"));
+    }
     let mut workers = Vec::with_capacity(threads);
     for worker_id in 0..threads {
         let slots = Arc::clone(&slots);
@@ -1075,11 +1226,23 @@ async fn run_runtime(
             })
             .context("start CPU worker");
         match worker {
-            Ok(worker) => workers.push(worker),
+            Ok(worker) => {
+                workers.push(worker);
+                if let Some(startup) = startup {
+                    startup.update(format!(
+                        "Preparing mining workers · {}/{}",
+                        workers.len(),
+                        threads
+                    ));
+                }
+            }
             Err(error) => {
                 stop.store(true, Ordering::Release);
                 for worker in workers {
                     let _ = worker.join();
+                }
+                if let Some(startup) = startup {
+                    startup.fail(format!("Could not start CPU mining workers: {error:#}"));
                 }
                 return Err(error);
             }
@@ -1093,6 +1256,62 @@ async fn run_runtime(
     dashboard_context
         .workers_started
         .store(true, Ordering::Release);
+    if let Some(startup) = startup {
+        startup.miner_ready();
+    }
+    let model = dashboard_model(&dashboard_context, &snapshot, Instant::now());
+    let mut dashboard =
+        match Dashboard::start(model, Arc::clone(&total_hashes), diagnostics.clone()) {
+            Ok(dashboard) => dashboard,
+            Err(error) => {
+                if let Some(startup) = startup {
+                    startup.fail(format!("Mining dashboard could not start: {error:#}"));
+                }
+                return Err(error).context("initialize mining dashboard terminal");
+            }
+        };
+    if let Some(dashboard) = &dashboard {
+        let diagnostics = dashboard.diagnostics();
+        client.set_diagnostics(diagnostics.clone());
+        if let Some(manager) = transactions.as_mut() {
+            manager.set_diagnostics(diagnostics);
+        }
+    }
+    connect_transaction_dashboard(
+        &mut transactions,
+        &dashboard,
+        Arc::clone(&transaction_state),
+    );
+    let dashboard_updater = dashboard.as_ref().map(Dashboard::updater);
+    refresh_dashboard(dashboard_updater.as_ref(), &dashboard_context, &snapshot);
+    if !client.verification.token_verified {
+        report_mining_warning(
+            &dashboard,
+            "AST token runtime pin is unavailable; mining proofs can still be computed, but AST balance is not trusted.",
+        );
+    }
+    if dashboard.is_none() {
+        for message in diagnostics.drain() {
+            eprintln!("astatine: {message}");
+        }
+        if !args.compute_only && spending_limit.is_zero() {
+            println!(
+                "Per-session spending limit is zero; autonomous signing is disabled. Hashing continues without submissions or finalizations."
+            );
+        }
+        print_startup(
+            &client, address, threads, &snapshot, &slots, &selected, changed,
+        );
+    }
+    let mut observer = start_read_only_observer(
+        client.clone(),
+        dashboard_context.clone(),
+        snapshot.clone(),
+        dashboard_updater.clone(),
+        diagnostics.clone(),
+    );
+    let mut observed_updates = observer.updates.clone();
+    let _ = observed_updates.borrow_and_update();
     observer.force_refresh();
     if let Some(probe_sender) = probe_sender {
         let _ = probe_sender.send(MiningProbe {
@@ -1116,8 +1335,6 @@ async fn run_runtime(
     let mut progress_ticker = time::interval(PROGRESS_INTERVAL);
     progress_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     progress_ticker.tick().await;
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
     let mut last_progress = time::Instant::now();
     let mut last_snapshot = observer.latest_snapshot().unwrap_or(snapshot);
     let mut fatal_error = None;
@@ -1130,7 +1347,7 @@ async fn run_runtime(
 
     'mining_loop: loop {
         tokio::select! {
-            signal = &mut ctrl_c => {
+            signal = ctrl_c.as_mut() => {
                 if let Err(error) = signal {
                     report_mining_warning(
                         &dashboard,
@@ -1259,7 +1476,7 @@ async fn run_runtime(
                                         pending_sync: &dashboard_context.pending_sync,
                                     },
                                 ) => Some(result),
-                                signal = &mut ctrl_c => {
+                                signal = ctrl_c.as_mut() => {
                                     if let Err(error) = signal {
                                         report_mining_warning(&dashboard, format!("Ctrl+C signal handler failed: {error}"));
                                     }
@@ -1434,7 +1651,7 @@ async fn run_runtime(
                                 work_hash: proof.hash,
                             },
                         ) => Some(result),
-                        signal = &mut ctrl_c => {
+                        signal = ctrl_c.as_mut() => {
                             if let Err(error) = signal {
                                 report_mining_warning(&dashboard, format!("Ctrl+C signal handler failed: {error}"));
                             }
@@ -1497,7 +1714,7 @@ async fn run_runtime(
                             );
                             tokio::select! {
                                 _ = time::sleep(delay) => {}
-                                signal = &mut ctrl_c => {
+                                signal = ctrl_c.as_mut() => {
                                     if let Err(error) = signal {
                                         report_mining_warning(&dashboard, format!("Ctrl+C signal handler failed: {error}"));
                                     }
@@ -2938,53 +3155,6 @@ fn dashboard_model(
         connection_error: first_error,
         critical_error: None,
     }
-}
-
-fn initial_dashboard_model(
-    context: &DashboardContext,
-    transaction_state: &TransactionDashboardState,
-) -> DashboardModel {
-    let mut selected_nodes = context
-        .selected
-        .iter()
-        .copied()
-        .map(|id| DashboardNode {
-            id,
-            window_id: None,
-            status: NodeStatus::Waiting,
-            expiry_timestamp: None,
-            mining_deadline: None,
-            countdown: None,
-            candidate: None,
-            reward: None,
-        })
-        .collect::<Vec<_>>();
-    selected_nodes.sort_by_key(|node| node.id);
-    let mut model = DashboardModel {
-        network: context.network,
-        chain_id: context.chain_id,
-        wallet: context.address,
-        inj_balance: None,
-        cpu_threads: context.threads,
-        session_limit: Some(context.spending_limit),
-        session_exposure: transaction_state.session_exposure,
-        block_number: 0,
-        block_hash: B256::ZERO,
-        snapshot_observed_at: Instant::now(),
-        last_block_advanced_at: Instant::now(),
-        snapshot_ready: false,
-        selected_nodes,
-        compute_only: context.compute_only,
-        signing_enabled: context.transaction_mode,
-        recovering: false,
-        stopping: false,
-        hashrate: 0.0,
-        current_action: None,
-        connection_error: None,
-        critical_error: None,
-    };
-    apply_transaction_state_to_model(&mut model, transaction_state);
-    model
 }
 
 fn dashboard_node_status(

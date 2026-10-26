@@ -9,6 +9,7 @@ mod mining;
 mod proof_telemetry;
 mod protocol;
 mod rpc;
+mod startup;
 mod transaction;
 mod wallet;
 
