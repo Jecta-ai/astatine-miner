@@ -394,11 +394,14 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
         bail!("sensitive storage path is not a real directory; refusing to follow it");
     }
     #[cfg(windows)]
-    if metadata.file_attributes()
-        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-        != 0
     {
-        bail!("sensitive storage path is a Windows reparse point; refusing to follow it");
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            bail!("sensitive storage path is a Windows reparse point; refusing to follow it");
+        }
     }
     #[cfg(unix)]
     {

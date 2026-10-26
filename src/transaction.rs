@@ -6538,7 +6538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires local Forge and Anvil; run with ASTATINE_EVM_ROOT set"]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
     async fn autonomous_startup_finalizes_nine_expired_windows_then_submits_signed_proof() {
         let root = std::env::var_os("ASTATINE_EVM_ROOT")
             .map(PathBuf::from)
@@ -6549,21 +6549,7 @@ mod tests {
                     .join("astatineEVM")
                     .join("evm")
             });
-        assert!(
-            root.join("src/AstatineMiner.sol").is_file(),
-            "invalid ASTATINE_EVM_ROOT"
-        );
-        let build = Command::new("forge")
-            .args(["build", "--root"])
-            .arg(&root)
-            .output()
-            .expect("Forge must be installed for the local EVM lifecycle test");
-        assert!(
-            build.status.success(),
-            "Forge build failed:\n{}\n{}",
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr)
-        );
+        prepare_local_test_contracts(&root);
 
         let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = port_listener.local_addr().unwrap().port();
@@ -6805,7 +6791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires local Forge and Anvil; run with ASTATINE_EVM_ROOT set"]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
     async fn autonomous_runtime_mines_and_finalizes_across_three_consecutive_windows() {
         let root = std::env::var_os("ASTATINE_EVM_ROOT")
             .map(PathBuf::from)
@@ -6816,18 +6802,7 @@ mod tests {
                     .join("astatineEVM")
                     .join("evm")
             });
-        assert!(root.join("src/AstatineMiner.sol").is_file());
-        let build = Command::new("forge")
-            .args(["build", "--root"])
-            .arg(&root)
-            .output()
-            .expect("Forge is required for the autonomous local lifecycle test");
-        assert!(
-            build.status.success(),
-            "Forge build failed:\n{}\n{}",
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr)
-        );
+        prepare_local_test_contracts(&root);
 
         tokio::time::timeout(Duration::from_secs(90), async {
             let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -7551,7 +7526,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires local Forge and Anvil; run with ASTATINE_EVM_ROOT set"]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
     async fn current_session_rewards_survive_external_finalization_and_exclude_losing_proofs() {
         let root = std::env::var_os("ASTATINE_EVM_ROOT")
             .map(PathBuf::from)
@@ -7562,18 +7537,7 @@ mod tests {
                     .join("astatineEVM")
                     .join("evm")
             });
-        assert!(root.join("src/AstatineMiner.sol").is_file());
-        let build = Command::new("forge")
-            .args(["build", "--root"])
-            .arg(&root)
-            .output()
-            .expect("Forge must be installed for the verified session reward lifecycle test");
-        assert!(
-            build.status.success(),
-            "Forge build failed:\n{}\n{}",
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr)
-        );
+        prepare_local_test_contracts(&root);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -8007,7 +7971,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires local Forge and Anvil; run with ASTATINE_EVM_ROOT set"]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
     async fn production_worker_submits_real_one_in_sixty_million_proof_after_head_updates() {
         let root = std::env::var_os("ASTATINE_EVM_ROOT")
             .map(PathBuf::from)
@@ -8018,18 +7982,7 @@ mod tests {
                     .join("astatineEVM")
                     .join("evm")
             });
-        assert!(root.join("src/AstatineMiner.sol").is_file());
-        let build = Command::new("forge")
-            .args(["build", "--root"])
-            .arg(&root)
-            .output()
-            .expect("Forge must be installed for the high-difficulty worker test");
-        assert!(
-            build.status.success(),
-            "Forge build failed:\n{}\n{}",
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr)
-        );
+        prepare_local_test_contracts(&root);
 
         tokio::time::timeout(Duration::from_secs(240), async {
             let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -8428,7 +8381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires local Forge and Anvil; run with ASTATINE_EVM_ROOT set"]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
     async fn transaction_manager_local_anvil_lifecycle_recovery_reorg_and_spending_cap() {
         let root = std::env::var_os("ASTATINE_EVM_ROOT")
             .map(PathBuf::from)
@@ -8439,21 +8392,7 @@ mod tests {
                     .join("astatineEVM")
                     .join("evm")
             });
-        assert!(
-            root.join("src/AstatineMiner.sol").is_file(),
-            "invalid ASTATINE_EVM_ROOT"
-        );
-        let build = Command::new("forge")
-            .args(["build", "--root"])
-            .arg(&root)
-            .output()
-            .expect("Forge must be installed for the local EVM lifecycle test");
-        assert!(
-            build.status.success(),
-            "Forge build failed:\n{}\n{}",
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr)
-        );
+        prepare_local_test_contracts(&root);
 
         let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = port_listener.local_addr().unwrap().port();
@@ -9115,8 +9054,56 @@ mod tests {
     }
 
     fn read_artifact(path: &std::path::Path) -> serde_json::Value {
-        serde_json::from_slice(&std::fs::read(path).expect("read Forge contract artifact"))
-            .expect("decode Forge contract artifact")
+        let artifact_path = if path.is_file() {
+            path.to_path_buf()
+        } else {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join(path.file_name().expect("contract artifact filename"))
+        };
+        serde_json::from_slice(
+            &std::fs::read(artifact_path).expect("read local EVM contract artifact"),
+        )
+        .expect("decode local EVM contract artifact")
+    }
+
+    const LOCAL_EVM_FIXTURE_SOURCE_COMMIT: &str = "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30";
+
+    fn prepare_local_test_contracts(root: &std::path::Path) {
+        if root.join("src/AstatineMiner.sol").is_file() {
+            let build = Command::new("forge")
+                .args(["build", "--root"])
+                .arg(root)
+                .output()
+                .expect("Foundry is required to rebuild local EVM artifacts");
+            assert!(
+                build.status.success(),
+                "Forge build failed:\n{}\n{}",
+                String::from_utf8_lossy(&build.stdout),
+                String::from_utf8_lossy(&build.stderr)
+            );
+        }
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for (artifact, forge_path) in [
+            ("AstatineMiner.json", "AstatineMiner.sol/AstatineMiner.json"),
+            ("MockAST.json", "MockAST.sol/MockAST.json"),
+        ] {
+            if !root.join("out").join(forge_path).is_file() {
+                let fixture = fixtures.join(artifact);
+                assert!(
+                    fixture.is_file(),
+                    "local EVM fixture {artifact} is missing; set ASTATINE_EVM_ROOT to a built astatineEVM/evm checkout"
+                );
+                let fixture: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
+                assert_eq!(
+                    fixture["source_commit"].as_str(),
+                    Some(LOCAL_EVM_FIXTURE_SOURCE_COMMIT),
+                    "local EVM fixture provenance must match the pinned source commit"
+                );
+            }
+        }
     }
 
     fn artifact_bytecode(artifact: &serde_json::Value) -> Vec<u8> {

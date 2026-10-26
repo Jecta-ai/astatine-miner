@@ -35,6 +35,8 @@ jobs:
             binary: astatine.exe
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: target
     steps:
       - uses: actions/checkout@v7
       - name: Install stable Rust components
@@ -60,7 +62,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          binary="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          binary="target/release/${{ matrix.binary }}"
           "$binary" --version
           "$binary" --help >/dev/null
           "$binary" mine --help >/dev/null
@@ -93,7 +95,7 @@ jobs:
           $GitRoot = Split-Path (Split-Path $GitExe -Parent) -Parent
           $Winpty = Join-Path $GitRoot 'usr\bin\winpty.exe'
           if (-not (Test-Path $Winpty)) { throw "winpty is unavailable at $Winpty" }
-          $PromptExe = Join-Path $env:GITHUB_WORKSPACE 'target\x86_64-pc-windows-msvc\release\examples\windows_password_prompt.exe'
+          $PromptExe = Join-Path $env:GITHUB_WORKSPACE 'target\release\examples\windows_password_prompt.exe'
           $Password = 'Testnet8-Windows-NoEcho-Password'
           $SmokeOutput = ($Password + "`n") | & $Winpty $PromptExe 2>&1 | Out-String
           if ($LASTEXITCODE -ne 0) { throw 'Windows hidden-password smoke failed' }
@@ -104,7 +106,7 @@ jobs:
         uses: actions/upload-artifact@v7.0.2
         with:
           name: astatine-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          path: target/release/${{ matrix.binary }}
           if-no-files-found: error
           retention-days: 14
 
@@ -139,17 +141,9 @@ jobs:
       - name: Install stable Rust components
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - uses: foundry-rs/foundry-toolchain@v1
-      - name: Checkout pinned Astatine EVM test contracts
-        env:
-          ASTATINE_EVM_COMMIT: eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30
-        run: |
-          git clone --no-checkout https://github.com/emyrinj/astatineEVM.git "$RUNNER_TEMP/astatineEVM"
-          git -C "$RUNNER_TEMP/astatineEVM" checkout "$ASTATINE_EVM_COMMIT"
-          git -C "$RUNNER_TEMP/astatineEVM" submodule update --init --recursive evm/lib/forge-std evm/lib/openzeppelin-contracts
-          forge build --root "$RUNNER_TEMP/astatineEVM/evm"
+      - name: Verify local EVM tools
+        run: forge --version && anvil --version
       - name: Run all local Anvil lifecycle tests
-        env:
-          ASTATINE_EVM_ROOT: ${{ runner.temp }}/astatineEVM/evm
         run: cargo test --locked -- --ignored --test-threads=1
 
   package-release:
