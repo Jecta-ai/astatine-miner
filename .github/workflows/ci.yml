@@ -202,6 +202,7 @@ jobs:
           tar -tzf astatine-linux-aarch64.tar.gz
           unzip -l astatine-windows-x86_64.zip
           python3 - "$package" <<'PY'
+          import os
           import pathlib
           import subprocess
           import sys
@@ -209,6 +210,7 @@ jobs:
           import zipfile
 
           root = pathlib.Path(sys.argv[1])
+          source_root = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
           expected = {"LICENSE-MIT", "THIRD_PARTY_LICENSES.md"}
           architectures = {
               "macos-aarch64": ("astatine", "Mach-O 64-bit arm64 executable"),
@@ -233,11 +235,11 @@ jobs:
                   binary = next(member for member in members if member.name == "astatine")
                   assert binary.mode & 0o111, f"{name}: binary is not executable"
                   for filename in expected:
-                      assert archive.extractfile(filename).read() == (pathlib.Path.cwd() / filename).read_bytes()
+                      assert archive.extractfile(filename).read() == (source_root / filename).read_bytes()
           with zipfile.ZipFile(root / "astatine-windows-x86_64.zip") as archive:
               assert set(archive.namelist()) == expected | {"astatine.exe"}
               for filename in expected:
-                  assert archive.read(filename) == (pathlib.Path.cwd() / filename).read_bytes()
+                  assert archive.read(filename) == (source_root / filename).read_bytes()
           PY
       - uses: actions/upload-artifact@v7.0.2
         with:
