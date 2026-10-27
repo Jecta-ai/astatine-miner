@@ -97,7 +97,7 @@ jobs:
           if (-not (Test-Path $Winpty)) { throw "winpty is unavailable at $Winpty" }
           $PromptExe = Join-Path $env:GITHUB_WORKSPACE 'target\release\examples\windows_password_prompt.exe'
           $Password = 'Testnet8-Windows-NoEcho-Password'
-          $SmokeOutput = ($Password + "`n") | & $Winpty $PromptExe 2>&1 | Out-String
+          $SmokeOutput = ($Password + "`n") | & $Winpty -Xallow-non-tty $PromptExe 2>&1 | Out-String
           if ($LASTEXITCODE -ne 0) { throw 'Windows hidden-password smoke failed' }
           if ($SmokeOutput.Contains($Password)) { throw 'Password prompt echoed secret input to terminal output' }
           if (-not $SmokeOutput.Contains('WINDOWS_PASSWORD_PROMPT_OK')) { throw 'Windows hidden-password prompt did not complete' }
