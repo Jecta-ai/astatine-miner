@@ -211,8 +211,8 @@ jobs:
           root = pathlib.Path(sys.argv[1])
           expected = {"LICENSE-MIT", "THIRD_PARTY_LICENSES.md"}
           architectures = {
-              "macos-aarch64": ("astatine", "Mach-O 64-bit executable arm64"),
-              "macos-x86_64": ("astatine", "Mach-O 64-bit executable x86_64"),
+              "macos-aarch64": ("astatine", "Mach-O 64-bit arm64 executable"),
+              "macos-x86_64": ("astatine", "Mach-O 64-bit x86_64 executable"),
               "linux-x86_64": ("astatine", "ELF 64-bit LSB pie executable, x86-64"),
               "linux-aarch64": ("astatine", "ELF 64-bit LSB pie executable, ARM aarch64"),
               "windows-x86_64": ("astatine.exe", "PE32+ executable (console) x86-64"),
