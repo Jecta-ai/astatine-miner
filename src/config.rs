@@ -283,7 +283,7 @@ impl ConfigStore {
 fn system_config_dir() -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        return windows_config_dir(env::var_os("APPDATA").as_deref());
+        windows_config_dir(env::var_os("APPDATA").as_deref())
     }
 
     #[cfg(target_os = "macos")]
@@ -636,11 +636,13 @@ fn persist_error(error: PersistError, operation: &str) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::read_regular_limited;
     #[cfg(windows)]
     use super::windows_config_dir;
     #[cfg(unix)]
     use super::xdg_config_dir;
-    use super::{AppConfig, ConfigStore, parse_inj_wei, read_regular_limited};
+    use super::{AppConfig, ConfigStore, parse_inj_wei};
     use crate::cli::Network;
     use alloy_primitives::U256;
     use std::{ffi::OsStr, path::PathBuf};
@@ -716,8 +718,10 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("Astatine ü data");
         let store = ConfigStore::at_root(root);
-        let mut config = AppConfig::default();
-        config.network = Network::Testnet;
+        let config = AppConfig {
+            network: Network::Testnet,
+            ..AppConfig::default()
+        };
         store.save(&config).unwrap();
         assert_eq!(store.load().unwrap(), config);
 
