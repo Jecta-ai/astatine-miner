@@ -31,7 +31,7 @@ use tokio::{
     time::{Instant, MissedTickBehavior, interval, sleep},
 };
 
-const JOURNAL_VERSION: u32 = 4;
+const JOURNAL_VERSION: u32 = 5;
 const ARCHIVE_VERSION: u32 = 1;
 const MAX_JOURNAL_ENTRIES: usize = 4_096;
 const ARCHIVE_TRIGGER_ENTRIES: usize = 64;
@@ -71,6 +71,7 @@ pub struct SignedTransaction {
 pub enum TransactionAction {
     SubmitProof,
     FinalizeWindow,
+    ForwardReward,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +156,21 @@ enum TransactionStatus {
     MinedReverted,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RewardForwardingStatus {
+    AwaitingReward,
+    VerifiedEligible,
+    NotEligible,
+    Signed,
+    Broadcast,
+    ReceiptPending,
+    Confirmed,
+    Reverted,
+    UnknownOutcome,
+    PolicyBlocked,
+}
+
 impl TransactionStatus {
     fn is_unresolved(self) -> bool {
         matches!(
@@ -206,6 +222,24 @@ struct TransactionEntry {
     reward_confirmations: u64,
     #[serde(default)]
     reward_confirmed: bool,
+    #[serde(default)]
+    reward_forward_destination: Option<String>,
+    #[serde(default)]
+    reward_forward_status: Option<RewardForwardingStatus>,
+    #[serde(default)]
+    reward_forward_error: Option<String>,
+    #[serde(default)]
+    forward_payout_id: Option<String>,
+    #[serde(default)]
+    forward_source_proof_hash: Option<String>,
+    #[serde(default)]
+    forward_source_contract: Option<String>,
+    #[serde(default)]
+    forward_amount_wei: Option<String>,
+    #[serde(default)]
+    forward_reward_block: Option<u64>,
+    #[serde(default)]
+    forward_reward_block_hash: Option<String>,
     proof_nonce: Option<u128>,
     proof_hash: Option<String>,
     header_hex: Option<String>,
@@ -328,7 +362,7 @@ fn migrate_journal(
     if state.version == JOURNAL_VERSION {
         return Ok((state, false));
     }
-    if state.version == 3 {
+    if matches!(state.version, 3 | 4) {
         state.version = JOURNAL_VERSION;
         return Ok((state, true));
     }
@@ -390,6 +424,10 @@ fn proof_attempt_key(contract: Address) -> String {
 
 fn reward_scan_key(contract: Address, window_id: u64) -> String {
     format!("{contract:#x}:{window_id}")
+}
+
+fn reward_payout_id(contract: Address, window_id: u64, wallet: Address) -> String {
+    format!("1439:{contract:#x}:{window_id}:{wallet:#x}")
 }
 
 pub struct TransactionJournal {
@@ -596,19 +634,42 @@ impl TransactionJournal {
         if self.has_unresolved() {
             bail!("an earlier transaction has unresolved broadcast status; refusing a second send");
         }
+        let journal_wallet = self
+            .state
+            .active_session
+            .as_ref()
+            .and_then(|session| Address::from_str(&session.wallet).ok())
+            .context("active spending session has no recoverable wallet")?;
         if request.to != intent.contract || request.chain_id != 1439 {
             bail!("transaction request does not match the approved Testnet intent");
         }
         match intent.action {
             TransactionAction::SubmitProof
-                if request.value != U256::from(SUBMISSION_FEE_WEI) || intent.proof.is_none() =>
+                if request.value != U256::from(SUBMISSION_FEE_WEI)
+                    || intent.proof.is_none()
+                    || intent.forwarding.is_some()
+                    || intent.reward_destination.is_some_and(|destination| {
+                        destination.is_zero() || destination == journal_wallet
+                    }) =>
             {
                 bail!("proof transaction must include the canonical submission fee and proof data")
             }
             TransactionAction::FinalizeWindow
-                if !request.value.is_zero() || intent.proof.is_some() =>
+                if !request.value.is_zero()
+                    || intent.proof.is_some()
+                    || intent.reward_destination.is_some()
+                    || intent.forwarding.is_some() =>
             {
                 bail!("finalization transaction must be a zero-value call without proof data")
+            }
+            TransactionAction::ForwardReward => {
+                if !request.value.is_zero()
+                    || intent.proof.is_some()
+                    || intent.reward_destination.is_some()
+                {
+                    bail!("reward forwarding must be a zero-value ERC-20 call without proof data");
+                }
+                self.validate_forwarding_intent(intent, &request.data, journal_wallet)?;
             }
             _ => {}
         }
@@ -675,6 +736,115 @@ impl TransactionJournal {
         Ok(maximum_exposure)
     }
 
+    fn validate_forwarding_intent(
+        &self,
+        intent: &TransactionIntent,
+        calldata: &[u8],
+        wallet: Address,
+    ) -> Result<()> {
+        let forwarding = intent
+            .forwarding
+            .as_ref()
+            .context("reward transfer is missing its persisted payout authorization")?;
+        if forwarding.amount.is_zero()
+            || forwarding.destination.is_zero()
+            || forwarding.destination == wallet
+        {
+            bail!("reward forwarding amount or destination is invalid");
+        }
+        let expected_id = reward_payout_id(forwarding.source_contract, intent.window_id, wallet);
+        if forwarding.payout_id != expected_id {
+            bail!("reward payout identity is not canonical");
+        }
+        let source = self
+            .state
+            .entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .transaction_hash
+                    .eq_ignore_ascii_case(&format!("{:#x}", forwarding.source_proof_hash))
+            })
+            .context("authorized source proof is missing from the transaction journal")?;
+        let source_wallet = Address::from_str(&source.wallet)
+            .context("authorized source proof has an invalid wallet")?;
+        let source_contract = Address::from_str(&source.contract)
+            .context("authorized source proof has an invalid miner contract")?;
+        let expected_outcome = format!("reward-paid:{}", forwarding.amount);
+        if source.action != TransactionAction::SubmitProof
+            || source.status != TransactionStatus::MinedSuccess
+            || source.outcome.as_deref() != Some("candidate-updated")
+            || !source.reward_confirmed
+            || source.reward_forward_status != Some(RewardForwardingStatus::VerifiedEligible)
+            || source.reward_block != Some(forwarding.reward_block)
+            || source.reward_block_hash.as_deref()
+                != Some(format!("{:#x}", forwarding.reward_block_hash).as_str())
+            || source.reward_outcome.as_deref() != Some(expected_outcome.as_str())
+            || source.reward_forward_destination.as_deref()
+                != Some(format!("{:#x}", forwarding.destination).as_str())
+            || source_contract != forwarding.source_contract
+            || source_wallet != wallet
+            || source.node_id != intent.node_id
+            || source.window_id != intent.window_id
+        {
+            bail!(
+                "reward transfer does not match the source proof's confirmed payout and explicit destination authorization"
+            );
+        }
+        let expected_calldata = crate::contracts::IERC20Read::transferCall {
+            to: forwarding.destination,
+            amount: forwarding.amount,
+        }
+        .abi_encode();
+        if calldata != expected_calldata {
+            bail!("reward transfer calldata does not match the authorized AST payout");
+        }
+        let attempts = self
+            .state
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.action == TransactionAction::ForwardReward
+                    && entry.forward_payout_id.as_deref() == Some(forwarding.payout_id.as_str())
+            })
+            .count();
+        if attempts >= 2 {
+            bail!(
+                "reward forwarding already exhausted its one safe retry after a confirmed revert"
+            );
+        }
+        if self.forwarding_payout_in_archives(&forwarding.payout_id)? {
+            bail!("reward payout already has a durable archived forwarding attempt");
+        }
+        if self.state.entries.iter().any(|entry| {
+            entry.action == TransactionAction::ForwardReward
+                && entry.forward_payout_id.as_deref() == Some(forwarding.payout_id.as_str())
+                && entry.status != TransactionStatus::MinedReverted
+        }) {
+            bail!(
+                "reward payout already has a forwarding transaction; refusing a duplicate transfer"
+            );
+        }
+        Ok(())
+    }
+
+    fn forwarding_payout_in_archives(&self, payout_id: &str) -> Result<bool> {
+        for archive_meta in &self.state.archives {
+            let contents = self
+                .store
+                .read_transaction_archive(&archive_meta.file_name)?;
+            let archive: JournalArchive =
+                serde_json::from_slice(&contents).context("decode transaction archive")?;
+            if archive.entries.iter().any(|entry| {
+                entry.action == TransactionAction::ForwardReward
+                    && entry.forward_payout_id.as_deref() == Some(payout_id)
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn prepare(&mut self, prepared: PreparedTransaction) -> Result<()> {
         let PreparedTransaction {
             request,
@@ -708,6 +878,40 @@ impl TransactionJournal {
             ),
             None => (None, None, None),
         };
+        let reward_forward_destination = match intent.action {
+            TransactionAction::SubmitProof => intent
+                .reward_destination
+                .map(|address| format!("{address:#x}")),
+            TransactionAction::ForwardReward => intent
+                .forwarding
+                .as_ref()
+                .map(|forwarding| format!("{:#x}", forwarding.destination)),
+            TransactionAction::FinalizeWindow => None,
+        };
+        let reward_forward_status = (intent.action == TransactionAction::SubmitProof)
+            .then_some(reward_forward_destination.as_ref())
+            .flatten()
+            .map(|_| RewardForwardingStatus::AwaitingReward);
+        let (
+            forward_payout_id,
+            forward_source_proof_hash,
+            forward_source_contract,
+            forward_amount_wei,
+            forward_reward_block,
+            forward_reward_block_hash,
+        ) = intent
+            .forwarding
+            .as_ref()
+            .map_or((None, None, None, None, None, None), |forwarding| {
+                (
+                    Some(forwarding.payout_id.clone()),
+                    Some(format!("{:#x}", forwarding.source_proof_hash)),
+                    Some(format!("{:#x}", forwarding.source_contract)),
+                    Some(forwarding.amount.to_string()),
+                    Some(forwarding.reward_block),
+                    Some(format!("{:#x}", forwarding.reward_block_hash)),
+                )
+            });
         if intent.action == TransactionAction::SubmitProof {
             self.state
                 .proof_attempted_through
@@ -736,6 +940,15 @@ impl TransactionJournal {
             reward_block_hash: None,
             reward_confirmations: 0,
             reward_confirmed: false,
+            reward_forward_destination,
+            reward_forward_status,
+            reward_forward_error: None,
+            forward_payout_id,
+            forward_source_proof_hash,
+            forward_source_contract,
+            forward_amount_wei,
+            forward_reward_block,
+            forward_reward_block_hash,
             proof_nonce,
             proof_hash,
             header_hex,
@@ -746,18 +959,63 @@ impl TransactionJournal {
             confirmations_required,
             created_unix_secs: unix_time_secs(),
         });
+        if let Some(forwarding) = intent.forwarding {
+            let source = self
+                .state
+                .entries
+                .iter_mut()
+                .find(|entry| {
+                    entry
+                        .transaction_hash
+                        .eq_ignore_ascii_case(&format!("{:#x}", forwarding.source_proof_hash))
+                })
+                .context("authorized source proof is missing from the journal")?;
+            if source.action != TransactionAction::SubmitProof
+                || source.status != TransactionStatus::MinedSuccess
+                || source.outcome.as_deref() != Some("candidate-updated")
+                || !source.reward_confirmed
+                || source.reward_forward_destination.as_deref()
+                    != Some(format!("{:#x}", forwarding.destination).as_str())
+            {
+                bail!("reward forwarding transaction does not match its persisted authorization");
+            }
+            source.reward_forward_status = Some(RewardForwardingStatus::Signed);
+            source.reward_forward_error = None;
+        }
         self.persist()
     }
 
     fn set_broadcast_state(&mut self, hash: B256, status: TransactionStatus) -> Result<()> {
-        let entry = self.entry_mut(hash)?;
-        if !matches!(
-            entry.status,
-            TransactionStatus::Prepared | TransactionStatus::Unknown
-        ) {
-            bail!("transaction journal broadcast state transition is invalid");
+        let source_hash = {
+            let entry = self.entry_mut(hash)?;
+            if !matches!(
+                entry.status,
+                TransactionStatus::Prepared | TransactionStatus::Unknown
+            ) {
+                bail!("transaction journal broadcast state transition is invalid");
+            }
+            entry.status = status;
+            (entry.action == TransactionAction::ForwardReward)
+                .then(|| {
+                    entry
+                        .forward_source_proof_hash
+                        .as_deref()
+                        .and_then(|value| B256::from_str(value).ok())
+                })
+                .flatten()
+        };
+        if let Some(source_hash) = source_hash {
+            set_forwarding_source_status(
+                &mut self.state,
+                source_hash,
+                if status == TransactionStatus::Unknown {
+                    RewardForwardingStatus::UnknownOutcome
+                } else {
+                    RewardForwardingStatus::Broadcast
+                },
+                None,
+            )?;
         }
-        entry.status = status;
         self.persist()
     }
 
@@ -768,26 +1026,55 @@ impl TransactionJournal {
         confirmations: u64,
         outcome: String,
     ) -> Result<()> {
-        let entry = self.entry_mut(hash)?;
-        let block_hash = format!("{:#x}", receipt.block_hash);
-        let receipt_changed = entry.status != TransactionStatus::Included
-            || entry.outcome.as_deref() != Some(outcome.as_str())
-            || entry.receipt_block != Some(receipt.block_number)
-            || entry.receipt_block_hash.as_deref() != Some(block_hash.as_str())
-            || entry.receipt_status != Some(receipt.status)
-            || entry.actual_cost_wei.is_some();
-        let confirmations_changed = entry.confirmations != confirmations;
-        let crossed_required_confirmations = entry.confirmations
-            < u64::from(entry.confirmations_required)
-            && confirmations >= u64::from(entry.confirmations_required);
-        entry.status = TransactionStatus::Included;
-        entry.actual_cost_wei = None;
-        entry.outcome = Some(outcome);
-        entry.receipt_block = Some(receipt.block_number);
-        entry.receipt_block_hash = Some(block_hash);
-        entry.receipt_status = Some(receipt.status);
-        entry.confirmations = confirmations;
-        if receipt_changed || (confirmations_changed && crossed_required_confirmations) {
+        let (receipt_changed, confirmations_changed, crossed_required_confirmations, source_hash) = {
+            let entry = self.entry_mut(hash)?;
+            let block_hash = format!("{:#x}", receipt.block_hash);
+            let receipt_changed = entry.status != TransactionStatus::Included
+                || entry.outcome.as_deref() != Some(outcome.as_str())
+                || entry.receipt_block != Some(receipt.block_number)
+                || entry.receipt_block_hash.as_deref() != Some(block_hash.as_str())
+                || entry.receipt_status != Some(receipt.status)
+                || entry.actual_cost_wei.is_some();
+            let confirmations_changed = entry.confirmations != confirmations;
+            let crossed_required_confirmations = entry.confirmations
+                < u64::from(entry.confirmations_required)
+                && confirmations >= u64::from(entry.confirmations_required);
+            entry.status = TransactionStatus::Included;
+            entry.actual_cost_wei = None;
+            entry.outcome = Some(outcome);
+            entry.receipt_block = Some(receipt.block_number);
+            entry.receipt_block_hash = Some(block_hash);
+            entry.receipt_status = Some(receipt.status);
+            entry.confirmations = confirmations;
+            let source_hash = (entry.action == TransactionAction::ForwardReward)
+                .then(|| {
+                    entry
+                        .forward_source_proof_hash
+                        .as_deref()
+                        .and_then(|value| B256::from_str(value).ok())
+                })
+                .flatten();
+            (
+                receipt_changed,
+                confirmations_changed,
+                crossed_required_confirmations,
+                source_hash,
+            )
+        };
+        let forwarding_changed = if let Some(source_hash) = source_hash {
+            set_forwarding_source_status(
+                &mut self.state,
+                source_hash,
+                RewardForwardingStatus::ReceiptPending,
+                None,
+            )?
+        } else {
+            false
+        };
+        if receipt_changed
+            || forwarding_changed
+            || (confirmations_changed && crossed_required_confirmations)
+        {
             self.persist()?;
         }
         Ok(())
@@ -801,25 +1088,61 @@ impl TransactionJournal {
         actual_cost: U256,
         outcome: String,
     ) -> Result<()> {
-        let entry = self.entry_mut(hash)?;
-        if confirmations < u64::from(entry.confirmations_required) {
-            bail!("cannot settle a receipt before the configured confirmation threshold");
-        }
-        if receipt.status && outcome == "receipt-event-unverified" {
-            bail!("cannot settle a successful receipt before its canonical event is verified");
-        }
-        entry.status = if receipt.status {
-            TransactionStatus::MinedSuccess
-        } else {
-            TransactionStatus::MinedReverted
+        let (source_hash, ineligible_proof_hash) = {
+            let entry = self.entry_mut(hash)?;
+            if confirmations < u64::from(entry.confirmations_required) {
+                bail!("cannot settle a receipt before the configured confirmation threshold");
+            }
+            if receipt.status && outcome == "receipt-event-unverified" {
+                bail!("cannot settle a successful receipt before its canonical event is verified");
+            }
+            let action = entry.action;
+            let ineligible_proof_hash = (action == TransactionAction::SubmitProof
+                && entry.reward_forward_destination.is_some()
+                && (!receipt.status || outcome != "candidate-updated"))
+                .then_some(hash);
+            entry.status = if receipt.status {
+                TransactionStatus::MinedSuccess
+            } else {
+                TransactionStatus::MinedReverted
+            };
+            entry.actual_cost_wei = Some(actual_cost.to_string());
+            entry.last_known_cost_wei = None;
+            entry.outcome = Some(outcome);
+            entry.receipt_block = Some(receipt.block_number);
+            entry.receipt_block_hash = Some(format!("{:#x}", receipt.block_hash));
+            entry.receipt_status = Some(receipt.status);
+            entry.confirmations = confirmations;
+            let source_hash = (action == TransactionAction::ForwardReward)
+                .then(|| {
+                    entry
+                        .forward_source_proof_hash
+                        .as_deref()
+                        .and_then(|value| B256::from_str(value).ok())
+                })
+                .flatten();
+            (source_hash, ineligible_proof_hash)
         };
-        entry.actual_cost_wei = Some(actual_cost.to_string());
-        entry.last_known_cost_wei = None;
-        entry.outcome = Some(outcome);
-        entry.receipt_block = Some(receipt.block_number);
-        entry.receipt_block_hash = Some(format!("{:#x}", receipt.block_hash));
-        entry.receipt_status = Some(receipt.status);
-        entry.confirmations = confirmations;
+        if let Some(source_hash) = source_hash {
+            set_forwarding_source_status(
+                &mut self.state,
+                source_hash,
+                if receipt.status {
+                    RewardForwardingStatus::Confirmed
+                } else {
+                    RewardForwardingStatus::Reverted
+                },
+                None,
+            )?;
+        }
+        if let Some(proof_hash) = ineligible_proof_hash {
+            set_forwarding_source_status(
+                &mut self.state,
+                proof_hash,
+                RewardForwardingStatus::NotEligible,
+                None,
+            )?;
+        }
         self.persist()
     }
 
@@ -849,11 +1172,42 @@ impl TransactionJournal {
         let confirmed = confirmations >= u64::from(entry.confirmations_required);
         let crossed_archive_threshold =
             !previously_at_archive_threshold && confirmations >= ARCHIVE_AFTER_CONFIRMATIONS;
-        let changed =
+        let mut changed =
             entry.reward_confirmations != confirmations || entry.reward_confirmed != confirmed;
         if changed {
             entry.reward_confirmations = confirmations;
             entry.reward_confirmed = confirmed;
+        }
+        if entry.action == TransactionAction::SubmitProof
+            && entry.reward_forward_destination.is_some()
+            && !matches!(
+                entry.reward_forward_status,
+                Some(
+                    RewardForwardingStatus::Signed
+                        | RewardForwardingStatus::Broadcast
+                        | RewardForwardingStatus::ReceiptPending
+                        | RewardForwardingStatus::Confirmed
+                        | RewardForwardingStatus::Reverted
+                        | RewardForwardingStatus::UnknownOutcome
+                        | RewardForwardingStatus::PolicyBlocked
+                )
+            )
+        {
+            let is_reward = entry
+                .reward_outcome
+                .as_deref()
+                .is_some_and(|outcome| outcome.starts_with("reward-paid:"));
+            let next = if !is_reward {
+                RewardForwardingStatus::NotEligible
+            } else if confirmed {
+                RewardForwardingStatus::VerifiedEligible
+            } else {
+                RewardForwardingStatus::AwaitingReward
+            };
+            if entry.reward_forward_status != Some(next) {
+                entry.reward_forward_status = Some(next);
+                changed = true;
+            }
         }
         Ok((
             newly_confirmed,
@@ -863,18 +1217,48 @@ impl TransactionJournal {
 
     fn clear_reward_block_hash(&mut self, hash: B256) -> Result<()> {
         let entry = self.entry_mut(hash)?;
+        let mut changed = false;
         if entry.reward_block_hash.take().is_some() {
             entry.reward_confirmations = 0;
             entry.reward_confirmed = false;
+            changed = true;
+        }
+        if entry.reward_forward_destination.is_some()
+            && entry.reward_forward_status == Some(RewardForwardingStatus::VerifiedEligible)
+        {
+            entry.reward_forward_status = Some(RewardForwardingStatus::AwaitingReward);
+            changed = true;
+        }
+        if changed {
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    fn update_reward_forward_status(
+        &mut self,
+        source_proof_hash: B256,
+        status: RewardForwardingStatus,
+        reason: Option<String>,
+    ) -> Result<()> {
+        if set_forwarding_source_status(&mut self.state, source_proof_hash, status, reason)? {
             self.persist()?;
         }
         Ok(())
     }
 
     fn mark_uncertain(&mut self, hash: B256) -> Result<()> {
-        let (action, contract, window_id) = {
+        let (action, contract, window_id, forward_source_hash) = {
             let entry = self.entry_mut(hash)?;
-            let data = (entry.action, entry.contract.clone(), entry.window_id);
+            let data = (
+                entry.action,
+                entry.contract.clone(),
+                entry.window_id,
+                entry
+                    .forward_source_proof_hash
+                    .as_deref()
+                    .and_then(|value| B256::from_str(value).ok()),
+            );
             entry.status = TransactionStatus::Unknown;
             entry.last_known_cost_wei = entry
                 .actual_cost_wei
@@ -913,6 +1297,16 @@ impl TransactionJournal {
             self.state
                 .reward_scan_cursors
                 .remove(&reward_scan_key(contract_address, window_id));
+        }
+        if action == TransactionAction::ForwardReward
+            && let Some(source_hash) = forward_source_hash
+        {
+            set_forwarding_source_status(
+                &mut self.state,
+                source_hash,
+                RewardForwardingStatus::UnknownOutcome,
+                None,
+            )?;
         }
         self.persist()
     }
@@ -1059,6 +1453,32 @@ impl TransactionJournal {
                     entry.reward_confirmations = confirmations;
                     entry.reward_confirmed = reward_confirmed;
                 }
+                if entry.reward_forward_destination.is_some()
+                    && !matches!(
+                        entry.reward_forward_status,
+                        Some(
+                            RewardForwardingStatus::Signed
+                                | RewardForwardingStatus::Broadcast
+                                | RewardForwardingStatus::ReceiptPending
+                                | RewardForwardingStatus::Confirmed
+                                | RewardForwardingStatus::Reverted
+                                | RewardForwardingStatus::UnknownOutcome
+                                | RewardForwardingStatus::PolicyBlocked
+                        )
+                    )
+                {
+                    let next = if !outcome.starts_with("reward-paid:") {
+                        RewardForwardingStatus::NotEligible
+                    } else if reward_confirmed {
+                        RewardForwardingStatus::VerifiedEligible
+                    } else {
+                        RewardForwardingStatus::AwaitingReward
+                    };
+                    if entry.reward_forward_status != Some(next) {
+                        entry.reward_forward_status = Some(next);
+                        changed = true;
+                    }
+                }
             }
         }
         if self
@@ -1076,25 +1496,74 @@ impl TransactionJournal {
         if self.state.entries.len() < ARCHIVE_TRIGGER_ENTRIES {
             return Ok(0);
         }
-        let indices = self
-            .state
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                let settled = matches!(
-                    entry.status,
-                    TransactionStatus::MinedSuccess | TransactionStatus::MinedReverted
-                ) && entry.confirmations >= ARCHIVE_AFTER_CONFIRMATIONS;
-                let reward_verified = entry.action != TransactionAction::SubmitProof
-                    || entry.outcome.as_deref() != Some("candidate-updated")
-                    || (entry.reward_confirmed
-                        && entry.reward_block_hash.is_some()
-                        && entry.reward_confirmations >= ARCHIVE_AFTER_CONFIRMATIONS);
-                (settled && reward_verified).then_some(index)
-            })
-            .take(ARCHIVE_BATCH_SIZE)
-            .collect::<Vec<_>>();
+        let mut indices = Vec::new();
+        let mut selected = HashSet::new();
+        let mut index = 0;
+        while index < self.state.entries.len() && indices.len() < ARCHIVE_BATCH_SIZE {
+            let entry = &self.state.entries[index];
+            if !archive_entry_is_settled(entry) {
+                index += 1;
+                continue;
+            }
+            let accepted_proof_needs_forwarding = entry.action == TransactionAction::SubmitProof
+                && entry.outcome.as_deref() == Some("candidate-updated")
+                && entry.reward_forward_destination.is_some()
+                && entry
+                    .reward_outcome
+                    .as_deref()
+                    .is_some_and(|outcome| outcome.starts_with("reward-paid:"));
+            if accepted_proof_needs_forwarding {
+                let payout_id = reward_payout_id(
+                    Address::from_str(&entry.contract)
+                        .context("archived forwarding source contract is invalid")?,
+                    entry.window_id,
+                    Address::from_str(&entry.wallet)
+                        .context("archived forwarding source wallet is invalid")?,
+                );
+                let forward_indices = self
+                    .state
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(candidate_index, candidate)| {
+                        (candidate.action == TransactionAction::ForwardReward
+                            && candidate.forward_payout_id.as_deref() == Some(payout_id.as_str()))
+                        .then_some(candidate_index)
+                    })
+                    .collect::<Vec<_>>();
+                let has_confirmed_forward = forward_indices.iter().any(|forward_index| {
+                    self.state.entries[*forward_index].status == TransactionStatus::MinedSuccess
+                });
+                let all_forwards_settled = forward_indices.iter().all(|forward_index| {
+                    archive_entry_is_settled(&self.state.entries[*forward_index])
+                });
+                if forward_indices.is_empty() || !has_confirmed_forward || !all_forwards_settled {
+                    index += 1;
+                    continue;
+                }
+                if indices.len().saturating_add(1 + forward_indices.len()) > ARCHIVE_BATCH_SIZE {
+                    break;
+                }
+                if selected.insert(index) {
+                    indices.push(index);
+                }
+                for forward_index in forward_indices {
+                    if selected.insert(forward_index) {
+                        indices.push(forward_index);
+                    }
+                }
+                index += 1;
+                continue;
+            }
+            if entry.action == TransactionAction::ForwardReward {
+                // Forwarding transactions are archived atomically with their source proof.
+                index += 1;
+                continue;
+            }
+            selected.insert(index);
+            indices.push(index);
+            index += 1;
+        }
         if indices.is_empty() {
             return Ok(0);
         }
@@ -1207,6 +1676,124 @@ impl TransactionJournal {
         }
         Ok(())
     }
+
+    fn validate_reward_forward_resume_destination(&self, destination: Address) -> Result<()> {
+        for entry in &self.state.entries {
+            if entry.action != TransactionAction::SubmitProof
+                || !matches!(
+                    entry.reward_forward_status,
+                    Some(
+                        RewardForwardingStatus::AwaitingReward
+                            | RewardForwardingStatus::VerifiedEligible
+                            | RewardForwardingStatus::Signed
+                            | RewardForwardingStatus::Broadcast
+                            | RewardForwardingStatus::ReceiptPending
+                            | RewardForwardingStatus::UnknownOutcome
+                            | RewardForwardingStatus::PolicyBlocked
+                            | RewardForwardingStatus::Reverted
+                    )
+                )
+            {
+                continue;
+            }
+            let authorized = entry
+                .reward_forward_destination
+                .as_deref()
+                .context("pending reward forwarding has no persisted destination")
+                .and_then(|value| {
+                    Address::from_str(value).context("pending reward destination is invalid")
+                })?;
+            if authorized != destination {
+                bail!(
+                    "a previously authorized reward for node {} window {} is pending for destination {authorized:#x}; resume with that same destination before selecting another",
+                    entry.node_id,
+                    entry.window_id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn resume_reward_forwarding(&mut self, destination: Address) -> Result<()> {
+        let mut changed = false;
+        for index in 0..self.state.entries.len() {
+            let entry = &self.state.entries[index];
+            if entry.action != TransactionAction::SubmitProof
+                || entry.reward_forward_destination.as_deref()
+                    != Some(format!("{destination:#x}").as_str())
+                || !entry.reward_confirmed
+                || !entry
+                    .reward_outcome
+                    .as_deref()
+                    .is_some_and(|outcome| outcome.starts_with("reward-paid:"))
+                || !matches!(
+                    entry.reward_forward_status,
+                    Some(RewardForwardingStatus::PolicyBlocked | RewardForwardingStatus::Reverted)
+                )
+            {
+                continue;
+            }
+            let payout_id = reward_payout_id(
+                Address::from_str(&entry.contract)
+                    .context("forwarding source proof contract is invalid")?,
+                entry.window_id,
+                Address::from_str(&entry.wallet)
+                    .context("forwarding source proof wallet is invalid")?,
+            );
+            let attempts = self
+                .state
+                .entries
+                .iter()
+                .filter(|candidate| {
+                    candidate.action == TransactionAction::ForwardReward
+                        && candidate.forward_payout_id.as_deref() == Some(payout_id.as_str())
+                })
+                .count();
+            let entry = &mut self.state.entries[index];
+            if attempts >= 2 {
+                entry.reward_forward_status = Some(RewardForwardingStatus::PolicyBlocked);
+                entry.reward_forward_error = Some(
+                    "automatic retry limit reached after confirmed transfer reverts".to_owned(),
+                );
+            } else {
+                entry.reward_forward_status = Some(RewardForwardingStatus::VerifiedEligible);
+                entry.reward_forward_error = None;
+            }
+            changed = true;
+        }
+        if changed {
+            self.persist()?;
+        }
+        Ok(())
+    }
+}
+
+fn set_forwarding_source_status(
+    state: &mut JournalState,
+    source_proof_hash: B256,
+    status: RewardForwardingStatus,
+    reason: Option<String>,
+) -> Result<bool> {
+    let source = state
+        .entries
+        .iter_mut()
+        .find(|entry| {
+            entry
+                .transaction_hash
+                .eq_ignore_ascii_case(&format!("{source_proof_hash:#x}"))
+        })
+        .context("reward forwarding source proof is missing from the journal")?;
+    if source.action != TransactionAction::SubmitProof
+        || source.reward_forward_destination.is_none()
+    {
+        bail!("reward forwarding status has no explicit source-proof authorization");
+    }
+    if source.reward_forward_status == Some(status) && source.reward_forward_error == reason {
+        return Ok(false);
+    }
+    source.reward_forward_status = Some(status);
+    source.reward_forward_error = reason;
+    Ok(true)
 }
 
 pub struct TransactionManager {
@@ -1226,6 +1813,8 @@ pub struct TransactionManager {
     reward_scan_retry_at: Option<Instant>,
     reward_scan_retry_attempts: u8,
     receipt_reward_service_errors: u64,
+    reward_forward_destination: Option<Address>,
+    reward_forward_reported_errors: HashSet<String>,
     current_process_proof_hashes: HashSet<B256>,
     mined_rewards_by_window: HashMap<MinedRewardKey, U256>,
     mined_rewards_total: U256,
@@ -1236,6 +1825,11 @@ pub struct ConfirmedAction {
     pub transaction_hash: B256,
     pub receipt: TransactionReceipt,
     pub outcome: String,
+}
+
+enum SendOutcome {
+    Confirmed(ConfirmedAction),
+    Broadcast(B256),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1295,6 +1889,19 @@ struct TransactionIntent {
     window_id: u64,
     action: TransactionAction,
     proof: Option<ProofData>,
+    reward_destination: Option<Address>,
+    forwarding: Option<ForwardingIntent>,
+}
+
+#[derive(Clone, Debug)]
+struct ForwardingIntent {
+    payout_id: String,
+    source_proof_hash: B256,
+    source_contract: Address,
+    destination: Address,
+    amount: U256,
+    reward_block: u64,
+    reward_block_hash: B256,
 }
 
 struct PreparedTransaction {
@@ -1390,6 +1997,8 @@ impl TransactionManager {
             reward_scan_retry_at: None,
             reward_scan_retry_attempts: 0,
             receipt_reward_service_errors: 0,
+            reward_forward_destination: None,
+            reward_forward_reported_errors: HashSet::new(),
             current_process_proof_hashes: HashSet::new(),
             mined_rewards_by_window: HashMap::new(),
             mined_rewards_total: U256::ZERO,
@@ -1557,6 +2166,48 @@ impl TransactionManager {
 
     pub(crate) fn set_proof_attempt_guard(&mut self, guard: Arc<ProofAttemptGuard>) {
         self.proof_attempt_guard = Some(guard);
+    }
+
+    pub(crate) fn configure_reward_forwarding(
+        &mut self,
+        destination: Option<Address>,
+    ) -> Result<()> {
+        let Some(destination) = destination else {
+            self.reward_forward_destination = None;
+            if self.journal.state.entries.iter().any(|entry| {
+                entry.action == TransactionAction::SubmitProof
+                    && matches!(
+                        entry.reward_forward_status,
+                        Some(
+                            RewardForwardingStatus::AwaitingReward
+                                | RewardForwardingStatus::VerifiedEligible
+                                | RewardForwardingStatus::Signed
+                                | RewardForwardingStatus::Broadcast
+                                | RewardForwardingStatus::ReceiptPending
+                                | RewardForwardingStatus::UnknownOutcome
+                                | RewardForwardingStatus::PolicyBlocked
+                                | RewardForwardingStatus::Reverted
+                        )
+                    )
+            }) {
+                self.report_warning(
+                    "a previously authorized reward forwarding remains pending; restart mining with the same `--send-rewards-to` destination to resume it",
+                );
+            }
+            return Ok(());
+        };
+        if destination.is_zero() || destination == self.wallet {
+            bail!("reward destination must be nonzero and different from the mining wallet");
+        }
+        self.journal
+            .validate_reward_forward_resume_destination(destination)?;
+        self.reward_forward_destination = Some(destination);
+        self.journal.resume_reward_forwarding(destination)?;
+        self.report_info(format!(
+            "reward forwarding enabled for this invocation → {:#x}",
+            destination
+        ));
+        Ok(())
     }
 
     fn record_proof_metric(&self, node_id: u8, metric: ProofMetric) {
@@ -2105,6 +2756,195 @@ impl TransactionManager {
         self.schedule_reward_reconciliation(client, snapshot)
     }
 
+    pub(crate) async fn service_reward_forwarding(
+        &mut self,
+        client: &NetworkClient,
+        snapshot: &ReadSnapshot,
+        signer: &SigningKey,
+    ) -> Result<bool> {
+        let Some(destination) = self.reward_forward_destination else {
+            return Ok(false);
+        };
+        if !client.can_broadcast()
+            || !client.verification.token_verified
+            || self.journal.has_unresolved()
+        {
+            return Ok(false);
+        }
+        let Some(ast_balance) = snapshot.ast_balance else {
+            self.report_forwarding_warning(
+                "AST balance is unavailable; verified reward forwarding remains pending",
+            );
+            return Ok(false);
+        };
+        let sources = self.journal.state.entries.clone();
+        for source in sources {
+            if source.action != TransactionAction::SubmitProof
+                || source.reward_forward_destination.as_deref()
+                    != Some(format!("{destination:#x}").as_str())
+                || source.reward_forward_status != Some(RewardForwardingStatus::VerifiedEligible)
+                || !source.reward_confirmed
+            {
+                continue;
+            }
+            let payout_id = reward_payout_id(
+                Address::from_str(&source.contract)
+                    .context("forwarding source proof contract is invalid")?,
+                source.window_id,
+                Address::from_str(&source.wallet)
+                    .context("forwarding source proof wallet is invalid")?,
+            );
+            let attempts = self
+                .journal
+                .state
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.action == TransactionAction::ForwardReward
+                        && entry.forward_payout_id.as_deref() == Some(payout_id.as_str())
+                })
+                .collect::<Vec<_>>();
+            if self.journal.forwarding_payout_in_archives(&payout_id)?
+                || attempts
+                    .iter()
+                    .any(|entry| entry.status != TransactionStatus::MinedReverted)
+            {
+                continue;
+            }
+            if attempts.len() >= 2 {
+                self.journal.update_reward_forward_status(
+                    entry_hash(&source)?,
+                    RewardForwardingStatus::PolicyBlocked,
+                    Some(
+                        "automatic retry limit reached after confirmed transfer reverts".to_owned(),
+                    ),
+                )?;
+                continue;
+            }
+            let amount = parse_decimal_wei(
+                source
+                    .reward_outcome
+                    .as_deref()
+                    .and_then(|outcome| outcome.strip_prefix("reward-paid:"))
+                    .context("eligible reward has no verified payout amount")?,
+            )?;
+            if ast_balance < amount {
+                let reason = format!(
+                    "verified AST wallet balance {} is below this reward's exact payout {} AST",
+                    format_ast_wei(ast_balance),
+                    format_ast_wei(amount)
+                );
+                self.journal.update_reward_forward_status(
+                    entry_hash(&source)?,
+                    RewardForwardingStatus::PolicyBlocked,
+                    Some(reason.clone()),
+                )?;
+                self.report_forwarding_warning(reason);
+                continue;
+            }
+
+            let source_hash = entry_hash(&source)?;
+            let source_contract = Address::from_str(&source.contract)
+                .context("forwarding source miner contract is invalid")?;
+            let reward_block = source
+                .reward_block
+                .context("eligible reward has no canonical block number")?;
+            let reward_block_hash = B256::from_str(
+                source
+                    .reward_block_hash
+                    .as_deref()
+                    .context("eligible reward has no canonical block hash")?,
+            )
+            .context("eligible reward has an invalid canonical block hash")?;
+            let forwarding = ForwardingIntent {
+                payout_id,
+                source_proof_hash: source_hash,
+                source_contract,
+                destination,
+                amount,
+                reward_block,
+                reward_block_hash,
+            };
+            let calldata = crate::contracts::IERC20Read::transferCall {
+                to: destination,
+                amount,
+            }
+            .abi_encode();
+            let send_result = self
+                .send(
+                    client,
+                    signer,
+                    TransactionIntent {
+                        contract: self.ast_token,
+                        node_id: source.node_id,
+                        window_id: source.window_id,
+                        action: TransactionAction::ForwardReward,
+                        proof: None,
+                        reward_destination: None,
+                        forwarding: Some(forwarding),
+                    },
+                    U256::ZERO,
+                    calldata,
+                )
+                .await;
+            match send_result {
+                Ok(SendOutcome::Broadcast(hash)) => {
+                    let message = format!(
+                        "node {:02} window {} · forwarding {} AST to {:#x} · transaction {hash:#x} awaiting confirmation",
+                        source.node_id,
+                        source.window_id,
+                        format_ast_wei(amount),
+                        destination
+                    );
+                    self.report_info(message);
+                    self.publish_dashboard_state();
+                    return Ok(true);
+                }
+                Ok(SendOutcome::Confirmed(_)) => {
+                    bail!("reward forwarding transaction unexpectedly waited for its receipt")
+                }
+                Err(error) if self.journal.has_unresolved() => {
+                    self.report_forwarding_warning(format!(
+                        "reward forwarding outcome is journaled and requires recovery: {error:#}"
+                    ));
+                    self.publish_dashboard_state();
+                    return Ok(false);
+                }
+                Err(error) if is_transient_rpc_error(&error) => {
+                    self.report_forwarding_warning(format!(
+                        "reward forwarding preflight is temporarily unavailable: {error:#}"
+                    ));
+                    return Ok(false);
+                }
+                Err(error) if transaction_policy_refusal(&error).is_some() => {
+                    let reason = format!("reward forwarding is policy-blocked: {error:#}");
+                    self.journal.update_reward_forward_status(
+                        source_hash,
+                        RewardForwardingStatus::PolicyBlocked,
+                        Some(reason.clone()),
+                    )?;
+                    self.report_forwarding_warning(reason);
+                }
+                Err(error) if is_stale_transaction_preflight(&error) => {
+                    self.report_forwarding_warning(format!(
+                        "reward forwarding is waiting for fresh verified work: {error:#}"
+                    ));
+                    return Ok(false);
+                }
+                Err(error) => {
+                    let reason = format!("reward forwarding is policy-blocked: {error:#}");
+                    self.journal.update_reward_forward_status(
+                        source_hash,
+                        RewardForwardingStatus::PolicyBlocked,
+                        Some(reason.clone()),
+                    )?;
+                    self.report_forwarding_warning(reason);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     async fn service_reward_reconciliation_while_receipt_pending(
         &mut self,
         client: &NetworkClient,
@@ -2472,24 +3312,33 @@ impl TransactionManager {
             nonce: submission.nonce,
         }
         .abi_encode();
-        self.send(
-            client,
-            signer,
-            TransactionIntent {
-                contract: submission.contract,
-                node_id: submission.node_id,
-                window_id: submission.window_id,
-                action: TransactionAction::SubmitProof,
-                proof: Some(ProofData {
-                    nonce: submission.nonce,
-                    work_hash: submission.work_hash,
-                    header: submission.header,
-                }),
-            },
-            U256::from(SUBMISSION_FEE_WEI),
-            data,
-        )
-        .await
+        match self
+            .send(
+                client,
+                signer,
+                TransactionIntent {
+                    contract: submission.contract,
+                    node_id: submission.node_id,
+                    window_id: submission.window_id,
+                    action: TransactionAction::SubmitProof,
+                    proof: Some(ProofData {
+                        nonce: submission.nonce,
+                        work_hash: submission.work_hash,
+                        header: submission.header,
+                    }),
+                    reward_destination: self.reward_forward_destination,
+                    forwarding: None,
+                },
+                U256::from(SUBMISSION_FEE_WEI),
+                data,
+            )
+            .await?
+        {
+            SendOutcome::Confirmed(action) => Ok(action),
+            SendOutcome::Broadcast(_) => {
+                bail!("proof submission unexpectedly returned before receipt verification")
+            }
+        }
     }
 
     pub async fn finalize_window(
@@ -2503,20 +3352,36 @@ impl TransactionManager {
         if signer_address(signer) != self.wallet {
             bail!("unlocked signer does not match the configured wallet");
         }
-        self.send(
-            client,
-            signer,
-            TransactionIntent {
-                contract,
-                node_id,
-                window_id,
-                action: TransactionAction::FinalizeWindow,
-                proof: None,
-            },
-            U256::ZERO,
-            AstatineMinerRead::finalizeWindowCall {}.abi_encode(),
-        )
-        .await
+        match self
+            .send(
+                client,
+                signer,
+                TransactionIntent {
+                    contract,
+                    node_id,
+                    window_id,
+                    action: TransactionAction::FinalizeWindow,
+                    proof: None,
+                    reward_destination: None,
+                    forwarding: None,
+                },
+                U256::ZERO,
+                AstatineMinerRead::finalizeWindowCall {}.abi_encode(),
+            )
+            .await?
+        {
+            SendOutcome::Confirmed(action) => Ok(action),
+            SendOutcome::Broadcast(_) => {
+                bail!("window finalization unexpectedly returned before receipt verification")
+            }
+        }
+    }
+
+    fn report_forwarding_warning(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if self.reward_forward_reported_errors.insert(message.clone()) {
+            self.report_warning(message);
+        }
     }
 
     pub fn close_session(&mut self) -> Result<()> {
@@ -2559,7 +3424,7 @@ impl TransactionManager {
         intent: TransactionIntent,
         value: U256,
         data: Vec<u8>,
-    ) -> Result<ConfirmedAction> {
+    ) -> Result<SendOutcome> {
         if !client.can_broadcast() || client.manifest.chain_id != self.chain_id {
             bail!("transaction signing is disabled outside the approved Injective Testnet profile");
         }
@@ -2578,19 +3443,28 @@ impl TransactionManager {
             );
         }
         self.journal.require_wallet_session(self.wallet)?;
-        let pinned_address = client
-            .manifest
-            .nodes
-            .iter()
-            .find(|pin| pin.id == intent.node_id)
-            .with_context(|| {
-                format!(
-                    "node {} is absent from the Testnet manifest",
-                    intent.node_id
-                )
-            })?;
-        if crate::deployment::parse_address(&pinned_address.address)? != intent.contract {
-            bail!("selected node contract address differs from its built-in Testnet pin");
+        match intent.action {
+            TransactionAction::SubmitProof | TransactionAction::FinalizeWindow => {
+                let pinned_address = client
+                    .manifest
+                    .nodes
+                    .iter()
+                    .find(|pin| pin.id == intent.node_id)
+                    .with_context(|| {
+                        format!(
+                            "node {} is absent from the Testnet manifest",
+                            intent.node_id
+                        )
+                    })?;
+                if crate::deployment::parse_address(&pinned_address.address)? != intent.contract {
+                    bail!("selected node contract address differs from its built-in Testnet pin");
+                }
+            }
+            TransactionAction::ForwardReward => {
+                if intent.contract != self.ast_token || !client.verification.token_verified {
+                    bail!("reward forwarding target is not the verified AST token");
+                }
+            }
         }
         let preflight_snapshot = client.snapshot(Some(self.wallet)).await?;
         validate_fresh_state(
@@ -2642,12 +3516,31 @@ impl TransactionManager {
         client
             .verify_broadcast_snapshot(&fresh_snapshot.block)
             .await?;
-        let runtime_contract = client
-            .verify_node_runtime_at(intent.node_id, fresh_snapshot.block.number)
-            .await?;
-        if runtime_contract != intent.contract {
-            bail!("selected node contract address differs from its built-in Testnet pin");
+        match intent.action {
+            TransactionAction::SubmitProof | TransactionAction::FinalizeWindow => {
+                let runtime_contract = client
+                    .verify_node_runtime_at(intent.node_id, fresh_snapshot.block.number)
+                    .await?;
+                if runtime_contract != intent.contract {
+                    bail!("selected node contract address differs from its built-in Testnet pin");
+                }
+            }
+            TransactionAction::ForwardReward => {
+                let runtime_token = client
+                    .verify_ast_token_runtime_at(fresh_snapshot.block.number)
+                    .await?;
+                if runtime_token != intent.contract || runtime_token != self.ast_token {
+                    bail!("reward forwarding target differs from the verified AST token pin");
+                }
+            }
         }
+        validate_forwarding_reward_confirmation(
+            client,
+            &intent,
+            &fresh_snapshot,
+            self.confirmations_required,
+        )
+        .await?;
         if client.pending_nonce(self.wallet).await? != nonce {
             return Err(StaleTransactionPreflight {
                 details: "wallet pending nonce changed before transaction signing; refresh before retrying"
@@ -2748,6 +3641,10 @@ impl TransactionManager {
             }
         }
         self.publish_dashboard_state();
+
+        if action == TransactionAction::ForwardReward {
+            return Ok(SendOutcome::Broadcast(signed.hash));
+        }
 
         let deadline = Instant::now() + RECEIPT_WAIT;
         // The mining coordinator awaits this send through receipt finality. Keep applying
@@ -2867,11 +3764,11 @@ impl TransactionManager {
                                 self.record_proof_metric(node_id, ProofMetric::CandidateRejected);
                             }
                         }
-                        return Ok(ConfirmedAction {
+                        return Ok(SendOutcome::Confirmed(ConfirmedAction {
                             transaction_hash: signed.hash,
                             receipt,
                             outcome,
-                        });
+                        }));
                     }
                     ReceiptProgress::Pending => {
                         let entry = self.journal.entry(signed.hash)?;
@@ -2969,6 +3866,83 @@ impl TransactionManager {
                 } else {
                     Ok(format!("window-finalized-winner:{winner}:payout:{payout}"))
                 }
+            }
+            TransactionAction::ForwardReward => {
+                if contract != self.ast_token {
+                    bail!("reward transfer journal target is not the pinned AST token");
+                }
+                let payout_id = entry
+                    .forward_payout_id
+                    .as_deref()
+                    .context("reward transfer has no payout identity")?;
+                let source_hash = entry
+                    .forward_source_proof_hash
+                    .as_deref()
+                    .context("reward transfer has no source proof identity")?;
+                let source_hash = B256::from_str(source_hash)
+                    .context("reward transfer source proof hash is invalid")?;
+                let destination = Address::from_str(
+                    entry
+                        .reward_forward_destination
+                        .as_deref()
+                        .context("reward transfer has no authorized destination")?,
+                )
+                .context("reward transfer destination is invalid")?;
+                let amount = parse_decimal_wei(
+                    entry
+                        .forward_amount_wei
+                        .as_deref()
+                        .context("reward transfer has no authorized payout amount")?,
+                )?;
+                let source_contract = Address::from_str(
+                    entry
+                        .forward_source_contract
+                        .as_deref()
+                        .context("reward transfer has no source miner contract")?,
+                )
+                .context("reward transfer source miner contract is invalid")?;
+                let source = self
+                    .journal
+                    .state
+                    .entries
+                    .iter()
+                    .find(|source| {
+                        source
+                            .transaction_hash
+                            .eq_ignore_ascii_case(&format!("{source_hash:#x}"))
+                    })
+                    .context("reward transfer source proof is missing from the journal")?;
+                if source.action != TransactionAction::SubmitProof
+                    || source.reward_forward_destination.as_deref()
+                        != Some(format!("{destination:#x}").as_str())
+                    || Address::from_str(&source.contract)? != source_contract
+                    || source.window_id != entry.window_id
+                    || reward_payout_id(source_contract, source.window_id, entry_wallet)
+                        != payout_id
+                    || entry_wallet != Address::from_str(&source.wallet)?
+                    || source
+                        .reward_outcome
+                        .as_deref()
+                        .and_then(|outcome| outcome.strip_prefix("reward-paid:"))
+                        .and_then(|value| parse_decimal_wei(value).ok())
+                        != Some(amount)
+                {
+                    bail!(
+                        "reward transfer no longer matches its explicitly authorized verified payout"
+                    );
+                }
+                verify_forwarding_transfer_events(
+                    &receipt.logs,
+                    self.ast_token,
+                    self.wallet,
+                    destination,
+                    amount,
+                    receipt.block_number,
+                    receipt.block_hash,
+                )?;
+                Ok(format!(
+                    "reward-forwarded:{payout_id}:{amount}:{destination:#x}"
+                ))
             }
         }
     }
@@ -3132,6 +4106,38 @@ async fn scan_reward_job(
     })
 }
 
+async fn validate_forwarding_reward_confirmation(
+    client: &NetworkClient,
+    intent: &TransactionIntent,
+    snapshot: &ReadSnapshot,
+    confirmations_required: u8,
+) -> Result<()> {
+    if intent.action != TransactionAction::ForwardReward {
+        return Ok(());
+    }
+    let forwarding = intent
+        .forwarding
+        .as_ref()
+        .context("reward forwarding intent has no source reward evidence")?;
+    let mut canonical_blocks = HashMap::from([(snapshot.block.number, snapshot.block.hash)]);
+    let confirmations = client
+        .receipt_confirmations_at_snapshot(
+            forwarding.reward_block,
+            forwarding.reward_block_hash,
+            &snapshot.block,
+            &mut canonical_blocks,
+        )
+        .await?;
+    if confirmations.is_none_or(|count| count < u64::from(confirmations_required)) {
+        return Err(StaleTransactionPreflight {
+            details: "the source reward receipt is no longer canonical or lacks the configured confirmation depth"
+                .to_owned(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn validate_fresh_state(
     snapshot: &ReadSnapshot,
     chain_id: u64,
@@ -3143,6 +4149,34 @@ fn validate_fresh_state(
             details: details.to_owned(),
         })
     };
+    if intent.action == TransactionAction::ForwardReward {
+        if chain_id != 1439 || intent.contract.is_zero() {
+            return Err(stale(
+                "reward forwarding is restricted to the approved Testnet token",
+            ));
+        }
+        let forwarding = intent
+            .forwarding
+            .as_ref()
+            .context("reward forwarding intent is missing its payout data")?;
+        if forwarding.amount.is_zero()
+            || forwarding.destination.is_zero()
+            || forwarding.destination == wallet
+        {
+            return Err(stale("reward forwarding destination or amount is invalid"));
+        }
+        let ast_balance = snapshot
+            .ast_balance
+            .context("verified AST balance is unavailable for reward forwarding")?;
+        if ast_balance < forwarding.amount {
+            bail!(
+                "verified AST balance {} is below the exact authorized reward amount {}",
+                ast_balance,
+                forwarding.amount
+            );
+        }
+        return Ok(());
+    }
     let Some(node) = snapshot.nodes.iter().find(|node| node.id == intent.node_id) else {
         return Err(stale(
             "selected node is missing from the fresh verified snapshot",
@@ -3423,6 +4457,42 @@ fn verify_finalization_events(
     Ok((winner, payout))
 }
 
+fn verify_forwarding_transfer_events(
+    logs: &[RpcLog],
+    token: Address,
+    wallet: Address,
+    destination: Address,
+    amount: U256,
+    receipt_block: u64,
+    receipt_block_hash: B256,
+) -> Result<()> {
+    let mut matching_transfers = 0_u8;
+    for log in logs.iter().filter(|log| {
+        log.address == token && log.topics.first() == Some(&IERC20Read::Transfer::SIGNATURE_HASH)
+    }) {
+        let event = IERC20Read::Transfer::decode_raw_log_validate(
+            log.topics.iter().copied(),
+            log.data.as_ref(),
+        )
+        .context("decode AST reward forwarding Transfer event")?;
+        if event.from != wallet {
+            continue;
+        }
+        if event.to != destination
+            || event.value != amount
+            || log.block_number != Some(receipt_block)
+            || log.block_hash != Some(receipt_block_hash)
+        {
+            bail!("reward forwarding receipt contains a different outgoing AST transfer");
+        }
+        matching_transfers = matching_transfers.saturating_add(1);
+    }
+    if matching_transfers != 1 {
+        bail!("reward forwarding receipt must contain exactly one matching canonical AST Transfer");
+    }
+    Ok(())
+}
+
 fn finalization_log_position(
     logs: &[RpcLog],
     contract: Address,
@@ -3592,6 +4662,38 @@ fn validate_journal(state: &JournalState) -> Result<()> {
                 bail!("journal reward block hash has no block number");
             }
         }
+        if let Some(destination) = &entry.reward_forward_destination {
+            let destination = Address::from_str(destination)
+                .context("journal reward-forwarding destination is invalid")?;
+            if destination.is_zero()
+                || (!entry.wallet.is_empty()
+                    && Address::from_str(&entry.wallet).is_ok_and(|wallet| wallet == destination))
+            {
+                bail!(
+                    "journal reward-forwarding destination must be nonzero and differ from the miner wallet"
+                );
+            }
+        }
+        if let Some(source_hash) = &entry.forward_source_proof_hash {
+            B256::from_str(source_hash)
+                .context("journal forwarding source proof hash is invalid")?;
+        }
+        if let Some(source_contract) = &entry.forward_source_contract {
+            Address::from_str(source_contract)
+                .context("journal forwarding source miner contract is invalid")?;
+        }
+        if let Some(amount) = &entry.forward_amount_wei
+            && parse_decimal_wei(amount)?.is_zero()
+        {
+            bail!("journal forwarding amount must be positive");
+        }
+        if let Some(block_hash) = &entry.forward_reward_block_hash {
+            B256::from_str(block_hash)
+                .context("journal forwarding reward block hash is invalid")?;
+            if entry.forward_reward_block.is_none() {
+                bail!("journal forwarding reward block hash has no block number");
+            }
+        }
         if entry.reward_confirmed
             && (entry.reward_block_hash.is_none()
                 || entry.reward_confirmations < u64::from(entry.confirmations_required)
@@ -3613,11 +4715,93 @@ fn validate_journal(state: &JournalState) -> Result<()> {
             TransactionAction::FinalizeWindow
                 if entry.proof_nonce.is_some()
                     || entry.proof_hash.is_some()
-                    || entry.header_hex.is_some() =>
+                    || entry.header_hex.is_some()
+                    || entry.reward_forward_destination.is_some()
+                    || entry.reward_forward_status.is_some()
+                    || entry.reward_forward_error.is_some()
+                    || entry.forward_payout_id.is_some()
+                    || entry.forward_source_proof_hash.is_some()
+                    || entry.forward_source_contract.is_some()
+                    || entry.forward_amount_wei.is_some()
+                    || entry.forward_reward_block.is_some()
+                    || entry.forward_reward_block_hash.is_some() =>
             {
                 bail!("finalization journal entry unexpectedly contains proof data")
             }
-            _ => {}
+            TransactionAction::FinalizeWindow => {}
+            TransactionAction::SubmitProof => {
+                if entry.forward_payout_id.is_some()
+                    || entry.forward_source_proof_hash.is_some()
+                    || entry.forward_source_contract.is_some()
+                    || entry.forward_amount_wei.is_some()
+                    || entry.forward_reward_block.is_some()
+                    || entry.forward_reward_block_hash.is_some()
+                    || (entry.reward_forward_destination.is_some()
+                        != entry.reward_forward_status.is_some())
+                {
+                    bail!("proof journal forwarding authorization metadata is inconsistent");
+                }
+                if (entry.reward_forward_status == Some(RewardForwardingStatus::PolicyBlocked))
+                    != entry.reward_forward_error.is_some()
+                {
+                    bail!("proof journal forwarding policy status has no matching diagnostic");
+                }
+                if entry.reward_forward_status == Some(RewardForwardingStatus::VerifiedEligible)
+                    && (!entry.reward_confirmed
+                        || !entry
+                            .reward_outcome
+                            .as_deref()
+                            .is_some_and(|outcome| outcome.starts_with("reward-paid:")))
+                {
+                    bail!("verified forwarding status has no confirmed winning reward");
+                }
+            }
+            TransactionAction::ForwardReward => {
+                let destination = entry
+                    .reward_forward_destination
+                    .as_deref()
+                    .context("forwarding transaction has no destination")?;
+                let source_hash = entry
+                    .forward_source_proof_hash
+                    .as_deref()
+                    .context("forwarding transaction has no source proof hash")?;
+                let source_contract = Address::from_str(
+                    entry
+                        .forward_source_contract
+                        .as_deref()
+                        .context("forwarding transaction has no source miner contract")?,
+                )?;
+                let amount = parse_decimal_wei(
+                    entry
+                        .forward_amount_wei
+                        .as_deref()
+                        .context("forwarding transaction has no payout amount")?,
+                )?;
+                if entry.proof_nonce.is_some()
+                    || entry.proof_hash.is_some()
+                    || entry.header_hex.is_some()
+                    || entry.reward_forward_status.is_some()
+                    || entry.reward_forward_error.is_some()
+                    || entry.forward_reward_block.is_none()
+                    || entry.forward_reward_block_hash.is_none()
+                    || amount.is_zero()
+                    || Address::from_str(destination)? == Address::from_str(&entry.wallet)?
+                    || entry.forward_payout_id.as_deref()
+                        != Some(
+                            reward_payout_id(
+                                source_contract,
+                                entry.window_id,
+                                Address::from_str(&entry.wallet)?,
+                            )
+                            .as_str(),
+                        )
+                {
+                    bail!(
+                        "forwarding transaction does not have a complete canonical payout intent"
+                    );
+                }
+                B256::from_str(source_hash)?;
+            }
         }
         match entry.status {
             TransactionStatus::Prepared | TransactionStatus::Broadcast => {
@@ -3685,7 +4869,174 @@ fn validate_journal(state: &JournalState) -> Result<()> {
             }
         }
     }
+    let mut forwarding_counts = HashMap::<String, (usize, usize, usize)>::new();
+    for transfer in state
+        .entries
+        .iter()
+        .filter(|entry| entry.action == TransactionAction::ForwardReward)
+    {
+        let payout_id = transfer
+            .forward_payout_id
+            .as_deref()
+            .context("forwarding transaction has no payout ID")?;
+        let source_hash = B256::from_str(
+            transfer
+                .forward_source_proof_hash
+                .as_deref()
+                .context("forwarding transaction has no source proof hash")?,
+        )?;
+        let source_contract = Address::from_str(
+            transfer
+                .forward_source_contract
+                .as_deref()
+                .context("forwarding transaction has no source miner contract")?,
+        )?;
+        let source = state
+            .entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .transaction_hash
+                    .eq_ignore_ascii_case(&format!("{source_hash:#x}"))
+            })
+            .context("forwarding transaction source proof is missing from the journal")?;
+        let wallet = Address::from_str(&transfer.wallet)?;
+        let destination = Address::from_str(
+            transfer
+                .reward_forward_destination
+                .as_deref()
+                .context("forwarding transaction has no destination")?,
+        )?;
+        let amount = parse_decimal_wei(
+            transfer
+                .forward_amount_wei
+                .as_deref()
+                .context("forwarding transaction has no exact amount")?,
+        )?;
+        if source.action != TransactionAction::SubmitProof
+            || source.node_id != transfer.node_id
+            || source.window_id != transfer.window_id
+            || source.wallet != transfer.wallet
+            || Address::from_str(&source.contract)? != source_contract
+            || source.reward_forward_destination.as_deref()
+                != Some(format!("{destination:#x}").as_str())
+            || destination == wallet
+            || destination.is_zero()
+            || amount.is_zero()
+            || payout_id != reward_payout_id(source_contract, transfer.window_id, wallet)
+        {
+            bail!(
+                "forwarding transaction does not match its source proof and destination authorization"
+            );
+        }
+        let counts = forwarding_counts.entry(payout_id.to_owned()).or_default();
+        counts.0 += 1;
+        counts.1 += usize::from(transfer.status == TransactionStatus::MinedSuccess);
+        counts.2 += usize::from(transfer.status.is_unresolved());
+    }
+    for (payout_id, (attempts, successes, unresolved)) in forwarding_counts {
+        if attempts > 2 || successes > 1 || unresolved > 1 {
+            bail!(
+                "journal contains duplicate or excessive transfer attempts for payout {payout_id}"
+            );
+        }
+    }
+    for source in state.entries.iter().filter(|entry| {
+        entry.action == TransactionAction::SubmitProof && entry.reward_forward_destination.is_some()
+    }) {
+        match source.reward_forward_status {
+            Some(RewardForwardingStatus::VerifiedEligible)
+                if !source.reward_confirmed
+                    || !source
+                        .reward_outcome
+                        .as_deref()
+                        .is_some_and(|outcome| outcome.starts_with("reward-paid:")) =>
+            {
+                bail!("journal marks an unverified payout as eligible for forwarding");
+            }
+            Some(RewardForwardingStatus::Confirmed)
+                if !state.entries.iter().any(|entry| {
+                    entry.action == TransactionAction::ForwardReward
+                        && entry.forward_source_proof_hash.as_deref()
+                            == Some(source.transaction_hash.as_str())
+                        && entry.status == TransactionStatus::MinedSuccess
+                }) =>
+            {
+                bail!("journal confirmed forwarding without a matching successful transfer");
+            }
+            Some(RewardForwardingStatus::Reverted)
+                if !state.entries.iter().any(|entry| {
+                    entry.action == TransactionAction::ForwardReward
+                        && entry.forward_source_proof_hash.as_deref()
+                            == Some(source.transaction_hash.as_str())
+                        && entry.status == TransactionStatus::MinedReverted
+                }) =>
+            {
+                bail!("journal marks forwarding reverted without a matching reverted transfer");
+            }
+            Some(RewardForwardingStatus::UnknownOutcome)
+                if !state.entries.iter().any(|entry| {
+                    entry.action == TransactionAction::ForwardReward
+                        && entry.forward_source_proof_hash.as_deref()
+                            == Some(source.transaction_hash.as_str())
+                        && entry.status == TransactionStatus::Unknown
+                }) =>
+            {
+                bail!("journal marks forwarding outcome unknown without a matching transaction");
+            }
+            Some(RewardForwardingStatus::Broadcast)
+                if !state.entries.iter().any(|entry| {
+                    entry.action == TransactionAction::ForwardReward
+                        && entry.forward_source_proof_hash.as_deref()
+                            == Some(source.transaction_hash.as_str())
+                        && entry.status == TransactionStatus::Broadcast
+                }) =>
+            {
+                bail!("journal marks forwarding broadcast without a matching transaction");
+            }
+            Some(RewardForwardingStatus::ReceiptPending)
+                if !state.entries.iter().any(|entry| {
+                    entry.action == TransactionAction::ForwardReward
+                        && entry.forward_source_proof_hash.as_deref()
+                            == Some(source.transaction_hash.as_str())
+                        && entry.status == TransactionStatus::Included
+                }) =>
+            {
+                bail!("journal marks forwarding receipt-pending without a matching transaction");
+            }
+            Some(RewardForwardingStatus::Signed)
+                if !state.entries.iter().any(|entry| {
+                    entry.action == TransactionAction::ForwardReward
+                        && entry.forward_source_proof_hash.as_deref()
+                            == Some(source.transaction_hash.as_str())
+                        && entry.status == TransactionStatus::Prepared
+                }) =>
+            {
+                bail!("journal marks forwarding signed without a matching prepared transaction");
+            }
+            Some(RewardForwardingStatus::PolicyBlocked)
+                if source.reward_forward_error.is_none() =>
+            {
+                bail!("journal policy-blocked forwarding has no actionable reason");
+            }
+            Some(_) => {}
+            None => bail!("authorized source proof has no forwarding lifecycle status"),
+        }
+    }
     Ok(())
+}
+
+fn archive_entry_is_settled(entry: &TransactionEntry) -> bool {
+    let settled = matches!(
+        entry.status,
+        TransactionStatus::MinedSuccess | TransactionStatus::MinedReverted
+    ) && entry.confirmations >= ARCHIVE_AFTER_CONFIRMATIONS;
+    let reward_verified = entry.action != TransactionAction::SubmitProof
+        || entry.outcome.as_deref() != Some("candidate-updated")
+        || (entry.reward_confirmed
+            && entry.reward_block_hash.is_some()
+            && entry.reward_confirmations >= ARCHIVE_AFTER_CONFIRMATIONS);
+    settled && reward_verified
 }
 
 fn validate_archive_ledger(
@@ -3797,6 +5148,18 @@ fn parse_decimal_wei(value: &str) -> Result<U256> {
     U256::from_str_radix(value, 10).context("transaction journal amount is not decimal wei")
 }
 
+fn format_ast_wei(value: U256) -> String {
+    let scale = U256::from(1_000_000_000_u64);
+    let whole = value / scale;
+    let fractional = (value % scale).to_string();
+    let fractional = format!("{fractional:0>9}").trim_end_matches('0').to_owned();
+    if fractional.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fractional}")
+    }
+}
+
 fn new_session_id() -> String {
     let mut bytes = [0_u8; 16];
     thread_rng().fill_bytes(&mut bytes);
@@ -3815,13 +5178,14 @@ mod tests {
     use super::{
         ARCHIVE_AFTER_CONFIRMATIONS, ARCHIVE_TRIGGER_ENTRIES, Eip1559Request, HistoryCounter,
         HistoryTelemetry, JOURNAL_VERSION, PreparedTransaction, ProofData, ProofSubmission,
-        REWARD_EMPTY_SCAN_RETRY_BASE_SECS, RewardScanAnchor, RewardScanBatchOutput,
-        RewardScanCursor, SUBMISSION_FEE_WEI, TransactionAction, TransactionActivity,
-        TransactionActivityState, TransactionDashboardState, TransactionEntry, TransactionIntent,
-        TransactionJournal, TransactionManager, TransactionPolicyRefusalKind, TransactionStatus,
-        encode_rlp_list, entry_hash, parse_decimal_wei, reward_scan_key, rlp_bytes, rlp_u64,
-        rlp_u256, run_reward_scan_batch, sign_eip1559, transaction_policy_refusal, unix_time_secs,
-        validate_archive_ledger, verify_finalization_events, verify_submission_events,
+        REWARD_EMPTY_SCAN_RETRY_BASE_SECS, RewardForwardingStatus, RewardScanAnchor,
+        RewardScanBatchOutput, RewardScanCursor, SUBMISSION_FEE_WEI, TransactionAction,
+        TransactionActivity, TransactionActivityState, TransactionDashboardState, TransactionEntry,
+        TransactionIntent, TransactionJournal, TransactionManager, TransactionPolicyRefusalKind,
+        TransactionStatus, encode_rlp_list, entry_hash, parse_decimal_wei, reward_scan_key,
+        rlp_bytes, rlp_u64, rlp_u256, run_reward_scan_batch, sign_eip1559,
+        transaction_policy_refusal, unix_time_secs, validate_archive_ledger,
+        verify_finalization_events, verify_submission_events,
     };
     use crate::{
         cli::{MineArgs, Network},
@@ -3940,6 +5304,15 @@ mod tests {
             reward_block_hash,
             reward_confirmations,
             reward_confirmed: has_reward_evidence && reward_confirmations >= 2,
+            reward_forward_destination: None,
+            reward_forward_status: None,
+            reward_forward_error: None,
+            forward_payout_id: None,
+            forward_source_proof_hash: None,
+            forward_source_contract: None,
+            forward_amount_wei: None,
+            forward_reward_block: None,
+            forward_reward_block_hash: None,
             proof_nonce: accepted_proof.then_some(window_id as u128),
             proof_hash: accepted_proof.then(|| format!("{hash:#x}")),
             header_hex: accepted_proof.then(|| "01".to_owned()),
@@ -3949,6 +5322,57 @@ mod tests {
             confirmations: ARCHIVE_AFTER_CONFIRMATIONS,
             confirmations_required: 2,
             created_unix_secs: window_id,
+        }
+    }
+
+    #[test]
+    fn restart_cannot_change_destination_for_any_pending_reward_forwarding_state() {
+        let temp = tempdir().unwrap();
+        let store = ConfigStore::at_root(temp.path().to_path_buf());
+        let config = AppConfig::default();
+        let wallet = Address::with_last_byte(0x31);
+        let original_destination = Address::with_last_byte(0x32);
+        let changed_destination = Address::with_last_byte(0x33);
+        let contract = Address::with_last_byte(0x41);
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let pending_states = [
+            RewardForwardingStatus::AwaitingReward,
+            RewardForwardingStatus::VerifiedEligible,
+            RewardForwardingStatus::Signed,
+            RewardForwardingStatus::Broadcast,
+            RewardForwardingStatus::ReceiptPending,
+            RewardForwardingStatus::UnknownOutcome,
+            RewardForwardingStatus::PolicyBlocked,
+            RewardForwardingStatus::Reverted,
+        ];
+        for (index, status) in pending_states.into_iter().enumerate() {
+            let mut source = settled_history_entry(
+                contract,
+                1,
+                wallet,
+                "pending-forward-resume",
+                index as u64,
+                B256::with_last_byte(index as u8 + 1),
+                TransactionAction::SubmitProof,
+                "candidate-updated",
+                Some("reward-paid:100".to_owned()),
+                2,
+            );
+            source.reward_forward_destination = Some(format!("{original_destination:#x}"));
+            source.reward_forward_status = Some(status);
+            journal.state.entries.clear();
+            journal.state.entries.push(source);
+
+            assert!(
+                journal
+                    .validate_reward_forward_resume_destination(original_destination)
+                    .is_ok()
+            );
+            assert!(
+                journal
+                    .validate_reward_forward_resume_destination(changed_destination)
+                    .is_err()
+            );
         }
     }
 
@@ -3969,6 +5393,8 @@ mod tests {
                 window_id: 4,
                 action: TransactionAction::SubmitProof,
                 proof,
+                reward_destination: None,
+                forwarding: None,
             },
             session_limit,
             minimum_reserve,
@@ -4557,6 +5983,15 @@ mod tests {
                     reward_block_hash: None,
                     reward_confirmations: 0,
                     reward_confirmed: false,
+                    reward_forward_destination: None,
+                    reward_forward_status: None,
+                    reward_forward_error: None,
+                    forward_payout_id: None,
+                    forward_source_proof_hash: None,
+                    forward_source_contract: None,
+                    forward_amount_wei: None,
+                    forward_reward_block: None,
+                    forward_reward_block_hash: None,
                     proof_nonce: None,
                     proof_hash: None,
                     header_hex: None,
@@ -4754,6 +6189,15 @@ mod tests {
                     reward_block_hash: None,
                     reward_confirmations: 0,
                     reward_confirmed: false,
+                    reward_forward_destination: None,
+                    reward_forward_status: None,
+                    reward_forward_error: None,
+                    forward_payout_id: None,
+                    forward_source_proof_hash: None,
+                    forward_source_contract: None,
+                    forward_amount_wei: None,
+                    forward_reward_block: None,
+                    forward_reward_block_hash: None,
                     proof_nonce: Some(index as u128),
                     proof_hash: Some(format!("{:#x}", B256::from(U256::from(index + 1)))),
                     header_hex: Some("01".to_owned()),
@@ -4941,6 +6385,15 @@ mod tests {
             reward_block_hash: None,
             reward_confirmations: 0,
             reward_confirmed: false,
+            reward_forward_destination: None,
+            reward_forward_status: None,
+            reward_forward_error: None,
+            forward_payout_id: None,
+            forward_source_proof_hash: None,
+            forward_source_contract: None,
+            forward_amount_wei: None,
+            forward_reward_block: None,
+            forward_reward_block_hash: None,
             proof_nonce: Some(1),
             proof_hash: Some(format!("{:#x}", B256::with_last_byte(0x12))),
             header_hex: Some("01".to_owned()),
@@ -5830,6 +7283,8 @@ mod tests {
                 work_hash: B256::with_last_byte(7),
                 header: b"header".to_vec(),
             }),
+            reward_destination: None,
+            forwarding: None,
         };
         let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
         journal
@@ -5889,6 +7344,8 @@ mod tests {
                 work_hash: B256::with_last_byte(7),
                 header: b"header".to_vec(),
             }),
+            reward_destination: None,
+            forwarding: None,
         };
         let mut request = test_request();
         request.to = contract;
@@ -6093,6 +7550,15 @@ mod tests {
                 reward_block_hash: None,
                 reward_confirmations: 0,
                 reward_confirmed: false,
+                reward_forward_destination: None,
+                reward_forward_status: None,
+                reward_forward_error: None,
+                forward_payout_id: None,
+                forward_source_proof_hash: None,
+                forward_source_contract: None,
+                forward_amount_wei: None,
+                forward_reward_block: None,
+                forward_reward_block_hash: None,
                 proof_nonce: None,
                 proof_hash: None,
                 header_hex: None,
@@ -6504,6 +7970,15 @@ mod tests {
             reward_block_hash: None,
             reward_confirmations: 0,
             reward_confirmed: false,
+            reward_forward_destination: None,
+            reward_forward_status: None,
+            reward_forward_error: None,
+            forward_payout_id: None,
+            forward_source_proof_hash: None,
+            forward_source_contract: None,
+            forward_amount_wei: None,
+            forward_reward_block: None,
+            forward_reward_block_hash: None,
             proof_nonce: Some(1),
             proof_hash: Some(format!("{:#x}", B256::with_last_byte(2))),
             header_hex: Some(String::new()),
@@ -6885,7 +8360,7 @@ mod tests {
                     reward,
                     miner_bytecode: &miner_bytecode,
                     initial_target: U256::MAX,
-                    retarget_interval: 3,
+                    retarget_interval: 100,
                     window_secs: 60,
                 })
                 .await;
@@ -7003,6 +8478,7 @@ mod tests {
                 compute_only: false,
                 threads: NonZeroUsize::new(32),
                 nodes: vec![1, 3],
+                send_rewards_to: None,
             };
             let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
             let mut runtime = tokio::spawn(async move {
@@ -7405,6 +8881,7 @@ mod tests {
                 compute_only: false,
                 threads: NonZeroUsize::new(1),
                 nodes: vec![pending_proof.node_id],
+                send_rewards_to: None,
             };
             let (recovery_probe_tx, recovery_probe_rx) = tokio::sync::oneshot::channel();
             let mut recovery_runtime = tokio::spawn(async move {
@@ -7571,8 +9048,13 @@ mod tests {
                 .await
                 .unwrap();
         let deployment_wallet = Address::from_str(unlocked_accounts[0].as_str().unwrap()).unwrap();
+        let forwarding_destination =
+            Address::from_str(unlocked_accounts[1].as_str().unwrap()).unwrap();
         let external_finalizer = Address::from_str(unlocked_accounts[2].as_str().unwrap()).unwrap();
         assert_ne!(wallet, deployment_wallet);
+        assert_ne!(forwarding_destination, wallet);
+        assert_ne!(forwarding_destination, deployment_wallet);
+        assert_ne!(forwarding_destination, external_finalizer);
         assert_ne!(wallet, external_finalizer);
 
         let funded_inj = U256::from(1_000_u64) * U256::from(10_u8).pow(U256::from(18));
@@ -7679,6 +9161,9 @@ mod tests {
         let dashboard_state = Arc::new(RwLock::new(TransactionDashboardState::default()));
         let dashboard_sink_state = Arc::clone(&dashboard_state);
         let mut manager = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        manager
+            .configure_reward_forwarding(Some(forwarding_destination))
+            .unwrap();
         manager.set_dashboard_sink(Arc::new(move |state| {
             *dashboard_sink_state
                 .write()
@@ -7687,6 +9172,14 @@ mod tests {
         assert_eq!(manager.mined_rewards_total(), U256::ZERO);
         assert_eq!(
             network.snapshot(Some(wallet)).await.unwrap().ast_balance,
+            Some(U256::ZERO)
+        );
+        assert_eq!(
+            network
+                .snapshot(Some(forwarding_destination))
+                .await
+                .unwrap()
+                .ast_balance,
             Some(U256::ZERO)
         );
 
@@ -7745,8 +9238,6 @@ mod tests {
         rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
             .await
             .unwrap();
-        let paid_snapshot = network.snapshot(Some(wallet)).await.unwrap();
-        assert_eq!(paid_snapshot.ast_balance, Some(reward));
         assert_eq!(manager.mined_rewards_total(), U256::ZERO);
         assert_eq!(
             service_until_mined_reward(&mut manager, &network, wallet, reward).await,
@@ -7774,7 +9265,142 @@ mod tests {
                 .as_deref()
                 .is_some_and(|outcome| outcome.starts_with("reward-paid:"))
         );
+        assert_eq!(
+            first_reward_entry.reward_forward_status,
+            Some(RewardForwardingStatus::VerifiedEligible)
+        );
         assert_eq!(manager.mined_rewards_total(), reward);
+        let paid_snapshot = network.snapshot(Some(wallet)).await.unwrap();
+        assert_eq!(paid_snapshot.ast_balance, Some(reward));
+        let confirmed_native_balance = paid_snapshot.native_balance.unwrap();
+        rpc_request_local(
+            &rpc,
+            &endpoint,
+            "anvil_setBalance",
+            serde_json::json!([format!("{wallet:#x}"), "0x0"]),
+        )
+        .await
+        .unwrap();
+        let unfunded_snapshot = network.snapshot(Some(wallet)).await.unwrap();
+        assert!(
+            !manager
+                .service_reward_forwarding(&network, &unfunded_snapshot, &signer)
+                .await
+                .unwrap(),
+            "forwarding must be deferred without INJ gas funds"
+        );
+        assert_eq!(manager.mined_rewards_total(), reward);
+        assert!(manager.journal.state.entries.iter().any(|entry| {
+            entry.action == TransactionAction::SubmitProof
+                && entry.window_id == 0
+                && entry.reward_forward_status == Some(RewardForwardingStatus::PolicyBlocked)
+        }));
+        assert!(
+            !manager
+                .journal
+                .state
+                .entries
+                .iter()
+                .any(|entry| entry.action == TransactionAction::ForwardReward),
+            "an unfunded forwarding attempt must not be signed or journaled as a transfer"
+        );
+        rpc_request_local(
+            &rpc,
+            &endpoint,
+            "anvil_setBalance",
+            serde_json::json!([
+                format!("{wallet:#x}"),
+                format!("{confirmed_native_balance:#x}")
+            ]),
+        )
+        .await
+        .unwrap();
+        manager
+            .configure_reward_forwarding(Some(forwarding_destination))
+            .unwrap();
+        let paid_snapshot = network.snapshot(Some(wallet)).await.unwrap();
+        assert!(
+            manager
+                .service_reward_forwarding(&network, &paid_snapshot, &signer)
+                .await
+                .unwrap(),
+            "the confirmed third-party-finalized reward should start an authorized AST transfer"
+        );
+        rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = network.snapshot(Some(wallet)).await.unwrap();
+                manager
+                    .monitor_at_snapshot(&network, &snapshot.block)
+                    .await
+                    .unwrap();
+                let source_confirmed = manager.journal.state.entries.iter().any(|entry| {
+                    entry.action == TransactionAction::SubmitProof
+                        && entry.window_id == 0
+                        && entry.reward_forward_status == Some(RewardForwardingStatus::Confirmed)
+                });
+                let transfer_confirmed = manager.journal.state.entries.iter().any(|entry| {
+                    entry.action == TransactionAction::ForwardReward
+                        && entry.window_id == 0
+                        && entry.status == TransactionStatus::MinedSuccess
+                });
+                if source_confirmed && transfer_confirmed {
+                    return;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the exact AST forwarding transfer must reach canonical receipt confirmation");
+        let forward_entry = manager
+            .journal
+            .state
+            .entries
+            .iter()
+            .find(|entry| entry.action == TransactionAction::ForwardReward && entry.window_id == 0)
+            .unwrap();
+        assert_eq!(forward_entry.status, TransactionStatus::MinedSuccess);
+        let reward_wei = reward.to_string();
+        assert_eq!(
+            forward_entry.forward_amount_wei.as_deref(),
+            Some(reward_wei.as_str())
+        );
+        assert_eq!(
+            forward_entry.reward_forward_destination.as_deref(),
+            Some(format!("{forwarding_destination:#x}").as_str())
+        );
+        assert_eq!(
+            network.snapshot(Some(wallet)).await.unwrap().ast_balance,
+            Some(U256::ZERO),
+            "forwarding changes AST BALANCE but must not reverse session MINED"
+        );
+        assert_eq!(
+            network
+                .snapshot(Some(forwarding_destination))
+                .await
+                .unwrap()
+                .ast_balance,
+            Some(reward),
+            "the external recipient receives exactly the verified reward"
+        );
+        assert_eq!(manager.mined_rewards_total(), reward);
+        assert_eq!(
+            dashboard_state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .mined_rewards,
+            reward,
+            "forwarding must not decrement the current-invocation MINED total"
+        );
+        assert!(
+            !manager
+                .service_reward_forwarding(&network, &paid_snapshot, &signer)
+                .await
+                .unwrap(),
+            "reconciling a completed payout must not broadcast a duplicate transfer"
+        );
 
         let second_snapshot = network.snapshot(Some(wallet)).await.unwrap();
         let second_work = second_snapshot
@@ -7926,7 +9552,7 @@ mod tests {
         .expect("the CLI proof that lost to the external contender must be reconciled");
 
         let current_wallet_balance = network.snapshot(Some(wallet)).await.unwrap();
-        assert_eq!(current_wallet_balance.ast_balance, Some(reward));
+        assert_eq!(current_wallet_balance.ast_balance, Some(U256::ZERO));
         let external_winner_balance = network
             .snapshot(Some(deployment_wallet))
             .await
@@ -7939,17 +9565,175 @@ mod tests {
         );
         assert_eq!(manager.mined_rewards_total(), reward);
         assert_eq!(
+            network
+                .snapshot(Some(forwarding_destination))
+                .await
+                .unwrap()
+                .ast_balance,
+            Some(reward),
+            "the losing CLI proof must not create another destination transfer"
+        );
+        assert_eq!(
+            manager
+                .journal
+                .state
+                .entries
+                .iter()
+                .filter(|entry| entry.action == TransactionAction::ForwardReward)
+                .count(),
+            1,
+            "the losing proof must not schedule a second forwarding transfer"
+        );
+
+        let third_snapshot = network.snapshot(Some(wallet)).await.unwrap();
+        let third_state = third_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == 1)
+            .and_then(|node| node.state.as_ref())
+            .unwrap();
+        assert_eq!(third_state.work.window_id, 2);
+        let third_header = b"session-earned-by-cli-window-two";
+        let third_context = WorkContext {
+            chain_id: network.manifest.chain_id,
+            contract: miner,
+            window_id: third_state.work.window_id,
+            seed: third_state.work.seed,
+            miner: wallet,
+            header: third_header.to_vec(),
+        };
+        let third_nonce = 0_u128;
+        let third_hash = WorkHasher::new(&third_context).unwrap().hash(third_nonce);
+        assert!(meets_target(third_hash, third_state.work.target));
+        let (next_manager, third_action) = submit_local_proof_with_confirmation(
+            manager,
+            network.clone(),
+            clone_signer(&signer),
+            ProofSubmission {
+                contract: miner,
+                node_id: 1,
+                window_id: third_state.work.window_id,
+                nonce: third_nonce,
+                header: third_header.to_vec(),
+                work_hash: third_hash,
+            },
+            &store,
+            &rpc,
+            &endpoint,
+        )
+        .await;
+        manager = next_manager;
+        assert_eq!(third_action.outcome, "candidate-updated");
+        advance_window_past_expiry(&rpc, &endpoint, &network, 1, &third_snapshot).await;
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            external_finalizer,
+            Some(miner),
+            &finalize,
+            U256::ZERO,
+        )
+        .await;
+        rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let snapshot = network.snapshot(Some(wallet)).await.unwrap();
+                manager
+                    .service_reward_reconciliation(&network, &snapshot)
+                    .await
+                    .unwrap();
+                manager
+                    .monitor_at_snapshot(&network, &snapshot.block)
+                    .await
+                    .unwrap();
+                let forwarding_started = manager
+                    .service_reward_forwarding(&network, &snapshot, &signer)
+                    .await
+                    .unwrap();
+                if forwarding_started {
+                    rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+                        .await
+                        .unwrap();
+                }
+                let source_confirmed = manager.journal.state.entries.iter().any(|entry| {
+                    entry.action == TransactionAction::SubmitProof
+                        && entry.window_id == 2
+                        && entry.reward_forward_status == Some(RewardForwardingStatus::Confirmed)
+                });
+                let transfer_confirmed = manager.journal.state.entries.iter().any(|entry| {
+                    entry.action == TransactionAction::ForwardReward
+                        && entry.window_id == 2
+                        && entry.status == TransactionStatus::MinedSuccess
+                });
+                if source_confirmed && transfer_confirmed {
+                    return;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the second eligible winning window must be forwarded once");
+        assert_eq!(manager.mined_rewards_total(), reward * U256::from(2));
+        assert_eq!(
+            network.snapshot(Some(wallet)).await.unwrap().ast_balance,
+            Some(U256::ZERO)
+        );
+        assert_eq!(
+            network
+                .snapshot(Some(forwarding_destination))
+                .await
+                .unwrap()
+                .ast_balance,
+            Some(reward * U256::from(2))
+        );
+        assert_eq!(
+            manager
+                .journal
+                .state
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.action == TransactionAction::ForwardReward
+                        && entry.status == TransactionStatus::MinedSuccess
+                })
+                .count(),
+            2
+        );
+        assert_eq!(
             dashboard_state
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .mined_rewards,
-            reward,
+            reward * U256::from(2),
             "external transfers and losing proofs must not change the dashboard session total"
         );
 
         drop(manager);
-        let restarted = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        let mut restarted = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        restarted
+            .configure_reward_forwarding(Some(forwarding_destination))
+            .unwrap();
         assert_eq!(restarted.mined_rewards_total(), U256::ZERO);
+        let restarted_snapshot = network.snapshot(Some(wallet)).await.unwrap();
+        assert!(
+            !restarted
+                .service_reward_forwarding(&network, &restarted_snapshot, &signer)
+                .await
+                .unwrap(),
+            "explicitly resuming a completed payout must not send it twice"
+        );
+        assert_eq!(
+            restarted
+                .journal
+                .state
+                .entries
+                .iter()
+                .filter(|entry| entry.action == TransactionAction::ForwardReward)
+                .count(),
+            2
+        );
         assert!(restarted.journal.state.entries.iter().any(|entry| {
             entry.action == TransactionAction::SubmitProof
                 && entry.window_id == 0
@@ -7967,6 +9751,15 @@ mod tests {
                     .reward_outcome
                     .as_deref()
                     .is_some_and(|outcome| outcome.starts_with("not-window-winner:"))
+        }));
+        assert!(restarted.journal.state.entries.iter().any(|entry| {
+            entry.action == TransactionAction::SubmitProof
+                && entry.window_id == 2
+                && entry.reward_confirmed
+                && entry
+                    .reward_outcome
+                    .as_deref()
+                    .is_some_and(|outcome| outcome.starts_with("reward-paid:"))
         }));
     }
 
@@ -8196,6 +9989,7 @@ mod tests {
                 compute_only: false,
                 threads: NonZeroUsize::new(32),
                 nodes: vec![1],
+                send_rewards_to: None,
             };
             let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
             let runtime = tokio::spawn(async move {

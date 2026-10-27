@@ -45,6 +45,7 @@ secrets/
 *.secret
 *.key
 *.pem
+!support/release-signing-public.pem
 *.p12
 *.pfx
 id_rsa

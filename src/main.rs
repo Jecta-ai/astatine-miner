@@ -12,6 +12,7 @@ mod protocol;
 mod rpc;
 mod startup;
 mod transaction;
+mod update;
 mod wallet;
 
 use std::process::ExitCode;

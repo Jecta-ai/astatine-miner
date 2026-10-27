@@ -441,13 +441,14 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "astatine-cli-rust"
-version = "0.1.0"
+version = "0.1.0-testnet.9"
 dependencies = [
  "aes",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-sol-types",
  "anyhow",
+ "base64 0.22.1",
  "bip32",
  "bip39",
  "clap",
@@ -458,8 +459,10 @@ dependencies = [
  "rand 0.8.6",
  "ratatui",
  "reqwest",
+ "ring",
  "rpassword",
  "scrypt",
+ "semver 1.0.28",
  "serde",
  "serde_json",
  "sha2 0.11.0",

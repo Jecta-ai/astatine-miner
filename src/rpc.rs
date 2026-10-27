@@ -417,6 +417,24 @@ impl NetworkClient {
         Ok(address)
     }
 
+    pub async fn verify_ast_token_runtime_at(&self, block: u64) -> Result<Address> {
+        let pin = self
+            .manifest
+            .ast_token
+            .as_ref()
+            .context("AST token is absent from the verified manifest")?;
+        let address = parse_address(&pin.address)?;
+        let expected_hash = parse_hash(&pin.runtime_code_hash)?;
+        let code = get_code(self.primary_endpoint()?, address, block).await?;
+        if code.is_empty() || keccak256(code) != expected_hash {
+            bail!("AST token runtime code no longer matches the approved pin");
+        }
+        if !self.verification.token_verified {
+            bail!("AST token runtime or decimals are not verified");
+        }
+        Ok(address)
+    }
+
     pub async fn verify_broadcast_snapshot(&self, snapshot: &BlockSnapshot) -> Result<()> {
         let endpoint = self.primary_endpoint()?;
         let (latest_number, _) = endpoint_block(endpoint).await?;

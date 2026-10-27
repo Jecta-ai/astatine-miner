@@ -1,6 +1,7 @@
+use alloy_primitives::Address;
 use clap::{Arg, ArgMatches, Command as ClapCommand};
 use serde::{Deserialize, Serialize};
-use std::{num::NonZeroUsize, path::PathBuf};
+use std::{num::NonZeroUsize, path::PathBuf, str::FromStr};
 
 #[cfg(test)]
 use std::ffi::OsString;
@@ -19,6 +20,7 @@ pub enum Command {
     Nodes,
     Status,
     Rewards,
+    Update,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -26,6 +28,7 @@ pub struct MineArgs {
     pub compute_only: bool,
     pub threads: Option<NonZeroUsize>,
     pub nodes: Vec<u8>,
+    pub send_rewards_to: Option<Address>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -62,6 +65,23 @@ pub fn parse() -> Cli {
     Cli {
         command: parse_matches(&matches),
     }
+}
+
+fn parse_reward_destination(value: &str) -> Result<Address, String> {
+    let address =
+        Address::from_str(value).map_err(|_| "expected a 20-byte EVM address".to_owned())?;
+    if address.is_zero() {
+        return Err("reward destination cannot be the zero address".to_owned());
+    }
+    let body = value.strip_prefix("0x").unwrap_or_default();
+    let has_lower = body.bytes().any(|byte| byte.is_ascii_lowercase());
+    let has_upper = body.bytes().any(|byte| byte.is_ascii_uppercase());
+    if has_lower && has_upper {
+        Address::parse_checksummed(value, None).map_err(|_| {
+            "mixed-case reward destination has an invalid EIP-55 checksum".to_owned()
+        })?;
+    }
+    Ok(address)
 }
 
 #[cfg(test)]
@@ -124,6 +144,7 @@ fn command() -> ClapCommand {
                     Arg::new("compute-only")
                         .long("compute-only")
                         .action(clap::ArgAction::SetTrue)
+                        .conflicts_with("send-rewards-to")
                         .help("Hash verified work locally without signing or sending transactions"),
                 )
                 .arg(
@@ -141,6 +162,13 @@ fn command() -> ClapCommand {
                         .value_delimiter(',')
                         .value_parser(clap::value_parser!(u8).range(1..=9))
                         .help("Restrict mining to comma-separated node IDs (1-9)"),
+                )
+                .arg(
+                    Arg::new("send-rewards-to")
+                        .long("send-rewards-to")
+                        .value_name("ADDRESS")
+                        .value_parser(parse_reward_destination)
+                        .help("Forward verified AST rewards earned by this invocation to an EVM address"),
                 ),
         )
         .subcommand(wallet_command())
@@ -148,6 +176,7 @@ fn command() -> ClapCommand {
         .subcommand(ClapCommand::new("nodes").about("Show the configured mining nodes"))
         .subcommand(ClapCommand::new("status").about("Show local miner status"))
         .subcommand(ClapCommand::new("rewards").about("Show the verified AST token balance"))
+        .subcommand(ClapCommand::new("update").about("Check for and install an authenticated release update"))
 }
 
 fn wallet_command() -> ClapCommand {
@@ -218,6 +247,7 @@ fn parse_matches(matches: &ArgMatches) -> Command {
                 .get_many::<u8>("nodes")
                 .map(|nodes| nodes.copied().collect())
                 .unwrap_or_default(),
+            send_rewards_to: args.get_one::<Address>("send-rewards-to").copied(),
         }),
         Some(("wallet", args)) => match args.subcommand() {
             Some(("create", _)) => Command::Wallet(WalletCommand::Create),
@@ -249,6 +279,7 @@ fn parse_matches(matches: &ArgMatches) -> Command {
         Some(("nodes", _)) => Command::Nodes,
         Some(("status", _)) => Command::Status,
         Some(("rewards", _)) => Command::Rewards,
+        Some(("update", _)) => Command::Update,
         _ => unreachable!("top-level command is required and restricted to known commands"),
     }
 }
@@ -256,6 +287,7 @@ fn parse_matches(matches: &ArgMatches) -> Command {
 #[cfg(test)]
 mod tests {
     use super::{Command, ImportArgs, Network, WalletCommand, try_parse_from};
+    use alloy_primitives::Address;
 
     #[test]
     fn parses_primary_commands_and_safe_mining_options() {
@@ -276,6 +308,7 @@ mod tests {
         assert!(args.compute_only);
         assert_eq!(args.threads.map(|threads| threads.get()), Some(4));
         assert_eq!(args.nodes, [1, 3, 5]);
+        assert_eq!(args.send_rewards_to, None);
     }
 
     #[test]
@@ -285,6 +318,59 @@ mod tests {
             panic!("expected mine subcommand");
         };
         assert!(!args.compute_only);
+        assert_eq!(args.send_rewards_to, None);
+    }
+
+    #[test]
+    fn parses_reward_destination_and_enforces_mixed_case_checksum() {
+        let lowercase = try_parse_from([
+            "astatine",
+            "mine",
+            "--nodes",
+            "1,2,3,4,5,6,7,8,9",
+            "--threads",
+            "16",
+            "--send-rewards-to",
+            "0x0000000000000000000000000000000000000001",
+        ])
+        .expect("lowercase EVM destination should parse");
+        let Command::Mine(args) = lowercase.command else {
+            panic!("expected mine subcommand");
+        };
+        assert_eq!(args.nodes, (1..=9).collect::<Vec<_>>());
+        assert_eq!(args.threads.map(|threads| threads.get()), Some(16));
+        assert_eq!(args.send_rewards_to, Some(Address::with_last_byte(1)));
+
+        let checksummed = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+        assert!(try_parse_from(["astatine", "mine", "--send-rewards-to", checksummed]).is_ok());
+        assert!(
+            try_parse_from([
+                "astatine",
+                "mine",
+                "--send-rewards-to",
+                "0xD8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+            ])
+            .is_err()
+        );
+        assert!(
+            try_parse_from([
+                "astatine",
+                "mine",
+                "--send-rewards-to",
+                "0x0000000000000000000000000000000000000000"
+            ])
+            .is_err()
+        );
+        assert!(
+            try_parse_from([
+                "astatine",
+                "mine",
+                "--compute-only",
+                "--send-rewards-to",
+                checksummed
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -327,5 +413,8 @@ mod tests {
         let network = try_parse_from(["astatine", "network", "use", "mainnet"])
             .expect("network selection command should parse");
         assert_eq!(network.command, Command::NetworkUse(Network::Mainnet));
+
+        let update = try_parse_from(["astatine", "update"]).expect("update command should parse");
+        assert_eq!(update.command, Command::Update);
     }
 }

@@ -69,6 +69,7 @@ pub async fn dispatch(command: Command) -> Result<()> {
         }
         Command::Status => run_status().await,
         Command::Rewards => run_rewards().await,
+        Command::Update => crate::update::run().await,
     }
 }
 

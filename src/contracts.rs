@@ -96,6 +96,7 @@ alloy_sol_types::sol! {
     interface IERC20Read {
         function decimals() external view returns (uint8);
         function balanceOf(address account) external view returns (uint256);
+        function transfer(address to, uint256 amount) external returns (bool);
         event Transfer(address indexed from, address indexed to, uint256 value);
     }
 }
