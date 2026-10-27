@@ -249,7 +249,6 @@ impl ConfigStore {
             {
                 bail!("transaction journal lock is a reparse point");
             }
-            restrict_windows_acl(&file, false)?;
         }
         file.try_lock()
             .context("another astatine mining process already holds the transaction journal")?;
@@ -423,8 +422,6 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
             .set_permissions(fs::Permissions::from_mode(0o700))
             .context("restrict private storage directory permissions")?;
     }
-    #[cfg(windows)]
-    restrict_windows_directory(path)?;
     Ok(())
 }
 
@@ -435,9 +432,100 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
     builder.recursive(true).mode(0o700).create(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    use std::{os::windows::ffi::OsStrExt, ptr::null_mut};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            },
+            SECURITY_ATTRIBUTES,
+        },
+        Storage::FileSystem::CreateDirectoryW,
+    };
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !windows_reparse_point(&metadata) => return Ok(()),
+        Ok(_) => return Err(std::io::ErrorKind::AlreadyExists.into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.is_dir() && !windows_reparse_point(&metadata) => {}
+            Ok(_) => return Err(std::io::ErrorKind::NotADirectory.into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_private_directory(parent)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    struct LocalDescriptor(*mut core::ffi::c_void);
+    impl Drop for LocalDescriptor {
+        fn drop(&mut self) {
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+
+    // Set the protected DACL atomically at creation; standard users cannot
+    // reliably rewrite an inherited DACL after creating a directory.
+    let security_sddl = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            security_sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let descriptor = LocalDescriptor(descriptor);
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
     fs::create_dir_all(path)
+}
+
+#[cfg(windows)]
+fn windows_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
 }
 
 /// Read a regular file through a no-follow handle and enforce a hard size limit.
@@ -461,7 +549,7 @@ pub(crate) fn read_regular_limited(
     Ok(contents)
 }
 
-fn open_regular_file(path: &Path, restrict_windows_permissions: bool) -> Result<File> {
+fn open_regular_file(path: &Path, _restrict_windows_permissions: bool) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -473,15 +561,10 @@ fn open_regular_file(path: &Path, restrict_windows_permissions: bool) -> Result<
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, WRITE_DAC,
-        };
-        let access_mode = if restrict_windows_permissions {
-            FILE_GENERIC_READ | WRITE_DAC
-        } else {
-            FILE_GENERIC_READ
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
         };
         options
-            .access_mode(access_mode)
+            .access_mode(FILE_GENERIC_READ)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options
@@ -500,145 +583,8 @@ fn open_regular_file(path: &Path, restrict_windows_permissions: bool) -> Result<
         {
             bail!("path is a Windows reparse point; refusing to follow it");
         }
-        if restrict_windows_permissions {
-            restrict_windows_acl(&file, false)?;
-        }
     }
-    #[cfg(not(windows))]
-    let _ = restrict_windows_permissions;
-
     Ok(file)
-}
-
-#[cfg(windows)]
-fn restrict_windows_directory(path: &Path) -> Result<()> {
-    use std::{
-        os::windows::{ffi::OsStrExt, io::FromRawHandle},
-        ptr::null_mut,
-    };
-    use windows_sys::Win32::{
-        Foundation::INVALID_HANDLE_VALUE,
-        Storage::FileSystem::{
-            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
-        },
-    };
-
-    let path = path
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let handle = unsafe {
-        CreateFileW(
-            path.as_ptr(),
-            FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            null_mut(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error())
-            .context("open sensitive directory without following reparse points");
-    }
-    let directory = unsafe { File::from_raw_handle(handle) };
-    let metadata = directory
-        .metadata()
-        .context("inspect opened sensitive directory")?;
-    use std::os::windows::fs::MetadataExt;
-    if !metadata.is_dir()
-        || metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-    {
-        bail!("sensitive storage path changed to a non-directory or reparse point");
-    }
-    restrict_windows_acl(&directory, true)
-}
-
-#[cfg(windows)]
-fn restrict_windows_acl(file: &File, directory: bool) -> Result<()> {
-    use std::{
-        os::windows::io::AsRawHandle,
-        ptr::{null, null_mut},
-    };
-    use windows_sys::Win32::{
-        Foundation::LocalFree,
-        Security::Authorization::{
-            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
-            SetSecurityInfo,
-        },
-        Security::{
-            ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
-            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        },
-    };
-
-    struct LocalDescriptor(PSECURITY_DESCRIPTOR);
-    impl Drop for LocalDescriptor {
-        fn drop(&mut self) {
-            unsafe {
-                LocalFree(self.0);
-            }
-        }
-    }
-
-    let sddl = if directory {
-        "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"
-    } else {
-        "D:P(A;;FA;;;OW)(A;;FA;;;SY)"
-    };
-    let sddl = sddl.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-    let mut descriptor = null_mut();
-    if unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.as_ptr(),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            null_mut(),
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error())
-            .context("create a user-restricted Windows security descriptor");
-    }
-    let descriptor = LocalDescriptor(descriptor);
-    let mut dacl_present = 0;
-    let mut dacl: *mut ACL = null_mut();
-    let mut dacl_defaulted = 0;
-    if unsafe {
-        GetSecurityDescriptorDacl(
-            descriptor.0,
-            &mut dacl_present,
-            &mut dacl,
-            &mut dacl_defaulted,
-        )
-    } == 0
-        || dacl_present == 0
-        || dacl.is_null()
-    {
-        return Err(std::io::Error::last_os_error()).context("read the Windows storage DACL");
-    }
-    let result = unsafe {
-        SetSecurityInfo(
-            file.as_raw_handle(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            dacl,
-            null(),
-        )
-    };
-    if result != 0 {
-        return Err(std::io::Error::from_raw_os_error(result as i32))
-            .context("restrict Windows storage access to the owner and SYSTEM");
-    }
-    Ok(())
 }
 
 fn atomic_write(path: &Path, data: &[u8], replace: bool) -> Result<()> {
@@ -654,10 +600,6 @@ fn atomic_write(path: &Path, data: &[u8], replace: bool) -> Result<()> {
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o600))
             .context("restrict temporary file permissions")?;
-    }
-    #[cfg(windows)]
-    {
-        drop(open_regular_file(temporary.path(), true)?);
     }
     temporary.write_all(data).context("write staged file")?;
     temporary

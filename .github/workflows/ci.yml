@@ -144,7 +144,7 @@ jobs:
       - name: Verify local EVM tools
         run: forge --version && anvil --version
       - name: Run all local Anvil lifecycle tests
-        run: cargo test --locked -- --ignored --test-threads=1
+        run: cargo test --release --locked -- --ignored --test-threads=1
 
   package-release:
     name: Package five native releases
