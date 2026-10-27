@@ -9326,6 +9326,26 @@ mod tests {
                 .unwrap(),
             "the confirmed third-party-finalized reward should start an authorized AST transfer"
         );
+        let first_forward_hash = manager
+            .journal
+            .state
+            .entries
+            .iter()
+            .find(|entry| entry.action == TransactionAction::ForwardReward && entry.window_id == 0)
+            .map(|entry| entry_hash(entry).unwrap())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while network
+                .transaction_receipt(first_forward_hash)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("Anvil must include the first forwarding transaction before confirmations advance");
         rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
             .await
             .unwrap();
@@ -9653,6 +9673,29 @@ mod tests {
                     .await
                     .unwrap();
                 if forwarding_started {
+                    let forward_hash = manager
+                        .journal
+                        .state
+                        .entries
+                        .iter()
+                        .find(|entry| {
+                            entry.action == TransactionAction::ForwardReward
+                                && entry.window_id == 2
+                        })
+                        .map(|entry| entry_hash(entry).unwrap())
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while network
+                            .transaction_receipt(forward_hash)
+                            .await
+                            .unwrap()
+                            .is_none()
+                        {
+                            sleep(Duration::from_millis(25)).await;
+                        }
+                    })
+                    .await
+                    .expect("Anvil must include each forwarding transaction before confirmation blocks advance");
                     rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
                         .await
                         .unwrap();

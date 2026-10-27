@@ -555,6 +555,7 @@ struct StagedReplacement {
     destination: PathBuf,
     staged: PathBuf,
     backup: PathBuf,
+    #[cfg(unix)]
     had_original: bool,
 }
 
@@ -612,10 +613,13 @@ fn stage_replacement(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(error).context("inspect update destination"),
     };
+    #[cfg(not(unix))]
+    let _ = had_original;
     Ok(StagedReplacement {
         destination: destination.to_owned(),
         staged,
         backup,
+        #[cfg(unix)]
         had_original,
     })
 }
