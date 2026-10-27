@@ -40,7 +40,7 @@ zeroize = { version = "=1.9.1", default-features = false, features = ["alloc"] }
 libc = "=0.2.191"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console"] }
 
 [patch.crates-io]
 paste = { path = "support/paste-shim" }
