@@ -456,8 +456,9 @@ jobs:
           Copy-Item (Join-Path $ExtractDir 'LICENSE-MIT') (Join-Path $HelperLicenses 'LICENSE-MIT.update')
           Copy-Item (Join-Path $ExtractDir 'THIRD_PARTY_LICENSES.md') (Join-Path $HelperLicenses 'THIRD_PARTY_LICENSES.md.update')
           Write-HelperPlan $env:GITHUB_REF_NAME.Substring(1)
-          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/update-windows.ps1 -ParentPid $DummyParent.Id -PlanPath $HelperPlan
+          $HelperOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/update-windows.ps1 -ParentPid $DummyParent.Id -PlanPath $HelperPlan 2>&1
           if ($LASTEXITCODE -ne 0) {
+              $HelperOutput | ForEach-Object { Write-Host $_ }
               if (Test-Path -LiteralPath $HelperLog) { Get-Content -LiteralPath $HelperLog }
               throw 'Windows update helper failed its successful install case'
           }
@@ -469,7 +470,7 @@ jobs:
           Copy-Item (Join-Path $ExtractDir 'LICENSE-MIT') (Join-Path $HelperLicenses 'LICENSE-MIT.update')
           Copy-Item (Join-Path $ExtractDir 'THIRD_PARTY_LICENSES.md') (Join-Path $HelperLicenses 'THIRD_PARTY_LICENSES.md.update')
           Write-HelperPlan '0.0.0-invalid'
-          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/update-windows.ps1 -ParentPid $DummyParent.Id -PlanPath $HelperPlan
+          $HelperOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/update-windows.ps1 -ParentPid $DummyParent.Id -PlanPath $HelperPlan 2>&1
           if ($LASTEXITCODE -eq 0) { throw 'Windows update helper unexpectedly accepted a mismatched smoke-test version' }
           if ((Get-FileHash -Path $HelperExe -Algorithm SHA256).Hash -ne $OldExecutableHash) { throw 'Windows update helper failed to restore the previous executable' }
           if ((Get-Content (Join-Path $HelperLicenses 'LICENSE-MIT') -Raw).Trim() -ne 'preserve this on rollback') { throw 'Windows update helper failed to restore the previous license notice' }
