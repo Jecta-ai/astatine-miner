@@ -287,20 +287,20 @@ impl GpuEngine {
         let mut input_bytes = Vec::with_capacity(INPUT_HEADER_WORDS * 4 + template.len());
         push_u32(&mut input_bytes, u32::try_from(template.len())?);
         push_u32(&mut input_bytes, u32::try_from(count)?);
-        for chunk in first_nonce.to_be_bytes().chunks_exact(4) {
-            push_u32(&mut input_bytes, u32::from_be_bytes(chunk.try_into()?));
+        for chunk in first_nonce.to_be_bytes().as_chunks::<4>().0 {
+            push_u32(&mut input_bytes, u32::from_be_bytes(*chunk));
         }
         let target_bytes = target.to_be_bytes::<32>();
-        for chunk in target_bytes.chunks_exact(4) {
-            push_u32(&mut input_bytes, u32::from_be_bytes(chunk.try_into()?));
+        for chunk in target_bytes.as_chunks::<4>().0 {
+            push_u32(&mut input_bytes, u32::from_be_bytes(*chunk));
         }
         push_u32(&mut input_bytes, u32::from(incumbent.is_some()));
         let incumbent_bytes = incumbent.unwrap_or(B256::ZERO);
-        for chunk in incumbent_bytes.0.chunks_exact(4) {
-            push_u32(&mut input_bytes, u32::from_be_bytes(chunk.try_into()?));
+        for chunk in incumbent_bytes.0.as_chunks::<4>().0 {
+            push_u32(&mut input_bytes, u32::from_be_bytes(*chunk));
         }
-        for chunk in template.chunks_exact(4) {
-            push_u32(&mut input_bytes, u32::from_be_bytes(chunk.try_into()?));
+        for chunk in template.as_chunks::<4>().0 {
+            push_u32(&mut input_bytes, u32::from_be_bytes(*chunk));
         }
         if input_bytes.len() > INPUT_BUFFER_BYTES {
             bail!("canonical work dispatch exceeds the bounded GPU input buffer");
