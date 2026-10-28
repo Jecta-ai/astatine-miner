@@ -1,9 +1,9 @@
 [package]
 name = "astatine-cli-rust"
-version = "0.1.0-testnet.9"
+version = "0.1.0-testnet.10"
 edition = "2024"
 rust-version = "1.94.1"
-description = "A native Rust command-line miner for Astatine"
+description = "A native Rust CPU and GPU command-line miner for Astatine"
 license = "MIT"
 
 [[bin]]
@@ -22,12 +22,13 @@ bip39 = { version = "=3.0.0", default-features = false, features = ["rand", "std
 clap = { version = "=4.6.7", default-features = false, features = ["error-context", "help", "std", "usage"] }
 crossterm = "=0.28.1"
 ctr = "=0.10.1"
+pbkdf2 = "=0.13.0"
+pollster = "=0.4.0"
 rand = "=0.8.6"
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "crossterm_0_28"] }
-ring = "=0.17.14"
 rpassword = "=7.5.4"
-pbkdf2 = "=0.13.0"
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] }
+ring = "=0.17.14"
 semver = "=1.0.28"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.150"
@@ -37,6 +38,7 @@ subtle = "=2.6.1"
 tempfile = "=3.27.0"
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "=1.1.8"
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
 zeroize = { version = "=1.9.1", default-features = false, features = ["alloc"] }
 
 [target.'cfg(unix)'.dependencies]

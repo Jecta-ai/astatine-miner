@@ -1,5 +1,5 @@
 use crate::{
-    cli::MineArgs,
+    cli::{DeviceChoice, MineArgs},
     config::{ConfigStore, parse_inj_wei},
     dashboard::{
         Dashboard, DashboardEventKind, DashboardModel, DashboardNode, DashboardSignal,
@@ -7,6 +7,7 @@ use crate::{
     },
     deployment::DeploymentManifest,
     diagnostics::DiagnosticBuffer,
+    gpu::{GPU_BATCH_SIZE, GpuBatchIdentity, GpuDeviceInfo, GpuEngine},
     proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{BlockSnapshot, NetworkClient, NodeState, ReadSnapshot, is_transient_rpc_error},
@@ -40,7 +41,7 @@ const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const REWARD_SCAN_SERVICE_INTERVAL: Duration = Duration::from_millis(250);
 const IDLE_INTERVAL: Duration = Duration::from_millis(20);
-const NONCE_BATCH_SIZE: usize = 2_048;
+const NONCE_BATCH_SIZE: usize = GPU_BATCH_SIZE;
 const PENDING_PROOF_CANDIDATE_CAPACITY: usize = 9;
 const PROOF_WAKE_CAPACITY: usize = 1;
 const WORK_EXPIRY_SAFETY_SECS: u64 = 2;
@@ -131,6 +132,28 @@ pub(crate) struct NodeSlot {
     completed_hashes: AtomicU64,
     nonces: Mutex<NonceAllocator>,
     local_best: Mutex<Option<B256>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ActiveBackend {
+    Cpu { threads: usize },
+    Gpu(GpuDeviceInfo),
+}
+
+impl ActiveBackend {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Cpu { .. } => "CPU",
+            Self::Gpu(_) => "GPU",
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::Cpu { threads } => format!("{threads} Threads"),
+            Self::Gpu(info) => format!("{} · CPU verify", info.name),
+        }
+    }
 }
 
 impl NodeSlot {
@@ -454,6 +477,7 @@ struct ProofFound {
     hash: B256,
     target: U256,
     incumbent: Option<B256>,
+    batch_identity: Option<GpuBatchIdentity>,
     queued_at: Instant,
 }
 
@@ -661,9 +685,35 @@ fn should_unlock_recovered_wallet(
         && !has_unresolved_transaction
 }
 
-struct CpuWorkers {
+struct MiningWorkers {
     stop: Arc<AtomicBool>,
     workers: Vec<thread::JoinHandle<()>>,
+    has_gpu_controller: bool,
+}
+
+#[derive(Clone)]
+struct MiningWorkerContext {
+    slots: Arc<Vec<NodeSlot>>,
+    schedule: Arc<RwLock<Vec<usize>>>,
+    stop: Arc<AtomicBool>,
+    cursor: Arc<AtomicUsize>,
+    total_hashes: Arc<AtomicU64>,
+    proofs: ProofInboxSender,
+    telemetry: Arc<ProofPipelineTelemetry>,
+}
+
+#[derive(Clone, Copy)]
+struct HashedCandidate {
+    nonce: u128,
+    hash: B256,
+    reported_gpu_hash: Option<B256>,
+    batch_identity: Option<GpuBatchIdentity>,
+}
+
+enum BackendEvent {
+    Activated(ActiveBackend),
+    FallbackNotice(String),
+    Failed(String),
 }
 
 struct StartupControl<'a> {
@@ -671,18 +721,31 @@ struct StartupControl<'a> {
     progress: Option<&'a StartupProgress>,
 }
 
-impl CpuWorkers {
+impl MiningWorkers {
     fn stop_and_join(&mut self) -> bool {
         self.stop.store(true, Ordering::Release);
-        let mut panicked = false;
+        let mut failed = false;
         for worker in self.workers.drain(..) {
-            panicked |= worker.join().is_err();
+            if self.has_gpu_controller {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !worker.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if !worker.is_finished() {
+                    eprintln!(
+                        "astatine: GPU worker did not stop within 10 seconds; detaching the driver thread"
+                    );
+                    failed = true;
+                    continue;
+                }
+            }
+            failed |= worker.join().is_err();
         }
-        panicked
+        failed
     }
 }
 
-impl Drop for CpuWorkers {
+impl Drop for MiningWorkers {
     fn drop(&mut self) {
         let _ = self.stop_and_join();
     }
@@ -693,7 +756,7 @@ pub(crate) struct DashboardContext {
     pub(crate) network: crate::cli::Network,
     pub(crate) chain_id: u64,
     pub(crate) address: Address,
-    pub(crate) threads: usize,
+    pub(crate) active_backend: Arc<RwLock<ActiveBackend>>,
     pub(crate) spending_limit: U256,
     pub(crate) transaction_mode: bool,
     pub(crate) compute_only: bool,
@@ -752,7 +815,8 @@ pub(crate) struct MiningProbe {
     pub(crate) observer_refresh: ObserverRefreshHandle,
     pub(crate) stop_signal: DashboardSignal,
     pub(crate) proof_telemetry: Arc<ProofPipelineTelemetry>,
-    pub(crate) worker_threads: usize,
+    pub(crate) cpu_worker_threads: usize,
+    pub(crate) active_backend: ActiveBackend,
     #[cfg(test)]
     pub(crate) transaction_state: Arc<RwLock<TransactionDashboardState>>,
     #[cfg(test)]
@@ -1118,6 +1182,7 @@ async fn run_runtime(
     let stop = Arc::new(AtomicBool::new(false));
     let cursor = Arc::new(AtomicUsize::new(0));
     let total_hashes = Arc::new(AtomicU64::new(0));
+    let active_backend = Arc::new(RwLock::new(ActiveBackend::Cpu { threads }));
     let diagnostics = DiagnosticBuffer::default();
     let transaction_state = Arc::new(RwLock::new(initial_transaction_dashboard_state(
         transactions.as_ref(),
@@ -1127,7 +1192,7 @@ async fn run_runtime(
         network: client.manifest.network,
         chain_id: client.manifest.chain_id,
         address,
-        threads,
+        active_backend: Arc::clone(&active_backend),
         spending_limit,
         transaction_mode,
         compute_only: args.compute_only,
@@ -1227,9 +1292,6 @@ async fn run_runtime(
             }
         }
     }
-    if let Some(startup) = startup {
-        startup.begin("Preparing mining workers");
-    }
     let proof_delivery_paused = transaction_mode
         && (signer.is_none()
             || transactions
@@ -1237,60 +1299,118 @@ async fn run_runtime(
                 .is_some_and(|manager| manager.journal.has_unresolved()));
     let (proof_sender, mut proof_receiver) =
         proof_inbox(Arc::clone(&proof_attempt_guard), proof_delivery_paused);
+    let worker_context = MiningWorkerContext {
+        slots: Arc::clone(&slots),
+        schedule: Arc::clone(&schedule),
+        stop: Arc::clone(&stop),
+        cursor: Arc::clone(&cursor),
+        total_hashes: Arc::clone(&total_hashes),
+        proofs: proof_sender.clone(),
+        telemetry: Arc::clone(&proof_telemetry),
+    };
     if let Some(startup) = startup {
-        startup.update(format!("Preparing mining workers · 0/{threads}"));
+        startup.begin(match args.device {
+            DeviceChoice::Cpu => "Preparing CPU mining workers",
+            DeviceChoice::Gpu => "Initializing and self-testing physical GPU",
+            DeviceChoice::Auto => "Detecting and self-testing physical GPU",
+        });
     }
-    let mut workers = Vec::with_capacity(threads);
-    for worker_id in 0..threads {
-        let slots = Arc::clone(&slots);
-        let schedule = Arc::clone(&schedule);
-        let worker_stop = Arc::clone(&stop);
-        let cursor = Arc::clone(&cursor);
-        let total_hashes = Arc::clone(&total_hashes);
-        let telemetry = Arc::clone(&proof_telemetry);
-        let proof_sender = proof_sender.clone();
-        let worker = thread::Builder::new()
-            .name(format!("astatine-pow-{worker_id}"))
-            .spawn(move || {
-                worker_loop(
-                    slots,
-                    schedule,
-                    worker_stop,
-                    cursor,
-                    total_hashes,
-                    proof_sender,
-                    telemetry,
-                )
-            })
-            .context("start CPU worker");
-        match worker {
-            Ok(worker) => {
-                workers.push(worker);
-                if let Some(startup) = startup {
-                    startup.update(format!(
-                        "Preparing mining workers · {}/{}",
-                        workers.len(),
-                        threads
-                    ));
-                }
+    let mut worker_guard = MiningWorkers {
+        stop: Arc::clone(&stop),
+        workers: Vec::new(),
+        has_gpu_controller: false,
+    };
+    let mut backend_event_receiver = None;
+    match args.device {
+        DeviceChoice::Cpu => {
+            worker_guard.workers = start_cpu_worker_threads(threads, worker_context.clone())
+                .inspect_err(|error| {
+                    if let Some(startup) = startup {
+                        startup.fail(format!("Could not start CPU mining workers: {error:#}"));
+                    }
+                })?;
+            if let Some(startup) = startup {
+                startup.complete(format!("CPU workers ready · {threads} thread(s)"));
             }
-            Err(error) => {
-                stop.store(true, Ordering::Release);
-                for worker in workers {
-                    let _ = worker.join();
+        }
+        DeviceChoice::Gpu | DeviceChoice::Auto => {
+            if let Some(startup) = startup {
+                startup.update("GPU initialization includes a real WGSL SHA-256d self-test");
+            }
+            let (events, receiver) = mpsc::unbounded_channel();
+            backend_event_receiver = Some(receiver);
+            let controller_context = worker_context.clone();
+            worker_guard.has_gpu_controller = true;
+            let controller = thread::Builder::new()
+                .name("astatine-gpu-controller".to_owned())
+                .spawn(move || {
+                    gpu_worker_controller(args.device, threads, controller_context, events);
+                })
+                .context("start GPU backend controller")?;
+            worker_guard.workers.push(controller);
+
+            let initial_event = tokio::select! {
+                event = receive_backend_event(&mut backend_event_receiver) => event,
+                signal = ctrl_c.as_mut() => {
+                    if let Err(error) = signal {
+                        report_mining_warning(&None, format!("Ctrl+C signal handler failed: {error}"));
+                    }
+                    stop.store(true, Ordering::Release);
+                    if let Some(startup) = startup { startup.cancel(); }
+                    let _ = worker_guard.stop_and_join();
+                    return Ok(());
                 }
-                if let Some(startup) = startup {
-                    startup.fail(format!("Could not start CPU mining workers: {error:#}"));
+            };
+            match initial_event {
+                Some(BackendEvent::Activated(backend)) => {
+                    *active_backend
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = backend.clone();
+                    if let Some(startup) = startup {
+                        startup.complete(match &backend {
+                            ActiveBackend::Cpu { threads } if args.device == DeviceChoice::Auto => {
+                                format!("GPU unavailable; CPU fallback ready · {threads} thread(s)")
+                            }
+                            ActiveBackend::Cpu { threads } => {
+                                format!("CPU fallback ready · {threads} thread(s)")
+                            }
+                            ActiveBackend::Gpu(info) => {
+                                format!("GPU self-test passed · {} · {}", info.name, info.backend)
+                            }
+                        });
+                    }
                 }
-                return Err(error);
+                Some(BackendEvent::FallbackNotice(reason)) => {
+                    diagnostics.push(format!("{reason}; using CPU fallback."));
+                    *active_backend
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        ActiveBackend::Cpu { threads };
+                    if let Some(startup) = startup {
+                        startup.complete(format!("CPU fallback ready · {threads} thread(s)"));
+                    }
+                }
+                Some(BackendEvent::Failed(message)) => {
+                    stop.store(true, Ordering::Release);
+                    let _ = worker_guard.stop_and_join();
+                    if let Some(startup) = startup {
+                        startup.fail(message.clone());
+                    }
+                    bail!("{message}");
+                }
+                None => {
+                    stop.store(true, Ordering::Release);
+                    let _ = worker_guard.stop_and_join();
+                    let error = anyhow!("GPU backend stopped before initialization completed");
+                    if let Some(startup) = startup {
+                        startup.fail(format!("{error:#}"));
+                    }
+                    return Err(error);
+                }
             }
         }
     }
     drop(proof_sender);
-    let mut worker_guard = CpuWorkers {
-        stop: Arc::clone(&stop),
-        workers,
-    };
     dashboard_context
         .workers_started
         .store(true, Ordering::Release);
@@ -1348,7 +1468,13 @@ async fn run_runtime(
             );
         }
         print_startup(
-            &client, address, threads, &snapshot, &slots, &selected, changed,
+            &client,
+            address,
+            &active_backend,
+            &snapshot,
+            &slots,
+            &selected,
+            changed,
         );
     }
     let mut observer = start_read_only_observer(
@@ -1372,7 +1498,18 @@ async fn run_runtime(
                 .expect("test stop signal must be initialized")
                 .clone(),
             proof_telemetry: Arc::clone(&proof_telemetry),
-            worker_threads: threads,
+            cpu_worker_threads: match active_backend
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                ActiveBackend::Cpu { threads } => threads,
+                ActiveBackend::Gpu(_) => 0,
+            },
+            active_backend: active_backend
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             #[cfg(test)]
             transaction_state: Arc::clone(&transaction_state),
             #[cfg(test)]
@@ -1711,9 +1848,45 @@ async fn run_runtime(
                             || budget_exhausted),
                 );
             }
+            event = receive_backend_event(&mut backend_event_receiver) => {
+                match event {
+                    Some(BackendEvent::Activated(backend)) => {
+                        *active_backend
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = backend.clone();
+                        if let Some(updater) = &dashboard_updater {
+                            updater.update(|model| {
+                                model.device_label = backend.label().to_owned();
+                                model.device_detail = backend.detail();
+                            });
+                        }
+                        match backend {
+                            ActiveBackend::Cpu { threads } => report_mining_warning(
+                                &dashboard,
+                                format!("GPU backend stopped; safely continuing on CPU ({threads} worker thread(s)); reserved GPU nonce ranges will not be reused."),
+                            ),
+                            ActiveBackend::Gpu(info) => report_mining_info(
+                                &dashboard,
+                                format!("GPU backend active · {} · {}", info.name, info.backend),
+                            ),
+                        }
+                    }
+                    Some(BackendEvent::Failed(message)) => {
+                        fatal_error = Some(anyhow!(message));
+                        break 'mining_loop;
+                    }
+                    Some(BackendEvent::FallbackNotice(reason)) => {
+                        report_mining_warning(
+                            &dashboard,
+                            format!("{reason}; continuing with the CPU backend."),
+                        );
+                    }
+                    None => backend_event_receiver = None,
+                }
+            }
             proof = proof_receiver.recv() => {
                 let Some(proof) = proof else {
-                    fatal_error = Some(anyhow!("CPU proof inbox closed while mining was active"));
+                    fatal_error = Some(anyhow!("compute proof inbox closed while mining was active"));
                     break;
                 };
                 proof_telemetry.record(proof.node_id, ProofMetric::MainLoopReceived);
@@ -2014,7 +2187,10 @@ async fn run_runtime(
     }
 
     if worker_guard.stop_and_join() {
-        report_mining_warning(&dashboard, "CPU worker stopped after an internal panic.");
+        report_mining_warning(
+            &dashboard,
+            "Compute worker stopped abnormally or exceeded the bounded shutdown interval.",
+        );
     }
     for pending in proof_receiver.drain_pending() {
         proof_telemetry.record(pending.node_id, ProofMetric::DroppedOnShutdown);
@@ -2104,6 +2280,7 @@ enum ProofRevalidationFailure {
     HashMismatch,
     CurrentTarget,
     CurrentIncumbent,
+    InvalidGpuBatchIdentity,
 }
 
 fn revalidate_queued_proof(
@@ -2128,6 +2305,16 @@ fn revalidate_queued_proof_at(
         .ok_or(ProofRevalidationFailure::NoEligibleWork)?;
     if now >= current.valid_until {
         return Err(ProofRevalidationFailure::ExpiredDeadline);
+    }
+    if proof.batch_identity.is_some_and(|batch| {
+        batch.node_id != proof.node_id
+            || batch.node_id != slot.id
+            || batch.generation != proof.generation
+            || batch.window_id != proof.context.window_id
+            || batch.nonce_count == 0
+            || !batch.contains(proof.nonce)
+    }) {
+        return Err(ProofRevalidationFailure::InvalidGpuBatchIdentity);
     }
     if proof.context.window_id != current.fingerprint.hashing_context.window_id {
         return Err(ProofRevalidationFailure::WindowMismatch);
@@ -2173,6 +2360,7 @@ fn record_proof_revalidation_drop(
         ProofRevalidationFailure::HashMismatch => ProofMetric::DroppedHashMismatch,
         ProofRevalidationFailure::CurrentTarget => ProofMetric::DroppedCurrentTarget,
         ProofRevalidationFailure::CurrentIncumbent => ProofMetric::DroppedCurrentIncumbent,
+        ProofRevalidationFailure::InvalidGpuBatchIdentity => ProofMetric::GpuBatchIdentityRejected,
     };
     telemetry.record(slot.id, metric);
 }
@@ -3172,6 +3360,11 @@ fn dashboard_model(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    let active_backend = context
+        .active_backend
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let pending_sync = context
         .pending_sync
         .read()
@@ -3316,7 +3509,8 @@ fn dashboard_model(
         inj_balance: snapshot.native_balance,
         ast_balance: snapshot.ast_balance,
         mined_rewards: transaction_state.mined_rewards,
-        cpu_threads: context.threads,
+        device_label: active_backend.label().to_owned(),
+        device_detail: active_backend.detail(),
         session_limit: Some(context.spending_limit),
         session_exposure: transaction_state.session_exposure,
         block_number: snapshot.block.number,
@@ -3630,12 +3824,16 @@ async fn wait_for_dashboard_event(signal: Option<DashboardSignal>) -> DashboardE
 fn print_startup(
     client: &NetworkClient,
     address: Address,
-    threads: usize,
+    active_backend: &Arc<RwLock<ActiveBackend>>,
     snapshot: &ReadSnapshot,
     slots: &[NodeSlot],
     selected: &HashSet<u8>,
     selected_work_changed: bool,
 ) {
+    let backend = active_backend
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let ast_decimals = client
         .manifest
         .ast_token
@@ -3643,14 +3841,15 @@ fn print_startup(
         .map(|token| token.decimals)
         .unwrap_or(9);
     println!(
-        "Astatine {} | {} (chain {}) | wallet {:#x} | INJ {} | AST {} | CPU {} | block {}",
+        "Astatine {} | {} (chain {}) | wallet {:#x} | INJ {} | AST {} | DEVICE {} · {} | block {}",
         env!("CARGO_PKG_VERSION"),
         network_label(client.manifest.network),
         client.manifest.chain_id,
         address,
         format_inj(snapshot.native_balance),
         format_token_units(snapshot.ast_balance, ast_decimals),
-        threads,
+        backend.label(),
+        backend.detail(),
         snapshot.block.number
     );
     let eligible = slots
@@ -3717,6 +3916,353 @@ fn print_progress(snapshot: &ReadSnapshot, slots: &[NodeSlot], hashes: u64, elap
     }
 }
 
+fn start_cpu_worker_threads(
+    threads: usize,
+    context: MiningWorkerContext,
+) -> Result<Vec<thread::JoinHandle<()>>> {
+    let mut workers = Vec::with_capacity(threads);
+    for worker_id in 0..threads {
+        let worker_context = context.clone();
+        match thread::Builder::new()
+            .name(format!("astatine-pow-{worker_id}"))
+            .spawn(move || {
+                worker_loop(
+                    worker_context.slots,
+                    worker_context.schedule,
+                    worker_context.stop,
+                    worker_context.cursor,
+                    worker_context.total_hashes,
+                    worker_context.proofs,
+                    worker_context.telemetry,
+                )
+            }) {
+            Ok(worker) => workers.push(worker),
+            Err(error) => {
+                context.stop.store(true, Ordering::Release);
+                for worker in workers {
+                    let _ = worker.join();
+                }
+                return Err(error).context("start CPU mining worker");
+            }
+        }
+    }
+    Ok(workers)
+}
+
+async fn receive_backend_event(
+    receiver: &mut Option<mpsc::UnboundedReceiver<BackendEvent>>,
+) -> Option<BackendEvent> {
+    match receiver.as_mut() {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn gpu_worker_controller(
+    selection: DeviceChoice,
+    cpu_threads: usize,
+    context: MiningWorkerContext,
+    events: mpsc::UnboundedSender<BackendEvent>,
+) {
+    let gpu_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+        let mut engine = GpuEngine::initialize()?;
+        events
+            .send(BackendEvent::Activated(ActiveBackend::Gpu(
+                engine.info().clone(),
+            )))
+            .map_err(|_| anyhow!("GPU backend status channel closed during startup"))?;
+        let result = gpu_worker_loop(&mut engine, &context);
+        if context.stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        result?;
+        bail!("GPU compute worker stopped unexpectedly")
+    }));
+
+    if context.stop.load(Ordering::Acquire) {
+        return;
+    }
+    let failure = match gpu_result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => format!("GPU failed: {error:#}"),
+        Err(payload) => format!("GPU backend panicked: {}", panic_payload_message(payload)),
+    };
+    if selection == DeviceChoice::Auto {
+        activate_cpu_fallback(cpu_threads, context, events, failure);
+    } else {
+        let _ = events.send(BackendEvent::Failed(format!(
+            "{failure}; explicit GPU mode does not substitute CPU hashing"
+        )));
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else {
+        "unknown panic payload".to_owned()
+    }
+}
+
+fn activate_cpu_fallback(
+    cpu_threads: usize,
+    context: MiningWorkerContext,
+    events: mpsc::UnboundedSender<BackendEvent>,
+    reason: String,
+) {
+    if context.stop.load(Ordering::Acquire) {
+        return;
+    }
+    let workers = match start_cpu_worker_threads(cpu_threads, context.clone()) {
+        Ok(workers) => workers,
+        Err(error) => {
+            let _ = events.send(BackendEvent::Failed(format!(
+                "GPU failed ({reason}); CPU fallback could not start: {error:#}"
+            )));
+            return;
+        }
+    };
+    let _ = events.send(BackendEvent::Activated(ActiveBackend::Cpu {
+        threads: cpu_threads,
+    }));
+    let _ = events.send(BackendEvent::FallbackNotice(reason));
+    for worker in workers {
+        if worker.join().is_err() && !context.stop.load(Ordering::Acquire) {
+            let _ = events.send(BackendEvent::Failed(
+                "a CPU fallback worker panicked".to_owned(),
+            ));
+            context.stop.store(true, Ordering::Release);
+            return;
+        }
+    }
+}
+
+fn gpu_worker_loop(engine: &mut GpuEngine, context: &MiningWorkerContext) -> Result<()> {
+    let mut nonce_exhaustion_reported = false;
+    while !context.stop.load(Ordering::Acquire) {
+        let mut active = context
+            .schedule
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        active.retain(|index| context.slots[*index].current_work().is_some());
+        let Some(slot_index) = next_scheduled_slot(&active, &context.cursor) else {
+            thread::sleep(IDLE_INTERVAL);
+            continue;
+        };
+        let slot = &context.slots[slot_index];
+        let Some(work) = slot.current_work() else {
+            thread::sleep(IDLE_INTERVAL);
+            continue;
+        };
+        if !slot.is_generation_current(work.generation) {
+            context
+                .telemetry
+                .record(slot.id, ProofMetric::WorkerStoppedGeneration);
+            continue;
+        }
+        let Some((first_nonce, count)) = slot.reserve_nonces() else {
+            if !nonce_exhaustion_reported {
+                context
+                    .telemetry
+                    .record(slot.id, ProofMetric::WorkerNonceRangeExhausted);
+                nonce_exhaustion_reported = true;
+            }
+            thread::sleep(IDLE_INTERVAL);
+            continue;
+        };
+        nonce_exhaustion_reported = false;
+        let batch = GpuBatchIdentity {
+            node_id: slot.id,
+            generation: work.generation,
+            window_id: work.fingerprint.hashing_context.window_id,
+            first_nonce,
+            nonce_count: count,
+        };
+        let result = match engine.hash_batch(
+            &work.hasher,
+            first_nonce,
+            count,
+            work.target,
+            work.incumbent,
+            Some(&context.stop),
+        ) {
+            Ok(result) => result,
+            Err(_error) if context.stop.load(Ordering::Acquire) => return Ok(()),
+            Err(error) => return Err(error).context("execute GPU SHA-256d nonce batch"),
+        };
+        if result.completed_hashes != count {
+            bail!(
+                "GPU completed {} of {count} reserved nonce hashes",
+                result.completed_hashes
+            );
+        }
+        let completed = u64::try_from(result.completed_hashes)?;
+        context.total_hashes.fetch_add(completed, Ordering::Relaxed);
+        slot.completed_hashes
+            .fetch_add(completed, Ordering::Relaxed);
+        context
+            .telemetry
+            .record(slot.id, ProofMetric::GpuCompletedBatches);
+
+        let mut seen = HashSet::with_capacity(result.candidates.len());
+        for candidate in &result.candidates {
+            if !batch.contains(candidate.nonce) || !seen.insert(candidate.nonce) {
+                bail!("GPU returned a nonce outside its unique reserved batch");
+            }
+        }
+        if let Some(candidate) = result.candidates.into_iter().min_by(|left, right| {
+            left.hash
+                .cmp(&right.hash)
+                .then(left.nonce.cmp(&right.nonce))
+        }) {
+            process_hashed_candidate(
+                slot,
+                &work,
+                HashedCandidate {
+                    nonce: candidate.nonce,
+                    hash: candidate.hash,
+                    reported_gpu_hash: Some(candidate.hash),
+                    batch_identity: Some(batch),
+                },
+                &context.proofs,
+                &context.telemetry,
+            )
+            .map_err(|failure| anyhow!("GPU candidate failed CPU verification: {failure}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn process_hashed_candidate(
+    slot: &NodeSlot,
+    work: &Arc<WorkJob>,
+    candidate: HashedCandidate,
+    proofs: &ProofInboxSender,
+    telemetry: &ProofPipelineTelemetry,
+) -> std::result::Result<(), GpuCandidateFailure> {
+    let HashedCandidate {
+        nonce,
+        hash,
+        reported_gpu_hash,
+        batch_identity,
+    } = candidate;
+    if let Some(batch) = batch_identity {
+        if batch.node_id != slot.id
+            || batch.generation != work.generation
+            || batch.window_id != work.fingerprint.hashing_context.window_id
+            || batch.nonce_count == 0
+            || !batch.contains(nonce)
+        {
+            telemetry.record(slot.id, ProofMetric::GpuBatchIdentityRejected);
+            return Err(GpuCandidateFailure::InvalidBatchIdentity);
+        }
+        let Some(reported) = reported_gpu_hash else {
+            telemetry.record(slot.id, ProofMetric::GpuBatchIdentityRejected);
+            return Err(GpuCandidateFailure::MissingGpuHash);
+        };
+        let canonical = work.hasher.hash(nonce);
+        if canonical != reported || canonical != hash {
+            telemetry.record(slot.id, ProofMetric::GpuHashMismatch);
+            return Err(GpuCandidateFailure::HashMismatch {
+                gpu: reported,
+                cpu: canonical,
+            });
+        }
+        telemetry.record(slot.id, ProofMetric::GpuCandidatesCpuVerified);
+    } else if reported_gpu_hash.is_some() {
+        telemetry.record(slot.id, ProofMetric::GpuBatchIdentityRejected);
+        return Err(GpuCandidateFailure::UnexpectedGpuHash);
+    }
+
+    if !meets_target(hash, work.target) {
+        return Ok(());
+    }
+    telemetry.record(slot.id, ProofMetric::TargetValidHashes);
+    if !slot.is_generation_current(work.generation) {
+        telemetry.record(slot.id, ProofMetric::WorkerStaleGenerationHash);
+        return Ok(());
+    }
+    if Instant::now() >= work.valid_until {
+        telemetry.record(slot.id, ProofMetric::WorkerDeadlineHashDropped);
+        return Ok(());
+    }
+    if work
+        .incumbent
+        .is_some_and(|incumbent| !beats_incumbent(hash, incumbent))
+    {
+        telemetry.record(slot.id, ProofMetric::IncumbentRejectedHashes);
+        return Ok(());
+    }
+    telemetry.record(slot.id, ProofMetric::IncumbentPassedHashes);
+    match slot.update_local_best(work.generation, work.valid_until, hash) {
+        LocalBestUpdate::NewBest => {}
+        LocalBestUpdate::NotBetter => {
+            telemetry.record(slot.id, ProofMetric::TargetValidNotNewLocalBest);
+            return Ok(());
+        }
+        LocalBestUpdate::StaleGeneration => {
+            telemetry.record(slot.id, ProofMetric::WorkerStaleGenerationHash);
+            return Ok(());
+        }
+        LocalBestUpdate::ExpiredDeadline => {
+            telemetry.record(slot.id, ProofMetric::WorkerDeadlineHashDropped);
+            return Ok(());
+        }
+    }
+    telemetry.record(slot.id, ProofMetric::NewLocalBestHashes);
+    if proofs
+        .attempts
+        .suppresses(slot.id, work.fingerprint.hashing_context.window_id)
+    {
+        telemetry.record(slot.id, ProofMetric::SuppressedPriorAttempt);
+        return Ok(());
+    }
+    let _ = proofs.deliver(
+        ProofFound {
+            node_id: slot.id,
+            generation: work.generation,
+            context: work.fingerprint.hashing_context.clone(),
+            nonce,
+            hash,
+            target: work.target,
+            incumbent: work.incumbent,
+            batch_identity,
+            queued_at: Instant::now(),
+        },
+        telemetry,
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+enum GpuCandidateFailure {
+    InvalidBatchIdentity,
+    MissingGpuHash,
+    UnexpectedGpuHash,
+    HashMismatch { gpu: B256, cpu: B256 },
+}
+
+impl std::fmt::Display for GpuCandidateFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidBatchIdentity => {
+                formatter.write_str("nonce is outside its assigned batch")
+            }
+            Self::MissingGpuHash => formatter.write_str("GPU candidate has no reported digest"),
+            Self::UnexpectedGpuHash => formatter.write_str("CPU candidate carries a GPU digest"),
+            Self::HashMismatch { gpu, cpu } => {
+                write!(
+                    formatter,
+                    "GPU digest {gpu:#x} differs from CPU digest {cpu:#x}"
+                )
+            }
+        }
+    }
+}
+
 fn worker_loop(
     slots: Arc<Vec<NodeSlot>>,
     schedule: Arc<RwLock<Vec<usize>>>,
@@ -3777,62 +4323,23 @@ fn worker_loop(
                 break;
             };
             completed += 1;
-            if !meets_target(hash, work.target) {
-                continue;
-            }
-            telemetry.record(slot.id, ProofMetric::TargetValidHashes);
-            if !slot.is_generation_current(work.generation) {
-                telemetry.record(slot.id, ProofMetric::WorkerStaleGenerationHash);
-                continue;
-            }
-            if Instant::now() >= work.valid_until {
-                telemetry.record(slot.id, ProofMetric::WorkerDeadlineHashDropped);
-                continue;
-            }
-            if work
-                .incumbent
-                .is_some_and(|incumbent| !beats_incumbent(hash, incumbent))
-            {
-                telemetry.record(slot.id, ProofMetric::IncumbentRejectedHashes);
-                continue;
-            }
-            telemetry.record(slot.id, ProofMetric::IncumbentPassedHashes);
-            match slot.update_local_best(work.generation, work.valid_until, hash) {
-                LocalBestUpdate::NewBest => {}
-                LocalBestUpdate::NotBetter => {
-                    telemetry.record(slot.id, ProofMetric::TargetValidNotNewLocalBest);
-                    continue;
-                }
-                LocalBestUpdate::StaleGeneration => {
-                    telemetry.record(slot.id, ProofMetric::WorkerStaleGenerationHash);
-                    continue;
-                }
-                LocalBestUpdate::ExpiredDeadline => {
-                    telemetry.record(slot.id, ProofMetric::WorkerDeadlineHashDropped);
-                    continue;
-                }
-            }
-            telemetry.record(slot.id, ProofMetric::NewLocalBestHashes);
-            if proofs
-                .attempts
-                .suppresses(slot.id, work.fingerprint.hashing_context.window_id)
-            {
-                telemetry.record(slot.id, ProofMetric::SuppressedPriorAttempt);
-                continue;
-            }
-            let _ = proofs.deliver(
-                ProofFound {
-                    node_id: slot.id,
-                    generation: work.generation,
-                    context: work.fingerprint.hashing_context.clone(),
+            if process_hashed_candidate(
+                slot,
+                &work,
+                HashedCandidate {
                     nonce,
                     hash,
-                    target: work.target,
-                    incumbent: work.incumbent,
-                    queued_at: Instant::now(),
+                    reported_gpu_hash: None,
+                    batch_identity: None,
                 },
+                &proofs,
                 &telemetry,
-            );
+            )
+            .is_err()
+            {
+                telemetry.record(slot.id, ProofMetric::WorkerHashFailure);
+                break;
+            }
         }
         total_hashes.fetch_add(completed, Ordering::Relaxed);
         slot.completed_hashes
@@ -3891,19 +4398,21 @@ fn network_label(network: crate::cli::Network) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        DashboardContext, FinalizationState, HashingContext, NodeSlot, NonceAllocator,
-        ObserverUpdate, PENDING_PROOF_CANDIDATE_CAPACITY, PendingDashboardSync, ProofFound,
-        SnapshotFreshness, compare_snapshot_freshness, dashboard_model, dashboard_node_status,
+        ActiveBackend, DashboardContext, FinalizationState, HashedCandidate, HashingContext,
+        MiningWorkerContext, NodeSlot, NonceAllocator, ObserverUpdate,
+        PENDING_PROOF_CANDIDATE_CAPACITY, PendingDashboardSync, ProofFound, SnapshotFreshness,
+        activate_cpu_fallback, compare_snapshot_freshness, dashboard_model, dashboard_node_status,
         finalization_retry_delay, history_profile_enabled, next_poll_delay, next_scheduled_slot,
-        proof_inbox, reconcile_head_progress, revalidate_queued_proof, revalidate_queued_proof_at,
-        selected_nodes, should_unlock_recovered_wallet, take_observer_update, update_slots,
-        worker_loop,
+        process_hashed_candidate, proof_inbox, reconcile_head_progress, revalidate_queued_proof,
+        revalidate_queued_proof_at, selected_nodes, should_unlock_recovered_wallet,
+        take_observer_update, update_slots, worker_loop,
     };
     use crate::{
-        cli::{MineArgs, Network},
+        cli::{DeviceChoice, MineArgs, Network},
         config::ConfigStore,
         dashboard::{NodeStatus, hashes_per_second},
         deployment::DeploymentManifest,
+        gpu::GpuBatchIdentity,
         proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
         protocol::{WorkContext, WorkHasher, meets_target},
         rpc::{
@@ -4086,7 +4595,7 @@ mod tests {
             network: Network::Testnet,
             chain_id: 1439,
             address: Address::with_last_byte(9),
-            threads: 2,
+            active_backend: Arc::new(RwLock::new(ActiveBackend::Cpu { threads: 2 })),
             spending_limit: U256::ZERO,
             transaction_mode: false,
             compute_only: true,
@@ -4183,7 +4692,7 @@ mod tests {
             network: Network::Testnet,
             chain_id: 1439,
             address: wallet,
-            threads: 1,
+            active_backend: Arc::new(RwLock::new(ActiveBackend::Cpu { threads: 1 })),
             spending_limit: U256::from(1),
             transaction_mode: true,
             compute_only: false,
@@ -4464,7 +4973,7 @@ mod tests {
             network: Network::Testnet,
             chain_id: 1439,
             address: wallet,
-            threads: 2,
+            active_backend: Arc::new(RwLock::new(ActiveBackend::Cpu { threads: 2 })),
             spending_limit: U256::ZERO,
             transaction_mode: false,
             compute_only: false,
@@ -4542,6 +5051,209 @@ mod tests {
         };
         assert_eq!(final_range.reserve(4), Some((u128::MAX - 1, 2)));
         assert_eq!(final_range.reserve(4), None);
+
+        let slot = NodeSlot::new(1);
+        let gpu_reserved = slot.reserve_nonces().unwrap();
+        let cpu_fallback = slot.reserve_nonces().unwrap();
+        assert_eq!(gpu_reserved, (0, crate::gpu::GPU_BATCH_SIZE));
+        assert_eq!(
+            cpu_fallback,
+            (
+                crate::gpu::GPU_BATCH_SIZE as u128,
+                crate::gpu::GPU_BATCH_SIZE
+            )
+        );
+    }
+
+    #[test]
+    fn gpu_candidate_is_batch_bound_and_cpu_revalidated_before_proof_queueing() {
+        let manifest = DeploymentManifest::load(Network::Testnet).unwrap();
+        let slot = NodeSlot::new(1);
+        let miner = Address::with_last_byte(8);
+        let contract = Address::with_last_byte(9);
+        let mut state = eligible_state();
+        state.work.target = U256::MAX;
+        let now = Instant::now();
+        slot.set_work_at(
+            &manifest,
+            miner,
+            contract,
+            Some(&state),
+            &test_block(1, 100),
+            now,
+        )
+        .unwrap();
+        let work = slot.current_work_at(now).unwrap();
+        let nonce = u128::from(u64::MAX) + 1;
+        let hash = work.hasher.hash(nonce);
+        let batch = GpuBatchIdentity {
+            node_id: 1,
+            generation: work.generation,
+            window_id: state.work.window_id,
+            first_nonce: nonce - 1,
+            nonce_count: 3,
+        };
+        let telemetry = ProofPipelineTelemetry::default();
+        let (proofs, receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+
+        let mismatch = process_hashed_candidate(
+            &slot,
+            &work,
+            HashedCandidate {
+                nonce,
+                hash: B256::ZERO,
+                reported_gpu_hash: Some(B256::ZERO),
+                batch_identity: Some(batch),
+            },
+            &proofs,
+            &telemetry,
+        );
+        assert!(matches!(
+            mismatch,
+            Err(super::GpuCandidateFailure::HashMismatch { .. })
+        ));
+        assert!(!receiver.has_pending());
+        assert_eq!(telemetry.count(1, ProofMetric::GpuHashMismatch), 1);
+
+        let outside_batch = GpuBatchIdentity {
+            first_nonce: nonce + 1,
+            nonce_count: 1,
+            ..batch
+        };
+        let rejected = process_hashed_candidate(
+            &slot,
+            &work,
+            HashedCandidate {
+                nonce,
+                hash,
+                reported_gpu_hash: Some(hash),
+                batch_identity: Some(outside_batch),
+            },
+            &proofs,
+            &telemetry,
+        );
+        assert!(matches!(
+            rejected,
+            Err(super::GpuCandidateFailure::InvalidBatchIdentity)
+        ));
+        assert!(!receiver.has_pending());
+
+        process_hashed_candidate(
+            &slot,
+            &work,
+            HashedCandidate {
+                nonce,
+                hash,
+                reported_gpu_hash: Some(hash),
+                batch_identity: Some(batch),
+            },
+            &proofs,
+            &telemetry,
+        )
+        .unwrap();
+        let queued = receiver.take_next().unwrap();
+        assert_eq!(queued.batch_identity, Some(batch));
+        revalidate_queued_proof(&slot, &queued, &telemetry)
+            .expect("GPU proof must pass the existing final CPU preflight");
+        assert_eq!(telemetry.count(1, ProofMetric::GpuCandidatesCpuVerified), 1);
+        assert_eq!(telemetry.count(1, ProofMetric::GpuBatchIdentityRejected), 1);
+    }
+
+    #[test]
+    fn gpu_candidate_from_invalidated_work_generation_is_never_queued() {
+        let manifest = DeploymentManifest::load(Network::Testnet).unwrap();
+        let slot = NodeSlot::new(1);
+        let miner = Address::with_last_byte(8);
+        let contract = Address::with_last_byte(9);
+        let state = eligible_state();
+        let start = Instant::now();
+        let first_block = test_block(1, 100);
+        slot.set_work_at(
+            &manifest,
+            miner,
+            contract,
+            Some(&state),
+            &first_block,
+            start,
+        )
+        .unwrap();
+        let old_work = slot.current_work_at(start).unwrap();
+        let nonce = u128::from(u64::MAX) + 5;
+        let hash = old_work.hasher.hash(nonce);
+        let batch = GpuBatchIdentity {
+            node_id: 1,
+            generation: old_work.generation,
+            window_id: old_work.fingerprint.hashing_context.window_id,
+            first_nonce: nonce,
+            nonce_count: 1,
+        };
+
+        let mut new_state = state;
+        new_state.work.seed = B256::with_last_byte(0xa7);
+        slot.set_work_at(
+            &manifest,
+            miner,
+            contract,
+            Some(&new_state),
+            &test_block(2, 101),
+            start + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_ne!(slot.generation(), old_work.generation);
+
+        let telemetry = ProofPipelineTelemetry::default();
+        let (proofs, receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        process_hashed_candidate(
+            &slot,
+            &old_work,
+            HashedCandidate {
+                nonce,
+                hash,
+                reported_gpu_hash: Some(hash),
+                batch_identity: Some(batch),
+            },
+            &proofs,
+            &telemetry,
+        )
+        .unwrap();
+        assert!(!receiver.has_pending());
+        assert_eq!(
+            telemetry.count(1, ProofMetric::WorkerStaleGenerationHash),
+            1
+        );
+    }
+
+    #[test]
+    fn automatic_backend_fallback_starts_shared_allocator_cpu_workers() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (proof_sender, _proof_receiver) =
+            proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let context = MiningWorkerContext {
+            slots: Arc::new((1..=9).map(NodeSlot::new).collect()),
+            schedule: Arc::new(RwLock::new(Vec::new())),
+            stop: Arc::clone(&stop),
+            cursor: Arc::new(AtomicUsize::new(0)),
+            total_hashes: Arc::new(AtomicU64::new(0)),
+            proofs: proof_sender,
+            telemetry: Arc::new(ProofPipelineTelemetry::default()),
+        };
+        let controller = thread::spawn(move || {
+            activate_cpu_fallback(2, context, events, "test-injected GPU failure".to_owned());
+        });
+        let event = receiver.blocking_recv().unwrap();
+        assert!(matches!(
+            event,
+            super::BackendEvent::Activated(ActiveBackend::Cpu { threads: 2 })
+        ));
+        let fallback_notice = receiver.blocking_recv().unwrap();
+        assert!(matches!(
+            fallback_notice,
+            super::BackendEvent::FallbackNotice(reason)
+                if reason.contains("test-injected GPU failure")
+        ));
+        stop.store(true, Ordering::Release);
+        controller.join().unwrap();
     }
 
     #[test]
@@ -4915,6 +5627,7 @@ mod tests {
             hash: proof_hash,
             target: state.work.target,
             incumbent: None,
+            batch_identity: None,
             queued_at: start,
         };
 
@@ -4984,6 +5697,7 @@ mod tests {
             hash: work_hash,
             target,
             incumbent: None,
+            batch_identity: None,
             queued_at: start,
         };
         let telemetry = ProofPipelineTelemetry::default();
@@ -5159,6 +5873,7 @@ mod tests {
                     hash: queued_hash,
                     target: state.work.target,
                     incumbent: None,
+                    batch_identity: None,
                     queued_at: Instant::now(),
                 },
                 &telemetry,
@@ -5242,6 +5957,7 @@ mod tests {
             hash: B256::with_last_byte(1),
             target: U256::MAX,
             incumbent: None,
+            batch_identity: None,
             queued_at: Instant::now(),
         };
 
@@ -5269,6 +5985,7 @@ mod tests {
             hash: B256::with_last_byte(1),
             target: U256::MAX,
             incumbent: None,
+            batch_identity: None,
             queued_at: Instant::now(),
         };
         assert!(sender.deliver(proof.clone(), &telemetry));
@@ -5368,6 +6085,7 @@ mod tests {
         let error = super::run(
             &store,
             MineArgs {
+                device: DeviceChoice::Cpu,
                 compute_only: false,
                 threads: None,
                 nodes: Vec::new(),
@@ -5391,6 +6109,7 @@ mod tests {
         let error = super::run(
             &store,
             MineArgs {
+                device: DeviceChoice::Cpu,
                 compute_only: false,
                 threads: None,
                 nodes: Vec::new(),
@@ -5430,6 +6149,7 @@ mod tests {
             &store,
             read_only.clone(),
             MineArgs {
+                device: DeviceChoice::Cpu,
                 compute_only: false,
                 threads: None,
                 nodes: vec![1],
@@ -5456,6 +6176,7 @@ mod tests {
             &store,
             funded.clone(),
             MineArgs {
+                device: DeviceChoice::Cpu,
                 compute_only: true,
                 threads: None,
                 nodes: vec![1],
@@ -5473,6 +6194,7 @@ mod tests {
             &store,
             funded,
             MineArgs {
+                device: DeviceChoice::Cpu,
                 compute_only: false,
                 threads: None,
                 nodes: vec![1],

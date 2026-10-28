@@ -50,9 +50,13 @@ pub(crate) enum ProofMetric {
     ReceiptConfirmed,
     CandidateUpdated,
     CandidateRejected,
+    GpuCompletedBatches,
+    GpuCandidatesCpuVerified,
+    GpuHashMismatch,
+    GpuBatchIdentityRejected,
 }
 
-const METRIC_COUNT: usize = ProofMetric::CandidateRejected as usize + 1;
+const METRIC_COUNT: usize = ProofMetric::GpuBatchIdentityRejected as usize + 1;
 
 struct NodeCounters {
     values: [AtomicU64; METRIC_COUNT],
@@ -181,7 +185,7 @@ impl ProofPipelineTelemetry {
                     counters.values[metric as usize].load(Ordering::Relaxed)
                 };
                 format!(
-                    "proof-pipeline node={:02} target_valid={} target_valid_not_new_local_best={} incumbent_rejected={} incumbent_passed={} new_local_best={} stale_worker_hash={} worker_deadline_hash_dropped={} worker_stopped_generation={} worker_stopped_deadline={} worker_hash_failures={} nonce_space_exhausted={} queued={} queue_full_coalesced={} queue_candidate_superseded={} queue_replaced_better={} queue_replaced_new_context={} queue_wake_coalesced={} receiver_closed={} received={} generation_revalidated={} generation_dropped={} no_eligible_work={} deadline_expired={} window_mismatch={} context_mismatch={} hash_mismatch={} current_target_rejected={} current_incumbent_rejected={} prior_attempt_suppressed={} unresolved_deferred={} spending_refused={} signing_disabled={} signer_identity_mismatch={} preflight_started={} preflight_rpc_failed={} preflight_stale={} preflight_policy_refused={} preflight_other_failed={} signed={} broadcast={} broadcast_unknown={} receipt_confirmed={} candidate_updated={} candidate_rejected={} dropped_on_shutdown={}",
+                    "proof-pipeline node={:02} target_valid={} target_valid_not_new_local_best={} incumbent_rejected={} incumbent_passed={} new_local_best={} stale_worker_hash={} worker_deadline_hash_dropped={} worker_stopped_generation={} worker_stopped_deadline={} worker_hash_failures={} nonce_space_exhausted={} queued={} queue_full_coalesced={} queue_candidate_superseded={} queue_replaced_better={} queue_replaced_new_context={} queue_wake_coalesced={} receiver_closed={} received={} generation_revalidated={} generation_dropped={} no_eligible_work={} deadline_expired={} window_mismatch={} context_mismatch={} hash_mismatch={} current_target_rejected={} current_incumbent_rejected={} prior_attempt_suppressed={} unresolved_deferred={} spending_refused={} signing_disabled={} signer_identity_mismatch={} preflight_started={} preflight_rpc_failed={} preflight_stale={} preflight_policy_refused={} preflight_other_failed={} signed={} broadcast={} broadcast_unknown={} receipt_confirmed={} candidate_updated={} candidate_rejected={} dropped_on_shutdown={} gpu_batches={} gpu_candidates_cpu_verified={} gpu_hash_mismatch={} gpu_batch_identity_rejected={}",
                     index + 1,
                     count(ProofMetric::TargetValidHashes),
                     count(ProofMetric::TargetValidNotNewLocalBest),
@@ -228,6 +232,10 @@ impl ProofPipelineTelemetry {
                     count(ProofMetric::CandidateUpdated),
                     count(ProofMetric::CandidateRejected),
                     count(ProofMetric::DroppedOnShutdown),
+                    count(ProofMetric::GpuCompletedBatches),
+                    count(ProofMetric::GpuCandidatesCpuVerified),
+                    count(ProofMetric::GpuHashMismatch),
+                    count(ProofMetric::GpuBatchIdentityRejected),
                 )
             })
             .collect()

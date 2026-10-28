@@ -5188,13 +5188,14 @@ mod tests {
         verify_finalization_events, verify_submission_events,
     };
     use crate::{
-        cli::{MineArgs, Network},
+        cli::{DeviceChoice, MineArgs, Network},
         config::{AppConfig, ConfigStore, parse_inj_wei},
         contracts::{AstatineMinerRead, IERC20Read},
         diagnostics::DiagnosticBuffer,
         mining::{
-            DashboardContext, FinalizationOptions, MiningProbe, NodeSlot, ObserverUpdate,
-            finalize_initial_expired_windows, start_read_only_observer, update_slots,
+            ActiveBackend, DashboardContext, FinalizationOptions, MiningProbe, NodeSlot,
+            ObserverUpdate, finalize_initial_expired_windows, start_read_only_observer,
+            update_slots,
         },
         proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
         protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
@@ -8280,6 +8281,13 @@ mod tests {
         prepare_local_test_contracts(&root);
 
         tokio::time::timeout(Duration::from_secs(90), async {
+            // The local Anvil lifecycle can be run against the real GPU backend
+            // with ASTATINE_E2E_DEVICE=gpu; ordinary hosted CI remains CPU-only.
+            let test_device = match std::env::var("ASTATINE_E2E_DEVICE").as_deref() {
+                Ok("gpu") => DeviceChoice::Gpu,
+                Ok("auto") => DeviceChoice::Auto,
+                _ => DeviceChoice::Cpu,
+            };
             let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = port_listener.local_addr().unwrap().port();
             drop(port_listener);
@@ -8312,6 +8320,12 @@ mod tests {
                     .await
                     .unwrap();
             let deployment_wallet = Address::from_str(accounts[0].as_str().unwrap()).unwrap();
+            let forwarding_destination = (test_device == DeviceChoice::Gpu
+                && std::env::var("ASTATINE_E2E_FORWARD_GPU").as_deref() == Ok("1"))
+            .then_some(deployment_wallet);
+            assert!(forwarding_destination.is_none_or(|destination| destination != account));
+            let forwarding_destination_text =
+                forwarding_destination.map(|address| format!("{address:#x}"));
             let funded_balance = U256::from(1_000_u64) * U256::from(10_u8).pow(U256::from(18));
             rpc_request_local(
                 &rpc,
@@ -8331,6 +8345,7 @@ mod tests {
             let allocation = U256::from(1_000_u64) * token_unit;
             let total_allocation = allocation * U256::from(9_u8);
             let reward = U256::from(100_u64) * token_unit;
+            let reward_text = reward.to_string();
             let mut token_init = artifact_bytecode(&token_artifact);
             token_init.extend_from_slice(&abi_uint8_word(decimals));
             let token = deploy_unlocked(&rpc, &endpoint, deployment_wallet, &token_init).await;
@@ -8434,22 +8449,20 @@ mod tests {
             network.delay_next_finalization_fee_quote(Duration::from_millis(250));
             let expired = network.snapshot(Some(account)).await.unwrap();
             assert_eq!(expired.nodes.len(), 9);
+            let node1 = expired
+                .nodes
+                .iter()
+                .find(|node| node.id == 1)
+                .expect("node1 must be in the local snapshot");
             assert!(
-                expired.nodes.iter().any(|node| {
-                    node.id == 1
-                        && node
-                            .state
-                            .as_ref()
-                            .is_some_and(|state| state.finalizable && !state.eligible)
-                }),
+                node1
+                    .state
+                    .as_ref()
+                    .is_some_and(|state| state.finalizable && !state.eligible),
                 "node1 snapshot at block {} timestamp {}: {:?}",
                 expired.block.number,
                 expired.block.timestamp,
-                expired
-                    .nodes
-                    .iter()
-                    .find(|node| node.id == 1)
-                    .and_then(|node| node.state.as_ref())
+                node1
             );
             assert!(expired.nodes.iter().any(|node| {
                 node.id == 3
@@ -8475,10 +8488,11 @@ mod tests {
             let run_network = network.clone();
             let run_signer = clone_signer(&signer);
             let args = MineArgs {
+                device: test_device,
                 compute_only: false,
                 threads: NonZeroUsize::new(32),
                 nodes: vec![1, 3],
-                send_rewards_to: None,
+                send_rewards_to: forwarding_destination,
             };
             let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
             let mut runtime = tokio::spawn(async move {
@@ -8500,7 +8514,14 @@ mod tests {
                 ),
                 Err(_) => panic!("production mining runtime did not start within five seconds"),
             };
-            assert_eq!(probe.worker_threads, 32);
+            let actual_cpu_workers = match &probe.active_backend {
+                ActiveBackend::Cpu { threads } => *threads,
+                ActiveBackend::Gpu(_) => 0,
+            };
+            assert_eq!(probe.cpu_worker_threads, actual_cpu_workers);
+            if test_device == DeviceChoice::Gpu {
+                assert!(matches!(probe.active_backend, ActiveBackend::Gpu(_)));
+            }
             assert_eq!(
                 probe
                     .transaction_state
@@ -8652,8 +8673,34 @@ mod tests {
             .await;
             assert!(first_rewarding_finalization.receipt_status.unwrap());
             wait_for_verified_reward(&store, 1, 1, &probe.history_telemetry).await;
+            if forwarding_destination.is_some() {
+                let forwarded = wait_for_journal_entry_for_window(
+                    &store,
+                    1,
+                    TransactionAction::ForwardReward,
+                    1,
+                    TransactionStatus::MinedSuccess,
+                )
+                .await;
+                assert_eq!(
+                    forwarded.forward_amount_wei.as_deref(),
+                    Some(reward_text.as_str())
+                );
+            }
             let rewarded_snapshot = network.snapshot(Some(account)).await.unwrap();
-            assert!(rewarded_snapshot.ast_balance.is_some_and(|balance| balance >= reward));
+            if forwarding_destination.is_some() {
+                assert_eq!(rewarded_snapshot.ast_balance, Some(U256::ZERO));
+                assert!(network
+                    .snapshot(forwarding_destination)
+                    .await
+                    .unwrap()
+                    .ast_balance
+                    .is_some_and(|balance| balance >= reward));
+            } else {
+                assert!(rewarded_snapshot
+                    .ast_balance
+                    .is_some_and(|balance| balance >= reward));
+            }
             wait_for_dashboard_mined_reward(&probe.transaction_state, reward).await;
             let second_window = wait_for_eligible_window(&network, 1, 2).await;
             wait_for_active_probe(&probe, 1, 2).await;
@@ -8765,6 +8812,14 @@ mod tests {
             rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
                 .await
                 .unwrap();
+            rpc_request_local(
+                &rpc,
+                &endpoint,
+                "anvil_setAutomine",
+                serde_json::json!([true]),
+            )
+            .await
+            .unwrap();
             let node3_second_finalization = wait_for_journal_entry_for_window(
                 &store,
                 3,
@@ -8819,6 +8874,41 @@ mod tests {
                 .unwrap();
             assert_eq!(rewarded_windows.len(), 4);
             assert_eq!(expected_session_mined, reward * U256::from(4));
+            if forwarding_destination.is_some() {
+                let sources = rewarded_journal
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.action == TransactionAction::SubmitProof
+                            && entry.reward_confirmed
+                            && entry.reward_forward_destination.is_some()
+                            && entry
+                                .reward_outcome
+                                .as_deref()
+                                .is_some_and(|outcome| outcome.starts_with("reward-paid:"))
+                    })
+                    .map(|entry| (entry.node_id, entry.window_id))
+                    .collect::<HashSet<_>>();
+                assert_eq!(sources.len(), 4);
+                for (node_id, window_id) in sources {
+                    let forwarded = wait_for_journal_entry_for_window(
+                        &store,
+                        node_id,
+                        TransactionAction::ForwardReward,
+                        window_id,
+                        TransactionStatus::MinedSuccess,
+                    )
+                    .await;
+                    assert_eq!(
+                        forwarded.forward_amount_wei.as_deref(),
+                        Some(reward_text.as_str())
+                    );
+                    assert_eq!(
+                        forwarded.reward_forward_destination.as_deref(),
+                        forwarding_destination_text.as_deref()
+                    );
+                }
+            }
             assert_eq!(
                 wait_for_dashboard_mined_reward(&probe.transaction_state, expected_session_mined)
                     .await,
@@ -8826,7 +8916,37 @@ mod tests {
                 "the live dashboard must show every verified winning window from this invocation"
             );
             let cumulative_balance = network.snapshot(Some(account)).await.unwrap();
-            assert_eq!(cumulative_balance.ast_balance, Some(expected_session_mined));
+            if let Some(destination) = forwarding_destination {
+                assert_eq!(cumulative_balance.ast_balance, Some(U256::ZERO));
+                assert_eq!(
+                    network.snapshot(Some(destination)).await.unwrap().ast_balance,
+                    Some(expected_session_mined)
+                );
+            } else {
+                assert_eq!(cumulative_balance.ast_balance, Some(expected_session_mined));
+            }
+            if forwarding_destination.is_some() {
+                wait_for_no_unresolved_transactions(&store).await;
+                probe.stop_signal.request_stop();
+                let result = tokio::time::timeout(Duration::from_secs(10), &mut runtime)
+                    .await
+                    .expect("GPU forwarding runtime should stop cleanly")
+                    .expect("GPU forwarding runtime task should join");
+                assert!(result.is_ok());
+                return;
+            }
+            if forwarding_destination.is_none() {
+                // Hold the next proof transaction in the local node so shutdown
+                // and journal recovery exercise the pending-broadcast path.
+                rpc_request_local(
+                    &rpc,
+                    &endpoint,
+                    "anvil_setAutomine",
+                    serde_json::json!([false]),
+                )
+                .await
+                .unwrap();
+            }
             let third_window = wait_for_eligible_window(&network, 1, 3).await;
             wait_for_active_probe(&probe, 1, 3).await;
             let node3_third_window =
@@ -8878,10 +8998,11 @@ mod tests {
             let recovery_network = network.clone();
             let recovery_signer = clone_signer(&signer);
             let recovery_args = MineArgs {
+                device: test_device,
                 compute_only: false,
                 threads: NonZeroUsize::new(1),
                 nodes: vec![pending_proof.node_id],
-                send_rewards_to: None,
+                send_rewards_to: forwarding_destination,
             };
             let (recovery_probe_tx, recovery_probe_rx) = tokio::sync::oneshot::channel();
             let mut recovery_runtime = tokio::spawn(async move {
@@ -10029,6 +10150,7 @@ mod tests {
             let run_network = network.clone();
             let run_signer = clone_signer(&signer);
             let args = MineArgs {
+                device: crate::cli::DeviceChoice::Cpu,
                 compute_only: false,
                 threads: NonZeroUsize::new(32),
                 nodes: vec![1],
@@ -10054,7 +10176,7 @@ mod tests {
                 ),
                 Err(_) => panic!("32-worker runtime must start within five seconds"),
             };
-            assert_eq!(probe.worker_threads, 32);
+            assert_eq!(probe.cpu_worker_threads, 32);
             let mut observed_updates = probe.observer_updates.clone();
             let _ = observed_updates.borrow_and_update();
             wait_for_proof_metric(&probe, 1, ProofMetric::TargetValidHashes, 1).await;
@@ -10487,7 +10609,7 @@ mod tests {
             network: Network::Testnet,
             chain_id: 1439,
             address: account,
-            threads: 2,
+            active_backend: Arc::new(RwLock::new(ActiveBackend::Cpu { threads: 2 })),
             spending_limit: parse_inj_wei(&config.per_session_spending_limit_inj).unwrap(),
             transaction_mode: true,
             compute_only: false,
@@ -11187,8 +11309,20 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| {
+            let matching_entries = store
+                .read_transaction_journal()
+                .ok()
+                .flatten()
+                .and_then(|contents| serde_json::from_slice::<super::JournalState>(&contents).ok())
+                .map(|state| {
+                    state
+                        .entries
+                        .into_iter()
+                        .filter(|entry| entry.node_id == node_id && entry.window_id == window_id)
+                        .collect::<Vec<_>>()
+                });
             panic!(
-                "journal did not reach {status:?} for node {node_id} {action:?} window {window_id}"
+                "journal did not reach {status:?} for node {node_id} {action:?} window {window_id}; matching entries: {matching_entries:?}"
             )
         })
     }

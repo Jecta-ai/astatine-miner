@@ -20,7 +20,36 @@ pub enum Command {
     Nodes,
     Status,
     Rewards,
+    Devices,
+    Benchmark(BenchmarkArgs),
     Update(UpdateArgs),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BenchmarkArgs {
+    pub seconds: u8,
+    pub threads: Option<NonZeroUsize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DeviceChoice {
+    #[default]
+    Cpu,
+    Gpu,
+    Auto,
+}
+
+impl FromStr for DeviceChoice {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "cpu" => Ok(Self::Cpu),
+            "gpu" => Ok(Self::Gpu),
+            "auto" => Ok(Self::Auto),
+            _ => Err("device must be cpu, gpu, or auto".to_owned()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +59,7 @@ pub struct UpdateArgs {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct MineArgs {
+    pub device: DeviceChoice,
     pub compute_only: bool,
     pub threads: Option<NonZeroUsize>,
     pub nodes: Vec<u8>,
@@ -106,7 +136,7 @@ fn command() -> ClapCommand {
         .version(env!("CARGO_PKG_VERSION"))
         .about("A native command-line miner for Astatine")
         .long_about(
-            "Astatine is a non-custodial CPU miner. Default mining may sign Testnet proof and finalization transactions within the configured session spending cap. Permissionless finalization can spend gas for empty windows or windows won by another miner. --compute-only never signs or submits transactions. Mainnet transaction signing is disabled.",
+            "Astatine is a non-custodial CPU/GPU miner. CPU is the default backend. GPU candidates are checked again by the canonical CPU WorkHasher before entering the bounded proof pipeline. Default mining may sign Testnet proof and finalization transactions within the configured session spending cap. Permissionless finalization can spend gas for empty windows or windows won by another miner. --compute-only never signs or submits transactions. Mainnet transaction signing is disabled.",
         )
         .subcommand_required(true)
         .arg_required_else_help(true)
@@ -144,7 +174,15 @@ fn command() -> ClapCommand {
         )
         .subcommand(
             ClapCommand::new("mine")
-                .about("Mine eligible Astatine work using the local CPU")
+                .about("Mine eligible Astatine work using the local CPU or a validated GPU")
+                .arg(
+                    Arg::new("device")
+                        .long("device")
+                        .value_name("DEVICE")
+                        .value_parser(clap::value_parser!(DeviceChoice))
+                        .default_value("cpu")
+                        .help("Compute backend: cpu (default), gpu, or auto"),
+                )
                 .arg(
                     Arg::new("compute-only")
                         .long("compute-only")
@@ -179,6 +217,26 @@ fn command() -> ClapCommand {
         .subcommand(wallet_command())
         .subcommand(network_command())
         .subcommand(ClapCommand::new("nodes").about("Show the configured mining nodes"))
+        .subcommand(ClapCommand::new("devices").about("List compute devices and run GPU SHA-256d self-tests"))
+        .subcommand(
+            ClapCommand::new("benchmark")
+                .about("Measure canonical CPU/GPU SHA-256d throughput without RPC or transactions")
+                .arg(
+                    Arg::new("seconds")
+                        .long("seconds")
+                        .value_name("N")
+                        .value_parser(clap::value_parser!(u8).range(1..=60))
+                        .default_value("5")
+                        .help("Benchmark duration per backend (1-60 seconds)"),
+                )
+                .arg(
+                    Arg::new("threads")
+                        .long("threads")
+                        .value_name("N")
+                        .value_parser(clap::value_parser!(NonZeroUsize))
+                        .help("CPU baseline thread count (defaults to the conservative CPU budget)"),
+                ),
+        )
         .subcommand(ClapCommand::new("status").about("Show local miner status"))
         .subcommand(ClapCommand::new("rewards").about("Show the verified AST token balance"))
         .subcommand(
@@ -255,6 +313,10 @@ fn parse_matches(matches: &ArgMatches) -> Command {
             transaction_confirmations: args.get_one::<u8>("confirmation-blocks").copied(),
         }),
         Some(("mine", args)) => Command::Mine(MineArgs {
+            device: args
+                .get_one::<DeviceChoice>("device")
+                .copied()
+                .unwrap_or_default(),
             compute_only: args.get_flag("compute-only"),
             threads: args.get_one::<NonZeroUsize>("threads").copied(),
             nodes: args
@@ -293,6 +355,13 @@ fn parse_matches(matches: &ArgMatches) -> Command {
         Some(("nodes", _)) => Command::Nodes,
         Some(("status", _)) => Command::Status,
         Some(("rewards", _)) => Command::Rewards,
+        Some(("devices", _)) => Command::Devices,
+        Some(("benchmark", args)) => Command::Benchmark(BenchmarkArgs {
+            seconds: *args
+                .get_one::<u8>("seconds")
+                .expect("benchmark duration has a default"),
+            threads: args.get_one::<NonZeroUsize>("threads").copied(),
+        }),
         Some(("update", args)) => Command::Update(UpdateArgs {
             check_only: args.get_flag("check"),
         }),
@@ -302,7 +371,10 @@ fn parse_matches(matches: &ArgMatches) -> Command {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, ImportArgs, Network, WalletCommand, try_parse_from};
+    use super::{
+        BenchmarkArgs, Command, DeviceChoice, ImportArgs, Network, NonZeroUsize, WalletCommand,
+        try_parse_from,
+    };
     use alloy_primitives::Address;
 
     #[test]
@@ -321,6 +393,7 @@ mod tests {
         let Command::Mine(args) = cli.command else {
             panic!("expected mine subcommand");
         };
+        assert_eq!(args.device, DeviceChoice::Cpu);
         assert!(args.compute_only);
         assert_eq!(args.threads.map(|threads| threads.get()), Some(4));
         assert_eq!(args.nodes, [1, 3, 5]);
@@ -334,7 +407,52 @@ mod tests {
             panic!("expected mine subcommand");
         };
         assert!(!args.compute_only);
+        assert_eq!(args.device, DeviceChoice::Cpu);
         assert_eq!(args.send_rewards_to, None);
+    }
+
+    #[test]
+    fn parses_explicit_gpu_device_modes() {
+        for (name, expected) in [
+            ("cpu", DeviceChoice::Cpu),
+            ("gpu", DeviceChoice::Gpu),
+            ("auto", DeviceChoice::Auto),
+        ] {
+            let cli = try_parse_from(["astatine", "mine", "--device", name])
+                .expect("device choice should parse");
+            let Command::Mine(args) = cli.command else {
+                panic!("expected mine subcommand");
+            };
+            assert_eq!(args.device, expected);
+        }
+        assert!(try_parse_from(["astatine", "mine", "--device", "cuda"]).is_err());
+    }
+
+    #[test]
+    fn parses_benchmark_as_a_bounded_read_only_command() {
+        assert_eq!(
+            try_parse_from(["astatine", "devices"]).unwrap().command,
+            Command::Devices
+        );
+        let default = try_parse_from(["astatine", "benchmark"]).unwrap();
+        assert_eq!(
+            default.command,
+            Command::Benchmark(BenchmarkArgs {
+                seconds: 5,
+                threads: None
+            })
+        );
+        let explicit =
+            try_parse_from(["astatine", "benchmark", "--seconds", "8", "--threads", "4"]).unwrap();
+        assert_eq!(
+            explicit.command,
+            Command::Benchmark(BenchmarkArgs {
+                seconds: 8,
+                threads: NonZeroUsize::new(4)
+            })
+        );
+        assert!(try_parse_from(["astatine", "benchmark", "--seconds", "0"]).is_err());
+        assert!(try_parse_from(["astatine", "benchmark", "--seconds", "61"]).is_err());
     }
 
     #[test]
@@ -342,6 +460,8 @@ mod tests {
         let lowercase = try_parse_from([
             "astatine",
             "mine",
+            "--device",
+            "gpu",
             "--nodes",
             "1,2,3,4,5,6,7,8,9",
             "--threads",
@@ -353,9 +473,18 @@ mod tests {
         let Command::Mine(args) = lowercase.command else {
             panic!("expected mine subcommand");
         };
+        assert_eq!(args.device, DeviceChoice::Gpu);
         assert_eq!(args.nodes, (1..=9).collect::<Vec<_>>());
         assert_eq!(args.threads.map(|threads| threads.get()), Some(16));
         assert_eq!(args.send_rewards_to, Some(Address::with_last_byte(1)));
+
+        let gpu_compute = try_parse_from(["astatine", "mine", "--device", "gpu", "--compute-only"])
+            .expect("GPU compute-only mode should parse");
+        let Command::Mine(args) = gpu_compute.command else {
+            panic!("expected mine subcommand");
+        };
+        assert_eq!(args.device, DeviceChoice::Gpu);
+        assert!(args.compute_only);
 
         let checksummed = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
         assert!(try_parse_from(["astatine", "mine", "--send-rewards-to", checksummed]).is_ok());

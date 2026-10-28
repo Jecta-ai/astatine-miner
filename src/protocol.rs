@@ -75,6 +75,14 @@ impl WorkHasher {
     pub fn scratch_len(&self) -> usize {
         self.template.len()
     }
+
+    /// Canonical ABI encoding with the nonce word set to zero.
+    ///
+    /// GPU backends use this template and replace only the four big-endian
+    /// 32-bit words that encode the low 128 bits of the ABI `uint128` nonce.
+    pub(crate) fn abi_template(&self) -> &[u8] {
+        &self.template
+    }
 }
 
 pub fn meets_target(hash: B256, target: U256) -> bool {

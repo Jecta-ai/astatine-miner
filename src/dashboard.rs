@@ -203,7 +203,8 @@ pub struct DashboardModel {
     pub inj_balance: Option<U256>,
     pub ast_balance: Option<U256>,
     pub mined_rewards: U256,
-    pub cpu_threads: usize,
+    pub device_label: String,
+    pub device_detail: String,
     pub session_limit: Option<U256>,
     pub session_exposure: Option<U256>,
     pub block_number: u64,
@@ -886,7 +887,11 @@ fn render_wide_header(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel,
             colors,
         ),
         metadata_line("MINED", &format_mined(model.mined_rewards), colors),
-        metadata_line("CPU", &format!("{} Threads", model.cpu_threads), colors),
+        metadata_line(
+            "DEVICE",
+            &format!("{} · {}", model.device_label, model.device_detail),
+            colors,
+        ),
         metadata_line("HASHRATE", &format_hashrate(model.hashrate), colors),
         metadata_line("SESSION", &format_session(model), colors),
     ];
@@ -921,8 +926,9 @@ fn render_compact(
             format_mined(model.mined_rewards)
         ))),
         Line::from(Span::raw(format!(
-            "CPU {} • {} • Session {}",
-            model.cpu_threads,
+            "DEVICE {} {} • {} • Session {}",
+            model.device_label,
+            model.device_detail,
             format_hashrate(model.hashrate),
             format_session(model)
         ))),
@@ -1006,9 +1012,10 @@ fn render_narrow(
     let lines = vec![
         Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
         Line::from(Span::raw(format!(
-            "{} • {}",
+            "{} • {} • {}",
             network_name(model.network),
-            model.mode(Instant::now())
+            model.mode(Instant::now()),
+            model.device_label,
         ))),
         Line::from(Span::raw(format!(
             "{} · INJ {}",
@@ -1539,7 +1546,8 @@ mod tests {
             inj_balance: Some(U256::from(2_948_000_000_000_000_000_u128)),
             ast_balance: Some(U256::from(39_000_000_000_000_u128)),
             mined_rewards: U256::from(26_000_000_000_000_u128),
-            cpu_threads: 6,
+            device_label: "CPU".to_owned(),
+            device_detail: "6 Threads".to_owned(),
             session_limit: Some(U256::from(500_000_000_000_000_000_u128)),
             session_exposure: Some(U256::from(52_000_000_000_000_000_u128)),
             block_number: 144_123_456,
@@ -1616,6 +1624,30 @@ mod tests {
             !text.lines().any(|line| line.starts_with("  02    ")),
             "{text}"
         );
+    }
+
+    #[test]
+    fn dashboard_identifies_the_active_gpu_backend_in_each_layout() {
+        let mut view = model(vec![node(1, NodeStatus::Mining, None)]);
+        view.device_label = "GPU".to_owned();
+        view.device_detail = "Apple M4 · CPU verify".to_owned();
+        for (width, height) in [(100, 24), (70, 24), (50, 14)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_dashboard(frame, &view, None, false))
+                .unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("GPU"),
+                "backend label was clipped at {width} columns: {text}"
+            );
+            if width >= 52 {
+                assert!(
+                    text.contains("Apple M4"),
+                    "GPU model was not rendered at {width} columns: {text}"
+                );
+            }
+        }
     }
 
     #[test]

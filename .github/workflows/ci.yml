@@ -496,9 +496,9 @@ jobs:
           # The rollback scenario must fail internally; clear that expected native exit code after its assertions pass.
           $global:LASTEXITCODE = 0
 
-  publish-testnet9-release:
-    name: Publish gated Testnet.9 prerelease
-    if: github.ref == 'refs/tags/v0.1.0-testnet.9'
+  publish-testnet10-release:
+    name: Publish gated Testnet.10 prerelease
+    if: github.ref == 'refs/tags/v0.1.0-testnet.10'
     needs: [native-checks, dependency-policy, anvil-integration, package-release, windows-package-smoke]
     runs-on: ubuntu-22.04
     permissions:
@@ -513,7 +513,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - support/release-notes-v0.1.0-testnet.9.md "$RUNNER_TEMP/testnet9-release-notes.md" "$GITHUB_SHA" <<'PY'
+          python3 - support/release-notes-v0.1.0-testnet.10.md "$RUNNER_TEMP/testnet10-release-notes.md" "$GITHUB_SHA" <<'PY'
           import pathlib
           import sys
 
@@ -538,21 +538,21 @@ jobs:
             gh release upload "$tag" "${assets[@]}" --repo emyrinj/astatine-miner --clobber
             gh release edit "$tag" --repo emyrinj/astatine-miner \
               --title "Astatine $tag — Injective Testnet" \
-              --notes-file "$RUNNER_TEMP/testnet9-release-notes.md" \
+              --notes-file "$RUNNER_TEMP/testnet10-release-notes.md" \
               --prerelease
           else
             gh release create "$tag" "${assets[@]}" \
               --repo emyrinj/astatine-miner \
               --title "Astatine $tag — Injective Testnet" \
-              --notes-file "$RUNNER_TEMP/testnet9-release-notes.md" \
+              --notes-file "$RUNNER_TEMP/testnet10-release-notes.md" \
               --prerelease
           fi
           gh release view "$tag" --repo emyrinj/astatine-miner --json tagName,isPrerelease,url
 
   post-release-public-install:
     name: Verify public Windows installer after publication
-    if: github.ref == 'refs/tags/v0.1.0-testnet.9'
-    needs: [publish-testnet9-release]
+    if: github.ref == 'refs/tags/v0.1.0-testnet.10'
+    needs: [publish-testnet10-release]
     runs-on: windows-2025
     timeout-minutes: 10
     steps:
