@@ -390,6 +390,7 @@ jobs:
       - name: Verify and install the Windows archive without administrator access
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $Package = Join-Path $env:RUNNER_TEMP 'testnet-package'
           $Archive = Join-Path $Package 'astatine-windows-x86_64.zip'
           $ManifestPath = Join-Path $Package 'update-manifest.txt'
@@ -432,6 +433,7 @@ jobs:
           $HelperRoot = Join-Path $env:RUNNER_TEMP 'astatine-update-helper-smoke'
           $HelperLicenses = Join-Path $HelperRoot 'licenses'
           $HelperExe = Join-Path $HelperRoot 'astatine.exe'
+          New-Item -ItemType Directory -Path $HelperRoot -Force | Out-Null
           New-Item -ItemType Directory -Path $HelperLicenses -Force | Out-Null
           Copy-Item (Join-Path $ExtractDir 'astatine.exe') $HelperExe
           Set-Content -LiteralPath (Join-Path $HelperLicenses 'LICENSE-MIT') 'old MIT notice'
@@ -455,7 +457,10 @@ jobs:
           Copy-Item (Join-Path $ExtractDir 'THIRD_PARTY_LICENSES.md') (Join-Path $HelperLicenses 'THIRD_PARTY_LICENSES.md.update')
           Write-HelperPlan $env:GITHUB_REF_NAME.Substring(1)
           & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/update-windows.ps1 -ParentPid $DummyParent.Id -PlanPath $HelperPlan
-          if ($LASTEXITCODE -ne 0) { throw 'Windows update helper failed its successful install case' }
+          if ($LASTEXITCODE -ne 0) {
+              if (Test-Path -LiteralPath $HelperLog) { Get-Content -LiteralPath $HelperLog }
+              throw 'Windows update helper failed its successful install case'
+          }
           if ((Get-Content (Join-Path $HelperLicenses 'LICENSE-MIT') -Raw) -ne (Get-Content (Join-Path $ExtractDir 'LICENSE-MIT') -Raw)) { throw 'Windows update helper did not install license notices' }
 
           $OldExecutableHash = (Get-FileHash -Path $HelperExe -Algorithm SHA256).Hash
