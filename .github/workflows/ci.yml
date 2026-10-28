@@ -493,6 +493,8 @@ jobs:
           }
           if ((Get-FileHash -Path $HelperExe -Algorithm SHA256).Hash -ne $OldExecutableHash) { throw 'Windows update helper failed to restore the previous executable' }
           if ((Get-Content (Join-Path $HelperLicenses 'LICENSE-MIT') -Raw).Trim() -ne 'preserve this on rollback') { throw 'Windows update helper failed to restore the previous license notice' }
+          # The rollback scenario must fail internally; clear that expected native exit code after its assertions pass.
+          $global:LASTEXITCODE = 0
 
   publish-testnet9-release:
     name: Publish gated Testnet.9 prerelease
