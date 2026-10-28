@@ -170,6 +170,16 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+pub async fn run_check() -> Result<()> {
+    match check_for_update().await? {
+        Some(version) => println!(
+            "Authenticated Astatine update {version} is available; run `astatine update` to install it."
+        ),
+        None => println!("Astatine {CURRENT_VERSION} is current for the Testnet release channel."),
+    }
+    Ok(())
+}
+
 pub async fn check_for_update() -> Result<Option<String>> {
     Ok(latest_signed_update()
         .await?

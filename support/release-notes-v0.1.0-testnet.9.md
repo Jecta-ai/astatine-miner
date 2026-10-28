@@ -12,8 +12,24 @@ Testnet.9 adds opt-in AST reward forwarding and authenticated release updates wh
 ### Authenticated releases and updates
 
 - Signed RSA release manifest binds the Testnet channel, version, five platform archives, five native executables, license notices, SHA-256 digests, and asset sizes.
-- Native update checks verify the pinned signature and each downloaded digest before replacing installed files; failed installations roll back. Configuration, wallets, and transaction journals are untouched.
+- `astatine update --check` verifies the signed manifest without downloading or installing binaries. `astatine update` verifies each downloaded digest before replacing installed files; failed installations roll back. Configuration, wallets, and transaction journals are untouched.
 - GitHub build-provenance attestations are published for the release assets. Verify one with `gh attestation verify <asset> --repo emyrinj/astatine-miner`.
+
+### Install
+
+macOS/Linux one-command install:
+
+```sh
+curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/__RELEASE_COMMIT__/support/install-unix.sh | sh
+```
+
+Windows PowerShell one-command install:
+
+```powershell
+$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/__RELEASE_COMMIT__/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
+```
+
+Both scripts can be downloaded and reviewed before execution; the full commands are in the README.
 
 ### Downloads
 

@@ -69,7 +69,8 @@ pub async fn dispatch(command: Command) -> Result<()> {
         }
         Command::Status => run_status().await,
         Command::Rewards => run_rewards().await,
-        Command::Update => crate::update::run().await,
+        Command::Update(args) if args.check_only => crate::update::run_check().await,
+        Command::Update(_) => crate::update::run().await,
     }
 }
 

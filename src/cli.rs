@@ -20,7 +20,12 @@ pub enum Command {
     Nodes,
     Status,
     Rewards,
-    Update,
+    Update(UpdateArgs),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpdateArgs {
+    pub check_only: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -176,7 +181,16 @@ fn command() -> ClapCommand {
         .subcommand(ClapCommand::new("nodes").about("Show the configured mining nodes"))
         .subcommand(ClapCommand::new("status").about("Show local miner status"))
         .subcommand(ClapCommand::new("rewards").about("Show the verified AST token balance"))
-        .subcommand(ClapCommand::new("update").about("Check for and install an authenticated release update"))
+        .subcommand(
+            ClapCommand::new("update")
+                .about("Check for and install an authenticated release update")
+                .arg(
+                    Arg::new("check")
+                        .long("check")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Check for a newer authenticated release without installing it"),
+                ),
+        )
 }
 
 fn wallet_command() -> ClapCommand {
@@ -279,7 +293,9 @@ fn parse_matches(matches: &ArgMatches) -> Command {
         Some(("nodes", _)) => Command::Nodes,
         Some(("status", _)) => Command::Status,
         Some(("rewards", _)) => Command::Rewards,
-        Some(("update", _)) => Command::Update,
+        Some(("update", args)) => Command::Update(UpdateArgs {
+            check_only: args.get_flag("check"),
+        }),
         _ => unreachable!("top-level command is required and restricted to known commands"),
     }
 }
@@ -415,6 +431,15 @@ mod tests {
         assert_eq!(network.command, Command::NetworkUse(Network::Mainnet));
 
         let update = try_parse_from(["astatine", "update"]).expect("update command should parse");
-        assert_eq!(update.command, Command::Update);
+        assert_eq!(
+            update.command,
+            Command::Update(super::UpdateArgs { check_only: false })
+        );
+        let check = try_parse_from(["astatine", "update", "--check"])
+            .expect("update check command should parse");
+        assert_eq!(
+            check.command,
+            Command::Update(super::UpdateArgs { check_only: true })
+        );
     }
 }

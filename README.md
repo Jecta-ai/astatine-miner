@@ -16,6 +16,14 @@ Requires `curl`, `openssl`, `tar`, and `install`. Supported targets are Apple Si
 curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.9/support/install-unix.sh | sh
 ```
 
+To download and review the installer before executing it:
+
+```sh
+curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.9/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
+less "$HOME/astatine-install-unix.sh"
+sh "$HOME/astatine-install-unix.sh"
+```
+
 Apple Silicon requires macOS 11 or later; Intel requires macOS 10.12 or later. The executable and license notices are installed under `~/.local/bin`; add that directory to `PATH` if needed. Linux configuration, wallets, and transaction journals use `${XDG_CONFIG_HOME:-$HOME/.config}/astatine`.
 
 ### Windows PowerShell
@@ -26,11 +34,21 @@ Supported target: Windows 10 or later, x86_64. The executable is installed under
 $Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.9/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
 ```
 
+To download and review the PowerShell installer before executing it:
+
+```powershell
+$Installer = Join-Path $env:TEMP 'astatine-install.ps1'
+Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.9/support/install-windows.ps1' -OutFile $Installer
+Get-Content -LiteralPath $Installer -Raw
+# After reviewing the script:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
+```
+
 Add `$HOME\bin` to your user `Path`, then open a new PowerShell window and verify with `astatine.exe --version`. Configuration, wallets, and transaction journals remain in `%APPDATA%\Astatine`.
 
 ### Authenticated updates
 
-`astatine update` checks the signed Testnet release manifest, downloads the matching executable and license notices, validates sizes and SHA-256 digests, smoke-tests the new executable, then replaces the installed files with rollback on failure. Windows uses a helper that waits for the updater process to exit before replacing the running executable. Mining checks for newer signed releases in a background task and adds a dashboard notification; it never updates or restarts a running miner automatically. Updates do not modify configuration, wallets, or transaction journals.
+`astatine update --check` verifies the signed release manifest and reports whether a newer Testnet release is available without downloading an executable. `astatine update` checks the signed manifest, downloads the matching executable and license notices, validates sizes and SHA-256 digests, smoke-tests the new executable, then replaces the installed files with rollback on failure. Windows uses a helper that waits for the updater process to exit before replacing the running executable. Mining checks for newer signed releases in a background task and adds a dashboard notification; it never updates or restarts a running miner automatically. Updates do not modify configuration, wallets, or transaction journals.
 
 The archives are authenticated by the pinned RSA-3072 key in addition to HTTPS. Its SHA-256 SubjectPublicKeyInfo fingerprint is `e610269b1a6dffe64eb1b9b4d97e9cca434884f5908a38888e310bdd74322e7c`; the PEM and Windows XML forms are in `support/release-signing-public.*`. macOS binaries are not Developer ID signed or notarized, and Windows binaries are not Authenticode signed; the release manifest signature provides the project-level authenticity check.
 
@@ -44,6 +62,7 @@ astatine mine
 astatine mine --compute-only
 astatine mine --send-rewards-to 0x0123456789abcdef0123456789abcdef01234567
 astatine update
+astatine update --check
 ```
 
 `astatine init` configures the wallet, network, CPU budget, reserve, transaction cap, and confirmation depth. Startup shows configuration, RPC/deployment checks, transaction recovery, wallet unlock, initial work, worker preparation and when historical reward verification is scheduled; detailed history counters are hidden during ordinary startup. Historical reward verification runs in the background so live proof work can continue while older events are checked. Interactive terminals use a subtle spinner, while redirected output uses plain-text progress. The mining dashboard shows live node state, INJ and AST balances, canonically verified rewards mined during the current invocation, hashrate, transaction, and session-exposure status; it distinguishes proof checking, signed-but-not-yet-broadcast, broadcast/confirmation, chain waiting, required/retrying finalization, and policy-blocked finalization. Autonomous mining retains the best queued proof per node in a bounded inbox, revalidates it against current verified work, and reports bounded per-node proof-pipeline counters on exit (including rejection reasons, paid-attempt suppression, broadcast, and verified candidate events). `--compute-only` hashes locally without unlocking a wallet or sending transactions. Use `--nodes 1,3,5` to restrict mining to selected nodes.

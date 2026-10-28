@@ -85,12 +85,15 @@ jobs:
         shell: pwsh
         run: |
           $Readme = Get-Content README.md -Raw
-          $Match = [regex]::Match($Readme, '(?s)```powershell\s*(.*?)\s*```')
-          if (-not $Match.Success) { throw 'Windows PowerShell install instructions were not found' }
+          $CodeBlocks = [regex]::Matches($Readme, '(?s)```powershell\s*(.*?)\s*```')
+          if ($CodeBlocks.Count -eq 0) { throw 'Windows PowerShell install instructions were not found' }
           $Scripts = @{
-            'README.md PowerShell installer' = $Match.Groups[1].Value
             'support/install-windows.ps1' = Get-Content support/install-windows.ps1 -Raw
             'support/update-windows.ps1' = Get-Content support/update-windows.ps1 -Raw
+            'support/verify-public-install-windows.ps1' = Get-Content support/verify-public-install-windows.ps1 -Raw
+          }
+          for ($Index = 0; $Index -lt $CodeBlocks.Count; $Index++) {
+            $Scripts["README.md PowerShell block $Index"] = $CodeBlocks[$Index].Groups[1].Value
           }
           foreach ($Name in $Scripts.Keys) {
             $Tokens = $null
@@ -479,6 +482,21 @@ jobs:
         with:
           name: astatine-${{ github.ref_name }}-release-packages
           path: ${{ runner.temp }}/testnet-package
+      - name: Pin release installer links to the verified commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - support/release-notes-v0.1.0-testnet.9.md "$RUNNER_TEMP/testnet9-release-notes.md" "$GITHUB_SHA" <<'PY'
+          import pathlib
+          import sys
+
+          template = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          commit = sys.argv[3]
+          assert len(commit) == 40 and all(char in "0123456789abcdef" for char in commit)
+          notes = template.replace("__RELEASE_COMMIT__", commit)
+          assert "__RELEASE_COMMIT__" not in notes
+          pathlib.Path(sys.argv[2]).write_text(notes, encoding="utf-8")
+          PY
       - name: Publish prerelease assets after every validation gate passes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -493,13 +511,27 @@ jobs:
             gh release upload "$tag" "${assets[@]}" --repo emyrinj/astatine-miner --clobber
             gh release edit "$tag" --repo emyrinj/astatine-miner \
               --title "Astatine $tag — Injective Testnet" \
-              --notes-file support/release-notes-v0.1.0-testnet.9.md \
+              --notes-file "$RUNNER_TEMP/testnet9-release-notes.md" \
               --prerelease
           else
             gh release create "$tag" "${assets[@]}" \
               --repo emyrinj/astatine-miner \
               --title "Astatine $tag — Injective Testnet" \
-              --notes-file support/release-notes-v0.1.0-testnet.9.md \
+              --notes-file "$RUNNER_TEMP/testnet9-release-notes.md" \
               --prerelease
           fi
           gh release view "$tag" --repo emyrinj/astatine-miner --json tagName,isPrerelease,url
+
+  post-release-public-install:
+    name: Verify public Windows installer after publication
+    if: github.ref == 'refs/tags/v0.1.0-testnet.9'
+    needs: [publish-testnet9-release]
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download and execute the commit-pinned public installer
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/verify-public-install-windows.ps1 -CommitSha $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Public Windows installer verification failed' }
