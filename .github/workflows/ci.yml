@@ -391,6 +391,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
           $Package = Join-Path $env:RUNNER_TEMP 'testnet-package'
           $Archive = Join-Path $Package 'astatine-windows-x86_64.zip'
           $ManifestPath = Join-Path $Package 'update-manifest.txt'
@@ -426,9 +427,19 @@ jobs:
           Copy-Item (Join-Path $ExtractDir 'astatine.exe') (Join-Path $InstallDir 'astatine.exe')
           Copy-Item (Join-Path $ExtractDir 'LICENSE-MIT') (Join-Path $InstallDir 'licenses\LICENSE-MIT')
           Copy-Item (Join-Path $ExtractDir 'THIRD_PARTY_LICENSES.md') (Join-Path $InstallDir 'licenses\THIRD_PARTY_LICENSES.md')
-          & (Join-Path $InstallDir 'astatine.exe') --version
-          & (Join-Path $InstallDir 'astatine.exe') --help | Out-Null
-          & (Join-Path $InstallDir 'astatine.exe') mine --help | Out-Null
+          $InstalledExecutable = Join-Path $InstallDir 'astatine.exe'
+          function Invoke-PackagedExecutableSmoke([string[]]$ExecutableArguments) {
+              Write-Host "Smoke testing packaged Windows executable: $($ExecutableArguments -join ' ')"
+              $ExecutableOutput = & $InstalledExecutable @ExecutableArguments 2>&1
+              $ExecutableExitCode = $LASTEXITCODE
+              if ($ExecutableExitCode -ne 0) {
+                  $ExecutableOutput | ForEach-Object { Write-Host $_ }
+                  throw "Packaged Windows executable failed '$($ExecutableArguments -join ' ')': exit code $ExecutableExitCode"
+              }
+          }
+          Invoke-PackagedExecutableSmoke -ExecutableArguments @('--version')
+          Invoke-PackagedExecutableSmoke -ExecutableArguments @('--help')
+          Invoke-PackagedExecutableSmoke -ExecutableArguments @('mine', '--help')
 
           $HelperRoot = Join-Path $env:RUNNER_TEMP 'astatine-update-helper-smoke'
           $HelperLicenses = Join-Path $HelperRoot 'licenses'
@@ -456,11 +467,13 @@ jobs:
           Copy-Item (Join-Path $ExtractDir 'LICENSE-MIT') (Join-Path $HelperLicenses 'LICENSE-MIT.update')
           Copy-Item (Join-Path $ExtractDir 'THIRD_PARTY_LICENSES.md') (Join-Path $HelperLicenses 'THIRD_PARTY_LICENSES.md.update')
           Write-HelperPlan $env:GITHUB_REF_NAME.Substring(1)
+          Write-Host 'Running Windows updater helper install-success case'
           $HelperOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/update-windows.ps1 -ParentPid $DummyParent.Id -PlanPath $HelperPlan 2>&1
-          if ($LASTEXITCODE -ne 0) {
-              $HelperOutput | ForEach-Object { Write-Host $_ }
+          $HelperExitCode = $LASTEXITCODE
+          $HelperOutput | ForEach-Object { Write-Host $_ }
+          if ($HelperExitCode -ne 0) {
               if (Test-Path -LiteralPath $HelperLog) { Get-Content -LiteralPath $HelperLog }
-              throw 'Windows update helper failed its successful install case'
+              throw "Windows update helper failed its successful install case (exit code $HelperExitCode)"
           }
           if ((Get-Content (Join-Path $HelperLicenses 'LICENSE-MIT') -Raw) -ne (Get-Content (Join-Path $ExtractDir 'LICENSE-MIT') -Raw)) { throw 'Windows update helper did not install license notices' }
 
@@ -470,8 +483,14 @@ jobs:
           Copy-Item (Join-Path $ExtractDir 'LICENSE-MIT') (Join-Path $HelperLicenses 'LICENSE-MIT.update')
           Copy-Item (Join-Path $ExtractDir 'THIRD_PARTY_LICENSES.md') (Join-Path $HelperLicenses 'THIRD_PARTY_LICENSES.md.update')
           Write-HelperPlan '0.0.0-invalid'
+          Write-Host 'Running Windows updater helper rollback case'
           $HelperOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/update-windows.ps1 -ParentPid $DummyParent.Id -PlanPath $HelperPlan 2>&1
-          if ($LASTEXITCODE -eq 0) { throw 'Windows update helper unexpectedly accepted a mismatched smoke-test version' }
+          $HelperExitCode = $LASTEXITCODE
+          $HelperOutput | ForEach-Object { Write-Host $_ }
+          if ($HelperExitCode -eq 0) {
+              if (Test-Path -LiteralPath $HelperLog) { Get-Content -LiteralPath $HelperLog }
+              throw 'Windows update helper unexpectedly accepted a mismatched smoke-test version'
+          }
           if ((Get-FileHash -Path $HelperExe -Algorithm SHA256).Hash -ne $OldExecutableHash) { throw 'Windows update helper failed to restore the previous executable' }
           if ((Get-Content (Join-Path $HelperLicenses 'LICENSE-MIT') -Raw).Trim() -ne 'preserve this on rollback') { throw 'Windows update helper failed to restore the previous license notice' }
 

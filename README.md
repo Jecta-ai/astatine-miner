@@ -13,13 +13,13 @@ Testnet.9 installers verify the signed release manifest and the platform archive
 Requires `curl`, `openssl`, `tar`, and `install`. Supported targets are Apple Silicon and Intel macOS, plus x86_64 and aarch64 Linux (glibc 2.35 or later).
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.9/support/install-unix.sh | sh
+curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/ec58dd7b1e2cdd4a1776e1dc22a7e3b83f6455e3/support/install-unix.sh | sh
 ```
 
 To download and review the installer before executing it:
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.9/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
+curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/ec58dd7b1e2cdd4a1776e1dc22a7e3b83f6455e3/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
 less "$HOME/astatine-install-unix.sh"
 sh "$HOME/astatine-install-unix.sh"
 ```
@@ -31,14 +31,14 @@ Apple Silicon requires macOS 11 or later; Intel requires macOS 10.12 or later. T
 Supported target: Windows 10 or later, x86_64. The executable is installed under your user profile.
 
 ```powershell
-$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.9/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
+$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/ec58dd7b1e2cdd4a1776e1dc22a7e3b83f6455e3/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
 ```
 
 To download and review the PowerShell installer before executing it:
 
 ```powershell
 $Installer = Join-Path $env:TEMP 'astatine-install.ps1'
-Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.9/support/install-windows.ps1' -OutFile $Installer
+Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/ec58dd7b1e2cdd4a1776e1dc22a7e3b83f6455e3/support/install-windows.ps1' -OutFile $Installer
 Get-Content -LiteralPath $Installer -Raw
 # After reviewing the script:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
