@@ -34,6 +34,7 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(80);
 const SNAPSHOT_STALE_AFTER: Duration = Duration::from_secs(20);
 const EMERALD: Color = Color::Rgb(41, 242, 107);
 const AMBER: Color = Color::Rgb(245, 184, 72);
+const GENESIS_AMBER: Color = Color::Rgb(190, 148, 72);
 const ERROR_RED: Color = Color::Rgb(239, 83, 80);
 const MUTED: Color = Color::Rgb(135, 145, 151);
 const LIGHT: Color = Color::Rgb(220, 226, 229);
@@ -47,6 +48,7 @@ pub enum NodeStatus {
     Confirming,
     Syncing,
     Waiting,
+    WaitingForGenesis,
     WaitingForChain,
     FinalizationRequired,
     FinalizationRetrying,
@@ -67,6 +69,7 @@ impl NodeStatus {
             Self::Confirming => "CONFIRMING",
             Self::Syncing => "SYNCING",
             Self::Waiting => "WAITING",
+            Self::WaitingForGenesis => "WAIT GENESIS",
             Self::WaitingForChain => "WAIT CHAIN",
             Self::FinalizationRequired => "FINALIZE",
             Self::FinalizationRetrying => "RETRYING",
@@ -92,6 +95,7 @@ impl NodeStatus {
             | Self::FinalizationBlocked
             | Self::Recovering => AMBER,
             Self::RpcError => ERROR_RED,
+            Self::WaitingForGenesis => GENESIS_AMBER,
             Self::Waiting | Self::Paused | Self::Ended => MUTED,
         }
     }
@@ -259,6 +263,13 @@ impl DashboardModel {
             .any(|node| node.status_at(now) == NodeStatus::WaitingForChain)
         {
             "WAITING FOR CHAIN"
+        } else if !self.selected_nodes.is_empty()
+            && self
+                .selected_nodes
+                .iter()
+                .all(|node| node.status_at(now) == NodeStatus::WaitingForGenesis)
+        {
+            "WAITING FOR GENESIS"
         } else if !self
             .selected_nodes
             .iter()
@@ -857,7 +868,11 @@ fn render_wide_header(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel,
     if area.height == 0 {
         return;
     }
-    let left_width = 31.min(area.width / 2);
+    let left_width = if model.mode(Instant::now()) == "WAITING FOR GENESIS" {
+        39.min(area.width / 2)
+    } else {
+        31.min(area.width / 2)
+    };
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(left_width), Constraint::Min(0)])
@@ -1009,14 +1024,25 @@ fn render_narrow(
         .map(|balance| format_units(balance, 9))
         .unwrap_or_else(|| "--".to_owned());
     let mined = format_units(model.mined_rewards, 9);
-    let lines = vec![
-        Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
-        Line::from(Span::raw(format!(
+    let mode = model.mode(Instant::now());
+    let mode_line = if mode == "WAITING FOR GENESIS" {
+        mode.to_owned()
+    } else {
+        format!(
             "{} • {} • {}",
             network_name(model.network),
-            model.mode(Instant::now()),
-            model.device_label,
-        ))),
+            mode,
+            model.device_label
+        )
+    };
+    let mode_span = if mode == "WAITING FOR GENESIS" {
+        Span::styled(mode_line, style(colors, GENESIS_AMBER, false))
+    } else {
+        Span::raw(mode_line)
+    };
+    let lines = vec![
+        Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
+        Line::from(mode_span),
         Line::from(Span::raw(format!(
             "{} · INJ {}",
             short_address(model.wallet),
@@ -1333,6 +1359,7 @@ fn version_mode_line(model: &DashboardModel, colors: bool) -> Line<'static> {
         | "WAITING FOR CHAIN"
         | "FINALIZATION REQUIRED"
         | "RETRYING FINALIZATION" => AMBER,
+        "WAITING FOR GENESIS" => GENESIS_AMBER,
         "FINALIZATION BLOCKED" => ERROR_RED,
         "RPC ERROR" => ERROR_RED,
         "STALE DATA" => AMBER,
@@ -1525,7 +1552,7 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        DashboardModel, DashboardNode, NodeStatus, WindowCountdown, format_hashrate,
+        DashboardModel, DashboardNode, GENESIS_AMBER, NodeStatus, WindowCountdown, format_hashrate,
         format_mined_value, format_optional_ast_value, format_reward, format_time_left,
         format_units, hashes_per_second, render_dashboard,
     };
@@ -1670,6 +1697,70 @@ mod tests {
         assert!(text.contains("WINDOW"));
         assert!(text.contains("9 selected / 9 total"));
         assert!(!text.contains("10  "));
+    }
+
+    #[test]
+    fn genesis_wait_is_muted_amber_one_row_per_node_without_a_countdown() {
+        let nodes = (1..=9)
+            .map(|id| node(id, NodeStatus::WaitingForGenesis, None))
+            .collect::<Vec<_>>();
+        let view = model(nodes);
+        let now = Instant::now();
+        assert_eq!(view.mode(now), "WAITING FOR GENESIS");
+        assert_eq!(NodeStatus::WaitingForGenesis.label(), "WAIT GENESIS");
+        assert_eq!(NodeStatus::WaitingForGenesis.color(), GENESIS_AMBER);
+        assert!(
+            view.selected_nodes
+                .iter()
+                .all(|node| node.time_left(now).is_none()),
+            "unstarted work must never receive a window countdown"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &view, None, false))
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("WAITING FOR GENESIS"), "{text}");
+        for id in 1..=9 {
+            assert!(
+                text.contains(&format!("{id:02}    #{}    WAIT GENESIS", 100 + id)),
+                "{text}"
+            );
+        }
+        assert!(text.contains("--:--"), "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("WAIT GENESIS"))
+                .count(),
+            9
+        );
+
+        let mut wide_threshold = Terminal::new(TestBackend::new(78, 24)).unwrap();
+        wide_threshold
+            .draw(|frame| render_dashboard(frame, &view, None, false))
+            .unwrap();
+        assert!(
+            buffer_text(&wide_threshold).contains("WAITING FOR GENESIS"),
+            "the exact global genesis status must fit the minimum wide layout"
+        );
+
+        let mut narrow = Terminal::new(TestBackend::new(48, 24)).unwrap();
+        narrow
+            .draw(|frame| render_dashboard(frame, &view, None, false))
+            .unwrap();
+        let narrow_text = buffer_text(&narrow);
+        assert!(narrow_text.contains("WAITING FOR GENESIS"), "{narrow_text}");
+    }
+
+    #[test]
+    fn mixed_genesis_and_active_nodes_do_not_become_globally_waiting_for_genesis() {
+        let view = model(vec![
+            node(1, NodeStatus::Mining, None),
+            node(3, NodeStatus::WaitingForGenesis, None),
+            node(5, NodeStatus::WaitingForGenesis, None),
+        ]);
+        assert_eq!(view.mode(Instant::now()), "LIVE MINING");
     }
 
     #[test]

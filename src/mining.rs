@@ -40,6 +40,7 @@ use tokio::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const GENESIS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const REWARD_SCAN_SERVICE_INTERVAL: Duration = Duration::from_millis(250);
@@ -832,7 +833,13 @@ pub(crate) enum FinalizationState {
 pub(crate) enum ObserverUpdate {
     Snapshot(ReadSnapshot),
     RpcError { message: String, report: bool },
+    GenesisPollError { message: String, report: bool },
     Fatal(String),
+}
+
+enum ObserverWake {
+    FullRefresh,
+    GenesisProbe(Vec<u8>),
 }
 
 pub(crate) struct ReadOnlyObserver {
@@ -897,7 +904,9 @@ impl ReadOnlyObserver {
     pub(crate) fn latest_snapshot(&self) -> Option<ReadSnapshot> {
         match &*self.updates.borrow() {
             ObserverUpdate::Snapshot(snapshot) => Some(snapshot.clone()),
-            ObserverUpdate::RpcError { .. } | ObserverUpdate::Fatal(_) => None,
+            ObserverUpdate::RpcError { .. }
+            | ObserverUpdate::GenesisPollError { .. }
+            | ObserverUpdate::Fatal(_) => None,
         }
     }
 
@@ -1828,6 +1837,11 @@ async fn run_runtime(
                         }
                         if dashboard.is_none() {
                             total_hashes.store(0, Ordering::Relaxed);
+                        }
+                    }
+                    ObserverUpdate::GenesisPollError { message, report } => {
+                        if report && dashboard.is_none() {
+                            report_mining_warning(&dashboard, message);
                         }
                     }
                     ObserverUpdate::Fatal(error) => {
@@ -2886,6 +2900,22 @@ pub(crate) fn update_slots(
     Ok(changed)
 }
 
+fn inactive_genesis_nodes(snapshot: &ReadSnapshot, selected: &HashSet<u8>) -> Vec<u8> {
+    let mut nodes = snapshot
+        .nodes
+        .iter()
+        .filter(|node| selected.contains(&node.id))
+        .filter(|node| node.pin.runtime_verified && node.pin.abi_verified)
+        .filter_map(|node| {
+            node.state
+                .as_ref()
+                .and_then(|state| (!state.work.started && !state.work.ended).then_some(node.id))
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_unstable();
+    nodes
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SnapshotFreshness {
     Current,
@@ -2922,20 +2952,76 @@ pub(crate) fn start_read_only_observer(
         let mut last_observed_at = Instant::now();
         let mut last_head_advanced_at = last_observed_at;
         let mut delay = POLL_INTERVAL;
+        let mut next_full_refresh = time::Instant::now() + delay;
+        let mut genesis_delay = GENESIS_POLL_INTERVAL;
+        let mut next_genesis_poll = time::Instant::now() + genesis_delay;
+        let mut consecutive_genesis_errors = 0_u8;
+        let mut genesis_poll_error_message: Option<String> = None;
         let mut consecutive_errors = 0_u8;
         loop {
-            tokio::select! {
+            let waiting_nodes = inactive_genesis_nodes(&last_snapshot, &context.selected);
+            let wake = tokio::select! {
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
                         break;
                     }
+                    ObserverWake::FullRefresh
                 }
                 refresh = refresh_rx.recv() => {
                     if refresh.is_none() {
                         break;
                     }
+                    ObserverWake::FullRefresh
                 }
-                _ = time::sleep(delay) => {}
+                _ = time::sleep_until(next_full_refresh) => ObserverWake::FullRefresh,
+                _ = time::sleep_until(next_genesis_poll), if !waiting_nodes.is_empty() => {
+                    ObserverWake::GenesisProbe(waiting_nodes)
+                }
+            };
+            match wake {
+                ObserverWake::FullRefresh => {}
+                ObserverWake::GenesisProbe(node_ids) => {
+                    match client.poll_genesis(&node_ids).await {
+                        Ok(candidates) => {
+                            consecutive_genesis_errors = 0;
+                            genesis_delay = GENESIS_POLL_INTERVAL;
+                            next_genesis_poll = time::Instant::now() + genesis_delay;
+                            if let Some(message) = genesis_poll_error_message.take() {
+                                clear_observer_genesis_poll_error(&updater, &node_ids, &message);
+                            }
+                            if candidates.is_empty() {
+                                continue;
+                            }
+                            diagnostics.push(format!(
+                                "genesis activation candidate observed for selected node(s) {candidates:?}; requesting a canonical full refresh"
+                            ));
+                        }
+                        Err(error) => {
+                            consecutive_genesis_errors =
+                                consecutive_genesis_errors.saturating_add(1);
+                            let message = format!(
+                                "genesis status poll failed for selected node(s) {node_ids:?}: {error:#}"
+                            );
+                            let report = consecutive_genesis_errors == 1
+                                || consecutive_genesis_errors.is_multiple_of(5);
+                            if report {
+                                diagnostics.push(message.clone());
+                            }
+                            if observer_genesis_poll_error(&updater, &node_ids, &message) {
+                                genesis_poll_error_message = Some(message.clone());
+                            }
+                            updates_tx
+                                .send_replace(ObserverUpdate::GenesisPollError { message, report });
+                            *observer_last_publication_at
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Instant::now();
+                            genesis_delay = next_poll_delay(genesis_delay);
+                            next_genesis_poll = time::Instant::now() + genesis_delay;
+                            continue;
+                        }
+                    }
+                }
             }
 
             let request_epoch = observer_refresh_epoch.load(Ordering::Acquire);
@@ -2943,20 +3029,30 @@ pub(crate) fn start_read_only_observer(
             let result = client.snapshot(Some(context.address)).await;
             if observer_refresh_epoch.load(Ordering::Acquire) != request_epoch {
                 delay = Duration::ZERO;
+                next_full_refresh = time::Instant::now();
                 continue;
             }
             match result {
-                Ok(snapshot) => {
-                    let freshness = snapshot_freshness(&client, &last_block, &snapshot.block).await;
+                Ok(mut snapshot) => {
+                    let freshness =
+                        match snapshot_freshness(&client, &last_block, &snapshot.block).await {
+                            Ok(SnapshotFreshness::Reorg) => client
+                                .reverify_activated_nodes_after_reorg(&mut snapshot)
+                                .await
+                                .map(|()| SnapshotFreshness::Reorg),
+                            result => result,
+                        };
                     let freshness = match freshness {
                         Ok(freshness) => freshness,
                         Err(error) => {
+                            client.clear_activation_work_verification();
                             let commit = observer_refresh_gate
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if observer_refresh_epoch.load(Ordering::Acquire) != request_epoch {
                                 drop(commit);
                                 delay = Duration::ZERO;
+                                next_full_refresh = time::Instant::now();
                                 continue;
                             }
                             let message = format!("read-only snapshot rejected: {error:#}");
@@ -3046,7 +3142,15 @@ pub(crate) fn start_read_only_observer(
                     last_observed_at = observed_at;
                     consecutive_errors = 0;
                     delay = POLL_INTERVAL;
+                    next_full_refresh = time::Instant::now() + delay;
+                    if consecutive_genesis_errors == 0 {
+                        genesis_delay = GENESIS_POLL_INTERVAL;
+                        if next_genesis_poll <= time::Instant::now() {
+                            next_genesis_poll = time::Instant::now() + genesis_delay;
+                        }
+                    }
                     refresh_dashboard(updater.as_ref(), &context, &snapshot);
+                    genesis_poll_error_message = None;
                     updates_tx.send_replace(ObserverUpdate::Snapshot(snapshot));
                     *observer_last_publication_at
                         .lock()
@@ -3060,9 +3164,11 @@ pub(crate) fn start_read_only_observer(
                     if observer_refresh_epoch.load(Ordering::Acquire) != request_epoch {
                         drop(commit);
                         delay = Duration::ZERO;
+                        next_full_refresh = time::Instant::now();
                         continue;
                     }
                     let message = format!("RPC refresh failed; stale work stopped: {error:#}");
+                    client.clear_activation_work_verification();
                     clear_observed_work(&context, &client.manifest, &last_snapshot.block);
                     observer_rpc_error(
                         &context,
@@ -3083,6 +3189,9 @@ pub(crate) fn start_read_only_observer(
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
                     drop(commit);
                     delay = next_poll_delay(delay);
+                    next_full_refresh = time::Instant::now() + delay;
+                    genesis_delay = next_poll_delay(genesis_delay);
+                    next_genesis_poll = time::Instant::now() + genesis_delay;
                 }
             }
         }
@@ -3104,7 +3213,25 @@ async fn snapshot_freshness(
     next: &crate::rpc::BlockSnapshot,
 ) -> Result<SnapshotFreshness> {
     let previous_canonical = if next.number < previous.number {
-        Some(client.canonical_block_hash(previous.number).await?)
+        match client.canonical_block_hash(previous.number).await {
+            Ok(hash) => Some(hash),
+            Err(previous_error) => {
+                let next_canonical = client.canonical_block_hash(next.number).await?;
+                let current_head = client.latest_block_snapshot().await?;
+                if next_canonical == next.hash
+                    && current_head.number == next.number
+                    && current_head.hash == next.hash
+                {
+                    // A reorging local/provider head may no longer serve the removed height.
+                    // Accept the lower snapshot only when it is itself corroborated and is
+                    // still the current head across the configured RPC set.
+                    return Ok(SnapshotFreshness::Reorg);
+                }
+                return Err(previous_error).context(
+                    "cannot corroborate a lower snapshot after the prior block disappeared",
+                );
+            }
+        }
     } else {
         None
     };
@@ -3307,10 +3434,14 @@ fn traced_node_status(state: Option<&NodeState>, trusted: bool) -> &'static str 
         return "RPC ERROR";
     }
     let state = state.expect("checked above");
-    if state.mining_paused {
-        "PAUSED"
-    } else if !state.work.started || state.work.ended || state.work.remaining_allocation.is_zero() {
+    if state.work.ended {
         "ENDED"
+    } else if !state.work.started {
+        "WAIT GENESIS"
+    } else if state.work.remaining_allocation.is_zero() {
+        "ENDED"
+    } else if state.mining_paused {
+        "PAUSED"
     } else if state.finalizable {
         "FINALIZING"
     } else if state.eligible {
@@ -3389,6 +3520,59 @@ fn observer_rpc_error(
             }
         });
     }
+}
+
+fn observer_genesis_poll_error(
+    updater: &Option<DashboardUpdater>,
+    node_ids: &[u8],
+    message: &str,
+) -> bool {
+    let Some(updater) = updater else {
+        return false;
+    };
+    let mut installed = false;
+    updater.update(|model| installed = apply_genesis_poll_error(model, node_ids, message));
+    installed
+}
+
+fn apply_genesis_poll_error(model: &mut DashboardModel, node_ids: &[u8], message: &str) -> bool {
+    if model.connection_error.is_some() {
+        return false;
+    }
+    model.connection_error = Some(message.to_owned());
+    for node in &mut model.selected_nodes {
+        if node_ids.contains(&node.id) && node.status == NodeStatus::WaitingForGenesis {
+            node.status = NodeStatus::RpcError;
+            node.mining_deadline = None;
+        }
+    }
+    true
+}
+
+fn clear_observer_genesis_poll_error(
+    updater: &Option<DashboardUpdater>,
+    node_ids: &[u8],
+    message: &str,
+) {
+    let Some(updater) = updater else {
+        return;
+    };
+    updater.update(|model| {
+        clear_genesis_poll_error(model, node_ids, message);
+    });
+}
+
+fn clear_genesis_poll_error(model: &mut DashboardModel, node_ids: &[u8], message: &str) -> bool {
+    if model.connection_error.as_deref() != Some(message) {
+        return false;
+    }
+    model.connection_error = None;
+    for node in &mut model.selected_nodes {
+        if node_ids.contains(&node.id) && node.status == NodeStatus::RpcError {
+            node.status = NodeStatus::WaitingForGenesis;
+        }
+    }
+    true
 }
 
 fn dashboard_model(
@@ -3595,10 +3779,14 @@ fn dashboard_node_status(
         return NodeStatus::RpcError;
     }
     let state = state.expect("checked above");
-    if state.mining_paused {
-        NodeStatus::Paused
-    } else if !state.work.started || state.work.ended || state.work.remaining_allocation.is_zero() {
+    if state.work.ended {
         NodeStatus::Ended
+    } else if !state.work.started {
+        NodeStatus::WaitingForGenesis
+    } else if state.work.remaining_allocation.is_zero() {
+        NodeStatus::Ended
+    } else if state.mining_paused {
+        NodeStatus::Paused
     } else if state.finalizable {
         NodeStatus::FinalizationRequired
     } else if state.eligible && has_current_work {
@@ -4529,12 +4717,13 @@ mod tests {
         ActiveBackend, DashboardContext, FinalizationState, HashedCandidate, HashingContext,
         MiningWorkerContext, NodeSlot, NonceAllocator, ObserverUpdate,
         PENDING_PROOF_CANDIDATE_CAPACITY, PendingDashboardSync, ProofFound, SnapshotFreshness,
-        activate_cpu_fallback, compare_snapshot_freshness, dashboard_model, dashboard_node_status,
+        activate_cpu_fallback, apply_genesis_poll_error, clear_genesis_poll_error,
+        compare_snapshot_freshness, dashboard_model, dashboard_node_status,
         finalization_retry_delay, gpu_is_meaningfully_faster, history_profile_enabled,
-        next_poll_delay, next_scheduled_slot, process_hashed_candidate, proof_inbox,
-        reconcile_head_progress, revalidate_queued_proof, revalidate_queued_proof_at,
-        selected_nodes, should_unlock_recovered_wallet, take_observer_update, update_slots,
-        worker_loop,
+        inactive_genesis_nodes, next_poll_delay, next_scheduled_slot, process_hashed_candidate,
+        proof_inbox, reconcile_head_progress, revalidate_queued_proof, revalidate_queued_proof_at,
+        selected_nodes, should_unlock_recovered_wallet, take_observer_update, traced_node_status,
+        update_slots, worker_loop,
     };
     use crate::{
         cli::{DeviceChoice, MineArgs, Network},
@@ -4639,6 +4828,45 @@ mod tests {
             NodeStatus::RpcError
         );
 
+        state.work.started = false;
+        state.work.ended = false;
+        state.work.remaining_allocation = U256::from(10_u8);
+        state.eligible = false;
+        state.finalizable = false;
+        assert_eq!(
+            dashboard_node_status(Some(&state), true, false, false, None),
+            NodeStatus::WaitingForGenesis
+        );
+        assert_eq!(traced_node_status(Some(&state), true), "WAIT GENESIS");
+        state.work.remaining_allocation = U256::ZERO;
+        assert_eq!(
+            dashboard_node_status(Some(&state), true, false, false, None),
+            NodeStatus::WaitingForGenesis,
+            "a verified unstarted node is waiting for genesis even before allocation is visible"
+        );
+        assert_eq!(traced_node_status(Some(&state), true), "WAIT GENESIS");
+        assert_eq!(
+            dashboard_node_status(Some(&state), false, false, false, None),
+            NodeStatus::RpcError,
+            "an inactive but unverified runtime must not be shown as waiting for genesis"
+        );
+        assert_eq!(traced_node_status(Some(&state), false), "RPC ERROR");
+        state.work.ended = true;
+        assert_eq!(
+            dashboard_node_status(Some(&state), true, false, false, None),
+            NodeStatus::Ended,
+            "a permanently ended node must not wait for genesis"
+        );
+
+        state.work.started = true;
+        state.work.ended = false;
+        assert_eq!(
+            dashboard_node_status(Some(&state), true, false, false, None),
+            NodeStatus::Ended,
+            "an active node with exhausted allocation is ended"
+        );
+        assert_eq!(traced_node_status(Some(&state), true), "ENDED");
+        state.work.remaining_allocation = U256::from(10_u8);
         state.mining_paused = true;
         assert_eq!(
             dashboard_node_status(Some(&state), true, true, true, None),
@@ -4698,6 +4926,133 @@ mod tests {
             ),
             NodeStatus::Recovering
         );
+    }
+
+    #[test]
+    fn genesis_poll_selection_is_limited_to_selected_verified_unstarted_nodes() {
+        let mut inactive = eligible_state();
+        inactive.work.started = false;
+        inactive.eligible = false;
+        inactive.finalizable = false;
+
+        let mut ended = inactive.clone();
+        ended.work.ended = true;
+
+        let mut unallocated = inactive.clone();
+        unallocated.work.remaining_allocation = U256::ZERO;
+
+        let mut exhausted = eligible_state();
+        exhausted.work.remaining_allocation = U256::ZERO;
+
+        let mut nodes = vec![
+            NodeView {
+                id: 1,
+                address: Address::with_last_byte(1),
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(inactive.clone()),
+                error: None,
+            },
+            NodeView {
+                id: 2,
+                address: Address::with_last_byte(2),
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(eligible_state()),
+                error: None,
+            },
+            NodeView {
+                id: 3,
+                address: Address::with_last_byte(3),
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(ended),
+                error: None,
+            },
+            NodeView {
+                id: 4,
+                address: Address::with_last_byte(4),
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(unallocated),
+                error: None,
+            },
+            NodeView {
+                id: 5,
+                address: Address::with_last_byte(5),
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: None,
+                error: Some("state unavailable".to_owned()),
+            },
+            NodeView {
+                id: 6,
+                address: Address::with_last_byte(6),
+                pin: ContractPinStatus {
+                    runtime_verified: false,
+                    abi_verified: false,
+                    error: Some("runtime pin not trusted".to_owned()),
+                },
+                state: Some(inactive),
+                error: None,
+            },
+            NodeView {
+                id: 7,
+                address: Address::with_last_byte(7),
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some({
+                    let mut state = eligible_state();
+                    state.work.started = false;
+                    state.eligible = false;
+                    state.finalizable = false;
+                    state
+                }),
+                error: None,
+            },
+            NodeView {
+                id: 8,
+                address: Address::with_last_byte(8),
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(exhausted),
+                error: None,
+            },
+        ];
+        nodes.reverse();
+        let snapshot = ReadSnapshot {
+            block: test_block(100, 500),
+            native_balance: None,
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes,
+        };
+        let selected = HashSet::from([1, 2, 3, 4, 5, 6, 8]);
+
+        assert_eq!(inactive_genesis_nodes(&snapshot, &selected), [1, 4]);
+        assert!(inactive_genesis_nodes(&snapshot, &HashSet::new()).is_empty());
     }
 
     #[test]
@@ -4798,6 +5153,60 @@ mod tests {
             repeated_read_at
         ));
         assert_eq!(repeated.last_block_advanced_at, repeated_read_at);
+
+        let mut probe_error_model = model.clone();
+        probe_error_model
+            .selected_nodes
+            .iter_mut()
+            .find(|node| node.id == 3)
+            .unwrap()
+            .status = NodeStatus::WaitingForGenesis;
+        let probe_error = "genesis status poll failed for selected node(s) [3]: timeout";
+        assert!(apply_genesis_poll_error(
+            &mut probe_error_model,
+            &[3],
+            probe_error
+        ));
+        assert_eq!(probe_error_model.mode(Instant::now()), "RPC ERROR");
+        assert_eq!(
+            probe_error_model
+                .selected_nodes
+                .iter()
+                .find(|node| node.id == 3)
+                .unwrap()
+                .status,
+            NodeStatus::RpcError
+        );
+        assert_eq!(
+            probe_error_model
+                .selected_nodes
+                .iter()
+                .find(|node| node.id == 1)
+                .unwrap()
+                .status,
+            NodeStatus::Mining,
+            "an inactive-node poll error must not mark other selected mining nodes failed"
+        );
+        assert!(!clear_genesis_poll_error(
+            &mut probe_error_model,
+            &[3],
+            "a different RPC error"
+        ));
+        assert!(clear_genesis_poll_error(
+            &mut probe_error_model,
+            &[3],
+            probe_error
+        ));
+        assert_eq!(probe_error_model.connection_error, None);
+        assert_eq!(
+            probe_error_model
+                .selected_nodes
+                .iter()
+                .find(|node| node.id == 3)
+                .unwrap()
+                .status,
+            NodeStatus::WaitingForGenesis
+        );
     }
 
     #[test]
@@ -6175,6 +6584,16 @@ mod tests {
 
     #[test]
     fn rpc_retry_backoff_is_exponential_and_bounded() {
+        assert_eq!(
+            super::GENESIS_POLL_INTERVAL,
+            Duration::from_secs(1),
+            "healthy inactive-genesis polling starts at one second"
+        );
+        assert_eq!(
+            next_poll_delay(super::GENESIS_POLL_INTERVAL),
+            Duration::from_secs(2),
+            "a failed genesis poll applies the same bounded exponential backoff"
+        );
         assert_eq!(
             next_poll_delay(super::POLL_INTERVAL),
             Duration::from_secs(10)
