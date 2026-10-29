@@ -1,11 +1,16 @@
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::SolValue;
 use anyhow::{Result, bail};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, block_api::compress256};
 
 pub const MAX_HEADER_LENGTH: usize = 1_024;
 const NONCE_WORD_OFFSET: usize = 6 * 32;
+const SHA256_PREFIX_BLOCKS: usize = NONCE_WORD_OFFSET / 64;
+const SHA256_PREFIX_BYTES: usize = SHA256_PREFIX_BLOCKS * 64;
 const WORK_DOMAIN_V2: [u8; 32] = *b"ASTATINE_WORK_V2\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+const SHA256_INITIAL_STATE: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
 
 pub fn work_domain_v2() -> B256 {
     B256::from(WORK_DOMAIN_V2)
@@ -25,6 +30,7 @@ pub struct WorkContext {
 #[derive(Clone, Debug)]
 pub struct WorkHasher {
     template: Vec<u8>,
+    sha256_prefix_midstate: [u32; 8],
 }
 
 impl WorkHasher {
@@ -45,10 +51,19 @@ impl WorkHasher {
         )
             .abi_encode_params();
 
-        if template.len() < NONCE_WORD_OFFSET + 32 {
+        if template.len() < NONCE_WORD_OFFSET + 32 || template.len() < SHA256_PREFIX_BYTES {
             bail!("Alloy produced a malformed Astatine work ABI tuple");
         }
-        Ok(Self { template })
+        let mut sha256_prefix_midstate = SHA256_INITIAL_STATE;
+        let prefix_blocks = template[..SHA256_PREFIX_BYTES].as_chunks::<64>().0;
+        if prefix_blocks.len() != SHA256_PREFIX_BLOCKS {
+            bail!("Alloy produced an ABI prefix that is not a whole SHA-256 block count");
+        }
+        compress256(&mut sha256_prefix_midstate, prefix_blocks);
+        Ok(Self {
+            template,
+            sha256_prefix_midstate,
+        })
     }
 
     pub fn hash_into(&self, nonce: u128, scratch: &mut [u8]) -> Result<B256> {
@@ -82,6 +97,13 @@ impl WorkHasher {
     /// 32-bit words that encode the low 128 bits of the ABI `uint128` nonce.
     pub(crate) fn abi_template(&self) -> &[u8] {
         &self.template
+    }
+
+    /// SHA-256 chaining state after the three invariant 64-byte ABI blocks
+    /// preceding the nonce word. GPU hashing must resume at byte offset 192;
+    /// this is an internal compression state, not a finalized digest.
+    pub(crate) fn sha256_prefix_midstate(&self) -> [u32; 8] {
+        self.sha256_prefix_midstate
     }
 }
 
@@ -154,5 +176,31 @@ mod tests {
         changed = context;
         changed.header.push(0);
         assert_ne!(WorkHasher::new(&changed).unwrap().hash(nonce), expected);
+    }
+
+    #[test]
+    fn sha256_midstate_tracks_the_abi_prefix_and_ignores_dynamic_header_bytes() {
+        let (context, _, _) = canonical_work();
+        let original = WorkHasher::new(&context).unwrap().sha256_prefix_midstate();
+
+        let mut changed_header = context.clone();
+        changed_header.header.push(0x5a);
+        assert_eq!(
+            WorkHasher::new(&changed_header)
+                .unwrap()
+                .sha256_prefix_midstate(),
+            original,
+            "dynamic header bytes follow the nonce and must not affect the 192-byte prefix"
+        );
+
+        let mut changed_chain = context;
+        changed_chain.chain_id += 1;
+        assert_ne!(
+            WorkHasher::new(&changed_chain)
+                .unwrap()
+                .sha256_prefix_midstate(),
+            original,
+            "a work-context change in the ABI prefix must invalidate the cached midstate"
+        );
     }
 }

@@ -3,7 +3,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version = '0.1.0-testnet.10'
+$Version = '0.1.0-testnet.11'
 $Temp = Join-Path $env:TEMP ("astatine-public-install-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $Temp | Out-Null
 try {

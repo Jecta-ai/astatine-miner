@@ -1,5 +1,5 @@
 $ErrorActionPreference = 'Stop'
-$Version = '0.1.0-testnet.10'
+$Version = '0.1.0-testnet.11'
 $Asset = 'astatine-windows-x86_64.zip'
 $Base = "https://github.com/emyrinj/astatine-miner/releases/download/v$Version"
 $Temp = Join-Path $env:TEMP ("astatine-install-" + [Guid]::NewGuid().ToString('N'))

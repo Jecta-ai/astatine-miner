@@ -8281,13 +8281,25 @@ mod tests {
         prepare_local_test_contracts(&root);
 
         tokio::time::timeout(Duration::from_secs(90), async {
-            // The local Anvil lifecycle can be run against the real GPU backend
-            // with ASTATINE_E2E_DEVICE=gpu; ordinary hosted CI remains CPU-only.
+            // The local Anvil lifecycle can use the physical GPU. Set
+            // ASTATINE_E2E_GPU_NODE_SET=single|three|all to exercise bounded
+            // compute-only scheduling over selected node counts.
             let test_device = match std::env::var("ASTATINE_E2E_DEVICE").as_deref() {
                 Ok("gpu") => DeviceChoice::Gpu,
                 Ok("auto") => DeviceChoice::Auto,
                 _ => DeviceChoice::Cpu,
             };
+            let gpu_compute_nodes = if test_device == DeviceChoice::Gpu {
+                match std::env::var("ASTATINE_E2E_GPU_NODE_SET").as_deref() {
+                    Ok("single") => Some(vec![1]),
+                    Ok("three") => Some(vec![1, 3, 5]),
+                    Ok("all") => Some((1..=9).collect()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let gpu_compute_only = gpu_compute_nodes.is_some();
             let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = port_listener.local_addr().unwrap().port();
             drop(port_listener);
@@ -8445,10 +8457,38 @@ mod tests {
                 decimals,
             )
             .unwrap();
-            network.fail_next_finalization_fee_quote_once();
-            network.delay_next_finalization_fee_quote(Duration::from_millis(250));
+            if gpu_compute_only {
+                rpc_request_local(&rpc, &endpoint, "evm_increaseTime", serde_json::json!([90]))
+                    .await
+                    .unwrap();
+                rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+                    .await
+                    .unwrap();
+                for (_, miner, _) in &miners {
+                    let finalize = AstatineMinerRead::finalizeWindowCall {}.abi_encode();
+                    send_unlocked(
+                        &rpc,
+                        &endpoint,
+                        deployment_wallet,
+                        Some(*miner),
+                        &finalize,
+                        U256::ZERO,
+                    )
+                    .await;
+                }
+            } else {
+                network.fail_next_finalization_fee_quote_once();
+                network.delay_next_finalization_fee_quote(Duration::from_millis(250));
+            }
             let expired = network.snapshot(Some(account)).await.unwrap();
             assert_eq!(expired.nodes.len(), 9);
+            if gpu_compute_only {
+                assert!(expired.nodes.iter().all(|node| {
+                    node.state
+                        .as_ref()
+                        .is_some_and(|state| state.eligible && !state.finalizable)
+                }));
+            } else {
             let node1 = expired
                 .nodes
                 .iter()
@@ -8471,6 +8511,7 @@ mod tests {
                         .as_ref()
                         .is_some_and(|state| state.eligible && !state.finalizable)
             }));
+            }
             let temp = tempdir().unwrap();
             let store = ConfigStore::at_root(temp.path().to_path_buf());
             let config = AppConfig {
@@ -8489,10 +8530,14 @@ mod tests {
             let run_signer = clone_signer(&signer);
             let args = MineArgs {
                 device: test_device,
-                compute_only: false,
+                compute_only: gpu_compute_only,
                 threads: NonZeroUsize::new(32),
-                nodes: vec![1, 3],
-                send_rewards_to: forwarding_destination,
+                nodes: gpu_compute_nodes.clone().unwrap_or_else(|| vec![1, 3]),
+                send_rewards_to: if gpu_compute_only {
+                    None
+                } else {
+                    forwarding_destination
+                },
             };
             let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
             let mut runtime = tokio::spawn(async move {
@@ -8521,6 +8566,203 @@ mod tests {
             assert_eq!(probe.cpu_worker_threads, actual_cpu_workers);
             if test_device == DeviceChoice::Gpu {
                 assert!(matches!(probe.active_backend, ActiveBackend::Gpu(_)));
+            }
+            if let Some(selected_gpu_nodes) = gpu_compute_nodes.as_ref() {
+                assert!(matches!(probe.active_backend, ActiveBackend::Gpu(_)));
+                probe.proof_processing_gate.send_replace(false);
+                assert_eq!(
+                    probe
+                        .schedule
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .len(),
+                    selected_gpu_nodes.len(),
+                    "GPU compute-only run must schedule exactly its selected independent slots"
+                );
+                let initial = network.snapshot(Some(account)).await.unwrap();
+                assert_eq!(initial.nodes.len(), 9);
+                assert!(initial.nodes.iter().all(|node| {
+                    node.state
+                        .as_ref()
+                        .is_some_and(|state| state.eligible && !state.finalizable)
+                }));
+                let mut starting_hashes = [0_u64; 9];
+                let mut starting_generations = [0_u64; 9];
+                for &node_id in selected_gpu_nodes {
+                    let node = initial
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == node_id)
+                        .expect("selected node appears in the nine-node snapshot");
+                    let state = node.state.as_ref().expect("all nine nodes have work");
+                    let index = usize::from(node_id - 1);
+                    starting_hashes[index] = probe.slots[index].completed_hashes();
+                    starting_generations[index] = probe.slots[index].generation();
+                    wait_for_active_probe(&probe, node_id, state.work.window_id).await;
+                    wait_for_hash_increase(&probe, node_id, starting_hashes[index]).await;
+                }
+                for &node_id in selected_gpu_nodes {
+                    assert!(
+                        probe
+                            .proof_telemetry
+                            .count(node_id, ProofMetric::GpuCompletedBatches)
+                            > 0,
+                        "selected node {node_id:02} must receive GPU batches"
+                    );
+                    assert!(
+                        probe
+                            .proof_telemetry
+                            .count(node_id, ProofMetric::GpuCandidatesCpuVerified)
+                            > 0,
+                        "selected node {node_id:02} must CPU-verify its reduced GPU winner"
+                    );
+                    assert_eq!(
+                        probe
+                            .proof_telemetry
+                            .count(node_id, ProofMetric::GpuHashMismatch),
+                        0
+                    );
+                    assert_eq!(
+                        probe
+                            .proof_telemetry
+                            .count(node_id, ProofMetric::GpuBatchIdentityRejected),
+                        0
+                    );
+                }
+
+                let mut observer_updates = probe.observer_updates.clone();
+                let _ = observer_updates.borrow_and_update();
+                rpc_request_local(
+                    &rpc,
+                    &endpoint,
+                    "evm_increaseTime",
+                    serde_json::json!([90]),
+                )
+                .await
+                .unwrap();
+                rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+                    .await
+                    .unwrap();
+                probe.observer_refresh.force_refresh();
+                let expired_all =
+                    wait_for_observer_snapshot(&mut observer_updates, initial.block.number + 1)
+                        .await;
+                assert!(expired_all.nodes.iter().all(|node| {
+                    node.state
+                        .as_ref()
+                        .is_some_and(|state| state.finalizable && !state.eligible)
+                }));
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if probe
+                            .slots
+                            .iter()
+                            .all(|slot| slot.active_window_id().is_none())
+                        {
+                            break;
+                        }
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("all expired GPU work must be invalidated");
+                let expired_hashes = probe
+                    .slots
+                    .iter()
+                    .map(NodeSlot::completed_hashes)
+                    .collect::<Vec<_>>();
+                let mut drained_hashes = expired_hashes.clone();
+                let mut stable_samples = 0;
+                for _ in 0..40 {
+                    sleep(Duration::from_millis(50)).await;
+                    let current = probe
+                        .slots
+                        .iter()
+                        .map(NodeSlot::completed_hashes)
+                        .collect::<Vec<_>>();
+                    if current == drained_hashes {
+                        stable_samples += 1;
+                        if stable_samples >= 4 {
+                            break;
+                        }
+                    } else {
+                        drained_hashes = current;
+                        stable_samples = 0;
+                    }
+                }
+                assert!(
+                    stable_samples >= 4,
+                    "GPU hashes must stop growing after expired work drains"
+                );
+                let in_flight_hashes = drained_hashes
+                    .iter()
+                    .zip(&expired_hashes)
+                    .map(|(current, before)| current.saturating_sub(*before))
+                    .sum::<u64>();
+                assert!(
+                    in_flight_hashes <= (crate::gpu::MAX_GPU_BATCH_SIZE * 2) as u64,
+                    "only the bounded two-batch pipeline may finish stale work"
+                );
+
+                for (_, miner, _) in &miners {
+                    let finalize = AstatineMinerRead::finalizeWindowCall {}.abi_encode();
+                    send_unlocked(
+                        &rpc,
+                        &endpoint,
+                        deployment_wallet,
+                        Some(*miner),
+                        &finalize,
+                        U256::ZERO,
+                    )
+                    .await;
+                }
+                let next_work = network.snapshot(Some(account)).await.unwrap();
+                assert!(next_work.nodes.iter().all(|node| {
+                    node.state
+                        .as_ref()
+                        .is_some_and(|state| state.eligible && !state.finalizable)
+                }));
+                probe.observer_refresh.force_refresh();
+                let observed_next = wait_for_observer_snapshot(
+                    &mut observer_updates,
+                    next_work.block.number,
+                )
+                .await;
+                for &node_id in selected_gpu_nodes {
+                    let node = observed_next
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == node_id)
+                        .expect("selected node appears after the context transition");
+                    let state = node.state.as_ref().expect("selected node advances");
+                    let index = usize::from(node_id - 1);
+                    assert!(probe.slots[index].generation() > starting_generations[index]);
+                    wait_for_active_probe(&probe, node_id, state.work.window_id).await;
+                    wait_for_hash_increase(&probe, node_id, drained_hashes[index]).await;
+                    assert_eq!(
+                        probe
+                            .proof_telemetry
+                            .count(node_id, ProofMetric::GpuHashMismatch),
+                        0
+                    );
+                    assert_eq!(
+                        probe
+                            .proof_telemetry
+                            .count(node_id, ProofMetric::GpuBatchIdentityRejected),
+                        0
+                    );
+                }
+                assert!(
+                    store.read_transaction_journal().unwrap().is_none(),
+                    "compute-only GPU lifecycle must remain transaction-free"
+                );
+                probe.stop_signal.request_stop();
+                let result = tokio::time::timeout(Duration::from_secs(20), &mut runtime)
+                    .await
+                    .expect("GPU compute-only runtime should stop cleanly")
+                    .expect("GPU compute-only runtime task should join");
+                assert!(result.is_ok());
+                return;
             }
             assert_eq!(
                 probe
