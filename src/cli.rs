@@ -25,10 +25,17 @@ pub enum Command {
     Update(UpdateArgs),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BenchmarkArgs {
     pub seconds: u8,
     pub threads: Option<NonZeroUsize>,
+    pub batch_size: Option<usize>,
+    pub workgroup_size: Option<u32>,
+    pub runs: u8,
+    pub profile: bool,
+    pub compare_full_sha: bool,
+    pub serial: bool,
+    pub output_json: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -226,8 +233,8 @@ fn command() -> ClapCommand {
                         .long("seconds")
                         .value_name("N")
                         .value_parser(clap::value_parser!(u8).range(1..=60))
-                        .default_value("5")
-                        .help("Benchmark duration per backend (1-60 seconds)"),
+                        .default_value("10")
+                        .help("Measurement duration per sample (1-60 seconds)"),
                 )
                 .arg(
                     Arg::new("threads")
@@ -235,6 +242,55 @@ fn command() -> ClapCommand {
                         .value_name("N")
                         .value_parser(clap::value_parser!(NonZeroUsize))
                         .help("CPU baseline thread count (defaults to the conservative CPU budget)"),
+                )
+                .arg(
+                    Arg::new("batch-size")
+                        .long("batch-size")
+                        .value_name("N")
+                        .value_parser([
+                            "2048", "8192", "16384", "32768", "65536", "131072", "262144",
+                        ])
+                        .help("Test one bounded GPU nonce batch size"),
+                )
+                .arg(
+                    Arg::new("workgroup-size")
+                        .long("workgroup-size")
+                        .value_name("N")
+                        .value_parser(["32", "64", "128", "256"])
+                        .help("Test one supported GPU workgroup size"),
+                )
+                .arg(
+                    Arg::new("runs")
+                        .long("runs")
+                        .value_name("N")
+                        .value_parser(clap::value_parser!(u8).range(3..=10))
+                        .default_value("3")
+                        .help("Measured repetitions per backend/configuration (3-10)"),
+                )
+                .arg(
+                    Arg::new("profile")
+                        .long("profile")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Sweep all supported GPU batch and workgroup sizes"),
+                )
+                .arg(
+                    Arg::new("compare-full-sha")
+                        .long("compare-full-sha")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Run matched full-SHA and cached-midstate GPU configurations"),
+                )
+                .arg(
+                    Arg::new("serial")
+                        .long("serial")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Disable the bounded two-batch overlap for a synchronous comparison"),
+                )
+                .arg(
+                    Arg::new("output-json")
+                        .long("output-json")
+                        .value_name("PATH")
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .help("Write raw benchmark samples and hardware details as JSON"),
                 ),
         )
         .subcommand(ClapCommand::new("status").about("Show local miner status"))
@@ -361,6 +417,21 @@ fn parse_matches(matches: &ArgMatches) -> Command {
                 .get_one::<u8>("seconds")
                 .expect("benchmark duration has a default"),
             threads: args.get_one::<NonZeroUsize>("threads").copied(),
+            batch_size: args
+                .get_one::<String>("batch-size")
+                .map(|value| value.parse().expect("batch-size parser accepts numbers")),
+            workgroup_size: args.get_one::<String>("workgroup-size").map(|value| {
+                value
+                    .parse()
+                    .expect("workgroup-size parser accepts numbers")
+            }),
+            runs: *args
+                .get_one::<u8>("runs")
+                .expect("benchmark repetitions have a default"),
+            profile: args.get_flag("profile"),
+            compare_full_sha: args.get_flag("compare-full-sha"),
+            serial: args.get_flag("serial"),
+            output_json: args.get_one::<PathBuf>("output-json").cloned(),
         }),
         Some(("update", args)) => Command::Update(UpdateArgs {
             check_only: args.get_flag("check"),
@@ -376,6 +447,7 @@ mod tests {
         try_parse_from,
     };
     use alloy_primitives::Address;
+    use std::path::PathBuf;
 
     #[test]
     fn parses_primary_commands_and_safe_mining_options() {
@@ -438,8 +510,15 @@ mod tests {
         assert_eq!(
             default.command,
             Command::Benchmark(BenchmarkArgs {
-                seconds: 5,
-                threads: None
+                seconds: 10,
+                threads: None,
+                batch_size: None,
+                workgroup_size: None,
+                runs: 3,
+                profile: false,
+                compare_full_sha: false,
+                serial: false,
+                output_json: None,
             })
         );
         let explicit =
@@ -448,11 +527,52 @@ mod tests {
             explicit.command,
             Command::Benchmark(BenchmarkArgs {
                 seconds: 8,
-                threads: NonZeroUsize::new(4)
+                threads: NonZeroUsize::new(4),
+                batch_size: None,
+                workgroup_size: None,
+                runs: 3,
+                profile: false,
+                compare_full_sha: false,
+                serial: false,
+                output_json: None,
             })
         );
         assert!(try_parse_from(["astatine", "benchmark", "--seconds", "0"]).is_err());
         assert!(try_parse_from(["astatine", "benchmark", "--seconds", "61"]).is_err());
+        assert!(try_parse_from(["astatine", "benchmark", "--batch-size", "4096"]).is_err());
+        assert!(try_parse_from(["astatine", "benchmark", "--workgroup-size", "16"]).is_err());
+        assert!(try_parse_from(["astatine", "benchmark", "--runs", "2"]).is_err());
+
+        let profile = try_parse_from([
+            "astatine",
+            "benchmark",
+            "--batch-size",
+            "65536",
+            "--workgroup-size",
+            "128",
+            "--runs",
+            "5",
+            "--profile",
+            "--compare-full-sha",
+            "--serial",
+            "--output-json",
+            "profile.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            profile.command,
+            Command::Benchmark(BenchmarkArgs {
+                seconds: 10,
+                threads: None,
+                batch_size: Some(65_536),
+                workgroup_size: Some(128),
+                runs: 5,
+                profile: true,
+                compare_full_sha: true,
+                serial: true,
+                output_json: Some(PathBuf::from("profile.json")),
+            })
+        );
     }
 
     #[test]

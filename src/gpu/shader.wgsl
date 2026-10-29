@@ -1,8 +1,14 @@
-const INPUT_HEADER_WORDS: u32 = 23u;
+const INPUT_HEADER_WORDS: u32 = 31u;
 // WorkHasher's ABI uint128 is at byte offset 6*32. Its upper 64 bits occupy
 // words 48..51 (zero); nonce limbs, most-significant first, occupy 52..55.
 const NONCE_WORD_START: u32 = 52u;
+// SHA-256 can resume from the cached state after the three invariant ABI blocks.
+const SHA256_PREFIX_BLOCKS: u32 = 3u;
+const SHA256_PREFIX_WORDS: u32 = SHA256_PREFIX_BLOCKS * 16u;
+const MIDSTATE_WORD_START: u32 = 23u;
 const RESULT_WORDS: u32 = 13u;
+override WORKGROUP_SIZE: u32 = 32u;
+override USE_MIDSTATE: u32 = 1u;
 
 const INITIAL_STATE: array<u32, 8> = array<u32, 8>(
     0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
@@ -33,6 +39,10 @@ var<storage, read> input_words: array<u32>;
 
 @group(0) @binding(1)
 var<storage, read_write> result_words: array<u32>;
+
+var<workgroup> candidate_valid: array<u32, WORKGROUP_SIZE>;
+var<workgroup> candidate_hashes: array<u32, WORKGROUP_SIZE * 8u>;
+var<workgroup> candidate_nonces: array<u32, WORKGROUP_SIZE * 4u>;
 
 fn rotate_right(value: u32, shift: u32) -> u32 {
     return (value >> shift) | (value << (32u - shift));
@@ -103,8 +113,24 @@ fn hash_work(nonce: array<u32, 4>) -> array<u32, 8> {
     let message_words = message_bytes / 4u;
     let block_count = (message_bytes + 72u) / 64u;
     var state = INITIAL_STATE;
+    var first_block = 0u;
+    var template_prefix_words = 0u;
+    if (USE_MIDSTATE != 0u) {
+        state = array<u32, 8>(
+            input_words[MIDSTATE_WORD_START],
+            input_words[MIDSTATE_WORD_START + 1u],
+            input_words[MIDSTATE_WORD_START + 2u],
+            input_words[MIDSTATE_WORD_START + 3u],
+            input_words[MIDSTATE_WORD_START + 4u],
+            input_words[MIDSTATE_WORD_START + 5u],
+            input_words[MIDSTATE_WORD_START + 6u],
+            input_words[MIDSTATE_WORD_START + 7u],
+        );
+        first_block = SHA256_PREFIX_BLOCKS;
+        template_prefix_words = SHA256_PREFIX_WORDS;
+    }
 
-    for (var block_index = 0u; block_index < block_count; block_index = block_index + 1u) {
+    for (var block_index = first_block; block_index < block_count; block_index = block_index + 1u) {
         var block: array<u32, 16>;
         for (var word_index = 0u; word_index < 16u; word_index = word_index + 1u) {
             let absolute_word = block_index * 16u + word_index;
@@ -113,7 +139,7 @@ fn hash_work(nonce: array<u32, 4>) -> array<u32, 8> {
                 if (absolute_word >= NONCE_WORD_START && absolute_word < NONCE_WORD_START + 4u) {
                     word = nonce[absolute_word - NONCE_WORD_START];
                 } else {
-                    word = input_words[INPUT_HEADER_WORDS + absolute_word];
+                    word = input_words[INPUT_HEADER_WORDS + absolute_word - template_prefix_words];
                 }
             } else if (absolute_word == message_words) {
                 word = 0x80000000u;
@@ -195,26 +221,91 @@ fn beats_incumbent(hash: array<u32, 8>) -> bool {
     return false;
 }
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn candidate_is_better(left: u32, right: u32) -> bool {
+    for (var word = 0u; word < 8u; word = word + 1u) {
+        let left_word = candidate_hashes[left * 8u + word];
+        let right_word = candidate_hashes[right * 8u + word];
+        if (left_word < right_word) {
+            return true;
+        }
+        if (left_word > right_word) {
+            return false;
+        }
+    }
+    for (var limb = 0u; limb < 4u; limb = limb + 1u) {
+        let left_limb = candidate_nonces[left * 4u + limb];
+        let right_limb = candidate_nonces[right * 4u + limb];
+        if (left_limb < right_limb) {
+            return true;
+        }
+        if (left_limb > right_limb) {
+            return false;
+        }
+    }
+    return false;
+}
+
+fn copy_candidate(destination: u32, source: u32) {
+    candidate_valid[destination] = candidate_valid[source];
+    for (var word = 0u; word < 8u; word = word + 1u) {
+        candidate_hashes[destination * 8u + word] = candidate_hashes[source * 8u + word];
+    }
+    for (var limb = 0u; limb < 4u; limb = limb + 1u) {
+        candidate_nonces[destination * 4u + limb] = candidate_nonces[source * 4u + limb];
+    }
+}
+
+@compute @workgroup_size(WORKGROUP_SIZE)
+fn main(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+) {
     let invocation = global_id.x;
-    if (invocation >= input_words[1]) {
-        return;
+    candidate_valid[local_index] = 0u;
+    if (invocation < input_words[1]) {
+        let nonce = nonce_for(invocation);
+        let hash = hash_work(nonce);
+        if (hash_meets_target(hash) && beats_incumbent(hash)) {
+            candidate_valid[local_index] = 1u;
+            for (var word = 0u; word < 8u; word = word + 1u) {
+                candidate_hashes[local_index * 8u + word] = hash[word];
+            }
+            for (var limb = 0u; limb < 4u; limb = limb + 1u) {
+                candidate_nonces[local_index * 4u + limb] = nonce[limb];
+            }
+        }
     }
-    let result_offset = invocation * RESULT_WORDS;
-    result_words[result_offset] = 0u;
-    let nonce = nonce_for(invocation);
-    let hash = hash_work(nonce);
-    if (!hash_meets_target(hash) || !beats_incumbent(hash)) {
-        return;
+
+    workgroupBarrier();
+    var reduction_stride = WORKGROUP_SIZE / 2u;
+    loop {
+        if (local_index < reduction_stride) {
+            let other = local_index + reduction_stride;
+            if (candidate_valid[other] != 0u
+                && (candidate_valid[local_index] == 0u || candidate_is_better(other, local_index))) {
+                copy_candidate(local_index, other);
+            }
+        }
+        workgroupBarrier();
+        if (reduction_stride == 1u) {
+            break;
+        }
+        reduction_stride = reduction_stride / 2u;
     }
-    for (var i = 0u; i < 8u; i = i + 1u) {
-        result_words[result_offset + 1u + i] = hash[i];
+
+    if (local_index == 0u) {
+        let result_offset = workgroup_id.x * RESULT_WORDS;
+        result_words[result_offset] = candidate_valid[0];
+        if (candidate_valid[0] != 0u) {
+            for (var word = 0u; word < 8u; word = word + 1u) {
+                result_words[result_offset + 1u + word] = candidate_hashes[word];
+            }
+            for (var limb = 0u; limb < 4u; limb = limb + 1u) {
+                result_words[result_offset + 9u + limb] = candidate_nonces[limb];
+            }
+        }
     }
-    for (var i = 0u; i < 4u; i = i + 1u) {
-        result_words[result_offset + 9u + i] = nonce[i];
-    }
-    result_words[result_offset] = 1u;
 }
 
 @compute @workgroup_size(1)

@@ -7,7 +7,10 @@ use crate::{
     },
     deployment::DeploymentManifest,
     diagnostics::DiagnosticBuffer,
-    gpu::{GPU_BATCH_SIZE, GpuBatchIdentity, GpuDeviceInfo, GpuEngine},
+    gpu::{
+        GPU_BATCH_SIZE, GpuBatchIdentity, GpuDeviceInfo, GpuEngine, PendingGpuBatch,
+        benchmark_cpu_reference,
+    },
     proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{BlockSnapshot, NetworkClient, NodeState, ReadSnapshot, is_transient_rpc_error},
@@ -151,9 +154,37 @@ impl ActiveBackend {
     fn detail(&self) -> String {
         match self {
             Self::Cpu { threads } => format!("{threads} Threads"),
-            Self::Gpu(info) => format!("{} · CPU verify", info.name),
+            Self::Gpu(info) => {
+                if info.tuned_hashes_per_second == 0 {
+                    format!(
+                        "{} · batch {} · WG{} · CPU verify",
+                        info.name, info.batch_size, info.workgroup_size
+                    )
+                } else if info.cpu_comparison_threads > 0 {
+                    format!(
+                        "{} · batch {} · WG{} · auto GPU {:.1}/CPU {:.1} MH/s",
+                        info.name,
+                        info.batch_size,
+                        info.workgroup_size,
+                        info.tuned_hashes_per_second as f64 / 1_000_000.0,
+                        info.cpu_comparison_hashes_per_second as f64 / 1_000_000.0,
+                    )
+                } else {
+                    format!(
+                        "{} · batch {} · WG{} · {:.2} MH/s · CPU verify",
+                        info.name,
+                        info.batch_size,
+                        info.workgroup_size,
+                        info.tuned_hashes_per_second as f64 / 1_000_000.0,
+                    )
+                }
+            }
         }
     }
+}
+
+fn gpu_is_meaningfully_faster(gpu_hashes_per_second: u64, cpu_hashes_per_second: u64) -> bool {
+    u128::from(gpu_hashes_per_second) * 100 > u128::from(cpu_hashes_per_second) * 110
 }
 
 impl NodeSlot {
@@ -243,11 +274,11 @@ impl NodeSlot {
         self.generation.load(Ordering::Acquire) == generation
     }
 
-    fn reserve_nonces(&self) -> Option<(u128, usize)> {
+    fn reserve_nonces(&self, requested: usize) -> Option<(u128, usize)> {
         self.nonces
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .reserve(NONCE_BATCH_SIZE)
+            .reserve(requested)
     }
 
     fn reset_local_best_for_generation(&self, generation: u64) {
@@ -708,6 +739,13 @@ struct HashedCandidate {
     hash: B256,
     reported_gpu_hash: Option<B256>,
     batch_identity: Option<GpuBatchIdentity>,
+}
+
+struct PendingGpuWorkBatch {
+    slot_index: usize,
+    work: Arc<WorkJob>,
+    identity: GpuBatchIdentity,
+    pending: PendingGpuBatch,
 }
 
 enum BackendEvent {
@@ -1369,13 +1407,18 @@ async fn run_runtime(
                     if let Some(startup) = startup {
                         startup.complete(match &backend {
                             ActiveBackend::Cpu { threads } if args.device == DeviceChoice::Auto => {
-                                format!("GPU unavailable; CPU fallback ready · {threads} thread(s)")
+                                format!(
+                                    "Auto selected CPU by measured throughput · {threads} thread(s)"
+                                )
                             }
                             ActiveBackend::Cpu { threads } => {
                                 format!("CPU fallback ready · {threads} thread(s)")
                             }
                             ActiveBackend::Gpu(info) => {
-                                format!("GPU self-test passed · {} · {}", info.name, info.backend)
+                                format!(
+                                    "GPU self-test passed · {} · {} · batch {} · WG{}",
+                                    info.name, info.backend, info.batch_size, info.workgroup_size
+                                )
                             }
                         });
                     }
@@ -3966,6 +4009,20 @@ fn gpu_worker_controller(
 ) {
     let gpu_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
         let mut engine = GpuEngine::initialize()?;
+        if selection == DeviceChoice::Auto {
+            let cpu_rate = benchmark_cpu_reference(cpu_threads)?;
+            let gpu_rate = engine.info().tuned_hashes_per_second;
+            engine.record_cpu_comparison(cpu_rate, cpu_threads);
+            if !gpu_is_meaningfully_faster(gpu_rate, cpu_rate) {
+                let reason = format!(
+                    "auto selected CPU: measured CPU {:.3} MH/s ({cpu_threads} threads) versus GPU {:.3} MH/s; GPU was not at least 10% faster",
+                    cpu_rate as f64 / 1_000_000.0,
+                    gpu_rate as f64 / 1_000_000.0,
+                );
+                activate_cpu_fallback(cpu_threads, context.clone(), events.clone(), reason);
+                return Ok(());
+            }
+        }
         events
             .send(BackendEvent::Activated(ActiveBackend::Gpu(
                 engine.info().clone(),
@@ -4019,7 +4076,7 @@ fn activate_cpu_fallback(
         Ok(workers) => workers,
         Err(error) => {
             let _ = events.send(BackendEvent::Failed(format!(
-                "GPU failed ({reason}); CPU fallback could not start: {error:#}"
+                "{reason}; CPU backend could not start: {error:#}"
             )));
             return;
         }
@@ -4041,6 +4098,7 @@ fn activate_cpu_fallback(
 
 fn gpu_worker_loop(engine: &mut GpuEngine, context: &MiningWorkerContext) -> Result<()> {
     let mut nonce_exhaustion_reported = false;
+    let mut pending: Option<PendingGpuWorkBatch> = None;
     while !context.stop.load(Ordering::Acquire) {
         let mut active = context
             .schedule
@@ -4049,28 +4107,43 @@ fn gpu_worker_loop(engine: &mut GpuEngine, context: &MiningWorkerContext) -> Res
             .clone();
         active.retain(|index| context.slots[*index].current_work().is_some());
         let Some(slot_index) = next_scheduled_slot(&active, &context.cursor) else {
-            thread::sleep(IDLE_INTERVAL);
+            if let Some(previous) = pending.take() {
+                complete_gpu_work_batch(engine, context, previous)?;
+            } else {
+                thread::sleep(IDLE_INTERVAL);
+            }
             continue;
         };
         let slot = &context.slots[slot_index];
         let Some(work) = slot.current_work() else {
-            thread::sleep(IDLE_INTERVAL);
+            if let Some(previous) = pending.take() {
+                complete_gpu_work_batch(engine, context, previous)?;
+            } else {
+                thread::sleep(IDLE_INTERVAL);
+            }
             continue;
         };
         if !slot.is_generation_current(work.generation) {
             context
                 .telemetry
                 .record(slot.id, ProofMetric::WorkerStoppedGeneration);
+            if let Some(previous) = pending.take() {
+                complete_gpu_work_batch(engine, context, previous)?;
+            }
             continue;
         }
-        let Some((first_nonce, count)) = slot.reserve_nonces() else {
+        let Some((first_nonce, count)) = slot.reserve_nonces(engine.batch_size()) else {
             if !nonce_exhaustion_reported {
                 context
                     .telemetry
                     .record(slot.id, ProofMetric::WorkerNonceRangeExhausted);
                 nonce_exhaustion_reported = true;
             }
-            thread::sleep(IDLE_INTERVAL);
+            if let Some(previous) = pending.take() {
+                complete_gpu_work_batch(engine, context, previous)?;
+            } else {
+                thread::sleep(IDLE_INTERVAL);
+            }
             continue;
         };
         nonce_exhaustion_reported = false;
@@ -4081,57 +4154,112 @@ fn gpu_worker_loop(engine: &mut GpuEngine, context: &MiningWorkerContext) -> Res
             first_nonce,
             nonce_count: count,
         };
-        let result = match engine.hash_batch(
+        let submitted = match engine.dispatch_batch(
             &work.hasher,
             first_nonce,
             count,
             work.target,
             work.incumbent,
-            Some(&context.stop),
+            &context.stop,
         ) {
-            Ok(result) => result,
+            Ok(pending) => pending,
             Err(_error) if context.stop.load(Ordering::Acquire) => return Ok(()),
-            Err(error) => return Err(error).context("execute GPU SHA-256d nonce batch"),
+            Err(error) => return Err(error).context("dispatch GPU SHA-256d nonce batch"),
         };
-        if result.completed_hashes != count {
-            bail!(
-                "GPU completed {} of {count} reserved nonce hashes",
-                result.completed_hashes
-            );
+        let next = PendingGpuWorkBatch {
+            slot_index,
+            work,
+            identity: batch,
+            pending: submitted,
+        };
+        if let Some(previous) = pending.replace(next) {
+            complete_gpu_work_batch(engine, context, previous)?;
         }
-        let completed = u64::try_from(result.completed_hashes)?;
-        context.total_hashes.fetch_add(completed, Ordering::Relaxed);
-        slot.completed_hashes
-            .fetch_add(completed, Ordering::Relaxed);
-        context
-            .telemetry
-            .record(slot.id, ProofMetric::GpuCompletedBatches);
+    }
+    if !context.stop.load(Ordering::Acquire)
+        && let Some(previous) = pending.take()
+    {
+        complete_gpu_work_batch(engine, context, previous)?;
+    }
+    Ok(())
+}
 
-        let mut seen = HashSet::with_capacity(result.candidates.len());
-        for candidate in &result.candidates {
-            if !batch.contains(candidate.nonce) || !seen.insert(candidate.nonce) {
-                bail!("GPU returned a nonce outside its unique reserved batch");
-            }
+fn complete_gpu_work_batch(
+    engine: &mut GpuEngine,
+    context: &MiningWorkerContext,
+    pending: PendingGpuWorkBatch,
+) -> Result<()> {
+    let PendingGpuWorkBatch {
+        slot_index,
+        work,
+        identity,
+        pending,
+    } = pending;
+    let result = match engine.collect_batch(pending, Some(&context.stop)) {
+        Ok(result) => result,
+        Err(_error) if context.stop.load(Ordering::Acquire) => return Ok(()),
+        Err(error) => return Err(error).context("collect GPU SHA-256d batch readback"),
+    };
+    if result.completed_hashes != identity.nonce_count
+        || result.workgroup_count != identity.nonce_count.div_ceil(result.workgroup_size)
+    {
+        bail!(
+            "GPU completed {} of {} reserved nonce hashes or returned an invalid workgroup count",
+            result.completed_hashes,
+            identity.nonce_count
+        );
+    }
+    if let Some(batch_size) = engine.observe_batch_latency(result.timings.submission_to_readback) {
+        eprintln!(
+            "astatine: GPU batch latency exceeded 100 ms; reduced the next dispatch to {batch_size} nonces"
+        );
+    }
+    let slot = &context.slots[slot_index];
+    if slot.id != identity.node_id {
+        bail!("GPU pending batch crossed into another node's state");
+    }
+    context
+        .total_hashes
+        .fetch_add(u64::try_from(result.completed_hashes)?, Ordering::Relaxed);
+    slot.completed_hashes
+        .fetch_add(u64::try_from(result.completed_hashes)?, Ordering::Relaxed);
+    context
+        .telemetry
+        .record(slot.id, ProofMetric::GpuCompletedBatches);
+
+    let mut seen_nonces = HashSet::with_capacity(result.candidates.len());
+    let mut seen_groups = HashSet::with_capacity(result.candidates.len());
+    for candidate in &result.candidates {
+        let offset = candidate
+            .nonce
+            .checked_sub(identity.first_nonce)
+            .ok_or_else(|| anyhow!("GPU returned a nonce before its reserved batch"))?;
+        if offset >= identity.nonce_count as u128
+            || usize::try_from(offset)? / result.workgroup_size != candidate.workgroup_index
+            || !seen_nonces.insert(candidate.nonce)
+            || !seen_groups.insert(candidate.workgroup_index)
+        {
+            bail!("GPU returned a duplicate, misattributed, or out-of-batch group winner");
         }
-        if let Some(candidate) = result.candidates.into_iter().min_by(|left, right| {
-            left.hash
-                .cmp(&right.hash)
-                .then(left.nonce.cmp(&right.nonce))
-        }) {
-            process_hashed_candidate(
-                slot,
-                &work,
-                HashedCandidate {
-                    nonce: candidate.nonce,
-                    hash: candidate.hash,
-                    reported_gpu_hash: Some(candidate.hash),
-                    batch_identity: Some(batch),
-                },
-                &context.proofs,
-                &context.telemetry,
-            )
-            .map_err(|failure| anyhow!("GPU candidate failed CPU verification: {failure}"))?;
-        }
+    }
+    if let Some(candidate) = result.candidates.into_iter().min_by(|left, right| {
+        left.hash
+            .cmp(&right.hash)
+            .then(left.nonce.cmp(&right.nonce))
+    }) {
+        process_hashed_candidate(
+            slot,
+            &work,
+            HashedCandidate {
+                nonce: candidate.nonce,
+                hash: candidate.hash,
+                reported_gpu_hash: Some(candidate.hash),
+                batch_identity: Some(identity),
+            },
+            &context.proofs,
+            &context.telemetry,
+        )
+        .map_err(|failure| anyhow!("GPU candidate failed CPU verification: {failure}"))?;
     }
     Ok(())
 }
@@ -4292,7 +4420,7 @@ fn worker_loop(
             telemetry.record(slot.id, ProofMetric::WorkerStoppedGeneration);
             continue;
         }
-        let Some((first_nonce, count)) = slot.reserve_nonces() else {
+        let Some((first_nonce, count)) = slot.reserve_nonces(NONCE_BATCH_SIZE) else {
             if !nonce_exhaustion_reported {
                 telemetry.record(slot.id, ProofMetric::WorkerNonceRangeExhausted);
                 nonce_exhaustion_reported = true;
@@ -4402,10 +4530,11 @@ mod tests {
         MiningWorkerContext, NodeSlot, NonceAllocator, ObserverUpdate,
         PENDING_PROOF_CANDIDATE_CAPACITY, PendingDashboardSync, ProofFound, SnapshotFreshness,
         activate_cpu_fallback, compare_snapshot_freshness, dashboard_model, dashboard_node_status,
-        finalization_retry_delay, history_profile_enabled, next_poll_delay, next_scheduled_slot,
-        process_hashed_candidate, proof_inbox, reconcile_head_progress, revalidate_queued_proof,
-        revalidate_queued_proof_at, selected_nodes, should_unlock_recovered_wallet,
-        take_observer_update, update_slots, worker_loop,
+        finalization_retry_delay, gpu_is_meaningfully_faster, history_profile_enabled,
+        next_poll_delay, next_scheduled_slot, process_hashed_candidate, proof_inbox,
+        reconcile_head_progress, revalidate_queued_proof, revalidate_queued_proof_at,
+        selected_nodes, should_unlock_recovered_wallet, take_observer_update, update_slots,
+        worker_loop,
     };
     use crate::{
         cli::{DeviceChoice, MineArgs, Network},
@@ -4457,6 +4586,17 @@ mod tests {
             finalizable: false,
             eligibility_reason: "eligible",
         }
+    }
+
+    #[test]
+    fn auto_uses_gpu_only_when_measured_rate_clearly_beats_cpu() {
+        assert!(!gpu_is_meaningfully_faster(0, 1));
+        assert!(!gpu_is_meaningfully_faster(100, 100));
+        assert!(!gpu_is_meaningfully_faster(105, 100));
+        assert!(!gpu_is_meaningfully_faster(110, 100));
+        assert!(gpu_is_meaningfully_faster(111, 100));
+        assert!(!gpu_is_meaningfully_faster(100, 111));
+        assert!(gpu_is_meaningfully_faster(200, 100));
     }
 
     fn test_block(number: u64, timestamp: u64) -> BlockSnapshot {
@@ -5053,14 +5193,14 @@ mod tests {
         assert_eq!(final_range.reserve(4), None);
 
         let slot = NodeSlot::new(1);
-        let gpu_reserved = slot.reserve_nonces().unwrap();
-        let cpu_fallback = slot.reserve_nonces().unwrap();
-        assert_eq!(gpu_reserved, (0, crate::gpu::GPU_BATCH_SIZE));
+        let gpu_reserved = slot.reserve_nonces(crate::gpu::MAX_GPU_BATCH_SIZE).unwrap();
+        let cpu_fallback = slot.reserve_nonces(super::NONCE_BATCH_SIZE).unwrap();
+        assert_eq!(gpu_reserved, (0, crate::gpu::MAX_GPU_BATCH_SIZE));
         assert_eq!(
             cpu_fallback,
             (
-                crate::gpu::GPU_BATCH_SIZE as u128,
-                crate::gpu::GPU_BATCH_SIZE
+                crate::gpu::MAX_GPU_BATCH_SIZE as u128,
+                super::NONCE_BATCH_SIZE
             )
         );
     }
@@ -5270,13 +5410,19 @@ mod tests {
                 .unwrap()
         );
         let initial_generation = slot.current_work().unwrap().generation;
-        assert_eq!(slot.reserve_nonces(), Some((0, super::NONCE_BATCH_SIZE)));
+        assert_eq!(
+            slot.reserve_nonces(super::NONCE_BATCH_SIZE),
+            Some((0, super::NONCE_BATCH_SIZE))
+        );
         assert!(
             !slot
                 .set_work(&manifest, miner, contract, Some(&state), &block)
                 .unwrap()
         );
-        assert_eq!(slot.reserve_nonces(), Some((2048, super::NONCE_BATCH_SIZE)));
+        assert_eq!(
+            slot.reserve_nonces(super::NONCE_BATCH_SIZE),
+            Some((2048, super::NONCE_BATCH_SIZE))
+        );
 
         let mut changed_state = eligible_state();
         changed_state.work.target = U256::MAX - U256::from(1);
@@ -5286,7 +5432,10 @@ mod tests {
         );
         let target_generation = slot.current_work().unwrap().generation;
         assert!(target_generation > initial_generation);
-        assert_eq!(slot.reserve_nonces(), Some((4096, super::NONCE_BATCH_SIZE)));
+        assert_eq!(
+            slot.reserve_nonces(super::NONCE_BATCH_SIZE),
+            Some((4096, super::NONCE_BATCH_SIZE))
+        );
 
         changed_state.candidate = Some(CandidateInfo {
             miner: Address::with_last_byte(7),
@@ -5302,7 +5451,10 @@ mod tests {
         );
         let incumbent_generation = slot.current_work().unwrap().generation;
         assert!(incumbent_generation > target_generation);
-        assert_eq!(slot.reserve_nonces(), Some((6144, super::NONCE_BATCH_SIZE)));
+        assert_eq!(
+            slot.reserve_nonces(super::NONCE_BATCH_SIZE),
+            Some((6144, super::NONCE_BATCH_SIZE))
+        );
 
         changed_state.work.seed = B256::with_last_byte(4);
         assert!(
@@ -5311,7 +5463,10 @@ mod tests {
         );
         let context_generation = slot.current_work().unwrap().generation;
         assert!(context_generation > incumbent_generation);
-        assert_eq!(slot.reserve_nonces(), Some((0, super::NONCE_BATCH_SIZE)));
+        assert_eq!(
+            slot.reserve_nonces(super::NONCE_BATCH_SIZE),
+            Some((0, super::NONCE_BATCH_SIZE))
+        );
 
         assert!(
             slot.set_work(&manifest, miner, contract, None, &block)

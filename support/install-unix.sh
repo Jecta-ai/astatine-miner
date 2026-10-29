@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION="0.1.0-testnet.10"
+VERSION="0.1.0-testnet.11"
 case "$(uname -s)" in
   Darwin)
     case "$(uname -m)" in

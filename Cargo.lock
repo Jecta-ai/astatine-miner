@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "astatine-cli-rust"
-version = "0.1.0-testnet.10"
+version = "0.1.0-testnet.11"
 dependencies = [
  "aes",
  "alloy-primitives",

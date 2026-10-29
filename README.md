@@ -6,20 +6,20 @@ The protocol has nine independent mining nodes, each with its own work and windo
 
 ## Install
 
-Testnet.10 installers verify the signed release manifest and the platform archive digest before installation. No root or administrator access is required. The installer replaces only the executable and license notices; configuration, wallets, and transaction journals are left untouched. The manifest is signed with the RSA release key pinned in the client and installer scripts.
+Testnet.11 installers verify the signed release manifest and the platform archive digest before installation. No root or administrator access is required. The installer replaces only the executable and license notices; configuration, wallets, and transaction journals are left untouched. The manifest is signed with the RSA release key pinned in the client and installer scripts.
 
 ### macOS and Linux
 
 Requires `curl`, `openssl`, `tar`, and `install`. Supported targets are Apple Silicon and Intel macOS, plus x86_64 and aarch64 Linux (glibc 2.35 or later).
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.10/support/install-unix.sh | sh
+curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.11/support/install-unix.sh | sh
 ```
 
 To download and review the installer before executing it:
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.10/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
+curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.11/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
 less "$HOME/astatine-install-unix.sh"
 sh "$HOME/astatine-install-unix.sh"
 ```
@@ -31,14 +31,14 @@ Apple Silicon requires macOS 11 or later; Intel requires macOS 10.12 or later. T
 Supported target: Windows 10 or later, x86_64. The executable is installed under your user profile.
 
 ```powershell
-$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.10/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
+$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.11/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
 ```
 
 To download and review the PowerShell installer before executing it:
 
 ```powershell
 $Installer = Join-Path $env:TEMP 'astatine-install.ps1'
-Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.10/support/install-windows.ps1' -OutFile $Installer
+Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.11/support/install-windows.ps1' -OutFile $Installer
 Get-Content -LiteralPath $Installer -Raw
 # After reviewing the script:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
@@ -67,7 +67,7 @@ astatine mine --device gpu --nodes 1,3,5
 astatine mine --device gpu --compute-only
 ```
 
-Explicit `gpu` mode stops with an actionable error if no physical adapter passes the actual WGSL SHA-256d self-test. It never silently becomes CPU mining. `auto` uses CPU when no compatible GPU is available or when GPU operation fails. Any in-flight GPU nonce range is abandoned on failure, not reassigned. `--threads` controls CPU mining workers; GPU mode uses a dedicated controller and does not start the full CPU mining pool.
+Explicit `gpu` mode stops with an actionable error if no physical adapter passes the actual WGSL SHA-256d self-test. It never silently becomes CPU mining. `auto` performs a short canonical-work comparison and chooses GPU only when its measured throughput is more than 10% faster than CPU; otherwise it chooses CPU. Auto mode also falls back to CPU if GPU operation later fails. Any in-flight GPU nonce range is abandoned on failure, not reassigned. `--threads` controls CPU mining workers; GPU mode uses a dedicated controller and does not start the full CPU mining pool.
 
 Every GPU candidate is rehashed with the canonical Rust `WorkHasher` before it enters the existing bounded proof inbox. The existing proof preflight, journal, signing, submission, finalization, reward reconciliation, and forwarding pipelines remain authoritative. The GPU module does not own wallets, RPC connections, or transaction signing.
 
@@ -77,27 +77,33 @@ Inspect local compute adapters and run their real shader self-test without conne
 astatine devices
 ```
 
-The initial wgpu backends target Metal on macOS, Direct3D 12 or Vulkan on Windows, and Vulkan on Linux. Driver and hardware support varies:
+The wgpu backends target Metal on macOS, Direct3D 12 or Vulkan on Windows, and Vulkan on Linux. Driver and hardware support varies:
 
-| Platform / GPU | Preferred backend | Testnet.10 evidence |
+| Platform / GPU | Preferred backend | Testnet.11 evidence |
 |---|---|---|
-| Apple Silicon · Apple M4 | Metal | Physical shader parity and three-window Anvil mining tested |
-| Intel macOS GPU | Metal | Native target builds; physical runtime not tested |
-| NVIDIA / AMD Windows GPU | Direct3D 12 or Vulkan | Windows target builds; physical runtime not tested |
-| NVIDIA / AMD Linux GPU | Vulkan | Linux target builds; physical runtime not tested |
+| Apple Silicon · Apple M4 | Metal | Physical shader parity, three-window mining and reward forwarding, and 1/3/9-node compute-only scheduling tested |
+| Intel macOS GPU | Metal | Physical runtime not tested; x86_64 target check passes locally |
+| NVIDIA / AMD Windows GPU | Direct3D 12 or Vulkan | Physical runtime not tested; Testnet.11 native CI pending |
+| NVIDIA / AMD Linux GPU | Vulkan | Physical runtime not tested; Testnet.11 native CI pending |
 
 Adapter enumeration or a successful native build is not itself a GPU correctness test.
 
-Run a local, read-only CPU/GPU baseline on identical canonical work (no wallet or RPC required):
+Run a local, read-only CPU/GPU benchmark on identical canonical work (no wallet or RPC required):
 
 ```sh
 astatine benchmark
 astatine benchmark --seconds 10 --threads 4
 ```
 
-The report separates initialization/self-test time from timed throughput, and includes completed hashes, dispatch/compute/readback batch latency, and approximate CPU work. Use measured results for the installed hardware; this first backend prioritizes correctness and may be slower than CPU mining on some devices. The GPU shader implements SHA-256d only; it does not alter the PoW protocol.
+The report includes three repeated CPU/GPU samples by default, separates initialization/self-test time from timed throughput, and records host-stage timings and JSON output when requested. GPU compute timestamps are reported only where supported; otherwise dispatch-to-readback is identified as wall latency. `--profile` sweeps all supported batch and workgroup sizes; `--compare-full-sha` compares full SHA-256 with the cached-midstate path, and `--serial` disables the bounded two-batch overlap for comparison. Example:
 
-Recorded baseline on an Apple M4 with Metal (2-second sample, four CPU workers, 64-invocation workgroups): CPU `17.504 MH/s`, GPU `1.309 MH/s`, effective ratio `0.07x`; GPU initialization and self-test took `0.093 s`, average dispatch/compute/readback wall time was `1.559 ms` per 2,048-nonce batch. GPU host processing took `0.188 s`, approximately `0.94%` of ten logical CPUs over the sample. This is one measured run, not a performance guarantee; run `astatine benchmark` on the target hardware.
+```sh
+astatine benchmark --seconds 10 --threads 4 --batch-size 262144 --workgroup-size 32 --compare-full-sha --output-json gpu-ab.json
+```
+
+Use measured results for the installed hardware. The GPU shader implements SHA-256d only; it does not alter the PoW protocol.
+
+The Testnet.10 reference is retained in [the Testnet.11 performance report](support/testnet11-performance.md). On the same Apple M4 / Metal adapter, the combined Testnet.11 configuration (262,144-nonce batches, 32-lane workgroups, SHA-256 midstate, and two-slot readback pipeline) measured a three-sample median of `59.504 MH/s`, 44.60x the supplied Testnet.10 GPU reference. Metal exposes no wgpu GPU timestamp queries on this adapter; the report separates effective throughput from submit-to-readback latency and records the serial, full-SHA, midstate, and pipeline comparisons. This is one machine's measured result, not a performance guarantee; run `astatine benchmark` on the target hardware.
 
 The archives are authenticated by the pinned RSA-3072 key in addition to HTTPS. Its SHA-256 SubjectPublicKeyInfo fingerprint is `e610269b1a6dffe64eb1b9b4d97e9cca434884f5908a38888e310bdd74322e7c`; the PEM and Windows XML forms are in `support/release-signing-public.*`. macOS binaries are not Developer ID signed or notarized, and Windows binaries are not Authenticode signed; the release manifest signature provides the project-level authenticity check.
 
