@@ -147,27 +147,29 @@ jobs:
           cmp THIRD_PARTY_LICENSES.md "$RUNNER_TEMP/THIRD_PARTY_LICENSES.md"
 
   anvil-integration:
-    name: Proof, finalization, reorg, and reward integration tests
+    name: Genesis, proof, finalization, reorg, and reward integration tests
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - name: Checkout pinned Coordinator and EVM integration source
-        uses: actions/checkout@v7
-        with:
-          repository: emyrinj/astatine-coordinator
-          ref: 54588aa7b020cd7e49fa2275a560cde8138dd707
-          path: test-sources/astatine-coordinator
-          submodules: recursive
-      - name: Verify and configure the pinned EVM source
-        shell: bash
+      # The upstream source repos are private; CI uses checked-in creation bytecode
+      # and verifies each fixture's pinned source commit before running Anvil.
+      - name: Verify pinned Anvil fixture provenance
         run: |
-          set -euo pipefail
-          evm_root="$GITHUB_WORKSPACE/test-sources/astatine-coordinator/lib/astatineEVM/evm"
-          expected_commit="eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30"
-          actual_commit="$(git -C "$evm_root" rev-parse HEAD)"
-          test "$actual_commit" = "$expected_commit"
-          echo "ASTATINE_EVM_ROOT=$evm_root" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          fixtures = pathlib.Path("tests/fixtures")
+          expected_sources = {
+              "AstatineMiner.json": "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30",
+              "MockAST.json": "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30",
+              "AstatineGenesisCoordinator.json": "54588aa7b020cd7e49fa2275a560cde8138dd707",
+          }
+          for name, expected_commit in expected_sources.items():
+              actual_commit = json.loads((fixtures / name).read_text())["source_commit"]
+              assert actual_commit == expected_commit, (name, actual_commit, expected_commit)
+          PY
       - name: Install stable Rust components
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - uses: foundry-rs/foundry-toolchain@v1
