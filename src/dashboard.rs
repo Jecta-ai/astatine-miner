@@ -210,7 +210,8 @@ pub struct DashboardModel {
     pub device_label: String,
     pub device_detail: String,
     pub session_limit: Option<U256>,
-    pub session_exposure: Option<U256>,
+    pub authorization_used: Option<U256>,
+    pub actual_rpc_cost: Option<U256>,
     pub block_number: u64,
     pub block_hash: B256,
     pub snapshot_observed_at: Instant,
@@ -904,11 +905,16 @@ fn render_wide_header(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel,
         metadata_line("MINED", &format_mined(model.mined_rewards), colors),
         metadata_line(
             "DEVICE",
-            &format!("{} · {}", model.device_label, model.device_detail),
+            &format!(
+                "{} · {} • {}",
+                model.device_label,
+                model.device_detail,
+                format_hashrate(model.hashrate)
+            ),
             colors,
         ),
-        metadata_line("HASHRATE", &format_hashrate(model.hashrate), colors),
-        metadata_line("SESSION", &format_session(model), colors),
+        metadata_line("AUTH / LIMIT", &format_authorization(model), colors),
+        metadata_line("RPC-REPORTED COST", &format_rpc_cost(model), colors),
     ];
     lines.truncate(usize::from(area.height));
     frame.render_widget(Paragraph::new(lines), chunks[1]);
@@ -941,11 +947,12 @@ fn render_compact(
             format_mined(model.mined_rewards)
         ))),
         Line::from(Span::raw(format!(
-            "DEVICE {} {} • {} • Session {}",
+            "DEVICE {} {} • {} • Auth {} • RPC cost {}",
             model.device_label,
             model.device_detail,
             format_hashrate(model.hashrate),
-            format_session(model)
+            format_authorization(model),
+            format_rpc_cost(model)
         ))),
     ];
     lines.truncate(usize::from(header_height));
@@ -1435,15 +1442,26 @@ fn format_mined(value: U256) -> String {
     format_mined_value(value)
 }
 
-fn format_session(model: &DashboardModel) -> String {
-    match (model.session_exposure, model.session_limit) {
-        (Some(exposure), Some(limit)) => format!(
-            "{} / {} INJ",
-            format_units(exposure, 18),
-            format_units(limit, 18)
-        ),
+fn format_authorization(model: &DashboardModel) -> String {
+    match (model.authorization_used, model.session_limit) {
+        (Some(used), Some(limit)) => {
+            let remaining = limit.checked_sub(used).unwrap_or(U256::ZERO);
+            format!(
+                "{} / {} INJ · {} left",
+                format_units(used, 18),
+                format_units(limit, 18),
+                format_units(remaining, 18)
+            )
+        }
         _ => "--".to_owned(),
     }
+}
+
+fn format_rpc_cost(model: &DashboardModel) -> String {
+    model
+        .actual_rpc_cost
+        .map(|value| format!("{} INJ", format_units(value, 18)))
+        .unwrap_or_else(|| "-- INJ".to_owned())
 }
 
 fn format_hashrate(rate: f64) -> String {
@@ -1576,7 +1594,8 @@ mod tests {
             device_label: "CPU".to_owned(),
             device_detail: "6 Threads".to_owned(),
             session_limit: Some(U256::from(500_000_000_000_000_000_u128)),
-            session_exposure: Some(U256::from(52_000_000_000_000_000_u128)),
+            authorization_used: Some(U256::from(52_000_000_000_000_000_u128)),
+            actual_rpc_cost: Some(U256::from(31_000_000_000_000_000_u128)),
             block_number: 144_123_456,
             block_hash: B256::with_last_byte(4),
             snapshot_observed_at: Instant::now(),
@@ -1978,8 +1997,11 @@ mod tests {
             })
             .unwrap();
         assert!(buffer_text(&terminal).contains("0.052 / 0.5 INJ"));
+        assert!(buffer_text(&terminal).contains("0.448 left"));
+        assert!(buffer_text(&terminal).contains("RPC-REPORTED COST"));
+        assert!(buffer_text(&terminal).contains("0.031 INJ"));
 
-        view.session_exposure = None;
+        view.authorization_used = None;
         view.connection_error = Some("snapshot unavailable".to_owned());
         terminal
             .draw(|frame| render_dashboard(frame, &view, None, false))
@@ -1987,7 +2009,7 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("CONFIRMING"));
         assert!(text.contains("RPC ERROR • snapshot unavailable"));
-        assert!(text.contains("SESSION"));
+        assert!(text.contains("AUTH / LIMIT"));
         assert!(text.contains("--"));
 
         view.connection_error = None;

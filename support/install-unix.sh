@@ -1,7 +1,58 @@
 #!/bin/sh
 set -eu
 
-VERSION="0.1.0-testnet.12"
+VERSION="0.1.0-testnet.13"
+
+compare_testnet_versions() {
+  awk -v current="$1" -v candidate="$2" '
+    function parse_version(version, values, core, suffix, dash, has_prerelease, count, parts, i, sequence) {
+      dash = index(version, "-")
+      has_prerelease = dash > 0
+      if (has_prerelease) {
+        core = substr(version, 1, dash - 1)
+        suffix = substr(version, dash + 1)
+      } else {
+        core = version
+        suffix = ""
+      }
+      count = split(core, parts, ".")
+      if (count != 3) return 0
+      for (i = 1; i <= 3; i++) {
+        if (parts[i] !~ /^(0|[1-9][0-9]*)$/ || length(parts[i]) > 10 || parts[i] + 0 > 2147483647) return 0
+        values[i] = parts[i] + 0
+      }
+      values[4] = has_prerelease
+      values[5] = 0
+      if (has_prerelease) {
+        if (suffix !~ /^testnet\.(0|[1-9][0-9]*)$/) return 0
+        sequence = substr(suffix, 9)
+        if (length(sequence) > 10 || sequence + 0 > 2147483647) return 0
+        values[5] = sequence + 0
+      }
+      return 1
+    }
+    BEGIN {
+      if (!parse_version(current, a) || !parse_version(candidate, b)) exit 2
+      for (i = 1; i <= 3; i++) {
+        if (a[i] < b[i]) { print -1; exit }
+        if (a[i] > b[i]) { print 1; exit }
+      }
+      if (a[4] != b[4]) { print (a[4] ? -1 : 1); exit }
+      if (a[4] && a[5] != b[5]) { print (a[5] < b[5] ? -1 : 1); exit }
+      print 0
+    }
+  '
+}
+
+if [ "${1:-}" = "--compare-testnet-versions" ]; then
+  if [ "$#" -ne 3 ]; then
+    printf '%s\n' 'Usage: install-unix.sh --compare-testnet-versions CURRENT CANDIDATE' >&2
+    exit 2
+  fi
+  compare_testnet_versions "$2" "$3"
+  exit $?
+fi
+
 case "$(uname -s)" in
   Darwin)
     case "$(uname -m)" in
@@ -79,23 +130,28 @@ tar -xzf "$ARCHIVE" -C "$TEMP_DIR"
 
 INSTALL_DIR="${HOME:?HOME is required}/.local/bin"
 LICENSE_DIR="$INSTALL_DIR/licenses"
-if [ -x "$INSTALL_DIR/astatine" ]; then
-  installed_version="$("$INSTALL_DIR/astatine" --version 2>/dev/null | awk 'NR == 1 { print $2 }' || true)"
-  case "$installed_version" in
-    0.1.0-testnet.*)
-      installed_sequence="${installed_version##*.}"
-      candidate_sequence="${VERSION##*.}"
-      case "$installed_sequence" in
-        ''|*[!0-9]*) ;;
-        *)
-          if [ "$installed_sequence" -gt "$candidate_sequence" ]; then
-            printf '%s\n' "Refusing to replace newer Astatine $installed_version with $VERSION" >&2
-            exit 1
-          fi
-          ;;
-      esac
-      ;;
-  esac
+if [ -e "$INSTALL_DIR/astatine" ]; then
+  if [ ! -x "$INSTALL_DIR/astatine" ]; then
+    printf '%s\n' 'Refusing to replace an existing Astatine executable that cannot be run for version verification' >&2
+    exit 1
+  fi
+  installed_output="$("$INSTALL_DIR/astatine" --version 2>/dev/null)" || {
+    printf '%s\n' 'Refusing to replace an existing Astatine executable whose version could not be read' >&2
+    exit 1
+  }
+  installed_version="$(printf '%s\n' "$installed_output" | awk 'NR == 1 && $1 == "astatine" { print $2 }')"
+  if [ -z "$installed_version" ]; then
+    printf '%s\n' 'Refusing to replace an existing executable with an unrecognized Astatine version' >&2
+    exit 1
+  fi
+  version_order="$(compare_testnet_versions "$installed_version" "$VERSION")" || {
+    printf '%s\n' "Refusing to replace an existing executable with an unsupported version: $installed_version" >&2
+    exit 1
+  }
+  if [ "$version_order" -gt 0 ]; then
+    printf '%s\n' "Refusing to replace newer Astatine $installed_version with $VERSION" >&2
+    exit 1
+  fi
 fi
 mkdir -p "$LICENSE_DIR"
 install -m 0755 "$TEMP_DIR/astatine" "$INSTALL_DIR/.astatine.update"

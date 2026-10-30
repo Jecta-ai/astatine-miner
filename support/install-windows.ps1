@@ -1,5 +1,68 @@
+param(
+    [switch]$CompareVersions,
+    [string]$CurrentVersion,
+    [string]$CandidateVersion
+)
+
 $ErrorActionPreference = 'Stop'
-$Version = '0.1.0-testnet.12'
+
+function ConvertTo-AstatineVersion([string]$Text) {
+    $Match = [regex]::Match(
+        $Text.Trim(),
+        '^(?:astatine\s+)?(?<Major>0|[1-9][0-9]*)\.(?<Minor>0|[1-9][0-9]*)\.(?<Patch>0|[1-9][0-9]*)(?:-testnet\.(?<Sequence>0|[1-9][0-9]*))?$'
+    )
+    if (-not $Match.Success) { throw "Unsupported Astatine version format: $Text" }
+    $Values = @(
+        [System.UInt64]::Parse($Match.Groups['Major'].Value, [System.Globalization.CultureInfo]::InvariantCulture),
+        [System.UInt64]::Parse($Match.Groups['Minor'].Value, [System.Globalization.CultureInfo]::InvariantCulture),
+        [System.UInt64]::Parse($Match.Groups['Patch'].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    )
+    if ($Values | Where-Object { $_ -gt 2147483647 }) { throw "Astatine version component exceeds the supported SemVer range: $Text" }
+    $IsPrerelease = $Match.Groups['Sequence'].Success
+    $Sequence = [UInt64]0
+    if ($IsPrerelease) {
+        $Sequence = [System.UInt64]::Parse($Match.Groups['Sequence'].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+        if ($Sequence -gt 2147483647) { throw "Astatine prerelease identifier exceeds the supported SemVer range: $Text" }
+    }
+    return [pscustomobject]@{
+        Major = $Values[0]
+        Minor = $Values[1]
+        Patch = $Values[2]
+        IsPrerelease = $IsPrerelease
+        Sequence = $Sequence
+    }
+}
+
+function Compare-AstatineVersions([string]$Current, [string]$Candidate) {
+    $CurrentParsed = ConvertTo-AstatineVersion $Current
+    $CandidateParsed = ConvertTo-AstatineVersion $Candidate
+    foreach ($Field in @('Major', 'Minor', 'Patch')) {
+        if ($CurrentParsed.$Field -lt $CandidateParsed.$Field) { return -1 }
+        if ($CurrentParsed.$Field -gt $CandidateParsed.$Field) { return 1 }
+    }
+    if ($CurrentParsed.IsPrerelease -ne $CandidateParsed.IsPrerelease) {
+        if ($CurrentParsed.IsPrerelease) { return -1 }
+        return 1
+    }
+    if ($CurrentParsed.IsPrerelease) {
+        if ($CurrentParsed.Sequence -lt $CandidateParsed.Sequence) { return -1 }
+        if ($CurrentParsed.Sequence -gt $CandidateParsed.Sequence) { return 1 }
+    }
+    return 0
+}
+
+if ($CompareVersions) {
+    try {
+        if (-not $CurrentVersion -or -not $CandidateVersion) { throw 'Both current and candidate versions are required' }
+        Write-Output (Compare-AstatineVersions $CurrentVersion $CandidateVersion)
+        exit 0
+    } catch {
+        [Console]::Error.WriteLine($_.Exception.Message)
+        exit 2
+    }
+}
+
+$Version = '0.1.0-testnet.13'
 $Asset = 'astatine-windows-x86_64.zip'
 $Base = "https://github.com/emyrinj/astatine-miner/releases/download/v$Version"
 $Temp = Join-Path $env:TEMP ("astatine-install-" + [Guid]::NewGuid().ToString('N'))
@@ -49,20 +112,20 @@ try {
     if (($Entries -join '|') -ne ($Expected -join '|')) { throw 'Windows archive contains unexpected files' }
     $StagedExe = Join-Path $Extract 'astatine.exe'
     $VersionOutput = & $StagedExe --version
-    if ($LASTEXITCODE -ne 0 -or ($VersionOutput -notmatch [regex]::Escape($Version))) {
+    if ($LASTEXITCODE -ne 0 -or (Compare-AstatineVersions ($VersionOutput -join "`n") $Version) -ne 0) {
         throw 'Downloaded executable failed its version smoke test'
     }
 
     $InstallDir = Join-Path $HOME 'bin'
     $ExistingExe = Join-Path $InstallDir 'astatine.exe'
     if (Test-Path -LiteralPath $ExistingExe) {
-        $ExistingVersionOutput = & $ExistingExe --version 2>$null
-        if ($LASTEXITCODE -eq 0 -and $ExistingVersionOutput -match 'astatine\s+0\.1\.0-testnet\.(\d+)') {
-            $InstalledSequence = [Int64]::Parse($Matches[1])
-            $CandidateSequence = [Int64]::Parse($Version.Split('.')[-1])
-            if ($InstalledSequence -gt $CandidateSequence) {
-                throw "Refusing to replace newer Astatine $($Matches[0]) with $Version"
-            }
+        $ExistingVersionOutput = & $ExistingExe --version 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Refusing to replace an existing Astatine executable whose version could not be read'
+        }
+        $VersionOrder = Compare-AstatineVersions ($ExistingVersionOutput -join "`n") $Version
+        if ($VersionOrder -gt 0) {
+            throw "Refusing to replace newer Astatine $($ExistingVersionOutput -join ' ') with $Version"
         }
     }
     $LicenseDir = Join-Path $InstallDir 'licenses'
@@ -84,7 +147,7 @@ try {
             Move-Item -LiteralPath $Stage -Destination $File.Destination -Force
         }
         $InstalledVersion = & (Join-Path $InstallDir 'astatine.exe') --version
-        if ($LASTEXITCODE -ne 0 -or ($InstalledVersion -notmatch [regex]::Escape($Version))) {
+        if ($LASTEXITCODE -ne 0 -or (Compare-AstatineVersions ($InstalledVersion -join "`n") $Version) -ne 0) {
             throw 'Installed executable failed its version smoke test'
         }
         foreach ($Backup in $Backups) {

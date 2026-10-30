@@ -963,7 +963,11 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
     progress.complete("Selected wallet checked");
     progress.begin("Connecting to RPC · validating Chain ID");
     let connected = race_with_ctrl_c(
-        NetworkClient::connect_with_progress(config.network, Some(&progress)),
+        NetworkClient::connect_with_progress(
+            config.network,
+            config.rpc_override(config.network),
+            Some(&progress),
+        ),
         &mut ctrl_c,
     )
     .await?;
@@ -1042,6 +1046,11 @@ async fn run_runtime(
     }
     let address = selected_address(&config)?;
     let spending_limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
+    if args.new_session && (args.compute_only || spending_limit.is_zero()) {
+        bail!(
+            "--new-session requires transaction mode and a positive per-session authorization cap"
+        );
+    }
     if let Some(destination) = args.send_rewards_to {
         if args.compute_only {
             bail!("automatic reward forwarding is unavailable in compute-only mode");
@@ -1108,12 +1117,13 @@ async fn run_runtime(
             .as_ref()
             .context("AST token pin is missing from the Testnet manifest")?;
         let ast_token = crate::deployment::parse_address(&token.address)?;
-        let mut manager = match TransactionManager::open_with_history_telemetry(
+        let mut manager = match TransactionManager::open_with_session_authorization(
             store,
             &config,
             address,
             ast_token,
             client.history_telemetry(),
+            args.new_session,
         ) {
             Ok(manager) => manager,
             Err(error) => {
@@ -1135,7 +1145,19 @@ async fn run_runtime(
             }
         }
         match race_with_ctrl_c(manager.reconcile(&client), ctrl_c).await? {
-            Some(Ok(())) => {}
+            Some(Ok(())) => {
+                let legacy = manager.legacy_unverified_settled_count()?;
+                if legacy > 0 {
+                    let message = format!(
+                        "{legacy} historical transaction settlement(s) retain their recorded costs but predate RC1 trusted-RPC processing"
+                    );
+                    if let Some(startup) = startup {
+                        startup.note(message);
+                    } else {
+                        eprintln!("{message}");
+                    }
+                }
+            }
             Some(Err(error)) => {
                 if let Some(startup) = startup {
                     startup.fail(format!("Transaction recovery failed: {error:#}"));
@@ -3222,14 +3244,13 @@ async fn snapshot_freshness(
                     && current_head.number == next.number
                     && current_head.hash == next.hash
                 {
-                    // A reorging local/provider head may no longer serve the removed height.
-                    // Accept the lower snapshot only when it is itself corroborated and is
-                    // still the current head across the configured RPC set.
+                    // A reorging provider head may no longer serve the removed height.
+                    // Accept the lower snapshot only when the selected RPC still reports it
+                    // as the current canonical head.
                     return Ok(SnapshotFreshness::Reorg);
                 }
-                return Err(previous_error).context(
-                    "cannot corroborate a lower snapshot after the prior block disappeared",
-                );
+                return Err(previous_error)
+                    .context("cannot verify a lower snapshot after the prior block disappeared");
             }
         }
     } else {
@@ -3244,7 +3265,7 @@ async fn snapshot_freshness(
     if freshness == SnapshotFreshness::Reorg && next.number < previous.number {
         if client.canonical_block_hash(next.number).await? != next.hash {
             bail!(
-                "lower snapshot block {} is not the corroborated canonical block",
+                "selected RPC does not report lower snapshot block {} as canonical",
                 next.number
             );
         }
@@ -3280,7 +3301,7 @@ fn compare_snapshot_freshness(
     if next.number == previous.number && next.hash != previous.hash {
         if next_canonical != Some(next.hash) {
             bail!(
-                "RPC snapshot hash at block {} is not the corroborated canonical hash",
+                "selected RPC does not report snapshot block {} as canonical",
                 next.number
             );
         }
@@ -3370,8 +3391,8 @@ fn trace_node_liveness(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let worker_enabled = context.workers_started.load(Ordering::Acquire);
-    let exposure = activities
-        .session_exposure
+    let authorization_used = activities
+        .authorization_used
         .map(|amount| amount.to_string())
         .unwrap_or_else(|| "unavailable".to_owned());
     for node_id in &context.selected {
@@ -3414,7 +3435,7 @@ fn trace_node_liveness(
             },
         );
         diagnostics.push(format!(
-            "node-liveness node={node_id:02} window={chain_window:?} block={} hash={:#x} verified={trusted} eligible={eligible} finalizable={finalizable} paused={paused} ended={ended} local_slot={slot_active} suspended={slot_suspended} slot_window={slot_window:?} scheduled={scheduled} workers_enabled={worker_enabled} deadline={deadline_state} deadline_expired={local_deadline_expired} head_progress_age_ms={} successful_rpc_age_ms={} node_hashes={} hashes_total={} tx={transaction} exposure_wei={exposure} finalization={finalization_state}",
+            "node-liveness node={node_id:02} window={chain_window:?} block={} hash={:#x} verified={trusted} eligible={eligible} finalizable={finalizable} paused={paused} ended={ended} local_slot={slot_active} suspended={slot_suspended} slot_window={slot_window:?} scheduled={scheduled} workers_enabled={worker_enabled} deadline={deadline_state} deadline_expired={local_deadline_expired} head_progress_age_ms={} successful_rpc_age_ms={} node_hashes={} hashes_total={} tx={transaction} authorization_used_wei={authorization_used} finalization={finalization_state}",
             snapshot.block.number,
             snapshot.block.hash,
             observed_at
@@ -3739,7 +3760,8 @@ fn dashboard_model(
         device_label: active_backend.label().to_owned(),
         device_detail: active_backend.detail(),
         session_limit: Some(context.spending_limit),
-        session_exposure: transaction_state.session_exposure,
+        authorization_used: transaction_state.authorization_used,
+        actual_rpc_cost: transaction_state.actual_rpc_cost,
         block_number: snapshot.block.number,
         block_hash: snapshot.block.hash,
         snapshot_observed_at: observed_at,
@@ -3940,7 +3962,8 @@ fn connect_transaction_dashboard(
 }
 
 fn apply_transaction_state_to_model(model: &mut DashboardModel, state: &TransactionDashboardState) {
-    model.session_exposure = state.session_exposure;
+    model.authorization_used = state.authorization_used;
+    model.actual_rpc_cost = state.actual_rpc_cost;
     model.mined_rewards = state.mined_rewards;
     model.recovering = state
         .activities
@@ -3994,17 +4017,27 @@ fn initial_transaction_dashboard_state(
     let Some(manager) = manager else {
         return TransactionDashboardState::default();
     };
-    let session_exposure = match manager.session_exposure() {
+    let authorization_used = match manager.authorization_used() {
         Ok(exposure) => exposure,
         Err(error) => {
             diagnostics.push(format!(
-                "dashboard could not read transaction session exposure: {error:#}"
+                "dashboard could not read session authorization total: {error:#}"
+            ));
+            None
+        }
+    };
+    let actual_rpc_cost = match manager.actual_rpc_cost() {
+        Ok(cost) => cost,
+        Err(error) => {
+            diagnostics.push(format!(
+                "dashboard could not read RPC-reported transaction costs: {error:#}"
             ));
             None
         }
     };
     TransactionDashboardState {
-        session_exposure,
+        authorization_used,
+        actual_rpc_cost,
         mined_rewards: manager.mined_rewards_total(),
         activities: manager.dashboard_activities(),
     }
@@ -5100,7 +5133,8 @@ mod tests {
             slots: Arc::clone(&slots),
             schedule: Arc::clone(&schedule),
             transaction_state: Arc::new(RwLock::new(TransactionDashboardState {
-                session_exposure: None,
+                authorization_used: None,
+                actual_rpc_cost: None,
                 mined_rewards: U256::from(26_000_000_000_000_u128),
                 activities: Vec::new(),
             })),
@@ -5327,7 +5361,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_freshness_rejects_stale_heads_and_accepts_corroborated_reorgs() {
+    fn snapshot_freshness_rejects_stale_heads_and_accepts_selected_rpc_reorgs() {
         let previous = BlockSnapshot {
             number: 100,
             timestamp: 1_000,
@@ -6661,6 +6695,7 @@ mod tests {
             MineArgs {
                 device: DeviceChoice::Cpu,
                 compute_only: false,
+                new_session: false,
                 threads: None,
                 nodes: Vec::new(),
                 send_rewards_to: None,
@@ -6685,6 +6720,7 @@ mod tests {
             MineArgs {
                 device: DeviceChoice::Cpu,
                 compute_only: false,
+                new_session: false,
                 threads: None,
                 nodes: Vec::new(),
                 send_rewards_to: None,
@@ -6725,6 +6761,7 @@ mod tests {
             MineArgs {
                 device: DeviceChoice::Cpu,
                 compute_only: false,
+                new_session: false,
                 threads: None,
                 nodes: vec![1],
                 send_rewards_to: Some(destination),
@@ -6752,6 +6789,7 @@ mod tests {
             MineArgs {
                 device: DeviceChoice::Cpu,
                 compute_only: true,
+                new_session: false,
                 threads: None,
                 nodes: vec![1],
                 send_rewards_to: Some(destination),
@@ -6770,6 +6808,7 @@ mod tests {
             MineArgs {
                 device: DeviceChoice::Cpu,
                 compute_only: false,
+                new_session: false,
                 threads: None,
                 nodes: vec![1],
                 send_rewards_to: Some(wallet),

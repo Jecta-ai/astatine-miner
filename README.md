@@ -6,20 +6,20 @@ The protocol has nine independent mining nodes, each with its own work and windo
 
 ## Install
 
-Testnet.12 installers verify the signed release manifest and the platform archive digest before installation. No root or administrator access is required. The installer replaces only the executable and license notices; configuration, wallets, and transaction journals are left untouched. The manifest is signed with the RSA release key pinned in the client and installer scripts.
+Testnet.13 candidate installers verify the signed release manifest and the platform archive digest before installation. No root or administrator access is required. The installer replaces only the executable and license notices; configuration, wallets, and transaction journals are left untouched. The manifest is signed with the RSA release key pinned in the client and installer scripts.
 
 ### macOS and Linux
 
 Requires `curl`, `openssl`, `tar`, and `install`. Supported targets are Apple Silicon and Intel macOS, plus x86_64 and aarch64 Linux (glibc 2.35 or later).
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.12/support/install-unix.sh | sh
+curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.13/support/install-unix.sh | sh
 ```
 
 To download and review the installer before executing it:
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.12/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
+curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.13/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
 less "$HOME/astatine-install-unix.sh"
 sh "$HOME/astatine-install-unix.sh"
 ```
@@ -31,14 +31,14 @@ Apple Silicon requires macOS 11 or later; Intel requires macOS 10.12 or later. T
 Supported target: Windows 10 or later, x86_64. The executable is installed under your user profile.
 
 ```powershell
-$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.12/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
+$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.13/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
 ```
 
 To download and review the PowerShell installer before executing it:
 
 ```powershell
 $Installer = Join-Path $env:TEMP 'astatine-install.ps1'
-Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.12/support/install-windows.ps1' -OutFile $Installer
+Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/v0.1.0-testnet.13/support/install-windows.ps1' -OutFile $Installer
 Get-Content -LiteralPath $Installer -Raw
 # After reviewing the script:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
@@ -137,15 +137,55 @@ astatine update
 astatine update --check
 ```
 
-`astatine init` configures the wallet, network, CPU budget, reserve, transaction cap, and confirmation depth. Startup shows configuration, RPC/deployment checks, transaction recovery, wallet unlock, initial work, worker preparation and when historical reward verification is scheduled; detailed history counters are hidden during ordinary startup. Historical reward verification runs in the background so live proof work can continue while older events are checked. Interactive terminals use a subtle spinner, while redirected output uses plain-text progress. The mining dashboard shows live node state, INJ and AST balances, canonically verified rewards mined during the current invocation, hashrate, transaction, and session-exposure status; it distinguishes proof checking, signed-but-not-yet-broadcast, broadcast/confirmation, chain waiting, required/retrying finalization, and policy-blocked finalization. Autonomous mining retains the best queued proof per node in a bounded inbox, revalidates it against current verified work, and reports bounded per-node proof-pipeline counters on exit (including rejection reasons, paid-attempt suppression, broadcast, and verified candidate events). `--compute-only` hashes locally without unlocking a wallet or sending transactions. Use `--nodes 1,3,5` to restrict mining to selected nodes.
+`astatine init` configures the wallet, network, RPC, CPU budget, reserve, authorization cap, and confirmation depth. Startup shows configuration, RPC/deployment checks, transaction recovery, wallet unlock, initial work, worker preparation and when historical reward reconciliation is scheduled; detailed history counters are hidden during ordinary startup. Historical reward reconciliation runs in the background so live proof work can continue while older events are checked against the selected RPC. Interactive terminals use a subtle spinner, while redirected output uses plain-text progress. The mining dashboard shows live node state, RPC-reported INJ and AST balances, RPC-reported rewards for the current invocation, hashrate, transaction state, cumulative maximum authorization, remaining authorization budget, and RPC-reported actual cost. It distinguishes proof checking, signed-but-not-yet-broadcast, broadcast/confirmation, chain waiting, required/retrying finalization, and policy-blocked finalization. Autonomous mining retains the best queued proof per node in a bounded inbox, revalidates it against current work, and reports bounded per-node proof-pipeline counters on exit. `--compute-only` hashes locally without unlocking a wallet or sending transactions. Use `--nodes 1,3,5` to restrict mining to selected nodes.
 
-Reward forwarding is off by default. `--send-rewards-to ADDRESS` explicitly authorizes this invocation to transfer only an AST payout verified from a canonical winning window receipt to that destination. The transfer amount is exact, the destination is persisted in the transaction journal, and the transfer fee counts toward the configured INJ session cap and reserve. It cannot be combined with `--compute-only`; the mining wallet's AST balance may decrease while `MINED` remains the total verified reward earned in this invocation. If a payout is pending or blocked, resume with the same destination before selecting another one.
+Reward forwarding is off by default. `--send-rewards-to ADDRESS` explicitly authorizes this invocation to forward an RPC-reported AST payout whose receipt event matches the miner's local transaction and payout checks to that destination. The selected RPC is trusted for the underlying chain data and may fabricate reward evidence. The amount is constrained to the reported event, the destination is persisted in the transaction journal, and the transfer authorization counts against the cumulative maximum INJ session cap. It cannot be combined with `--compute-only`; the mining wallet's AST balance may decrease while `MINED` remains the RPC-reported reward total for this invocation. If a payout is pending or blocked, resume with the same destination before selecting another one.
 
 Set `ASTATINE_HISTORY_PROFILE=1` before `astatine mine` (or `$env:ASTATINE_HISTORY_PROFILE='1'` in PowerShell) to print aggregate history profiling at startup and shutdown for developer diagnostics. The profile contains counters and timings only. Normal startup continues to display actionable transaction/RPC warnings and the background reward-verification status without the aggregate dump.
 
 New encrypted Ethereum V3 keystores accept passwords of at least four Unicode characters and at most 1024 bytes. Input is hidden and confirmed. A brief, non-blocking warning recommends a longer unique password when fewer than 12 characters are chosen. This applies to new wallets and mnemonic imports; importing an existing V3 keystore continues to use its original password.
 
-**Transaction costs:** Each proof submission pays a `0.01 INJ` fee. Finalizing a window consumes INJ gas, including when the window is empty or another miner wins. AST forwarding transfers also consume INJ gas. These costs count toward the configured per-session cap. The default cap is zero, which disables transaction signing; a positive cap explicitly authorizes spending. Mainnet transaction signing is disabled.
+**Transaction costs and authorization cap:** Each proof submission pays a `0.01 INJ` fee. Finalizing a window consumes INJ gas, including when the window is empty or another miner wins. AST forwarding transfers also consume INJ gas. For every signed transaction, Astatine durably charges `gas_limit × max_fee_per_gas + transaction_value` against the session cap before producing the signature. That maximum authorization is cumulative and is never refunded or reduced by RPC receipts, reported gas usage, or a completed transaction. The dashboard separates maximum authorized exposure from RPC-reported actual costs. A positive cap authorizes spending; the default zero cap disables signing. Use `astatine mine --new-session` to explicitly start a separate session after a prior spending session has been closed. It is refused while transactions are unresolved. Mainnet transaction signing is disabled.
+
+## RPC Configuration & Trust
+
+Astatine uses the selected network’s RPC URL from the bundled deployment manifest by default. The bundled Testnet primary is `https://k8s.testnet.json-rpc.injective.network/`. You do not need to operate an RPC node. `astatine init` displays the active network’s bundled default and lets you enter a custom RPC; pressing Enter keeps the current selection. Re-running setup keeps an existing custom RPC unless you change it.
+
+View or change the current network’s selection:
+
+```sh
+astatine get rpc
+astatine set rpc
+astatine set rpc https://my-trusted-rpc.example.com
+astatine set rpc default
+```
+
+PowerShell uses the same commands with `astatine.exe`:
+
+```powershell
+astatine.exe get rpc
+astatine.exe set rpc
+astatine.exe set rpc https://my-trusted-rpc.example.com
+astatine.exe set rpc default
+```
+
+Use `--network testnet` or `--network mainnet` on `get rpc` and `set rpc` to
+inspect or change that network’s override without changing the selected network.
+`astatine init --rpc https://my-trusted-rpc.example.com` validates and saves an
+override for the selected network. `astatine set rpc` without a URL is
+interactive; type `default` to restore the bundled endpoint. A remote endpoint
+must use HTTPS and return the selected network’s expected chain ID. HTTP is
+accepted only for local loopback development endpoints. URL credentials are not
+accepted; paths and query parameters are redacted in CLI output because some
+providers use them for API tokens.
+
+Astatine trusts the selected RPC provider for blockchain state, receipts and
+reward evidence; it does not cryptographically authenticate all RPC data. A
+malicious or compromised provider can return false work, transaction, receipt or
+reward information. The bundled archival endpoint is only a historical-log
+fallback with the bundled primary. It is not silently substituted when a custom
+primary is selected. The local session authorization cap does not depend on
+receipt correctness: receipts never replenish signing authority.
 
 ## License
 

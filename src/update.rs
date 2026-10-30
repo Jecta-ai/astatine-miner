@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn selects_highest_compatible_numeric_testnet_prerelease() {
-        let current = semver::Version::parse("0.1.0-testnet.11").unwrap();
+        let current = semver::Version::parse("0.1.0-testnet.12").unwrap();
         let releases = vec![
             GitHubRelease {
                 tag_name: "v0.1.0-testnet.8".to_owned(),
@@ -961,6 +961,11 @@ mod tests {
                 draft: false,
             },
             GitHubRelease {
+                tag_name: "v0.1.0-testnet.13".to_owned(),
+                prerelease: true,
+                draft: false,
+            },
+            GitHubRelease {
                 tag_name: "v0.2.0-testnet.10".to_owned(),
                 prerelease: true,
                 draft: false,
@@ -974,8 +979,8 @@ mod tests {
         assert_eq!(
             latest_testnet_release(releases, &current),
             Some((
-                semver::Version::parse("0.1.0-testnet.12").unwrap(),
-                "v0.1.0-testnet.12".to_owned(),
+                semver::Version::parse("0.1.0-testnet.13").unwrap(),
+                "v0.1.0-testnet.13".to_owned(),
             ))
         );
     }
