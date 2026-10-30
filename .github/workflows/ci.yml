@@ -97,6 +97,7 @@ jobs:
             'support/install-windows.ps1' = Get-Content support/install-windows.ps1 -Raw
             'support/update-windows.ps1' = Get-Content support/update-windows.ps1 -Raw
             'support/verify-public-install-windows.ps1' = Get-Content support/verify-public-install-windows.ps1 -Raw
+            'support/test-install-windows-version.ps1' = Get-Content support/test-install-windows-version.ps1 -Raw
           }
           for ($Index = 0; $Index -lt $CodeBlocks.Count; $Index++) {
             $Scripts["README.md PowerShell block $Index"] = $CodeBlocks[$Index].Groups[1].Value
@@ -107,21 +108,7 @@ jobs:
             [System.Management.Automation.Language.Parser]::ParseInput($Scripts[$Name], [ref]$Tokens, [ref]$Errors) | Out-Null
             if ($Errors.Count -ne 0) { throw "$Name`n$($Errors | Out-String)" }
           }
-          $VersionCases = @(
-            @{ Current = 'astatine 0.1.0-testnet.12'; Candidate = '0.1.0-testnet.13'; Expected = '-1' },
-            @{ Current = '0.1.1-testnet.1'; Candidate = '0.1.0-testnet.99'; Expected = '1' },
-            @{ Current = '0.1.0-testnet.99'; Candidate = '0.1.0'; Expected = '-1' },
-            @{ Current = '0.1.0'; Candidate = '0.1.0-testnet.99'; Expected = '1' },
-            @{ Current = '0.1.0-testnet.13'; Candidate = '0.1.0-testnet.13'; Expected = '0' }
-          )
-          foreach ($Case in $VersionCases) {
-            $Output = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/install-windows.ps1 -CompareVersions -CurrentVersion $Case.Current -CandidateVersion $Case.Candidate
-            if ($LASTEXITCODE -ne 0 -or $Output.Trim() -ne $Case.Expected) { throw "Version comparison failed: $($Case.Current) vs $($Case.Candidate): $Output" }
-          }
-          $Output = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/install-windows.ps1 -CompareVersions -CurrentVersion '0.1.0-preview.1' -CandidateVersion '0.1.0-testnet.13' 2>$null
-          if ($LASTEXITCODE -eq 0) { throw 'Unsupported prerelease identifiers must fail closed' }
-          $Output = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File support/install-windows.ps1 -CompareVersions -CurrentVersion '0.1.0-testnet.013' -CandidateVersion '0.1.0-testnet.13' 2>$null
-          if ($LASTEXITCODE -eq 0) { throw 'Leading-zero SemVer identifiers must fail closed' }
+          & ./support/test-install-windows-version.ps1
       - name: Build Windows password prompt smoke
         if: matrix.target == 'x86_64-pc-windows-msvc'
         run: cargo build --locked --release --example windows_password_prompt

@@ -586,11 +586,60 @@ fn chain_id(network: Network) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{persist_rpc_override, redact_rpc_url, select_rpc_override};
+    use super::{configure_init_rpc, persist_rpc_override, redact_rpc_url, select_rpc_override};
     use crate::{
         cli::Network,
         config::{AppConfig, ConfigStore},
+        transaction::TransactionJournal,
     };
+    use alloy_primitives::Address;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread::{self, JoinHandle},
+    };
+
+    fn mock_chain_id_rpc(chain_id: &'static str) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0, "RPC client closed before sending its request");
+                request.extend_from_slice(&chunk[..count]);
+                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": chain_id,
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
 
     #[tokio::test]
     async fn invalid_rpc_selection_preserves_saved_config_and_other_network_override() {
@@ -624,6 +673,96 @@ mod tests {
             before.rpc_override(Network::Testnet)
         );
         assert_eq!(config.rpc_override(Network::Mainnet), None);
+    }
+
+    #[tokio::test]
+    async fn init_and_rpc_changes_preserve_wallet_and_transaction_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(root.path().to_path_buf());
+        let wallet_address = Address::with_last_byte(0xa1);
+        let wallet = format!("{wallet_address:#x}");
+        let mut config = AppConfig {
+            wallet_address: Some(wallet.clone()),
+            per_session_spending_limit_inj: "1".to_owned(),
+            testnet_rpc: Some("https://old-testnet.example/rpc".to_owned()),
+            mainnet_rpc: Some("https://mainnet.example/rpc".to_owned()),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        drop(TransactionJournal::open(&store, &config, wallet_address).unwrap());
+        let mut journal_state: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        let session_id = journal_state["active_session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        journal_state["active_session"]["authorized_exposure_wei"] =
+            serde_json::Value::String("123".to_owned());
+        journal_state["active_session"]["reported_actual_wei"] =
+            serde_json::Value::String("7".to_owned());
+        let journal = serde_json::to_vec(&journal_state).unwrap();
+        store.write_transaction_journal(&journal).unwrap();
+
+        let (endpoint, server) = mock_chain_id_rpc("0x59f");
+        configure_init_rpc(&mut config, Some(&endpoint))
+            .await
+            .unwrap();
+        server.join().unwrap();
+        store.save(&config).unwrap();
+        assert_eq!(
+            store.load().unwrap().wallet_address.as_deref(),
+            Some(wallet.as_str())
+        );
+        assert_eq!(
+            config.rpc_override(Network::Testnet),
+            Some(endpoint.as_str())
+        );
+        assert_eq!(
+            config.rpc_override(Network::Mainnet),
+            Some("https://mainnet.example/rpc")
+        );
+        assert_eq!(store.read_transaction_journal().unwrap().unwrap(), journal);
+        let reopened = TransactionJournal::open(&store, &config, wallet_address).unwrap();
+        drop(reopened);
+
+        let (set_endpoint, set_server) = mock_chain_id_rpc("0x59f");
+        persist_rpc_override(&store, &mut config, Network::Testnet, &set_endpoint)
+            .await
+            .unwrap();
+        set_server.join().unwrap();
+        assert_eq!(
+            config.rpc_override(Network::Testnet),
+            Some(set_endpoint.as_str())
+        );
+        assert_eq!(config.wallet_address.as_deref(), Some(wallet.as_str()));
+        assert_eq!(store.read_transaction_journal().unwrap().unwrap(), journal);
+        let reopened = TransactionJournal::open(&store, &config, wallet_address).unwrap();
+        drop(reopened);
+
+        persist_rpc_override(&store, &mut config, Network::Testnet, "default")
+            .await
+            .unwrap();
+        assert_eq!(config.rpc_override(Network::Testnet), None);
+        assert_eq!(
+            config.rpc_override(Network::Mainnet),
+            Some("https://mainnet.example/rpc")
+        );
+        assert_eq!(config.wallet_address.as_deref(), Some(wallet.as_str()));
+        assert_eq!(
+            store.load().unwrap().wallet_address.as_deref(),
+            Some(wallet.as_str())
+        );
+        assert_eq!(store.read_transaction_journal().unwrap().unwrap(), journal);
+        let reopened = TransactionJournal::open(&store, &config, wallet_address).unwrap();
+        drop(reopened);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        assert_eq!(persisted["active_session"]["id"], session_id);
+        assert_eq!(
+            persisted["active_session"]["authorized_exposure_wei"],
+            "123"
+        );
+        assert_eq!(persisted["active_session"]["reported_actual_wei"], "7");
     }
 
     #[test]

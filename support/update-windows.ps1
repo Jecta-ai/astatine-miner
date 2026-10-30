@@ -1,10 +1,12 @@
 param(
-    [Parameter(Mandatory = $true)][int]$ParentPid,
-    [Parameter(Mandatory = $true)][string]$PlanPath
+    [switch]$CompareVersions,
+    [string]$CurrentVersion,
+    [string]$CandidateVersion,
+    [int]$ParentPid,
+    [string]$PlanPath
 )
 
 $ErrorActionPreference = 'Stop'
-$Plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
 $Applied = New-Object System.Collections.ArrayList
 $LockStream = $null
 $LockAcquired = $false
@@ -55,6 +57,22 @@ function Compare-AstatineVersions([string]$Current, [string]$Candidate) {
     return 0
 }
 
+if ($CompareVersions) {
+    try {
+        if (-not $CurrentVersion -or -not $CandidateVersion) { throw 'Both current and candidate versions are required' }
+        Write-Output (Compare-AstatineVersions $CurrentVersion $CandidateVersion)
+        exit 0
+    } catch {
+        [Console]::Error.WriteLine($_.Exception.Message)
+        exit 2
+    }
+}
+
+if ($ParentPid -le 0 -or [string]::IsNullOrWhiteSpace($PlanPath)) {
+    throw 'ParentPid and PlanPath are required outside version-comparison mode.'
+}
+$Plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
+
 try {
     while (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue) {
         Start-Sleep -Milliseconds 200
@@ -81,7 +99,7 @@ try {
     }
 
     $VersionOutput = & $Plan.executable --version 2>&1
-    if ($LASTEXITCODE -ne 0 -or (($VersionOutput -join "`n") -notmatch [regex]::Escape($Plan.expected_version))) {
+    if ($LASTEXITCODE -ne 0 -or (Compare-AstatineVersions ($VersionOutput -join "`n") $Plan.expected_version) -ne 0) {
         throw 'The installed executable failed its version smoke test.'
     }
 

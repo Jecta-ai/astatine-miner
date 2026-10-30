@@ -1486,6 +1486,8 @@ impl TransactionJournal {
             entry.confirmations = 0;
             data
         };
+        // Uncertainty restores only pending balance exposure. The active
+        // session's cumulative maximum authorization is intentionally untouched.
         self.adjust_reported_actual_spending(&session_id, actual_to_reverse, U256::ZERO)?;
         let contract_address =
             Address::from_str(&contract).context("uncertain transaction contract is invalid")?;
@@ -2696,7 +2698,7 @@ impl TransactionManager {
                     Ok(None) if entry.status == TransactionStatus::Included => {
                         self.journal.mark_uncertain(hash)?;
                         self.report_warning(format!(
-                            "included transaction {hash:#x} is no longer returned by RPC; maximum exposure restored"
+                            "included transaction {hash:#x} is no longer returned by the selected RPC; pending maximum exposure restored, session authorization remains charged"
                         ));
                     }
                     Ok(None) => {}
@@ -2756,7 +2758,7 @@ impl TransactionManager {
             if latest_block < block_number {
                 self.journal.mark_uncertain(hash)?;
                 self.report_warning(format!(
-                    "latest canonical head {latest_block} is behind settled receipt block {block_number} for {hash:#x}; exposure restored for read-only reorg recovery"
+                    "latest canonical head {latest_block} is behind settled receipt block {block_number} for {hash:#x}; pending maximum exposure restored for read-only reorg recovery, session authorization remains charged"
                 ));
                 continue;
             }
@@ -2789,21 +2791,21 @@ impl TransactionManager {
                             .await?;
                         if matches!(progress, ReceiptProgress::Uncertain) {
                             self.report_warning(format!(
-                                "transaction {hash:#x} reorged; maximum exposure restored"
+                                "transaction {hash:#x} could not be confirmed as canonical; pending maximum exposure restored, session authorization remains charged"
                             ));
                         }
                     }
                     Ok(None) | Err(_) => {
                         self.journal.mark_uncertain(hash)?;
                         self.report_warning(format!(
-                            "settled transaction {hash:#x} is no longer canonical; maximum exposure restored"
+                            "settled transaction {hash:#x} is no longer canonical; pending maximum exposure restored, session authorization remains charged"
                         ));
                     }
                 },
                 Err(error) => {
                     self.journal.mark_uncertain(hash)?;
                     self.report_warning(format!(
-                        "cannot verify canonical block for {hash:#x}; maximum exposure restored: {error:#}"
+                        "cannot verify canonical block for {hash:#x}; pending maximum exposure restored and session authorization remains charged: {error:#}"
                     ));
                 }
             }
@@ -6116,6 +6118,132 @@ mod tests {
         assert!(
             validate_transaction_binding(&forward_entry, &forward_transaction, &forward_receipt)
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_rpc_transaction_details_keep_session_authorization_charged() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            minimum_reserve_inj: "0".to_owned(),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x31);
+        let mut request = test_request();
+        let proof = ProofData {
+            nonce: 42,
+            work_hash: B256::with_last_byte(0x42),
+            header: vec![1, 2, 3],
+        };
+        request.data = AstatineMinerRead::submitSolutionCall {
+            header: Bytes::from(proof.header.clone()),
+            nonce: proof.nonce,
+        }
+        .abi_encode();
+        let tx_hash = sign_eip1559(&test_signer(), &request).unwrap().hash;
+        let token = Address::with_last_byte(0x51);
+        let mut manager = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        manager
+            .journal
+            .prepare(prepared_test_transaction(
+                &request,
+                tx_hash,
+                U256::from(1_000_000_000_000_000_000_u128),
+                U256::ZERO,
+                U256::MAX,
+                Some(proof),
+            ))
+            .unwrap();
+        manager
+            .journal
+            .set_broadcast_state(tx_hash, TransactionStatus::Broadcast)
+            .unwrap();
+        let authorized_before = manager.journal.session_authorized_total().unwrap();
+        let entry = manager.journal.entry(tx_hash).unwrap().clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let forged_sender = Address::with_last_byte(0x32);
+        let transaction_request = request.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request_json = read_history_http_request(&mut stream);
+            assert_eq!(request_json["method"], "eth_getTransactionByHash");
+            let result = serde_json::json!({
+                "hash": format!("{tx_hash:#x}"),
+                "chainId": format!("0x{:x}", transaction_request.chain_id),
+                "from": format!("{forged_sender:#x}"),
+                "to": format!("{:#x}", transaction_request.to),
+                "nonce": format!("0x{:x}", transaction_request.nonce),
+                "value": format!("{:#x}", transaction_request.value),
+                "gas": format!("0x{:x}", transaction_request.gas_limit),
+                "input": format!("0x{}", hex::encode(&transaction_request.data)),
+                "maxFeePerGas": format!("{:#x}", transaction_request.max_fee_per_gas),
+                "maxPriorityFeePerGas": format!(
+                    "{:#x}",
+                    transaction_request.max_priority_fee_per_gas
+                ),
+                "type": "0x2",
+            });
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_json["id"],
+                "result": result,
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        });
+        let url = format!("http://{address}");
+        let client = NetworkClient::local_test_client(
+            &url,
+            request.to,
+            B256::with_last_byte(0x61),
+            token,
+            B256::with_last_byte(0x62),
+            9,
+        )
+        .unwrap();
+        let receipt = TransactionReceipt {
+            transaction_hash: tx_hash,
+            transaction_index: 0,
+            from: wallet,
+            to: Some(request.to),
+            status: true,
+            gas_used: U256::from(50_000),
+            cumulative_gas_used: U256::from(50_000),
+            effective_gas_price: Some(U256::from(2)),
+            transaction_type: Some(2),
+            block_number: 10,
+            block_hash: B256::with_last_byte(0x63),
+            logs: Vec::new(),
+        };
+
+        assert!(matches!(
+            manager
+                .process_receipt(&client, &entry, &receipt, 11)
+                .await
+                .unwrap(),
+            super::ReceiptProgress::Uncertain
+        ));
+        server.join().unwrap();
+        assert_eq!(
+            manager.journal.session_authorized_total().unwrap(),
+            authorized_before
+        );
+        assert_eq!(
+            manager.journal.session_reported_actual_spending().unwrap(),
+            Some(U256::ZERO)
+        );
+        assert_eq!(
+            manager.journal.entry(tx_hash).unwrap().status,
+            TransactionStatus::Unknown
         );
     }
 
@@ -11248,7 +11376,7 @@ mod tests {
             )
             .await;
             assert!(first_rewarding_finalization.receipt_status.unwrap());
-            wait_for_verified_reward(&store, 1, 1, &probe.history_telemetry).await;
+            wait_for_verified_reward(&network, &store, 1, 1, &probe.history_telemetry).await;
             if forwarding_destination.is_some() {
                 let forwarded = wait_for_journal_entry_for_window(
                     &store,
@@ -11406,8 +11534,9 @@ mod tests {
             )
             .await;
             assert!(node3_second_finalization.receipt_status.unwrap());
-            wait_for_verified_reward(&store, 1, 2, &probe.history_telemetry).await;
+            wait_for_verified_reward(&network, &store, 1, 2, &probe.history_telemetry).await;
             wait_for_verified_reward(
+                &network,
                 &store,
                 3,
                 node3_finalization_window,
@@ -13254,6 +13383,8 @@ mod tests {
             parse_decimal_wei(&broadcast_proof.maximum_exposure_wei).unwrap()
                 > U256::from(SUBMISSION_FEE_WEI)
         );
+        let authorization_at_broadcast =
+            parse_decimal_wei(&broadcast_proof.maximum_exposure_wei).unwrap();
         assert!(
             store
                 .read_transaction_journal()
@@ -13277,6 +13408,11 @@ mod tests {
         let _ = submit_task.await;
 
         let mut recovered = TransactionManager::open(&store, &config, account, token).unwrap();
+        assert_eq!(
+            recovered.journal.session_authorized_total().unwrap(),
+            authorization_at_broadcast,
+            "journal restart must retain the signed authorization counter"
+        );
         recovered.reconcile(&network).await.unwrap();
         let pending_recovered = recovered
             .journal
@@ -13536,6 +13672,7 @@ mod tests {
         .await;
         assert_eq!(U256::abi_decode_validate(&balance_bytes).unwrap(), reward);
 
+        let authorized_before_reorg = manager.journal.session_authorized_total().unwrap();
         let reverted = rpc_request_local(
             &client,
             &endpoint,
@@ -13556,6 +13693,11 @@ mod tests {
         assert_eq!(finalization_entry.status, TransactionStatus::Unknown);
         assert!(finalization_entry.last_known_cost_wei.is_some());
         assert!(manager.journal.pending_exposure().unwrap() > U256::ZERO);
+        assert_eq!(
+            manager.journal.session_authorized_total().unwrap(),
+            authorized_before_reorg,
+            "reorg recovery restores pending exposure but never refunds session authorization"
+        );
         let accepted = manager
             .journal
             .state
@@ -14227,6 +14369,7 @@ mod tests {
     }
 
     async fn wait_for_verified_reward(
+        client: &NetworkClient,
         store: &ConfigStore,
         node_id: u8,
         window_id: u64,
@@ -14268,8 +14411,48 @@ mod tests {
                         .reward_scan_cursors
                         .get(&super::reward_scan_key(contract, window_id))
                 });
+            let related_entries = journal
+                .entries
+                .iter()
+                .filter(|entry| entry.node_id == node_id && entry.window_id == window_id)
+                .map(|entry| {
+                    format!(
+                        "{:?}/{:?}/outcome={:?}/reward={:?}/block={:?}/confirmed={}",
+                        entry.action,
+                        entry.status,
+                        entry.outcome,
+                        entry.reward_outcome,
+                        entry.reward_block,
+                        entry.reward_confirmed
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let node_work = client
+                .snapshot(None)
+                .await
+                .ok()
+                .and_then(|snapshot| {
+                    let block_number = snapshot.block.number;
+                    snapshot
+                        .nodes
+                        .into_iter()
+                        .find(|node| node.id == node_id)
+                        .and_then(|node| {
+                            node.state.map(|state| {
+                                format!(
+                                    "block={} window={} started={} ended={}",
+                                    block_number,
+                                    state.work.window_id,
+                                    state.work.started,
+                                    state.work.ended
+                                )
+                            })
+                        })
+                })
+                .unwrap_or_else(|| "selected node snapshot unavailable".to_owned());
             panic!(
-                "reward event for node {node_id} window {window_id} must be verified: entry={:?}, cursor={cursor:?}, anchor={:?}, {}",
+                "reward event for node {node_id} window {window_id} must be verified: entry={:?}, related=[{related_entries}], node_work=[{node_work}], cursor={cursor:?}, anchor={:?}, {}",
                 entry.map(|entry| (
                     entry.status,
                     entry.confirmations,
