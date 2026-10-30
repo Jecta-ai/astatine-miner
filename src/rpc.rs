@@ -12,17 +12,14 @@ use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use serde::{Deserialize, de::DeserializeOwned};
 use std::{
-    collections::HashMap,
-    sync::Arc,
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::task::JoinSet;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-
-#[cfg(test)]
-use std::sync::Mutex;
 
 #[cfg(test)]
 type TestProofNonceStarts = std::sync::Arc<Mutex<HashMap<(u8, u64, B256), u128>>>;
@@ -35,6 +32,7 @@ const MAX_RPC_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_LOG_QUERY_RANGE: u64 = 10_000;
 const SUBMISSION_FEE_WEI: u128 = 10_000_000_000_000_000;
 const ABI_PROBE_NONCE: u128 = u128::MAX - 7;
+const GENESIS_PROBE_CONCURRENCY: usize = 3;
 
 #[cfg(test)]
 fn consume_counter(counter: &AtomicUsize) -> bool {
@@ -239,6 +237,9 @@ pub struct NetworkClient {
     pub manifest: DeploymentManifest,
     endpoints: Vec<RpcEndpoint>,
     pub verification: DeploymentVerification,
+    /// Nodes whose started work has passed the activation-time runtime/ABI/PoW check.
+    /// Entries are cleared when genesis is absent or a canonical reorg is observed.
+    activation_work: Arc<Mutex<HashSet<u8>>>,
     diagnostics: Option<DiagnosticBuffer>,
     history_telemetry: Arc<HistoryTelemetry>,
     #[cfg(test)]
@@ -253,6 +254,67 @@ pub struct NetworkClient {
     fee_quote_delays_started: std::sync::Arc<AtomicU64>,
     #[cfg(test)]
     proof_nonce_starts: TestProofNonceStarts,
+    #[cfg(test)]
+    genesis_poll_observations: Arc<Mutex<Vec<GenesisPollObservation>>>,
+    #[cfg(test)]
+    genesis_poll_inflight: Arc<AtomicUsize>,
+    #[cfg(test)]
+    genesis_poll_max_inflight: Arc<AtomicUsize>,
+    #[cfg(test)]
+    genesis_poll_active_calls: Arc<AtomicUsize>,
+    #[cfg(test)]
+    genesis_poll_delay_ms: Arc<AtomicU64>,
+    #[cfg(test)]
+    fail_next_genesis_polls: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct GenesisPollObservation {
+    pub(crate) started_at: Instant,
+    pub(crate) completed_at: Instant,
+    pub(crate) node_ids: Vec<u8>,
+    pub(crate) max_concurrent_node_reads: usize,
+    pub(crate) succeeded: bool,
+}
+
+#[cfg(test)]
+struct GenesisProbeConcurrencyGuard {
+    inflight: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+struct GenesisPollCallGuard(Arc<AtomicUsize>);
+
+#[cfg(test)]
+impl GenesisPollCallGuard {
+    fn enter(active_calls: Arc<AtomicUsize>) -> Self {
+        active_calls.fetch_add(1, Ordering::AcqRel);
+        Self(active_calls)
+    }
+}
+
+#[cfg(test)]
+impl Drop for GenesisPollCallGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+impl GenesisProbeConcurrencyGuard {
+    fn enter(inflight: Arc<AtomicUsize>, maximum: &AtomicUsize) -> Self {
+        let current = inflight.fetch_add(1, Ordering::AcqRel) + 1;
+        maximum.fetch_max(current, Ordering::AcqRel);
+        Self { inflight }
+    }
+}
+
+#[cfg(test)]
+impl Drop for GenesisProbeConcurrencyGuard {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl NetworkClient {
@@ -339,6 +401,7 @@ impl NetworkClient {
         let mut client = Self {
             manifest,
             endpoints,
+            activation_work: Arc::new(Mutex::new(HashSet::new())),
             diagnostics: None,
             history_telemetry: Arc::new(HistoryTelemetry::default()),
             #[cfg(test)]
@@ -353,6 +416,18 @@ impl NetworkClient {
             fee_quote_delays_started: std::sync::Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             proof_nonce_starts: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            genesis_poll_observations: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            genesis_poll_inflight: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            genesis_poll_max_inflight: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            genesis_poll_active_calls: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            genesis_poll_delay_ms: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            fail_next_genesis_polls: Arc::new(AtomicUsize::new(0)),
             verification: DeploymentVerification {
                 token_verified: false,
                 reference_snapshot_verified: false,
@@ -818,6 +893,162 @@ impl NetworkClient {
         self.best_block().await.map(|(_, block)| block)
     }
 
+    pub(crate) fn clear_activation_work_verification(&self) {
+        self.activation_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Read only the `work()` status of selected nodes known to be awaiting genesis.
+    /// The caller must treat an activation candidate as a hint and follow it with
+    /// `snapshot()`, which performs the canonical full-state and pin verification.
+    pub(crate) async fn poll_genesis(&self, node_ids: &[u8]) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        let started_at = Instant::now();
+        #[cfg(test)]
+        let _active_call = GenesisPollCallGuard::enter(Arc::clone(&self.genesis_poll_active_calls));
+        #[cfg(test)]
+        {
+            let delay_ms = self.genesis_poll_delay_ms.swap(0, Ordering::AcqRel);
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+        #[cfg(test)]
+        self.genesis_poll_max_inflight.store(0, Ordering::Release);
+        let result = self.poll_genesis_inner(node_ids).await;
+        #[cfg(test)]
+        let succeeded = result.is_ok();
+        #[cfg(test)]
+        self.genesis_poll_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(GenesisPollObservation {
+                started_at,
+                completed_at: Instant::now(),
+                node_ids: node_ids.to_vec(),
+                max_concurrent_node_reads: self.genesis_poll_max_inflight.load(Ordering::Acquire),
+                succeeded,
+            });
+        result
+    }
+
+    async fn poll_genesis_inner(&self, node_ids: &[u8]) -> Result<Vec<u8>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        if consume_counter(&self.fail_next_genesis_polls) {
+            bail!("injected transient genesis status RPC failure");
+        }
+        let requested = node_ids.iter().copied().collect::<HashSet<_>>();
+        if requested.len() != node_ids.len() {
+            bail!("genesis poll node selection contains duplicates");
+        }
+        let mut pins = self
+            .manifest
+            .nodes
+            .iter()
+            .filter(|pin| requested.contains(&pin.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        pins.sort_by_key(|pin| pin.id);
+        if pins.len() != requested.len() {
+            bail!("genesis poll requested a node outside the deployment manifest");
+        }
+
+        let (endpoints, block) = self.best_block().await?;
+        let mut refresh_nodes = Vec::new();
+        for batch in pins.chunks(GENESIS_PROBE_CONCURRENCY) {
+            let mut jobs = JoinSet::new();
+            for pin in batch.iter().cloned() {
+                let endpoints = endpoints.clone();
+                let block_number = block.number;
+                #[cfg(test)]
+                let concurrency = GenesisProbeConcurrencyGuard::enter(
+                    Arc::clone(&self.genesis_poll_inflight),
+                    &self.genesis_poll_max_inflight,
+                );
+                jobs.spawn(async move {
+                    #[cfg(test)]
+                    let _concurrency = concurrency;
+                    let address = parse_address(&pin.address)?;
+                    let mut last_error = None;
+                    for endpoint in endpoints {
+                        match call_contract(
+                            &endpoint,
+                            address,
+                            AstatineMinerRead::workCall {},
+                            block_number,
+                        )
+                        .await
+                        {
+                            Ok(bytes) => {
+                                let work = decode_work(&bytes)?;
+                                let refresh = work.started
+                                    || work.ended
+                                    || work.remaining_allocation.is_zero();
+                                return Ok::<(u8, bool), anyhow::Error>((pin.id, refresh));
+                            }
+                            Err(error) => {
+                                last_error = Some(format!("{}: {error:#}", endpoint.name));
+                            }
+                        }
+                    }
+                    bail!(
+                        "could not read genesis status for node {}: {}",
+                        pin.id,
+                        last_error.unwrap_or_else(|| "no canonical RPC endpoint".to_owned())
+                    )
+                });
+            }
+            while let Some(joined) = jobs.join_next().await {
+                let (node_id, refresh) = joined.context("genesis status reader task failed")??;
+                if refresh {
+                    refresh_nodes.push(node_id);
+                }
+            }
+        }
+        refresh_nodes.sort_unstable();
+        Ok(refresh_nodes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn genesis_poll_observations(&self) -> Vec<GenesisPollObservation> {
+        self.genesis_poll_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_genesis_poll_observations(&self) {
+        self.genesis_poll_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delay_next_genesis_poll(&self, delay: Duration) {
+        self.genesis_poll_delay_ms.store(
+            delay.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::Release,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_genesis_polls(&self, count: usize) {
+        self.fail_next_genesis_polls
+            .fetch_add(count, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn genesis_poll_is_active(&self) -> bool {
+        self.genesis_poll_active_calls.load(Ordering::Acquire) > 0
+    }
+
     pub async fn canonical_block_hash(&self, block_number: u64) -> Result<B256> {
         let primary = self.primary_endpoint()?;
         self.history_telemetry
@@ -989,6 +1220,7 @@ impl NetworkClient {
         Ok(Self {
             manifest,
             endpoints: vec![endpoint],
+            activation_work: Arc::new(Mutex::new(HashSet::new())),
             diagnostics: None,
             history_telemetry: Arc::new(HistoryTelemetry::default()),
             #[cfg(test)]
@@ -1003,6 +1235,18 @@ impl NetworkClient {
             fee_quote_delays_started: std::sync::Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             proof_nonce_starts: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            genesis_poll_observations: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            genesis_poll_inflight: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            genesis_poll_max_inflight: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            genesis_poll_active_calls: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            genesis_poll_delay_ms: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            fail_next_genesis_polls: Arc::new(AtomicUsize::new(0)),
             verification: DeploymentVerification {
                 token_verified: true,
                 reference_snapshot_verified: false,
@@ -1242,6 +1486,10 @@ impl NetworkClient {
         block: &BlockSnapshot,
         pin: &NodePin,
     ) -> ContractPinStatus {
+        self.activation_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&pin.id);
         let runtime_check = async {
             let address = parse_address(&pin.address)?;
             let expected_hash = parse_hash(&pin.runtime_code_hash)?;
@@ -1265,6 +1513,7 @@ impl NetworkClient {
             }
         };
 
+        let mut verified_work = false;
         let abi_check = async {
             let state = fetch_node(endpoint, &self.manifest, address, block).await?;
             let has_best_bytes = call_contract(
@@ -1324,17 +1573,26 @@ impl NetworkClient {
                 if decode_return::<B256>(&remote_bytes)? != local_hash {
                     bail!("computeWorkHash disagrees with the canonical Rust implementation");
                 }
+                verified_work = true;
             }
             Ok::<(), anyhow::Error>(())
         }
         .await;
 
         match abi_check {
-            Ok(()) => ContractPinStatus {
-                runtime_verified: true,
-                abi_verified: true,
-                error: None,
-            },
+            Ok(()) => {
+                if verified_work {
+                    self.activation_work
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(pin.id);
+                }
+                ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                }
+            }
             Err(error) => ContractPinStatus {
                 runtime_verified: true,
                 abi_verified: false,
@@ -1374,6 +1632,8 @@ impl NetworkClient {
             }
         }
         nodes.sort_by_key(|node| node.id);
+        self.verify_active_nodes(&endpoints, &block, &mut nodes, false)
+            .await?;
 
         let (native_balance, native_balance_error) = if let Some(address) = wallet {
             match get_balance(&endpoint, address, block.number).await {
@@ -1427,6 +1687,138 @@ impl NetworkClient {
             ast_balance_error,
             nodes,
         })
+    }
+
+    async fn verify_active_nodes(
+        &self,
+        endpoints: &[RpcEndpoint],
+        block: &BlockSnapshot,
+        nodes: &mut [NodeView],
+        force: bool,
+    ) -> Result<()> {
+        if force {
+            self.activation_work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        let mut candidates = Vec::new();
+        {
+            let mut verified = self
+                .activation_work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for node in nodes.iter() {
+                let Some(state) = node.state.as_ref() else {
+                    verified.remove(&node.id);
+                    continue;
+                };
+                if !state.work.started || state.work.ended {
+                    verified.remove(&node.id);
+                    continue;
+                }
+                // The node's runtime pin fixes the hash algorithm; verify once per genesis
+                // activation rather than repeating code/ABI/hash probes on every work window.
+                if !force && verified.contains(&node.id) {
+                    continue;
+                }
+                let pin = self
+                    .manifest
+                    .nodes
+                    .iter()
+                    .find(|pin| pin.id == node.id)
+                    .cloned()
+                    .context("active snapshot node is absent from the deployment manifest")?;
+                candidates.push((node.id, pin));
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        let endpoint = endpoints
+            .first()
+            .context("active-node activation verification has no canonical RPC endpoint")?;
+        let chain_id = rpc_request::<String>(endpoint, "eth_chainId", serde_json::json!([]))
+            .await
+            .and_then(|value| parse_hex_quantity(&value))
+            .context("verify chain ID during genesis activation")?;
+        if chain_id != self.manifest.chain_id {
+            bail!(
+                "RPC {} changed chain ID during genesis activation: expected {}, observed {}",
+                endpoint.name,
+                self.manifest.chain_id,
+                chain_id
+            );
+        }
+
+        for batch in candidates.chunks(GENESIS_PROBE_CONCURRENCY) {
+            let mut jobs = JoinSet::new();
+            for (node_id, pin) in batch.iter().cloned() {
+                let client = self.clone();
+                let endpoint = endpoint.clone();
+                let block = block.clone();
+                jobs.spawn(async move {
+                    let status = client.verify_node_pin(&endpoint, &block, &pin).await;
+                    (node_id, status)
+                });
+            }
+            while let Some(joined) = jobs.join_next().await {
+                let (node_id, mut status) =
+                    joined.context("genesis activation verifier task failed")?;
+                let work_hash_verified = self
+                    .activation_work
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains(&node_id);
+                if status.runtime_verified && status.abi_verified && !work_hash_verified {
+                    status.abi_verified = false;
+                    status.error = Some(
+                        "activation verification did not confirm canonical PoW compatibility"
+                            .to_owned(),
+                    );
+                    self.activation_work
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&node_id);
+                }
+                if let Some(node) = nodes.iter_mut().find(|node| node.id == node_id) {
+                    node.error = status.error.clone();
+                    node.pin = status;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Recheck activation compatibility after a canonical-chain reorganization.
+    /// The original snapshot is verified again at its block before any work is published.
+    pub(crate) async fn reverify_activated_nodes_after_reorg(
+        &self,
+        snapshot: &mut ReadSnapshot,
+    ) -> Result<()> {
+        let (endpoints, head) = self.best_block().await?;
+        if head.number < snapshot.block.number {
+            bail!("RPC head is behind the snapshot during activation revalidation");
+        }
+        let mut matching_endpoints = Vec::new();
+        for endpoint in endpoints {
+            if let Ok(block) = block_at(&endpoint, snapshot.block.number).await
+                && block.hash == snapshot.block.hash
+            {
+                matching_endpoints.push(endpoint);
+            }
+        }
+        if matching_endpoints.is_empty() {
+            bail!("activation snapshot is no longer on a corroborated canonical chain");
+        }
+        self.verify_active_nodes(
+            &matching_endpoints,
+            &snapshot.block,
+            &mut snapshot.nodes,
+            true,
+        )
+        .await
     }
 
     async fn best_block(&self) -> Result<(Vec<RpcEndpoint>, BlockSnapshot)> {
@@ -2217,7 +2609,8 @@ mod tests {
         decode_mining, decode_work, is_transient_receipt_error, is_transient_rpc_error,
         is_window_expired_revert, is_window_not_expired_revert, rpc_request,
     };
-    use alloy_primitives::{Address, B256, Bytes, U256};
+    use crate::deployment::NodePin;
+    use alloy_primitives::{Address, B256, Bytes, U256, hex};
     use alloy_sol_types::{SolCall, SolValue};
     use reqwest::Url;
     use std::{
@@ -2329,6 +2722,44 @@ mod tests {
         }))
     }
 
+    fn block_result(number: u64, timestamp: u64, hash: B256) -> String {
+        rpc_result(serde_json::json!({
+            "number": format!("0x{number:x}"),
+            "timestamp": format!("0x{timestamp:x}"),
+            "hash": format!("{hash:#x}"),
+        }))
+    }
+
+    fn work_result(started: bool, ended: bool, remaining_allocation: U256) -> String {
+        let work = (
+            started,
+            ended,
+            0_u64,
+            100_u64,
+            160_u64,
+            B256::with_last_byte(1),
+            B256::ZERO,
+            U256::MAX,
+            U256::from(1_000_u64),
+            remaining_allocation,
+            64_u32,
+            U256::from(SUBMISSION_FEE_WEI),
+        )
+            .abi_encode();
+        rpc_result(serde_json::json!(format!("0x{}", hex::encode(work))))
+    }
+
+    fn genesis_probe_responses(node_count: usize, started: bool) -> Vec<(u16, String)> {
+        let mut responses = vec![
+            (200, rpc_result(serde_json::json!("0x1"))),
+            (200, block_result(1, 100, B256::with_last_byte(1))),
+        ];
+        responses.extend(
+            (0..node_count).map(|_| (200, work_result(started, false, U256::from(100_u64)))),
+        );
+        responses
+    }
+
     fn network_client(endpoints: Vec<RpcEndpoint>) -> NetworkClient {
         let primary_url = endpoints
             .iter()
@@ -2347,6 +2778,67 @@ mod tests {
         .unwrap();
         client.endpoints = endpoints;
         client
+    }
+
+    #[tokio::test]
+    async fn genesis_probe_reads_only_selected_nodes_with_bounded_concurrency() {
+        let (endpoint, server) = mock_endpoint("primary", genesis_probe_responses(3, false));
+        let mut client = network_client(vec![endpoint]);
+        client.manifest.nodes = (1..=9)
+            .map(|id| NodePin {
+                id,
+                address: format!("{:#x}", Address::with_last_byte(id)),
+                runtime_code_hash: format!("{:#x}", B256::with_last_byte(id)),
+            })
+            .collect();
+
+        let refresh = client.poll_genesis(&[1, 3, 5]).await.unwrap();
+        assert!(
+            refresh.is_empty(),
+            "unstarted nodes are not activation candidates"
+        );
+        let observations = client.genesis_poll_observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].node_ids, [1, 3, 5]);
+        assert!(
+            observations[0].max_concurrent_node_reads <= 3,
+            "genesis probe must cap node reads at its configured concurrency"
+        );
+        assert!(observations[0].completed_at >= observations[0].started_at);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn genesis_probe_only_signals_activation_candidates_for_full_refresh() {
+        let (endpoint, server) = mock_endpoint("primary", genesis_probe_responses(1, true));
+        let client = network_client(vec![endpoint]);
+
+        assert_eq!(client.poll_genesis(&[1]).await.unwrap(), [1]);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn genesis_poll_recovers_after_a_transient_rpc_failure() {
+        let (endpoint, server) = mock_endpoint(
+            "primary",
+            vec![
+                (200, rpc_result(serde_json::json!("0x1"))),
+                (200, block_result(1, 100, B256::with_last_byte(1))),
+                (503, "{}".to_owned()),
+                (200, rpc_result(serde_json::json!("0x1"))),
+                (200, block_result(1, 100, B256::with_last_byte(1))),
+                (200, work_result(false, false, U256::from(100_u64))),
+            ],
+        );
+        let client = network_client(vec![endpoint]);
+
+        assert!(client.poll_genesis(&[1]).await.is_err());
+        assert!(client.poll_genesis(&[1]).await.unwrap().is_empty());
+        let observations = client.genesis_poll_observations();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].node_ids, [1]);
+        assert_eq!(observations[1].node_ids, [1]);
+        server.join().unwrap();
     }
 
     #[test]

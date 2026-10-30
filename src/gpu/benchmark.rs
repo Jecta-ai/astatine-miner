@@ -17,6 +17,8 @@ const CPU_WARMUP: Duration = Duration::from_millis(500);
 const GPU_WARMUP_BATCHES: usize = 2;
 const TESTNET10_GPU_MHS: f64 = 1.334;
 const TESTNET10_CPU_MHS: f64 = 22.910;
+const TESTNET11_GPU_MHS: f64 = 69.102;
+const TESTNET11_CPU_MHS: f64 = 23.284;
 
 #[derive(Clone, Debug)]
 struct CpuSample {
@@ -110,8 +112,12 @@ pub(crate) fn run(args: BenchmarkArgs) -> Result<()> {
         args.seconds,
     );
     println!(
-        "Testnet.10 reference · CPU {:.3} MH/s · GPU {:.3} MH/s · GPU batch {:.3} ms · M4/Metal",
-        TESTNET10_CPU_MHS, TESTNET10_GPU_MHS, 1.518,
+        "Testnet.11 M4/Metal reference · CPU {:.3} MH/s · GPU {:.3} MH/s · batch 262144 · WG32",
+        TESTNET11_CPU_MHS, TESTNET11_GPU_MHS,
+    );
+    println!(
+        "Historical Testnet.10 M4/Metal reference · CPU {:.3} MH/s · GPU {:.3} MH/s · batch 2048 · GPU wall 1.518 ms",
+        TESTNET10_CPU_MHS, TESTNET10_GPU_MHS,
     );
     if args.profile || args.compare_full_sha {
         println!("Mode · bounded GPU configuration sweep; CPU baseline measured once");
@@ -559,6 +565,10 @@ fn print_gpu_configuration(
             gpu_median / 1_000_000.0
         );
         println!(
+            "  Relative to supplied Testnet.11 M4/Metal GPU reference: {:.3}x",
+            gpu_median / (TESTNET11_GPU_MHS * 1_000_000.0)
+        );
+        println!(
             "  Relative to established Testnet.10 GPU baseline: {:.2}x",
             gpu_median / (TESTNET10_GPU_MHS * 1_000_000.0)
         );
@@ -743,6 +753,16 @@ fn write_report_if_requested(report: RawBenchmarkReport<'_>) -> Result<()> {
             "gpu_batch_wall_ms": 1.518,
             "initialization_seconds": 0.102,
             "host_processing_seconds_per_10s": 1.366,
+        },
+        "testnet11_reference": {
+            "hardware": "Apple M4 / Metal",
+            "cpu_mh_s": TESTNET11_CPU_MHS,
+            "gpu_mh_s": TESTNET11_GPU_MHS,
+            "cpu_threads": 4,
+            "gpu_batch_size": 262144,
+            "workgroup_size": 32,
+            "sha256_midstate": true,
+            "pipeline_enabled": true,
         },
         "settings": {
             "cpu_threads": threads,

@@ -147,11 +147,29 @@ jobs:
           cmp THIRD_PARTY_LICENSES.md "$RUNNER_TEMP/THIRD_PARTY_LICENSES.md"
 
   anvil-integration:
-    name: Proof, finalization, reorg, and reward integration tests
+    name: Genesis, proof, finalization, reorg, and reward integration tests
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+      # The upstream source repos are private; CI uses checked-in creation bytecode
+      # and verifies each fixture's pinned source commit before running Anvil.
+      - name: Verify pinned Anvil fixture provenance
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          fixtures = pathlib.Path("tests/fixtures")
+          expected_sources = {
+              "AstatineMiner.json": "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30",
+              "MockAST.json": "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30",
+              "AstatineGenesisCoordinator.json": "54588aa7b020cd7e49fa2275a560cde8138dd707",
+          }
+          for name, expected_commit in expected_sources.items():
+              actual_commit = json.loads((fixtures / name).read_text())["source_commit"]
+              assert actual_commit == expected_commit, (name, actual_commit, expected_commit)
+          PY
       - name: Install stable Rust components
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - uses: foundry-rs/foundry-toolchain@v1
@@ -496,9 +514,9 @@ jobs:
           # The rollback scenario must fail internally; clear that expected native exit code after its assertions pass.
           $global:LASTEXITCODE = 0
 
-  publish-testnet11-release:
-    name: Publish gated Testnet.11 prerelease
-    if: github.ref == 'refs/tags/v0.1.0-testnet.11'
+  publish-testnet12-release:
+    name: Publish gated Testnet.12 prerelease
+    if: github.ref == 'refs/tags/v0.1.0-testnet.12'
     needs: [native-checks, dependency-policy, anvil-integration, package-release, windows-package-smoke]
     runs-on: ubuntu-22.04
     permissions:
@@ -513,7 +531,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - support/release-notes-v0.1.0-testnet.11.md "$RUNNER_TEMP/testnet11-release-notes.md" "$GITHUB_SHA" <<'PY'
+          python3 - support/release-notes-v0.1.0-testnet.12.md "$RUNNER_TEMP/testnet12-release-notes.md" "$GITHUB_SHA" <<'PY'
           import pathlib
           import sys
 
@@ -538,21 +556,21 @@ jobs:
             gh release upload "$tag" "${assets[@]}" --repo emyrinj/astatine-miner --clobber
             gh release edit "$tag" --repo emyrinj/astatine-miner \
               --title "Astatine $tag — Injective Testnet" \
-              --notes-file "$RUNNER_TEMP/testnet11-release-notes.md" \
+              --notes-file "$RUNNER_TEMP/testnet12-release-notes.md" \
               --prerelease
           else
             gh release create "$tag" "${assets[@]}" \
               --repo emyrinj/astatine-miner \
               --title "Astatine $tag — Injective Testnet" \
-              --notes-file "$RUNNER_TEMP/testnet11-release-notes.md" \
+              --notes-file "$RUNNER_TEMP/testnet12-release-notes.md" \
               --prerelease
           fi
           gh release view "$tag" --repo emyrinj/astatine-miner --json tagName,isPrerelease,url
 
   post-release-public-install:
     name: Verify public Windows installer after publication
-    if: github.ref == 'refs/tags/v0.1.0-testnet.11'
-    needs: [publish-testnet11-release]
+    if: github.ref == 'refs/tags/v0.1.0-testnet.12'
+    needs: [publish-testnet12-release]
     runs-on: windows-2025
     timeout-minutes: 10
     steps:

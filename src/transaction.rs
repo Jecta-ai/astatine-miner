@@ -5234,7 +5234,24 @@ mod tests {
 
         interface LocalAstatineMiner {
             function fundAST(uint256 amount) external;
+            function setGenesisActivator(address activator) external;
             function activateGenesis(bytes32 initialSeed) external;
+        }
+
+        interface LocalGenesisCoordinator {
+            function configureNodes(
+                address node1,
+                address node2,
+                address node3,
+                address node4,
+                address node5,
+                address node6,
+                address node7,
+                address node8,
+                address node9
+            ) external;
+            function activateAtomic(bytes32[9] calldata genesisSeeds) external;
+            function genesisActivated() external view returns (bool);
         }
     }
 
@@ -8266,6 +8283,1037 @@ mod tests {
         assert!(!manager.journal.has_unresolved());
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum GenesisActivationScenario {
+        SingleNode,
+        SingleNodeSigning,
+        ThreeNodes,
+        AtomicNineNodes,
+        TransientPollRecovery,
+        StopWhileWaiting,
+        AlreadyActiveAtStartup,
+        ExpiredAfterActivation,
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
+    async fn autonomous_runtime_waits_for_single_genesis_activation() {
+        run_genesis_activation_scenario(GenesisActivationScenario::SingleNode).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
+    async fn autonomous_runtime_submits_a_verified_proof_after_single_genesis_activation() {
+        run_genesis_activation_scenario(GenesisActivationScenario::SingleNodeSigning).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
+    async fn autonomous_runtime_waits_for_three_independent_genesis_activations() {
+        run_genesis_activation_scenario(GenesisActivationScenario::ThreeNodes).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Anvil; uses pinned miner and Coordinator bytecode fixtures"]
+    async fn autonomous_runtime_waits_for_atomic_coordinator_nine_node_genesis() {
+        run_genesis_activation_scenario(GenesisActivationScenario::AtomicNineNodes).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
+    async fn autonomous_runtime_recovers_from_transient_genesis_poll_errors() {
+        run_genesis_activation_scenario(GenesisActivationScenario::TransientPollRecovery).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
+    async fn autonomous_runtime_stops_cleanly_while_waiting_for_genesis() {
+        run_genesis_activation_scenario(GenesisActivationScenario::StopWhileWaiting).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
+    async fn autonomous_runtime_resumes_mining_when_genesis_is_active_at_startup() {
+        run_genesis_activation_scenario(GenesisActivationScenario::AlreadyActiveAtStartup).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
+    async fn autonomous_runtime_finalizes_work_expired_after_genesis_activation() {
+        run_genesis_activation_scenario(GenesisActivationScenario::ExpiredAfterActivation).await;
+    }
+
+    async fn run_genesis_activation_scenario(scenario: GenesisActivationScenario) {
+        let root = std::env::var_os("ASTATINE_EVM_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .join("astatineEVM")
+                    .join("evm")
+            });
+        prepare_local_test_contracts(&root);
+
+        tokio::time::timeout(Duration::from_secs(120), async {
+            let test_device = match std::env::var("ASTATINE_E2E_DEVICE").as_deref() {
+                Ok("gpu") => DeviceChoice::Gpu,
+                Ok("auto") => DeviceChoice::Auto,
+                _ => DeviceChoice::Cpu,
+            };
+            let selected_nodes = match scenario {
+                GenesisActivationScenario::SingleNode
+                | GenesisActivationScenario::SingleNodeSigning
+                | GenesisActivationScenario::TransientPollRecovery
+                | GenesisActivationScenario::StopWhileWaiting
+                | GenesisActivationScenario::AlreadyActiveAtStartup
+                | GenesisActivationScenario::ExpiredAfterActivation => vec![1],
+                GenesisActivationScenario::ThreeNodes => vec![1, 3, 5],
+                GenesisActivationScenario::AtomicNineNodes => (1..=9).collect(),
+            };
+            let transaction_mode = matches!(
+                scenario,
+                GenesisActivationScenario::SingleNodeSigning
+                    | GenesisActivationScenario::ExpiredAfterActivation
+            );
+            let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = port_listener.local_addr().unwrap().port();
+            drop(port_listener);
+            let mut process = Command::new("anvil")
+                .args([
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    &port.to_string(),
+                    "--chain-id",
+                    "1439",
+                    "--accounts",
+                    "3",
+                    "--silent",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("Anvil is required for genesis activation lifecycle tests");
+            let _process_guard = AnvilGuard(&mut process);
+            let endpoint = format!("http://127.0.0.1:{port}");
+            let rpc = reqwest::Client::new();
+            wait_for_anvil(&rpc, &endpoint).await;
+
+            let accounts =
+                rpc_request_local(&rpc, &endpoint, "eth_accounts", serde_json::json!([]))
+                    .await
+                    .unwrap();
+            let deployment_wallet = Address::from_str(accounts[0].as_str().unwrap()).unwrap();
+            let supplied_signer = transaction_mode.then(test_signer);
+            let wallet_address = supplied_signer
+                .as_ref()
+                .map(signer_address)
+                .unwrap_or_else(|| Address::with_last_byte(0xa5));
+            if transaction_mode {
+                let funded_balance =
+                    U256::from(1_000_u64) * U256::from(10_u8).pow(U256::from(18));
+                rpc_request_local(
+                    &rpc,
+                    &endpoint,
+                    "anvil_setBalance",
+                    serde_json::json!([format!("{wallet_address:#x}"), format!("{funded_balance:#x}")]),
+                )
+                .await
+                .unwrap();
+            }
+            let token_artifact = read_artifact(&root.join("out/MockAST.sol/MockAST.json"));
+            let miner_artifact =
+                read_artifact(&root.join("out/AstatineMiner.sol/AstatineMiner.json"));
+            let miner_bytecode = artifact_bytecode(&miner_artifact);
+            let decimals = 9_u8;
+            let token_unit = U256::from(10_u8).pow(U256::from(decimals));
+            let allocation = U256::from(1_000_u64) * token_unit;
+            let total_allocation = allocation * U256::from(9_u8);
+            let reward = U256::from(100_u64) * token_unit;
+            let initial_target = if scenario == GenesisActivationScenario::ExpiredAfterActivation {
+                U256::from(1_u8)
+            } else {
+                U256::MAX
+            };
+            let mut token_init = artifact_bytecode(&token_artifact);
+            token_init.extend_from_slice(&abi_uint8_word(decimals));
+            let token = deploy_unlocked(&rpc, &endpoint, deployment_wallet, &token_init).await;
+            let mint = LocalMockAST::mintCall {
+                account: deployment_wallet,
+                amount: total_allocation,
+            }
+            .abi_encode();
+            send_unlocked(
+                &rpc,
+                &endpoint,
+                deployment_wallet,
+                Some(token),
+                &mint,
+                U256::ZERO,
+            )
+            .await;
+
+            let mut miners = Vec::with_capacity(9);
+            for node_id in 1..=9_u8 {
+                let miner = deploy_local_miner(LocalMinerDeployment {
+                    client: &rpc,
+                    endpoint: &endpoint,
+                    deployment_wallet,
+                    token,
+                    token_decimals: decimals,
+                    allocation,
+                    reward,
+                    miner_bytecode: &miner_bytecode,
+                    initial_target,
+                    retarget_interval: 100,
+                    window_secs: 600,
+                })
+                .await;
+                let approve = LocalMockAST::approveCall {
+                    spender: miner,
+                    amount: allocation,
+                }
+                .abi_encode();
+                send_unlocked(
+                    &rpc,
+                    &endpoint,
+                    deployment_wallet,
+                    Some(token),
+                    &approve,
+                    U256::ZERO,
+                )
+                .await;
+                let fund = LocalAstatineMiner::fundASTCall { amount: allocation }.abi_encode();
+                send_unlocked(
+                    &rpc,
+                    &endpoint,
+                    deployment_wallet,
+                    Some(miner),
+                    &fund,
+                    U256::ZERO,
+                )
+                .await;
+                miners.push((node_id, miner, local_code_hash(&rpc, &endpoint, miner).await));
+            }
+
+            let atomic_coordinator = if scenario == GenesisActivationScenario::AtomicNineNodes {
+                let coordinator_fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/AstatineGenesisCoordinator.json");
+                let coordinator_artifact = read_artifact(&coordinator_fixture);
+                let mut coordinator_init = artifact_bytecode(&coordinator_artifact);
+                coordinator_init.extend_from_slice(&deployment_wallet.abi_encode());
+                coordinator_init.extend_from_slice(&token.abi_encode());
+                let coordinator =
+                    deploy_unlocked(&rpc, &endpoint, deployment_wallet, &coordinator_init).await;
+                for (_, miner, _) in &miners {
+                    let authorize = LocalAstatineMiner::setGenesisActivatorCall {
+                        activator: coordinator,
+                    }
+                    .abi_encode();
+                    send_unlocked(
+                        &rpc,
+                        &endpoint,
+                        deployment_wallet,
+                        Some(*miner),
+                        &authorize,
+                        U256::ZERO,
+                    )
+                    .await;
+                }
+                let configure = LocalGenesisCoordinator::configureNodesCall {
+                    node1: miners[0].1,
+                    node2: miners[1].1,
+                    node3: miners[2].1,
+                    node4: miners[3].1,
+                    node5: miners[4].1,
+                    node6: miners[5].1,
+                    node7: miners[6].1,
+                    node8: miners[7].1,
+                    node9: miners[8].1,
+                }
+                .abi_encode();
+                send_unlocked(
+                    &rpc,
+                    &endpoint,
+                    deployment_wallet,
+                    Some(coordinator),
+                    &configure,
+                    U256::ZERO,
+                )
+                .await;
+                Some(coordinator)
+            } else {
+                None
+            };
+
+            let network = NetworkClient::local_test_client_with_nodes(
+                &endpoint,
+                &miners,
+                token,
+                local_code_hash(&rpc, &endpoint, token).await,
+                decimals,
+            )
+            .unwrap();
+            if scenario == GenesisActivationScenario::AlreadyActiveAtStartup {
+                for node_id in &selected_nodes {
+                    let seed = B256::with_last_byte(0x40_u8.wrapping_add(*node_id));
+                    let activate =
+                        LocalAstatineMiner::activateGenesisCall { initialSeed: seed }.abi_encode();
+                    send_unlocked(
+                        &rpc,
+                        &endpoint,
+                        deployment_wallet,
+                        Some(miners[usize::from(*node_id - 1)].1),
+                        &activate,
+                        U256::ZERO,
+                    )
+                    .await;
+                }
+            }
+            let initial = network.snapshot(Some(wallet_address)).await.unwrap();
+            assert_eq!(initial.nodes.len(), 9);
+            assert!(initial.nodes.iter().all(|node| {
+                node.pin.runtime_verified
+                    && node.pin.abi_verified
+                    && node.state.as_ref().is_some_and(|state| {
+                        if scenario == GenesisActivationScenario::AlreadyActiveAtStartup
+                            && selected_nodes.contains(&node.id)
+                        {
+                            state.work.started && !state.work.ended && state.eligible
+                        } else {
+                            !state.work.started && !state.work.ended && !state.eligible
+                        }
+                    })
+            }));
+            let before_activation_snapshot = rpc_request_local(
+                &rpc,
+                &endpoint,
+                "evm_snapshot",
+                serde_json::json!([]),
+            )
+            .await
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+            let temp = tempdir().unwrap();
+            let store = ConfigStore::at_root(temp.path().to_path_buf());
+            let config = AppConfig {
+                network: Network::Testnet,
+                wallet_address: Some(format!("{wallet_address:#x}")),
+                cpu_threads: 4,
+                minimum_reserve_inj: "0.1".to_owned(),
+                per_session_spending_limit_inj: if transaction_mode {
+                    "20".to_owned()
+                } else {
+                    "0".to_owned()
+                },
+                transaction_confirmations: 1,
+                ..AppConfig::default()
+            };
+            store.save(&config).unwrap();
+            let args = MineArgs {
+                device: test_device,
+                compute_only: !transaction_mode,
+                threads: NonZeroUsize::new(4),
+                nodes: selected_nodes.clone(),
+                send_rewards_to: None,
+            };
+            network.clear_genesis_poll_observations();
+            if scenario == GenesisActivationScenario::StopWhileWaiting {
+                network.delay_next_genesis_poll(Duration::from_secs(2));
+            } else if scenario == GenesisActivationScenario::TransientPollRecovery {
+                network.fail_next_genesis_polls(2);
+            } else if scenario == GenesisActivationScenario::ExpiredAfterActivation {
+                network.delay_next_genesis_poll(Duration::from_secs(4));
+            }
+            let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+            let run_store = store.clone();
+            let run_config = config.clone();
+            let run_network = network.clone();
+            let mut runtime = tokio::spawn(async move {
+                crate::mining::run_with_client(
+                    &run_store,
+                    run_config,
+                    args,
+                    run_network,
+                    supplied_signer,
+                    Some(probe_tx),
+                )
+                .await
+            });
+            let probe = tokio::time::timeout(Duration::from_secs(5), probe_rx)
+                .await
+                .expect("mining runtime did not expose its startup probe")
+                .expect("mining runtime exited before worker startup");
+            if test_device == DeviceChoice::Gpu {
+                assert!(matches!(probe.active_backend, ActiveBackend::Gpu(_)));
+            }
+            if !transaction_mode {
+                probe.proof_processing_gate.send_replace(false);
+            }
+            let mut observer_updates = probe.observer_updates.clone();
+            let _ = observer_updates.borrow_and_update();
+            if scenario == GenesisActivationScenario::TransientPollRecovery {
+                let (message, report) = tokio::time::timeout(Duration::from_secs(4), async {
+                    loop {
+                        observer_updates.changed().await.unwrap();
+                        if let ObserverUpdate::GenesisPollError { message, report } =
+                            observer_updates.borrow_and_update().clone()
+                        {
+                            break (message, report);
+                        }
+                    }
+                })
+                .await
+                .expect("a failed genesis probe should publish its connectivity error");
+                assert!(report, "the first genesis probe failure should be reported");
+                assert!(message.contains("genesis status poll failed"));
+            }
+            if scenario == GenesisActivationScenario::AlreadyActiveAtStartup {
+                assert_eq!(
+                    *probe
+                        .schedule
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    [0],
+                    "already-active selected work must enter the scheduler at startup"
+                );
+                let state = initial.nodes[0]
+                    .state
+                    .as_ref()
+                    .expect("the already-active startup node state is present");
+                assert!(state.work.started && state.eligible && !state.work.ended);
+                wait_for_active_probe(&probe, 1, state.work.window_id).await;
+                wait_for_hash_increase(&probe, 1, 0).await;
+                assert!(
+                    network.genesis_poll_observations().is_empty(),
+                    "already-active startup work must not use inactive-genesis polling"
+                );
+                assert_no_journaled_transactions(&store);
+                probe.stop_signal.request_stop();
+                let result = tokio::time::timeout(Duration::from_secs(10), &mut runtime)
+                    .await
+                    .expect("runtime should stop cleanly after mining already-active work")
+                    .expect("runtime task should join after stop");
+                assert!(result.is_ok());
+                return;
+            }
+            assert!(
+                probe
+                    .schedule
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "verified but unstarted nodes must not enter the mining scheduler"
+            );
+            assert!(probe.slots.iter().all(|slot| slot.completed_hashes() == 0));
+            assert_no_journaled_transactions(&store);
+
+            let mut activated_nodes = HashSet::new();
+            if scenario == GenesisActivationScenario::ExpiredAfterActivation {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !network.genesis_poll_is_active() {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("delayed genesis poll did not start");
+
+                let seed = B256::with_last_byte(0x61);
+                let activate =
+                    LocalAstatineMiner::activateGenesisCall { initialSeed: seed }.abi_encode();
+                send_unlocked(
+                    &rpc,
+                    &endpoint,
+                    deployment_wallet,
+                    Some(miners[0].1),
+                    &activate,
+                    U256::ZERO,
+                )
+                .await;
+                rpc_request_local(
+                    &rpc,
+                    &endpoint,
+                    "evm_increaseTime",
+                    serde_json::json!([601]),
+                )
+                .await
+                .unwrap();
+                rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+                    .await
+                    .unwrap();
+
+                let expired_head = network.latest_block_snapshot().await.unwrap();
+                let expired_snapshot = network.snapshot(Some(wallet_address)).await.unwrap();
+                let expired_state = expired_snapshot.nodes[0]
+                    .state
+                    .as_ref()
+                    .expect("activated node state is readable after its window expires");
+                assert!(expired_state.work.started && expired_state.finalizable);
+                assert!(!expired_state.eligible && !expired_state.work.ended);
+                assert_eq!(expired_state.work.seed, seed);
+                assert_eq!(expired_state.work.window_id, 0);
+
+                let _ = wait_for_observer_snapshot(&mut observer_updates, expired_head.number).await;
+                let finalization = wait_for_journal_entry_for_window(
+                    &store,
+                    1,
+                    TransactionAction::FinalizeWindow,
+                    0,
+                    TransactionStatus::MinedSuccess,
+                )
+                .await;
+                assert_eq!(finalization.window_id, 0);
+                let finalized_snapshot = network.snapshot(Some(wallet_address)).await.unwrap();
+                let next_window = finalized_snapshot.nodes[0]
+                    .state
+                    .as_ref()
+                    .expect("the post-finalization node state is readable");
+                assert!(next_window.work.started && next_window.eligible);
+                assert!(!next_window.finalizable && !next_window.work.ended);
+                assert_eq!(next_window.work.window_id, 1);
+                wait_for_active_probe(&probe, 1, next_window.work.window_id).await;
+                wait_for_hash_increase(&probe, 1, 0).await;
+                probe.proof_processing_gate.send_replace(false);
+                probe.stop_signal.request_stop();
+                let result = tokio::time::timeout(Duration::from_secs(10), &mut runtime)
+                    .await
+                    .expect("runtime should stop after finalizing late-activated expired work")
+                    .expect("runtime task should join after stop");
+                assert!(result.is_ok());
+                return;
+            }
+            if scenario == GenesisActivationScenario::StopWhileWaiting {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !network.genesis_poll_is_active() {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("one-second genesis polling did not start");
+                assert_no_journaled_transactions(&store);
+                assert!(probe.slots.iter().all(|slot| slot.completed_hashes() == 0));
+                let _ = observer_updates.borrow_and_update();
+                let polls_before_stop = network.genesis_poll_observations().len();
+                probe.stop_signal.request_stop();
+                let result = tokio::time::timeout(Duration::from_secs(10), &mut runtime)
+                    .await
+                    .expect("runtime should cancel a pending genesis poll")
+                    .expect("runtime task should join after stop");
+                assert!(result.is_ok());
+                assert!(!network.genesis_poll_is_active());
+                    assert_no_journaled_transactions(&store);
+                assert_eq!(
+                    network.genesis_poll_observations().len(),
+                    polls_before_stop,
+                    "cancelled genesis polling must not publish a late completion"
+                );
+                match tokio::time::timeout(Duration::from_secs(6), observer_updates.changed())
+                    .await
+                {
+                    Err(_) | Ok(Err(_)) => {}
+                    Ok(Ok(())) => panic!("observer published a stale update after shutdown"),
+                }
+                let after_stop = network.latest_block_snapshot().await.unwrap();
+                assert_eq!(after_stop.number, initial.block.number);
+                assert!(probe.slots.iter().all(|slot| slot.completed_hashes() == 0));
+                return;
+            }
+
+            let pre_activation_block = network.latest_block_snapshot().await.unwrap();
+            let expected_poll_count = if scenario == GenesisActivationScenario::TransientPollRecovery {
+                3
+            } else {
+                2
+            };
+            let poll_timeout = if scenario == GenesisActivationScenario::TransientPollRecovery {
+                Duration::from_secs(12)
+            } else {
+                Duration::from_secs(7)
+            };
+            let polls = tokio::time::timeout(poll_timeout, async {
+                loop {
+                    let polls = network.genesis_poll_observations();
+                    if polls.len() >= expected_poll_count {
+                        break polls;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("selected inactive nodes were not polled for genesis");
+            for poll in polls.iter().take(2) {
+                assert_eq!(poll.node_ids, selected_nodes);
+                assert!(poll.max_concurrent_node_reads <= 3);
+            }
+            if scenario == GenesisActivationScenario::TransientPollRecovery {
+                assert!(!polls[0].succeeded && !polls[1].succeeded);
+                assert!(polls[2].succeeded, "genesis polling must resume after RPC recovery");
+            } else {
+                assert!(polls[0].succeeded && polls[1].succeeded);
+            }
+            let poll_interval = polls[1]
+                .started_at
+                .saturating_duration_since(polls[0].started_at);
+            println!(
+                "genesis-poll-observation nodes={selected_nodes:?} interval_ms={} max_concurrency={}",
+                poll_interval.as_millis(),
+                polls[0].max_concurrent_node_reads,
+            );
+            assert!(
+                (Duration::from_millis(800)..=Duration::from_millis(2_500))
+                    .contains(&poll_interval),
+                "genesis probe interval was {poll_interval:?}, expected approximately one second"
+            );
+            if scenario == GenesisActivationScenario::TransientPollRecovery {
+                let first_backoff_interval = poll_interval;
+                let second_backoff_interval = polls[2]
+                    .started_at
+                    .saturating_duration_since(polls[1].started_at);
+                println!(
+                    "genesis-poll-retry intervals_ms={},{}",
+                    first_backoff_interval.as_millis(),
+                    second_backoff_interval.as_millis(),
+                );
+                assert!(
+                    (Duration::from_millis(1_800)..=Duration::from_millis(2_500))
+                        .contains(&first_backoff_interval),
+                    "the first failed genesis probe should back off to about two seconds, got {first_backoff_interval:?}"
+                );
+                assert!(
+                    (Duration::from_millis(3_800)..=Duration::from_millis(5_500))
+                        .contains(&second_backoff_interval),
+                    "the second failed genesis probe should back off to about four seconds, got {second_backoff_interval:?}"
+                );
+            }
+            assert!(
+                polls[1].started_at >= polls[0].completed_at,
+                "a second poll must not overlap the first poll for the same node"
+            );
+            let while_waiting = network.latest_block_snapshot().await.unwrap();
+            assert_eq!(while_waiting.number, pre_activation_block.number);
+            assert_eq!(while_waiting.hash, pre_activation_block.hash);
+            assert!(probe.slots.iter().all(|slot| slot.completed_hashes() == 0));
+            assert_no_journaled_transactions(&store);
+            assert_eq!(
+                probe
+                    .transaction_state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mined_rewards,
+                U256::ZERO
+            );
+
+            let atomic_seeds = std::array::from_fn(|index| {
+                B256::with_last_byte(0x80_u8.wrapping_add(index as u8))
+            });
+            let mut latest_activation_block = pre_activation_block.number;
+            if scenario == GenesisActivationScenario::AtomicNineNodes {
+                let coordinator = atomic_coordinator.expect("atomic scenario deployed Coordinator");
+                let before = network.latest_block_snapshot().await.unwrap();
+                let activation_started = Instant::now();
+                let activation_hash_baseline = probe
+                    .slots
+                    .iter()
+                    .map(NodeSlot::completed_hashes)
+                    .collect::<Vec<_>>();
+                let activate = LocalGenesisCoordinator::activateAtomicCall {
+                    genesisSeeds: atomic_seeds,
+                }
+                .abi_encode();
+                send_unlocked(
+                    &rpc,
+                    &endpoint,
+                    deployment_wallet,
+                    Some(coordinator),
+                    &activate,
+                    U256::ZERO,
+                )
+                .await;
+                let after = network.latest_block_snapshot().await.unwrap();
+                assert_eq!(after.number, before.number + 1, "all nine starts use one atomic transaction");
+                latest_activation_block = after.number;
+                let configured = LocalGenesisCoordinator::genesisActivatedCall {}.abi_encode();
+                let activated = local_call(&rpc, &endpoint, coordinator, &configured).await;
+                assert!(bool::abi_decode_validate(&activated).unwrap());
+
+                let snapshot =
+                    wait_for_observer_snapshot(&mut observer_updates, after.number).await;
+                let mut shared_start_time = None;
+                for node_id in &selected_nodes {
+                    let node = snapshot
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == *node_id)
+                        .unwrap();
+                    assert_eq!(node.address, miners[usize::from(*node_id - 1)].1);
+                    assert!(node.pin.runtime_verified && node.pin.abi_verified);
+                    let state = node.state.as_ref().expect("activated node state is present");
+                    assert!(state.work.started && !state.work.ended && state.eligible);
+                    assert_eq!(state.work.window_id, 0);
+                    assert_eq!(state.work.target, U256::MAX);
+                    assert_eq!(state.work.seed, atomic_seeds[usize::from(*node_id - 1)]);
+                    if let Some(start) = shared_start_time {
+                        assert_eq!(state.work.window_start_time, start);
+                    } else {
+                        shared_start_time = Some(state.work.window_start_time);
+                    }
+                    activated_nodes.insert(*node_id);
+                    wait_for_active_probe(&probe, *node_id, state.work.window_id).await;
+                    wait_for_hash_increase(
+                        &probe,
+                        *node_id,
+                        activation_hash_baseline[usize::from(*node_id - 1)],
+                    )
+                    .await;
+                    if test_device == DeviceChoice::Gpu {
+                        assert!(
+                            probe
+                                .proof_telemetry
+                                .count(*node_id, ProofMetric::GpuCompletedBatches)
+                                > 0
+                        );
+                        assert!(
+                            probe
+                                .proof_telemetry
+                                .count(*node_id, ProofMetric::GpuCandidatesCpuVerified)
+                                > 0
+                        );
+                        assert_eq!(
+                            probe
+                                .proof_telemetry
+                                .count(*node_id, ProofMetric::GpuHashMismatch),
+                            0
+                        );
+                    }
+                }
+                let activation_latency = activation_started.elapsed();
+                println!(
+                    "genesis-activation-latency scenario=atomic-nine max_ms={}",
+                    activation_latency.as_millis()
+                );
+                assert!(
+                    activation_latency < Duration::from_secs(5),
+                    "atomic genesis activation should start hashing promptly"
+                );
+            } else {
+                for node_id in &selected_nodes {
+                    let previous_hashes =
+                        probe.slots[usize::from(*node_id - 1)].completed_hashes();
+                    let before = network.latest_block_snapshot().await.unwrap();
+                    let activation_started = Instant::now();
+                    let seed = B256::with_last_byte(0x60_u8.wrapping_add(*node_id));
+                    let activate =
+                        LocalAstatineMiner::activateGenesisCall { initialSeed: seed }.abi_encode();
+                    send_unlocked(
+                        &rpc,
+                        &endpoint,
+                        deployment_wallet,
+                        Some(miners[usize::from(*node_id - 1)].1),
+                        &activate,
+                        U256::ZERO,
+                    )
+                    .await;
+                    let after = network.latest_block_snapshot().await.unwrap();
+                    assert_eq!(after.number, before.number + 1);
+                    latest_activation_block = after.number;
+                    activated_nodes.insert(*node_id);
+                    let snapshot =
+                        wait_for_observer_snapshot(&mut observer_updates, after.number).await;
+                    for node in &snapshot.nodes {
+                        let expected_started = activated_nodes.contains(&node.id);
+                        let state = node.state.as_ref().expect("all local nodes remain readable");
+                        assert_eq!(state.work.started, expected_started, "node {:02}", node.id);
+                        if expected_started {
+                            assert_eq!(node.address, miners[usize::from(node.id - 1)].1);
+                            assert!(node.pin.runtime_verified && node.pin.abi_verified);
+                            assert!(state.eligible && !state.work.ended);
+                            assert_eq!(state.work.window_id, 0);
+                            assert_eq!(state.work.target, U256::MAX);
+                            assert_eq!(
+                                state.work.seed,
+                                B256::with_last_byte(0x60_u8.wrapping_add(node.id))
+                            );
+                        }
+                    }
+                    let expected_schedule = selected_nodes
+                        .iter()
+                        .filter(|selected| activated_nodes.contains(selected))
+                        .map(|selected| usize::from(*selected - 1))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        *probe
+                            .schedule
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        expected_schedule
+                    );
+                    let state = snapshot
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == *node_id)
+                        .unwrap()
+                        .state
+                        .as_ref()
+                        .unwrap();
+                    wait_for_active_probe(&probe, *node_id, state.work.window_id).await;
+                    wait_for_hash_increase(&probe, *node_id, previous_hashes).await;
+                    if test_device == DeviceChoice::Gpu {
+                        assert!(
+                            probe
+                                .proof_telemetry
+                                .count(*node_id, ProofMetric::GpuCompletedBatches)
+                                > 0
+                        );
+                        assert!(
+                            probe
+                                .proof_telemetry
+                                .count(*node_id, ProofMetric::GpuCandidatesCpuVerified)
+                                > 0
+                        );
+                        assert_eq!(
+                            probe
+                                .proof_telemetry
+                                .count(*node_id, ProofMetric::GpuHashMismatch),
+                            0
+                        );
+                    }
+                    let activation_latency = activation_started.elapsed();
+                    println!(
+                        "genesis-activation-latency node={node_id:02} ms={}",
+                        activation_latency.as_millis()
+                    );
+                    assert!(
+                        activation_latency < Duration::from_secs(5),
+                        "node {node_id:02} should start hashing promptly after genesis"
+                    );
+                    if transaction_mode {
+                        probe.proof_processing_gate.send_replace(false);
+                    }
+                }
+            }
+            assert_eq!(
+                probe
+                    .transaction_state
+                    .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mined_rewards,
+                U256::ZERO,
+                "a submitted proof is not counted as a mined reward before window finalization"
+            );
+            if transaction_mode {
+                let proof = wait_for_journal_entry_for_window(
+                    &store,
+                    1,
+                    TransactionAction::SubmitProof,
+                    0,
+                    TransactionStatus::MinedSuccess,
+                )
+                .await;
+                assert_eq!(proof.outcome.as_deref(), Some("candidate-updated"));
+                assert!(proof.receipt_block.is_some_and(|block| block > latest_activation_block));
+                assert!(probe.proof_telemetry.count(1, ProofMetric::Signed) > 0);
+                assert!(probe.proof_telemetry.count(1, ProofMetric::Broadcast) > 0);
+                assert!(probe.proof_telemetry.count(1, ProofMetric::ReceiptConfirmed) > 0);
+                if test_device == DeviceChoice::Gpu {
+                    assert!(
+                        probe
+                            .proof_telemetry
+                            .count(1, ProofMetric::GpuCandidatesCpuVerified)
+                            > 0
+                    );
+                    assert_eq!(
+                        probe
+                            .proof_telemetry
+                            .count(1, ProofMetric::GpuHashMismatch),
+                        0
+                    );
+                }
+                assert_eq!(
+                    probe
+                        .proof_telemetry
+                        .count(1, ProofMetric::DroppedNoEligibleWork),
+                    0
+                );
+            } else {
+                assert_no_journaled_transactions(&store);
+                for node_id in &selected_nodes {
+                    assert_eq!(probe.proof_telemetry.count(*node_id, ProofMetric::Signed), 0);
+                    assert_eq!(probe.proof_telemetry.count(*node_id, ProofMetric::Broadcast), 0);
+                }
+
+                let _ = observer_updates.borrow_and_update();
+                let reverted = rpc_request_local(
+                    &rpc,
+                    &endpoint,
+                    "evm_revert",
+                    serde_json::json!([before_activation_snapshot]),
+                )
+                .await
+                .unwrap();
+                assert_eq!(reverted.as_bool(), Some(true));
+                let reverted_head = network.latest_block_snapshot().await.unwrap();
+                probe.observer_refresh.force_refresh();
+                let reverted_snapshot =
+                    wait_for_observer_snapshot(&mut observer_updates, reverted_head.number).await;
+                assert!(reverted_snapshot.nodes.iter().all(|node| {
+                    node.state
+                        .as_ref()
+                        .is_some_and(|state| !state.work.started && !state.eligible)
+                }));
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if probe
+                            .schedule
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_empty()
+                            && probe.slots.iter().all(|slot| slot.active_window_id().is_none())
+                        {
+                            break;
+                        }
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("reorged genesis work must be invalidated");
+                let invalidated_hashes = probe
+                    .slots
+                    .iter()
+                    .map(NodeSlot::completed_hashes)
+                    .collect::<Vec<_>>();
+                let mut drained = invalidated_hashes.clone();
+                let mut stable = 0;
+                for _ in 0..120 {
+                    sleep(Duration::from_millis(50)).await;
+                    let current = probe
+                        .slots
+                        .iter()
+                        .map(NodeSlot::completed_hashes)
+                        .collect::<Vec<_>>();
+                    if current == drained {
+                        stable += 1;
+                        if stable >= 3 {
+                            break;
+                        }
+                    } else {
+                        drained = current;
+                        stable = 0;
+                    }
+                }
+                assert!(
+                    stable >= 3,
+                    "hashing must stop after the activation reorg drains: stable={stable}, initial={invalidated_hashes:?}, final={drained:?}, schedule={:?}, active_windows={:?}",
+                    *probe
+                        .schedule
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    probe
+                        .slots
+                        .iter()
+                        .map(NodeSlot::active_window_id)
+                        .collect::<Vec<_>>(),
+                );
+                let stale_hashes = drained
+                    .iter()
+                    .zip(&invalidated_hashes)
+                    .map(|(current, before)| current.saturating_sub(*before))
+                    .sum::<u64>();
+                assert!(
+                    stale_hashes <= (crate::gpu::MAX_GPU_BATCH_SIZE * 2) as u64,
+                    "only the bounded GPU batches already in flight may finish after a reorg"
+                );
+                assert_no_journaled_transactions(&store);
+
+                if scenario == GenesisActivationScenario::AtomicNineNodes {
+                    let coordinator = atomic_coordinator.unwrap();
+                    let _ = observer_updates.borrow_and_update();
+                    let before = network.latest_block_snapshot().await.unwrap();
+                    let activate = LocalGenesisCoordinator::activateAtomicCall {
+                        genesisSeeds: atomic_seeds,
+                    }
+                    .abi_encode();
+                    send_unlocked(
+                        &rpc,
+                        &endpoint,
+                        deployment_wallet,
+                        Some(coordinator),
+                        &activate,
+                        U256::ZERO,
+                    )
+                    .await;
+                    let after = network.latest_block_snapshot().await.unwrap();
+                    assert_eq!(after.number, before.number + 1);
+                    let snapshot =
+                        wait_for_observer_snapshot(&mut observer_updates, after.number).await;
+                    for node_id in &selected_nodes {
+                        let state = snapshot.nodes[usize::from(*node_id - 1)]
+                            .state
+                            .as_ref()
+                            .expect("reactivated node state is present");
+                        assert!(snapshot.nodes[usize::from(*node_id - 1)].pin.abi_verified);
+                        wait_for_active_probe(&probe, *node_id, state.work.window_id).await;
+                        wait_for_hash_increase(
+                            &probe,
+                            *node_id,
+                            drained[usize::from(*node_id - 1)],
+                        )
+                        .await;
+                    }
+                } else {
+                    for node_id in &selected_nodes {
+                        let _ = observer_updates.borrow_and_update();
+                        let before = network.latest_block_snapshot().await.unwrap();
+                        let seed = B256::with_last_byte(0x60_u8.wrapping_add(*node_id));
+                        let activate = LocalAstatineMiner::activateGenesisCall {
+                            initialSeed: seed,
+                        }
+                        .abi_encode();
+                        send_unlocked(
+                            &rpc,
+                            &endpoint,
+                            deployment_wallet,
+                            Some(miners[usize::from(*node_id - 1)].1),
+                            &activate,
+                            U256::ZERO,
+                        )
+                        .await;
+                        let after = network.latest_block_snapshot().await.unwrap();
+                        assert_eq!(after.number, before.number + 1);
+                        let snapshot =
+                            wait_for_observer_snapshot(&mut observer_updates, after.number).await;
+                        let state = snapshot.nodes[usize::from(*node_id - 1)]
+                            .state
+                            .as_ref()
+                            .expect("reactivated node state is present");
+                        assert!(snapshot.nodes[usize::from(*node_id - 1)].pin.abi_verified);
+                        wait_for_active_probe(&probe, *node_id, state.work.window_id).await;
+                        wait_for_hash_increase(
+                            &probe,
+                            *node_id,
+                            drained[usize::from(*node_id - 1)],
+                        )
+                        .await;
+                    }
+                }
+                assert_no_journaled_transactions(&store);
+            }
+            probe.stop_signal.request_stop();
+            let result = tokio::time::timeout(Duration::from_secs(20), &mut runtime)
+                .await
+                .expect("genesis-aware runtime should stop cleanly")
+                .expect("genesis-aware runtime task should join");
+            assert!(result.is_ok());
+            assert!(!network.genesis_poll_is_active());
+        })
+        .await
+        .expect("genesis activation lifecycle timed out");
+    }
+
     #[tokio::test]
     #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
     async fn autonomous_runtime_mines_and_finalizes_across_three_consecutive_windows() {
@@ -8517,7 +9565,7 @@ mod tests {
             let config = AppConfig {
                 network: Network::Testnet,
                 wallet_address: Some(format!("{account:#x}")),
-                cpu_threads: 32,
+                cpu_threads: 4,
                 minimum_reserve_inj: "0".to_owned(),
                 per_session_spending_limit_inj: "1".to_owned(),
                 transaction_confirmations: 1,
@@ -8531,7 +9579,7 @@ mod tests {
             let args = MineArgs {
                 device: test_device,
                 compute_only: gpu_compute_only,
-                threads: NonZeroUsize::new(32),
+                threads: NonZeroUsize::new(4),
                 nodes: gpu_compute_nodes.clone().unwrap_or_else(|| vec![1, 3]),
                 send_rewards_to: if gpu_compute_only {
                     None
@@ -11270,6 +12318,8 @@ mod tests {
     }
 
     const LOCAL_EVM_FIXTURE_SOURCE_COMMIT: &str = "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30";
+    const LOCAL_COORDINATOR_FIXTURE_SOURCE_COMMIT: &str =
+        "54588aa7b020cd7e49fa2275a560cde8138dd707";
 
     fn prepare_local_test_contracts(root: &std::path::Path) {
         if root.join("src/AstatineMiner.sol").is_file() {
@@ -11305,6 +12355,18 @@ mod tests {
                 );
             }
         }
+        let coordinator_fixture = fixtures.join("AstatineGenesisCoordinator.json");
+        assert!(
+            coordinator_fixture.is_file(),
+            "local Coordinator fixture is missing"
+        );
+        let coordinator: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(coordinator_fixture).unwrap()).unwrap();
+        assert_eq!(
+            coordinator["source_commit"].as_str(),
+            Some(LOCAL_COORDINATOR_FIXTURE_SOURCE_COMMIT),
+            "Coordinator fixture provenance must match the pinned source commit"
+        );
     }
 
     fn artifact_bytecode(artifact: &serde_json::Value) -> Vec<u8> {
@@ -11517,6 +12579,16 @@ mod tests {
             sleep(Duration::from_millis(50)).await;
         }
         panic!("transaction journal did not reach {status:?} for {action:?}");
+    }
+
+    fn assert_no_journaled_transactions(store: &ConfigStore) {
+        if let Some(contents) = store.read_transaction_journal().unwrap() {
+            let journal: super::JournalState = serde_json::from_slice(&contents).unwrap();
+            assert!(
+                journal.entries.is_empty(),
+                "waiting for genesis must not create transaction journal entries"
+            );
+        }
     }
 
     async fn wait_for_journal_entry_for_window(
