@@ -330,16 +330,25 @@ def synthetic_rehearsal(repo_root: pathlib.Path) -> None:
             )
             write_checksums(directory)
 
-        wrong_repository = copy_release("wrong-repository")
-        wrong_repository_manifest = wrong_repository / "update-manifest.txt"
-        wrong_repository_manifest.write_text(
-            wrong_repository_manifest.read_text(encoding="utf-8").replace(
-                f"repository={REPOSITORY}", "repository=attacker.invalid/astatine-miner"
-            ),
-            encoding="utf-8",
-        )
-        re_sign(wrong_repository)
-        cases.append(("repository identity mismatch", lambda: validate_release(wrong_repository, tag, repo_root, public_key, signed=True)))
+        for label, rejected_repository in (
+            ("legacy-repository", "emyrinj/astatine-miner"),
+            ("attacker-repository", "attacker.invalid/astatine-miner"),
+        ):
+            wrong_repository = copy_release(label)
+            wrong_repository_manifest = wrong_repository / "update-manifest.txt"
+            wrong_repository_manifest.write_text(
+                wrong_repository_manifest.read_text(encoding="utf-8").replace(
+                    f"repository={REPOSITORY}", f"repository={rejected_repository}"
+                ),
+                encoding="utf-8",
+            )
+            re_sign(wrong_repository)
+            cases.append(
+                (
+                    f"rejected repository identity: {rejected_repository}",
+                    lambda directory=wrong_repository: validate_release(directory, tag, repo_root, public_key, signed=True),
+                )
+            )
 
         wrong_version = copy_release("wrong-version")
         wrong_version_manifest = wrong_version / "update-manifest.txt"

@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Version = '0.1.0-testnet.13'
-$Repository = 'emyrinj/astatine-miner'
+$Repository = 'Jecta-ai/astatine-miner'
 $Temp = Join-Path $env:TEMP ("astatine-public-install-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $Temp | Out-Null
 try {

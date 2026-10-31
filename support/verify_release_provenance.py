@@ -292,7 +292,9 @@ def self_test() -> None:
         ({**valid, "path": ".github/workflows/untrusted.yml@refs/tags/v0.1.0-testnet.13"}, REPOSITORY, "v0.1.0-testnet.13", "a" * 40),
         ({**valid, "path": f"{WORKFLOW}@refs/heads/main"}, REPOSITORY, "v0.1.0-testnet.13", "a" * 40),
         ({**valid, "repository": {"full_name": "attacker.invalid/astatine-miner"}}, REPOSITORY, "v0.1.0-testnet.13", "a" * 40),
+        ({**valid, "repository": {"full_name": "emyrinj/astatine-miner"}}, REPOSITORY, "v0.1.0-testnet.13", "a" * 40),
         (valid, "attacker.invalid/astatine-miner", "v0.1.0-testnet.13", "a" * 40),
+        (valid, "emyrinj/astatine-miner", "v0.1.0-testnet.13", "a" * 40),
         (valid, REPOSITORY, "v0.1.0-testnet.13", "b" * 40),
     ):
         try:
@@ -325,6 +327,7 @@ def self_test() -> None:
         ({**rehearsal, "path": f"{WORKFLOW}@refs/tags/v0.1.0-testnet.13"}, REPOSITORY, branch, "c" * 40),
         ({**rehearsal, "path": ".github/workflows/other.yml@refs/heads/feature/testnet13-rc1-remediation"}, REPOSITORY, branch, "c" * 40),
         ({**rehearsal, "repository": {"full_name": "attacker.invalid/astatine-miner"}}, REPOSITORY, branch, "c" * 40),
+        ({**rehearsal, "repository": {"full_name": "emyrinj/astatine-miner"}}, REPOSITORY, branch, "c" * 40),
         (rehearsal, REPOSITORY, "../untrusted", "c" * 40),
     ):
         try:

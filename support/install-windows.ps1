@@ -89,7 +89,7 @@ if ($VerifyVersionOutput) {
 }
 
 $Version = '0.1.0-testnet.13'
-$Repository = 'emyrinj/astatine-miner'
+$Repository = 'Jecta-ai/astatine-miner'
 $Asset = 'astatine-windows-x86_64.zip'
 $Base = "https://github.com/$Repository/releases/download/v$Version"
 $Temp = Join-Path $env:TEMP ("astatine-install-" + [Guid]::NewGuid().ToString('N'))

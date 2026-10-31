@@ -2,7 +2,7 @@
 set -eu
 
 VERSION="0.1.0-testnet.13"
-REPOSITORY="emyrinj/astatine-miner"
+REPOSITORY="Jecta-ai/astatine-miner"
 
 compare_testnet_versions() {
   awk -v current="$1" -v candidate="$2" '

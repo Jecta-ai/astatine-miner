@@ -11414,6 +11414,19 @@ mod tests {
             )
             .await;
             assert!(node3_second_finalization.receipt_status.unwrap());
+            let mut reward_updates = probe.observer_updates.clone();
+            let _ = reward_updates.borrow_and_update();
+            let reward_head = network.latest_block_snapshot().await.unwrap();
+            probe.observer_refresh.force_refresh();
+            let observed_reward_head =
+                wait_for_observer_snapshot(&mut reward_updates, reward_head.number).await;
+            assert!(observed_reward_head.nodes.iter().any(|node| {
+                node.id == 3
+                    && node
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.work.window_id > node3_finalization_window)
+            }));
             wait_for_verified_reward(&network, &store, 1, 2, &probe.history_telemetry).await;
             wait_for_verified_reward(
                 &network,

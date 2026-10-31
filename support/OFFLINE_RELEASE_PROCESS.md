@@ -185,7 +185,8 @@ the expected signed inventory.
 `support/release-repository.txt` is the exact release identity for the updater,
 package validator, build script, and workflow checks. Standalone installers and
 documentation embed the same exact current identity and are checked against
-that file. A migration must update the canonical identity and every client,
+that file. The current identity is `Jecta-ai/astatine-miner`. A future migration
+must update the canonical identity and every client,
 installer URL, workflow attestation expectation, README/release-note link, and
 test in one reviewed change. Wildcards or accepting multiple repository names
 are not supported. The owner must rebuild and re-attest the migrated source; old

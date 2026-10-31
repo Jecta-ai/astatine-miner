@@ -974,6 +974,12 @@ mod tests {
         bad = bad.replace("channel=testnet", "channel=mainnet");
         assert!(parse_manifest(bad.as_bytes()).is_err());
 
+        let legacy_repository = manifest_text().replace(
+            &format!("repository={REPOSITORY}"),
+            "repository=emyrinj/astatine-miner",
+        );
+        assert!(parse_manifest(legacy_repository.as_bytes()).is_err());
+
         let bad_versions = [
             "0.1.0-testnet.foo",
             "0.1.0-testnet.13.extra",
