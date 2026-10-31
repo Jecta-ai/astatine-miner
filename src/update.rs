@@ -15,16 +15,14 @@ use std::{
     time::Duration,
 };
 
-const REPOSITORY: &str = "emyrinj/astatine-miner";
+const REPOSITORY: &str = env!("ASTATINE_RELEASE_REPOSITORY");
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_RELEASE_LIST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ASSET_BYTES: usize = 128 * 1024 * 1024;
 const SIGNATURE_BYTES: usize = 384;
-const RELEASES_API: &str =
-    "https://api.github.com/repos/emyrinj/astatine-miner/releases?per_page=50";
 
-const RSA_MODULUS_BASE64: &str = "vFRqlV94vTfLogc01RAkRPzmEYGO62akKkOLpBtaBqemy4gjOpDZAjSWn2wsPilPAvGQT2UWvck56GlUbv7vRzz17AvPf7cwKv+hYGCQA/5WEmhxhgLUSei44ihW5AAFC068U8iD37CwMEPDy23u4jl35HKwvEd5xasdaz8db8cX/9pquUdOL3mGnPpTXkzZqQHnkEEA42jKo8jKpl0IDTlVoKZ8Kdw6BBnzGLhizJtZGiDj5J3hH5YHrT5weh8RBDnqKSj8xNiGhgsDh5xVTUsttFfjlOFHrCHrkED3+UG01xJ5PYFyos4QSO7feLkbjlpOfh1x8pMlQ96YXIZ3mxNDltLgXqJ98/IzVvp/ewLmIkGY6pW5Exlvdbz6nfgtcbaiXCi9MwbevAojzLJ1V/wps7F/hyuv9dKSRIoaRIHkgSnA6YP8epTnJn+swL9LHdZjayS1vkXf8s46IAaLyh8ts3pJY8Tb5gAIzJ6OvDxijD1AnnhrMEew9lcVVW6H";
+const RSA_MODULUS_BASE64: &str = "kEm6xA0HF7BGDhKZlJkvGrdImcDQfezTL3jEE3Tq9LzGMI6J7iRTdFcFZolbDAbY31dlZH/klKQdYJ2GQ8pgBurFsKnVkN+Yk6njIL3/f2Ug4ZzfMdiXGquQDNxmxfRzGSj3PpH7fpekTjcBRM3fjH2j0yec1dGinvuXy79+7W4EQ8DBK/4v/8MdfjqaOq+hg4SNeKQKmIus0qGGqAb32cJaFOhzLea5K/KaWOOBtW/E1QwxFhwl78dRJPbfHacCCMiUBKnBsbXQxbfxcEtLP+Bjv9fnXQ7rU4ZQ2GCHDckkU+EXmRFzV7rc1qZmnXdADAtOY7RTWxQv7ngAhUabiXwZ+Nx8GZ3LpgUhu827kHePWl/3BVsZJAum75906v2gpBTlGdLDDHhwlGaKJ7LOE4OK4fv4+kQ5SjTFIQeKMmJeNJ+0++ioiIw6VHMz8DPB1naiWa4g0Aib5u4fKvHa3BeTq3CDIk8sZY++9LzkJLu0sCqXS3tFKpp0W/Efaed1";
 const RSA_EXPONENT_BASE64: &str = "AQAB";
 
 const TARGETS: [&str; 5] = [
@@ -189,8 +187,9 @@ pub async fn check_for_update() -> Result<Option<String>> {
 async fn latest_signed_update() -> Result<Option<(String, UpdateManifest)>> {
     let current = Version::parse(CURRENT_VERSION).context("parse the compiled Astatine version")?;
     let client = http_client()?;
+    let releases_api = format!("https://api.github.com/repos/{REPOSITORY}/releases?per_page=50");
     let response = client
-        .get(RELEASES_API)
+        .get(&releases_api)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
         .await
@@ -884,7 +883,7 @@ fn verify_signature_with_key(n: &[u8], e: &[u8], message: &[u8], signature: &[u8
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubRelease, ManifestAsset, UpdateLock, latest_testnet_release,
+        GitHubRelease, ManifestAsset, REPOSITORY, UpdateLock, latest_testnet_release,
         parse_executable_version_output, parse_manifest, parse_supported_testnet_version,
         validate_manifest, verify_asset_bytes, verify_executable_version_output,
         verify_signature_with_key,
@@ -945,8 +944,8 @@ mod tests {
     }
 
     fn manifest_text() -> String {
-        let mut text = String::from(
-            "astatine-update-manifest-v1\nrepository=emyrinj/astatine-miner\nchannel=testnet\nversion=0.1.0-testnet.9\n",
+        let mut text = format!(
+            "astatine-update-manifest-v1\nrepository={REPOSITORY}\nchannel=testnet\nversion=0.1.0-testnet.9\n"
         );
         for (key, asset) in manifest_assets() {
             text.push_str(&format!(

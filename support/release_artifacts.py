@@ -17,7 +17,13 @@ import zipfile
 from collections.abc import Callable
 
 
-REPOSITORY = "emyrinj/astatine-miner"
+_REPOSITORY_LINES = pathlib.Path(__file__).with_name("release-repository.txt").read_text(encoding="ascii").splitlines()
+if (
+    len(_REPOSITORY_LINES) != 1
+    or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*", _REPOSITORY_LINES[0]) is None
+):
+    raise RuntimeError("support/release-repository.txt must contain one exact owner/repository identity")
+REPOSITORY = _REPOSITORY_LINES[0]
 MAX_ASSET_BYTES = 512 * 1024 * 1024
 MAX_CONTROL_FILE_BYTES = 2 * 1024 * 1024
 TARGETS = {
@@ -272,13 +278,22 @@ def synthetic_rehearsal(repo_root: pathlib.Path) -> None:
 
         private_key = temporary_root / "synthetic-signing-key.pem"
         public_key = temporary_root / "synthetic-signing-public.pem"
+        wrong_private_key = temporary_root / "wrong-synthetic-signing-key.pem"
+        wrong_public_key = temporary_root / "wrong-synthetic-signing-public.pem"
         subprocess.run(
             ["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:3072", "-out", str(private_key)],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        subprocess.run(
+            ["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:3072", "-out", str(wrong_private_key)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         subprocess.run(["openssl", "pkey", "-in", str(private_key), "-pubout", "-out", str(public_key)], check=True, capture_output=True)
+        subprocess.run(["openssl", "pkey", "-in", str(wrong_private_key), "-pubout", "-out", str(wrong_public_key)], check=True, capture_output=True)
         subprocess.run(
             ["openssl", "dgst", "-sha256", "-sign", str(private_key), "-out", str(good / "update-manifest.sig"), str(good / "update-manifest.txt")],
             check=True,
@@ -288,6 +303,8 @@ def synthetic_rehearsal(repo_root: pathlib.Path) -> None:
         validate_release(good, tag, repo_root, public_key, signed=True)
 
         cases: list[tuple[str, Callable[[], None]]] = []
+
+        cases.append(("wrong public key", lambda: validate_release(good, tag, repo_root, wrong_public_key, signed=True)))
 
         def copy_release(label: str) -> pathlib.Path:
             destination = temporary_root / label
@@ -303,6 +320,37 @@ def synthetic_rehearsal(repo_root: pathlib.Path) -> None:
         with (manifest_substitution / "update-manifest.txt").open("ab") as modified:
             modified.write(b"tampered=true\n")
         cases.append(("unsigned manifest substitution", lambda: validate_release(manifest_substitution, tag, repo_root, public_key, signed=True)))
+
+        def re_sign(directory: pathlib.Path) -> None:
+            manifest_path = directory / "update-manifest.txt"
+            subprocess.run(
+                ["openssl", "dgst", "-sha256", "-sign", str(private_key), "-out", str(directory / "update-manifest.sig"), str(manifest_path)],
+                check=True,
+                capture_output=True,
+            )
+            write_checksums(directory)
+
+        wrong_repository = copy_release("wrong-repository")
+        wrong_repository_manifest = wrong_repository / "update-manifest.txt"
+        wrong_repository_manifest.write_text(
+            wrong_repository_manifest.read_text(encoding="utf-8").replace(
+                f"repository={REPOSITORY}", "repository=attacker.invalid/astatine-miner"
+            ),
+            encoding="utf-8",
+        )
+        re_sign(wrong_repository)
+        cases.append(("repository identity mismatch", lambda: validate_release(wrong_repository, tag, repo_root, public_key, signed=True)))
+
+        wrong_version = copy_release("wrong-version")
+        wrong_version_manifest = wrong_version / "update-manifest.txt"
+        wrong_version_manifest.write_text(
+            wrong_version_manifest.read_text(encoding="utf-8").replace(
+                "version=0.1.0-testnet.13", "version=0.1.0-testnet.14"
+            ),
+            encoding="utf-8",
+        )
+        re_sign(wrong_version)
+        cases.append(("incorrect release version", lambda: validate_release(wrong_version, tag, repo_root, public_key, signed=True)))
 
         package_substitution = copy_release("package-substitution")
         package_name = TARGETS["linux-x86_64"][1]

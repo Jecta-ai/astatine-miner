@@ -2,6 +2,7 @@
 set -eu
 
 VERSION="0.1.0-testnet.13"
+REPOSITORY="emyrinj/astatine-miner"
 
 compare_testnet_versions() {
   awk -v current="$1" -v candidate="$2" '
@@ -101,7 +102,7 @@ case "$(uname -s)" in
   *) printf '%s\n' 'This installer supports macOS and Linux' >&2; exit 1 ;;
 esac
 
-BASE="https://github.com/emyrinj/astatine-miner/releases/download/v${VERSION}"
+BASE="https://github.com/${REPOSITORY}/releases/download/v${VERSION}"
 TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEMP_DIR"' EXIT HUP INT TERM
 MANIFEST="$TEMP_DIR/update-manifest.txt"
@@ -113,15 +114,15 @@ curl --fail --show-error --location --connect-timeout 10 --max-time 60 --max-fil
 curl --fail --show-error --location --connect-timeout 10 --max-time 60 --max-filesize 4096 "$BASE/update-manifest.sig" -o "$SIGNATURE"
 cat > "$PUBLIC_KEY" <<'PUBLIC_KEY_EOF'
 -----BEGIN PUBLIC KEY-----
-MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAvFRqlV94vTfLogc01RAk
-RPzmEYGO62akKkOLpBtaBqemy4gjOpDZAjSWn2wsPilPAvGQT2UWvck56GlUbv7v
-Rzz17AvPf7cwKv+hYGCQA/5WEmhxhgLUSei44ihW5AAFC068U8iD37CwMEPDy23u
-4jl35HKwvEd5xasdaz8db8cX/9pquUdOL3mGnPpTXkzZqQHnkEEA42jKo8jKpl0I
-DTlVoKZ8Kdw6BBnzGLhizJtZGiDj5J3hH5YHrT5weh8RBDnqKSj8xNiGhgsDh5xV
-TUsttFfjlOFHrCHrkED3+UG01xJ5PYFyos4QSO7feLkbjlpOfh1x8pMlQ96YXIZ3
-mxNDltLgXqJ98/IzVvp/ewLmIkGY6pW5Exlvdbz6nfgtcbaiXCi9MwbevAojzLJ1
-V/wps7F/hyuv9dKSRIoaRIHkgSnA6YP8epTnJn+swL9LHdZjayS1vkXf8s46IAaL
-yh8ts3pJY8Tb5gAIzJ6OvDxijD1AnnhrMEew9lcVVW6HAgMBAAE=
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAkEm6xA0HF7BGDhKZlJkv
+GrdImcDQfezTL3jEE3Tq9LzGMI6J7iRTdFcFZolbDAbY31dlZH/klKQdYJ2GQ8pg
+BurFsKnVkN+Yk6njIL3/f2Ug4ZzfMdiXGquQDNxmxfRzGSj3PpH7fpekTjcBRM3f
+jH2j0yec1dGinvuXy79+7W4EQ8DBK/4v/8MdfjqaOq+hg4SNeKQKmIus0qGGqAb3
+2cJaFOhzLea5K/KaWOOBtW/E1QwxFhwl78dRJPbfHacCCMiUBKnBsbXQxbfxcEtL
+P+Bjv9fnXQ7rU4ZQ2GCHDckkU+EXmRFzV7rc1qZmnXdADAtOY7RTWxQv7ngAhUab
+iXwZ+Nx8GZ3LpgUhu827kHePWl/3BVsZJAum75906v2gpBTlGdLDDHhwlGaKJ7LO
+E4OK4fv4+kQ5SjTFIQeKMmJeNJ+0++ioiIw6VHMz8DPB1naiWa4g0Aib5u4fKvHa
+3BeTq3CDIk8sZY++9LzkJLu0sCqXS3tFKpp0W/Efaed1AgMBAAE=
 -----END PUBLIC KEY-----
 PUBLIC_KEY_EOF
 
@@ -129,7 +130,7 @@ openssl dgst -sha256 -verify "$PUBLIC_KEY" -signature "$SIGNATURE" "$MANIFEST" >
 manifest_repository="$(awk -F= '$1 == "repository" { print $2 }' "$MANIFEST")"
 manifest_channel="$(awk -F= '$1 == "channel" { print $2 }' "$MANIFEST")"
 manifest_version="$(awk -F= '$1 == "version" { print $2 }' "$MANIFEST")"
-test "$manifest_repository" = "emyrinj/astatine-miner"
+test "$manifest_repository" = "$REPOSITORY"
 test "$manifest_channel" = "testnet"
 test "$manifest_version" = "$VERSION"
 asset_key="asset.package.${TARGET}="

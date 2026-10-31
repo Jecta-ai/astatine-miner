@@ -117,9 +117,33 @@ Use measured results for the installed hardware. The GPU shader implements SHA-2
 
 The Testnet.11 M4/Metal reference supplied for this release is `69.102 MH/s` GPU median and `23.284 MH/s` CPU median (four CPU workers). A fresh comparable Testnet.12 run measured GPU `68.689 MH/s` median (`68.689`, `68.677`, `68.738 MH/s`) and CPU `22.304 MH/s` median (`22.727`, `22.304`, `22.126 MH/s`). Across fifteen local Testnet.12 samples, the combined GPU median is `68.568 MH/s`. The GPU shader and compute pipeline were not changed. Full per-run samples, methodology, genesis activation latencies, and timing limitations are in [the Testnet.12 performance report](support/testnet12-performance.md). Metal exposes no wgpu GPU timestamp queries on this adapter, so dispatch-to-readback is wall latency, not isolated shader time. These are measured results, not a guarantee across devices; run `astatine benchmark` on the target hardware.
 
-The archives are authenticated by the pinned RSA-3072 key in addition to HTTPS. Its SHA-256 SubjectPublicKeyInfo fingerprint is `e610269b1a6dffe64eb1b9b4d97e9cca434884f5908a38888e310bdd74322e7c`; the PEM and Windows XML forms are in `support/release-signing-public.*`. macOS binaries are not Developer ID signed or notarized, and Windows binaries are not Authenticode signed; the release manifest signature provides the project-level authenticity check.
+Release manifests are authenticated by a pinned RSA-3072 key in addition to
+HTTPS. The currently embedded key's SHA-256 SubjectPublicKeyInfo fingerprint is
+`e6868b04ae1d09c367906df1e1d0e6558242498bbfda0c949e75c6646da05755`. This
+owner-supplied key is integrated across the Rust updater, Unix/Windows
+installers, and release validators; `support/release-key-fingerprint.txt`
+contains the matching active fingerprint. Before signing, the offline signer
+requires the selected private key to derive this exact public anchor. Replacing
+the pin means existing Testnet.12 clients with the legacy key cannot verify
+releases signed only by the new key. This candidate does not include a
+backward-compatible bridge; clients that require automatic updates from
+Testnet.12 need a migration path before release. macOS binaries are not
+Developer ID signed or notarized, and Windows binaries are not Authenticode
+signed.
 
-GitHub build-provenance attestations are published for the release archives, native executables, and signed manifest. To inspect one, use `gh attestation verify astatine-linux-x86_64.tar.gz --repo emyrinj/astatine-miner` with the GitHub CLI.
+GitHub Actions only builds/tests unsigned artifacts and creates provenance for
+the exact source commit. Creating a tag does not publish a release. The owner
+downloads and independently verifies the asset attestations, signs the manifest
+offline, then explicitly publishes the signed 15-asset inventory with
+`support/publish_signed_release.py`. See
+[`support/OFFLINE_RELEASE_PROCESS.md`](support/OFFLINE_RELEASE_PROCESS.md) for
+the owner commands and recovery behavior. To inspect build provenance for an
+unsigned package, use:
+
+```sh
+gh attestation verify astatine-linux-x86_64.tar.gz \
+  --repo "$(tr -d '\n' < support/release-repository.txt)"
+```
 
 ## Use
 

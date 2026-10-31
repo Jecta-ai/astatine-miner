@@ -18,6 +18,9 @@ Testnet.13 is an RC1 security-remediation candidate for the Rust miner.
   downgrades, including stable/prerelease ordering.
 - New encrypted wallets require 12-character passwords; existing V3 keystores
   remain import-compatible.
+- GitHub Actions builds/tests unsigned release assets and creates source
+  provenance. The release owner verifies and signs the manifest offline, then
+  manually publishes the signed inventory; a tag alone never publishes.
 
 The protocol, proof algorithm, GPU pipeline, rewards, node pins, and 0.01 INJ
 submission fee remain unchanged. RPC state, receipts, and reward evidence are
@@ -25,4 +28,4 @@ not cryptographically authenticated by the miner. The local authorization cap
 is per session and assumes its private journal and archives have not been
 intentionally rewritten by a process running under the same OS account.
 
-Commit-pinned source: [Testnet.13 release tag](https://github.com/emyrinj/astatine-miner/tree/v0.1.0-testnet.13).
+Commit-pinned source: https://github.com/__RELEASE_REPOSITORY__/tree/__RELEASE_COMMIT__

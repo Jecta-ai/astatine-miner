@@ -89,8 +89,9 @@ if ($VerifyVersionOutput) {
 }
 
 $Version = '0.1.0-testnet.13'
+$Repository = 'emyrinj/astatine-miner'
 $Asset = 'astatine-windows-x86_64.zip'
-$Base = "https://github.com/emyrinj/astatine-miner/releases/download/v$Version"
+$Base = "https://github.com/$Repository/releases/download/v$Version"
 $Temp = Join-Path $env:TEMP ("astatine-install-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $Temp | Out-Null
 try {
@@ -100,8 +101,7 @@ try {
     Invoke-WebRequest -Uri "$Base/update-manifest.sig" -OutFile $Signature -TimeoutSec 60
     if ((Get-Item -LiteralPath $Manifest).Length -gt 2097152) { throw 'Release manifest exceeds its size limit' }
     if ((Get-Item -LiteralPath $Signature).Length -ne 384) { throw 'Release signature has an invalid length' }
-
-    $KeyXml = '<RSAKeyValue><Modulus>vFRqlV94vTfLogc01RAkRPzmEYGO62akKkOLpBtaBqemy4gjOpDZAjSWn2wsPilPAvGQT2UWvck56GlUbv7vRzz17AvPf7cwKv+hYGCQA/5WEmhxhgLUSei44ihW5AAFC068U8iD37CwMEPDy23u4jl35HKwvEd5xasdaz8db8cX/9pquUdOL3mGnPpTXkzZqQHnkEEA42jKo8jKpl0IDTlVoKZ8Kdw6BBnzGLhizJtZGiDj5J3hH5YHrT5weh8RBDnqKSj8xNiGhgsDh5xVTUsttFfjlOFHrCHrkED3+UG01xJ5PYFyos4QSO7feLkbjlpOfh1x8pMlQ96YXIZ3mxNDltLgXqJ98/IzVvp/ewLmIkGY6pW5Exlvdbz6nfgtcbaiXCi9MwbevAojzLJ1V/wps7F/hyuv9dKSRIoaRIHkgSnA6YP8epTnJn+swL9LHdZjayS1vkXf8s46IAaLyh8ts3pJY8Tb5gAIzJ6OvDxijD1AnnhrMEew9lcVVW6H</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
+$KeyXml = '<RSAKeyValue><Modulus>kEm6xA0HF7BGDhKZlJkvGrdImcDQfezTL3jEE3Tq9LzGMI6J7iRTdFcFZolbDAbY31dlZH/klKQdYJ2GQ8pgBurFsKnVkN+Yk6njIL3/f2Ug4ZzfMdiXGquQDNxmxfRzGSj3PpH7fpekTjcBRM3fjH2j0yec1dGinvuXy79+7W4EQ8DBK/4v/8MdfjqaOq+hg4SNeKQKmIus0qGGqAb32cJaFOhzLea5K/KaWOOBtW/E1QwxFhwl78dRJPbfHacCCMiUBKnBsbXQxbfxcEtLP+Bjv9fnXQ7rU4ZQ2GCHDckkU+EXmRFzV7rc1qZmnXdADAtOY7RTWxQv7ngAhUabiXwZ+Nx8GZ3LpgUhu827kHePWl/3BVsZJAum75906v2gpBTlGdLDDHhwlGaKJ7LOE4OK4fv4+kQ5SjTFIQeKMmJeNJ+0++ioiIw6VHMz8DPB1naiWa4g0Aib5u4fKvHa3BeTq3CDIk8sZY++9LzkJLu0sCqXS3tFKpp0W/Efaed1</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
     $Rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider
     $Rsa.FromXmlString($KeyXml)
     $ManifestBytes = [System.IO.File]::ReadAllBytes($Manifest)
@@ -113,7 +113,7 @@ try {
     }
     $ManifestLines = Get-Content -LiteralPath $Manifest
     if ($ManifestLines[0] -ne 'astatine-update-manifest-v1') { throw 'Unsupported release manifest format' }
-    if ($ManifestLines -notcontains 'repository=emyrinj/astatine-miner') { throw 'Manifest repository identity is invalid' }
+    if ($ManifestLines -notcontains "repository=$Repository") { throw 'Manifest repository identity is invalid' }
     if ($ManifestLines -notcontains 'channel=testnet') { throw 'Manifest channel is not Testnet' }
     $VersionLine = $ManifestLines | Where-Object { $_.StartsWith('version=') }
     if ($VersionLine -ne "version=$Version") { throw 'Signed manifest version does not match this installer' }

@@ -25,6 +25,19 @@ def is_pinned(reference: str) -> bool:
     return IMMUTABLE_SHA.fullmatch(reference.rsplit("@", 1)[1]) is not None
 
 
+def validate_signing_isolation(contents: str, workflow: pathlib.Path) -> None:
+    forbidden = (
+        "secrets.",
+        "TESTNET_RELEASE_SIGNING_KEY",
+        "ASTATINE_RELEASE_SIGNING_KEY",
+        "contents: write",
+        "gh release create",
+    )
+    for token in forbidden:
+        if token in contents:
+            raise AssertionError(f"{workflow}: workflow must not contain privileged release authority: {token}")
+
+
 def self_test() -> None:
     fixtures = {
         "  - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567": True,
@@ -40,6 +53,17 @@ def self_test() -> None:
         actual = reference is not None and is_pinned(reference)
         if actual != expected:
             raise AssertionError(f"action pin fixture failed: {line!r}; expected {expected}, got {actual}")
+    for privileged in (
+        "env: SOME_KEY: ${{ secrets.SOME_KEY }}",
+        "env: TESTNET_RELEASE_SIGNING_KEY: ${{ secrets.TESTNET_RELEASE_SIGNING_KEY }}",
+        "permissions: contents: write",
+        "run: gh release create v0.1.0-testnet.13",
+    ):
+        try:
+            validate_signing_isolation(privileged, pathlib.Path("synthetic-workflow.yml"))
+        except AssertionError:
+            continue
+        raise AssertionError(f"workflow isolation fixture unexpectedly accepted: {privileged}")
 
 
 def main() -> None:
@@ -49,7 +73,9 @@ def main() -> None:
     scanned = 0
     workflows = sorted({*root.glob("*.yml"), *root.glob("*.yaml")})
     for workflow in workflows:
-        for number, line in enumerate(workflow.read_text(encoding="utf-8").splitlines(), 1):
+        contents = workflow.read_text(encoding="utf-8")
+        validate_signing_isolation(contents, workflow)
+        for number, line in enumerate(contents.splitlines(), 1):
             reference = reference_for_line(line)
             if reference is None:
                 continue
