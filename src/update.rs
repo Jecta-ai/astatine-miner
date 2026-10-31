@@ -883,14 +883,14 @@ fn verify_signature_with_key(n: &[u8], e: &[u8], message: &[u8], signature: &[u8
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::stage_replacement;
     use super::{
         GitHubRelease, ManifestAsset, UpdateLock, latest_testnet_release,
         parse_executable_version_output, parse_manifest, parse_supported_testnet_version,
-        smoke_test_binary, validate_manifest, verify_asset_bytes, verify_executable_version_output,
+        validate_manifest, verify_asset_bytes, verify_executable_version_output,
         verify_signature_with_key,
     };
+    #[cfg(unix)]
+    use super::{smoke_test_binary, stage_replacement};
     use base64::{Engine, engine::general_purpose::STANDARD};
     use sha2::Digest;
     use std::collections::BTreeMap;
