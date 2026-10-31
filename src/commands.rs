@@ -250,7 +250,7 @@ async fn run_rewards() -> Result<()> {
             .await?;
     let snapshot = client.snapshot(Some(address)).await?;
     if !client.verification.token_verified {
-        bail!("AST token runtime is not verified; refusing to report a token balance as verified");
+        bail!("AST token runtime pin is not verified; refusing to read its token balance");
     }
     let balance = snapshot
         .ast_balance

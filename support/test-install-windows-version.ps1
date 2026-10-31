@@ -44,6 +44,40 @@ function Invoke-AstatineVersionComparison([string]$ScriptPath, [string]$Current,
     }
 }
 
+function Invoke-AstatineVersionOutputCheck([string]$ScriptPath, [string]$Expected, [string[]]$Lines) {
+    $StartInfo = [System.Diagnostics.ProcessStartInfo]::new($script:PowerShellPath)
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.CreateNoWindow = $true
+    $StartInfo.RedirectStandardOutput = $true
+    $StartInfo.RedirectStandardError = $true
+    $OutputJson = ConvertTo-Json -InputObject @($Lines) -Compress
+    foreach ($Argument in @(
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        $ScriptPath,
+        '-VerifyVersionOutput',
+        '-ExpectedVersion',
+        $Expected,
+        '-VersionOutputJson',
+        $OutputJson
+    )) {
+        $StartInfo.ArgumentList.Add($Argument)
+    }
+
+    $Process = [System.Diagnostics.Process]::Start($StartInfo)
+    $StandardOutput = $Process.StandardOutput.ReadToEnd()
+    $StandardError = $Process.StandardError.ReadToEnd()
+    $Process.WaitForExit()
+    [pscustomobject]@{
+        ExitCode = $Process.ExitCode
+        Output = $StandardOutput.Trim()
+        Error = $StandardError.Trim()
+    }
+}
+
 # Exercise expected nonzero child exits while the outer shell uses strict native
 # command handling. The process API keeps those exit codes available for tests.
 $PreviousNativeCommandPreference = $PSNativeCommandUseErrorActionPreference
@@ -95,6 +129,29 @@ try {
                 if ($Result.ExitCode -ne 2 -or [string]::IsNullOrWhiteSpace($Result.Error)) {
                     throw "$ScriptName accepted invalid $Position version '$Invalid'; exit=$($Result.ExitCode) output='$($Result.Output)' error='$($Result.Error)'"
                 }
+            }
+        }
+
+        $ExpectedVersionOutput = Invoke-AstatineVersionOutputCheck `
+            $Script '0.1.0-testnet.13' @('astatine 0.1.0-testnet.13')
+        if ($ExpectedVersionOutput.ExitCode -ne 0 -or $ExpectedVersionOutput.Output -ne '0') {
+            throw "${ScriptName} rejected its exact version output: $($ExpectedVersionOutput | ConvertTo-Json -Compress)"
+        }
+        foreach ($InvalidOutput in @(
+            @('astatine 0.1.0-testnet.130'),
+            @('astatine 0.1.0-testnet.foo'),
+            @('astatine 0.1.0-testnet.12'),
+            @('astatine 0.1.0-testnet.13 '),
+            @('0.1.0-testnet.13'),
+            @(' astatine 0.1.0-testnet.13'),
+            @('malformed version output'),
+            @('astatine 0.1.0-testnet.13', 'extra output line'),
+            @('astatine 0.1.0-testnet.13', '')
+        )) {
+            $RejectedOutput = Invoke-AstatineVersionOutputCheck `
+                $Script '0.1.0-testnet.13' $InvalidOutput
+            if ($RejectedOutput.ExitCode -ne 2 -or [string]::IsNullOrWhiteSpace($RejectedOutput.Error)) {
+                throw "${ScriptName} accepted malformed executable version output $($InvalidOutput -join '|'): $($RejectedOutput | ConvertTo-Json -Compress)"
             }
         }
     }

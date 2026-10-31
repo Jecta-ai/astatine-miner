@@ -50,4 +50,33 @@ for invalid in \
   assert_invalid "$invalid"
 done
 
-printf '%s\n' 'Unix installer semantic-version ordering and fail-closed checks passed'
+TEMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TEMP_DIR"' EXIT HUP INT TERM
+FAKE_EXECUTABLE="$TEMP_DIR/astatine"
+assert_executable_version() {
+  output=$1
+  should_pass=$2
+  {
+    printf '%s\n' '#!/bin/sh'
+    printf "printf '%%b' '%s'\n" "$output"
+  } > "$FAKE_EXECUTABLE"
+  chmod +x "$FAKE_EXECUTABLE"
+  if [ "$should_pass" = true ]; then
+    sh "$INSTALLER" --verify-executable-version 0.1.0-testnet.13 "$FAKE_EXECUTABLE"
+  elif sh "$INSTALLER" --verify-executable-version 0.1.0-testnet.13 "$FAKE_EXECUTABLE" >/dev/null 2>&1; then
+    printf '%s\n' "Malformed or mismatched executable version output was accepted: $output" >&2
+    exit 1
+  fi
+}
+
+assert_executable_version 'astatine 0.1.0-testnet.13\n' true
+assert_executable_version 'astatine 0.1.0-testnet.130\n' false
+assert_executable_version 'astatine 0.1.0-testnet.foo\n' false
+assert_executable_version 'astatine 0.1.0-testnet.12\n' false
+assert_executable_version 'astatine 0.1.0-testnet.13 \n' false
+assert_executable_version '0.1.0-testnet.13\n' false
+assert_executable_version 'not a version\n' false
+assert_executable_version 'astatine 0.1.0-testnet.13\nextra output\n' false
+assert_executable_version 'astatine 0.1.0-testnet.13' false
+
+printf '%s\n' 'Unix installer SemVer ordering, executable matching, and fail-closed checks passed'

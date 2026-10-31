@@ -152,7 +152,7 @@ fn command() -> ClapCommand {
         .version(env!("CARGO_PKG_VERSION"))
         .about("A native command-line miner for Astatine")
         .long_about(
-            "Astatine is a non-custodial CPU/GPU miner. CPU is the default backend. GPU candidates are checked again by the canonical CPU WorkHasher before entering the bounded proof pipeline. Testnet transaction authorizations count their maximum possible INJ exposure cumulatively for the session; RPC receipts never refund signing authority. Permissionless finalization can spend gas for empty windows or windows won by another miner. --compute-only never signs or submits transactions. Mainnet transaction signing is disabled.",
+            "Astatine is a non-custodial CPU/GPU miner. CPU is the default backend. GPU candidates are checked again by the canonical CPU WorkHasher before entering the bounded proof pipeline. Testnet transaction authorizations count their maximum possible INJ exposure cumulatively for the session; RPC receipts never refund signing authority. Permissionless finalization can spend gas for empty windows or windows won by another miner. Automatic AST reward forwarding is disabled because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually. --compute-only never signs or submits transactions. Mainnet transaction signing is disabled.",
         )
         .subcommand_required(true)
         .arg_required_else_help(true)
@@ -209,7 +209,6 @@ fn command() -> ClapCommand {
                     Arg::new("compute-only")
                         .long("compute-only")
                         .action(clap::ArgAction::SetTrue)
-                        .conflicts_with("send-rewards-to")
                         .help("Hash verified work locally without signing or sending transactions"),
                 )
                 .arg(
@@ -240,7 +239,7 @@ fn command() -> ClapCommand {
                         .long("send-rewards-to")
                         .value_name("ADDRESS")
                         .value_parser(parse_reward_destination)
-                        .help("Forward verified AST rewards earned by this invocation to an EVM address"),
+                        .help("Disabled in Testnet.13: RPC reward evidence cannot authorize AST transfers"),
                 ),
         )
         .subcommand(
@@ -713,7 +712,8 @@ mod tests {
                 "--send-rewards-to",
                 checksummed
             ])
-            .is_err()
+            .is_ok(),
+            "the mining runtime rejects the deprecated option with the RPC-trust explanation"
         );
     }
 

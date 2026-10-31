@@ -1,14 +1,17 @@
 param(
     [switch]$CompareVersions,
     [string]$CurrentVersion,
-    [string]$CandidateVersion
+    [string]$CandidateVersion,
+    [switch]$VerifyVersionOutput,
+    [string]$ExpectedVersion,
+    [string]$VersionOutputJson
 )
 
 $ErrorActionPreference = 'Stop'
 
 function ConvertTo-AstatineVersion([string]$Text) {
     $Match = [regex]::Match(
-        $Text.Trim(),
+        $Text,
         '^(?:astatine\s+)?(?<Major>0|[1-9][0-9]*)\.(?<Minor>0|[1-9][0-9]*)\.(?<Patch>0|[1-9][0-9]*)(?:-testnet\.(?<Sequence>0|[1-9][0-9]*))?$'
     )
     if (-not $Match.Success) { throw "Unsupported Astatine version format: $Text" }
@@ -51,10 +54,33 @@ function Compare-AstatineVersions([string]$Current, [string]$Candidate) {
     return 0
 }
 
+function Assert-AstatineVersionOutput([string[]]$Output, [string]$Expected) {
+    if ($null -eq $Output -or $Output.Count -ne 1) {
+        throw 'Executable --version output must contain exactly one line'
+    }
+    $null = ConvertTo-AstatineVersion $Expected
+    if ($Output[0] -cne "astatine $Expected") {
+        throw 'Executable --version output does not exactly match the expected version'
+    }
+}
+
 if ($CompareVersions) {
     try {
         if (-not $CurrentVersion -or -not $CandidateVersion) { throw 'Both current and candidate versions are required' }
         Write-Output (Compare-AstatineVersions $CurrentVersion $CandidateVersion)
+        exit 0
+    } catch {
+        [Console]::Error.WriteLine($_.Exception.Message)
+        exit 2
+    }
+}
+
+if ($VerifyVersionOutput) {
+    try {
+        if (-not $ExpectedVersion) { throw 'ExpectedVersion is required' }
+        $OutputLines = @(ConvertFrom-Json -InputObject $VersionOutputJson)
+        Assert-AstatineVersionOutput $OutputLines $ExpectedVersion
+        Write-Output '0'
         exit 0
     } catch {
         [Console]::Error.WriteLine($_.Exception.Message)
@@ -112,9 +138,10 @@ try {
     if (($Entries -join '|') -ne ($Expected -join '|')) { throw 'Windows archive contains unexpected files' }
     $StagedExe = Join-Path $Extract 'astatine.exe'
     $VersionOutput = & $StagedExe --version
-    if ($LASTEXITCODE -ne 0 -or (Compare-AstatineVersions ($VersionOutput -join "`n") $Version) -ne 0) {
+    if ($LASTEXITCODE -ne 0) {
         throw 'Downloaded executable failed its version smoke test'
     }
+    Assert-AstatineVersionOutput $VersionOutput $Version
 
     $InstallDir = Join-Path $HOME 'bin'
     $ExistingExe = Join-Path $InstallDir 'astatine.exe'
@@ -147,9 +174,10 @@ try {
             Move-Item -LiteralPath $Stage -Destination $File.Destination -Force
         }
         $InstalledVersion = & (Join-Path $InstallDir 'astatine.exe') --version
-        if ($LASTEXITCODE -ne 0 -or (Compare-AstatineVersions ($InstalledVersion -join "`n") $Version) -ne 0) {
+        if ($LASTEXITCODE -ne 0) {
             throw 'Installed executable failed its version smoke test'
         }
+        Assert-AstatineVersionOutput $InstalledVersion $Version
         foreach ($Backup in $Backups) {
             if ($Backup.HadOriginal) { Remove-Item -LiteralPath $Backup.Backup -Force }
         }

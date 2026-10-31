@@ -2,6 +2,9 @@ param(
     [switch]$CompareVersions,
     [string]$CurrentVersion,
     [string]$CandidateVersion,
+    [switch]$VerifyVersionOutput,
+    [string]$ExpectedVersion,
+    [string]$VersionOutputJson,
     [int]$ParentPid,
     [string]$PlanPath
 )
@@ -14,7 +17,7 @@ $Committed = $false
 
 function ConvertTo-AstatineVersion([string]$Text) {
     $Match = [regex]::Match(
-        $Text.Trim(),
+        $Text,
         '^(?:astatine\s+)?(?<Major>0|[1-9][0-9]*)\.(?<Minor>0|[1-9][0-9]*)\.(?<Patch>0|[1-9][0-9]*)(?:-testnet\.(?<Sequence>0|[1-9][0-9]*))?$'
     )
     if (-not $Match.Success) { throw "Unsupported Astatine version format: $Text" }
@@ -57,10 +60,33 @@ function Compare-AstatineVersions([string]$Current, [string]$Candidate) {
     return 0
 }
 
+function Assert-AstatineVersionOutput([string[]]$Output, [string]$Expected) {
+    if ($null -eq $Output -or $Output.Count -ne 1) {
+        throw 'Executable --version output must contain exactly one line'
+    }
+    $null = ConvertTo-AstatineVersion $Expected
+    if ($Output[0] -cne "astatine $Expected") {
+        throw 'Executable --version output does not exactly match the expected version'
+    }
+}
+
 if ($CompareVersions) {
     try {
         if (-not $CurrentVersion -or -not $CandidateVersion) { throw 'Both current and candidate versions are required' }
         Write-Output (Compare-AstatineVersions $CurrentVersion $CandidateVersion)
+        exit 0
+    } catch {
+        [Console]::Error.WriteLine($_.Exception.Message)
+        exit 2
+    }
+}
+
+if ($VerifyVersionOutput) {
+    try {
+        if (-not $ExpectedVersion) { throw 'ExpectedVersion is required' }
+        $OutputLines = @(ConvertFrom-Json -InputObject $VersionOutputJson)
+        Assert-AstatineVersionOutput $OutputLines $ExpectedVersion
+        Write-Output '0'
         exit 0
     } catch {
         [Console]::Error.WriteLine($_.Exception.Message)
@@ -99,9 +125,10 @@ try {
     }
 
     $VersionOutput = & $Plan.executable --version 2>&1
-    if ($LASTEXITCODE -ne 0 -or (Compare-AstatineVersions ($VersionOutput -join "`n") $Plan.expected_version) -ne 0) {
+    if ($LASTEXITCODE -ne 0) {
         throw 'The installed executable failed its version smoke test.'
     }
+    Assert-AstatineVersionOutput $VersionOutput $Plan.expected_version
 
     $Committed = $true
     foreach ($File in $Plan.files) {

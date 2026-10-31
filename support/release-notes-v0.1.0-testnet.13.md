@@ -11,11 +11,18 @@ Testnet.13 is an RC1 security-remediation candidate for the Rust miner.
 - The transaction journal durably counts each session's maximum transaction
   authorization before signing. Receipts, gas reports, and reorgs never refund
   the authorization budget; RPC-reported actual costs remain separate.
+- Automatic AST reward forwarding is disabled because a selected RPC can
+  fabricate payout evidence. `--send-rewards-to` is rejected; rewards remain
+  visible as selected-RPC reports and should be independently verified.
 - Unix and Windows installers fail closed on unsupported versions and reject
   downgrades, including stable/prerelease ordering.
+- New encrypted wallets require 12-character passwords; existing V3 keystores
+  remain import-compatible.
 
 The protocol, proof algorithm, GPU pipeline, rewards, node pins, and 0.01 INJ
 submission fee remain unchanged. RPC state, receipts, and reward evidence are
-not cryptographically authenticated by the miner.
+not cryptographically authenticated by the miner. The local authorization cap
+is per session and assumes its private journal and archives have not been
+intentionally rewritten by a process running under the same OS account.
 
 Commit-pinned source: [Testnet.13 release tag](https://github.com/emyrinj/astatine-miner/tree/v0.1.0-testnet.13).

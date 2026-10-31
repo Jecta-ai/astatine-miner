@@ -16,9 +16,10 @@ use crate::{
     rpc::{BlockSnapshot, NetworkClient, NodeState, ReadSnapshot, is_transient_rpc_error},
     startup::{CtrlCSignal, StartupProgress, race_with_ctrl_c},
     transaction::{
-        ConfirmedAction, ProofSubmission, TransactionAction, TransactionActivityState,
-        TransactionDashboardState, TransactionManager, TransactionPolicyRefusalKind,
-        is_stale_transaction_preflight, mined_transaction_reverted, transaction_policy_refusal,
+        AUTOMATIC_REWARD_FORWARDING_DISABLED, ConfirmedAction, ProofSubmission, TransactionAction,
+        TransactionActivityState, TransactionDashboardState, TransactionManager,
+        TransactionPolicyRefusalKind, is_stale_transaction_preflight, mined_transaction_reverted,
+        transaction_policy_refusal,
     },
     wallet::{selected_address, unlock_selected_interactive},
 };
@@ -936,6 +937,9 @@ impl Drop for ReadOnlyObserver {
 }
 
 pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
+    if args.send_rewards_to.is_some() {
+        bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
+    }
     let progress = StartupProgress::start();
     let mut ctrl_c: CtrlCSignal = Box::pin(tokio::signal::ctrl_c());
     progress.begin("Loading configuration");
@@ -1029,6 +1033,9 @@ async fn run_runtime(
         ctrl_c,
         progress: startup,
     } = startup_control;
+    if args.send_rewards_to.is_some() {
+        bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
+    }
     let show_history_profile =
         history_profile_enabled(std::env::var("ASTATINE_HISTORY_PROFILE").ok().as_deref());
     let probe_stop_signal = probe_sender.as_ref().map(|_| DashboardSignal::default());
@@ -1050,25 +1057,6 @@ async fn run_runtime(
         bail!(
             "--new-session requires transaction mode and a positive per-session authorization cap"
         );
-    }
-    if let Some(destination) = args.send_rewards_to {
-        if args.compute_only {
-            bail!("automatic reward forwarding is unavailable in compute-only mode");
-        }
-        if destination.is_zero() || destination == address {
-            bail!("reward destination must be nonzero and different from the mining wallet");
-        }
-        if config.network != crate::cli::Network::Testnet || !client.can_broadcast() {
-            bail!(
-                "automatic reward forwarding requires transaction signing on the approved Testnet"
-            );
-        }
-        if spending_limit.is_zero() {
-            bail!("automatic reward forwarding requires a positive per-session INJ spending cap");
-        }
-        if !client.verification.token_verified {
-            bail!("automatic reward forwarding requires a verified AST token deployment");
-        }
     }
     let transaction_mode = !args.compute_only && !spending_limit.is_zero();
     let threads = args
@@ -1756,7 +1744,6 @@ async fn run_runtime(
                             );
                         }
                         snapshot = observer.latest_snapshot().unwrap_or(snapshot);
-                        let mut finalized_any = false;
                         if let (Some(manager), Some(signer)) =
                             (transactions.as_mut(), signer.as_ref())
                         {
@@ -1793,7 +1780,6 @@ async fn run_runtime(
                             match finalization_result {
                                 Ok(true) => {
                                     observer.force_refresh();
-                                    finalized_any = true;
                                 }
                                 Ok(false) => {}
                                 Err(error) => {
@@ -1825,23 +1811,6 @@ async fn run_runtime(
                         if proof_receiver.has_pending() {
                             last_snapshot = snapshot;
                             continue 'mining_loop;
-                        }
-                        let selected_finalization_due = snapshot.nodes.iter().any(|node| {
-                            selected.contains(&node.id)
-                                && node.state.as_ref().is_some_and(|state| {
-                                    state.finalizable && !state.mining_paused
-                                })
-                        });
-                        if !finalized_any
-                            && !selected_finalization_due
-                            && let (Some(manager), Some(signer)) =
-                                (transactions.as_mut(), signer.as_ref())
-                            && let Err(error) = manager
-                                .service_reward_forwarding(&client, &snapshot, signer)
-                                .await
-                        {
-                            fatal_error = Some(error.context("service verified reward forwarding"));
-                            break 'mining_loop;
                         }
                         proof_receiver.set_paused(
                             transaction_mode
@@ -1899,23 +1868,6 @@ async fn run_runtime(
                         .await
                 {
                     fatal_error = Some(error.context("service historical reward verification"));
-                    break 'mining_loop;
-                }
-                let finalization_due = last_snapshot.nodes.iter().any(|node| {
-                    selected.contains(&node.id)
-                        && node.state.as_ref().is_some_and(|state| {
-                            state.finalizable && !state.mining_paused
-                        })
-                });
-                if !proof_receiver.has_pending()
-                    && !finalization_due
-                    && let (Some(manager), Some(signer)) =
-                        (transactions.as_mut(), signer.as_ref())
-                    && let Err(error) = manager
-                        .service_reward_forwarding(&client, &last_snapshot, signer)
-                        .await
-                {
-                    fatal_error = Some(error.context("service verified reward forwarding"));
                     break 'mining_loop;
                 }
                 proof_receiver.set_paused(
@@ -2176,23 +2128,6 @@ async fn run_runtime(
                             )),
                         );
                         observer.force_refresh();
-                        let forwarding_snapshot =
-                            observer.latest_snapshot().unwrap_or_else(|| last_snapshot.clone());
-                        let finalization_due = forwarding_snapshot.nodes.iter().any(|node| {
-                            selected.contains(&node.id)
-                                && node.state.as_ref().is_some_and(|state| {
-                                    state.finalizable && !state.mining_paused
-                                })
-                        });
-                        if !finalization_due
-                            && !proof_receiver.has_pending()
-                            && let Err(error) = manager
-                                .service_reward_forwarding(&client, &forwarding_snapshot, signer)
-                                .await
-                        {
-                            fatal_error = Some(error.context("service verified reward forwarding"));
-                            break 'mining_loop;
-                        }
                         proof_receiver.set_paused(
                             transaction_mode
                                 && manager.journal.has_unresolved(),
@@ -4770,7 +4705,10 @@ mod tests {
             BlockSnapshot, CandidateInfo, ContractPinStatus, NetworkClient, NodeState, NodeView,
             ReadSnapshot, WorkInfo,
         },
-        transaction::{TransactionActivityState, TransactionDashboardState},
+        transaction::{
+            AUTOMATIC_REWARD_FORWARDING_DISABLED, TransactionActivityState,
+            TransactionDashboardState,
+        },
     };
     use alloy_primitives::{Address, B256, Bytes, U256};
     use std::{
@@ -6736,10 +6674,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reward_forwarding_requires_budget_signing_and_a_distinct_wallet() {
+    async fn reward_forwarding_flag_is_rejected_before_wallet_or_chain_access() {
         let temp = tempdir().unwrap();
         let store = ConfigStore::at_root(temp.path().to_path_buf());
-        let wallet = Address::with_last_byte(0x41);
         let destination = Address::with_last_byte(0x42);
         let network = NetworkClient::local_test_client(
             "http://127.0.0.1:1",
@@ -6750,14 +6687,32 @@ mod tests {
             9,
         )
         .unwrap();
-        let read_only = crate::config::AppConfig {
-            wallet_address: Some(format!("{wallet:#x}")),
-            ..crate::config::AppConfig::default()
-        };
-        store.save(&read_only).unwrap();
-        let no_budget = super::run_with_client(
+        for compute_only in [false, true] {
+            let error = super::run_with_client(
+                &store,
+                crate::config::AppConfig::default(),
+                MineArgs {
+                    device: DeviceChoice::Cpu,
+                    compute_only,
+                    new_session: false,
+                    threads: None,
+                    nodes: vec![1],
+                    send_rewards_to: Some(destination),
+                },
+                network.clone(),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(AUTOMATIC_REWARD_FORWARDING_DISABLED)
+            );
+        }
+        let cli_error = super::run(
             &store,
-            read_only.clone(),
             MineArgs {
                 device: DeviceChoice::Cpu,
                 compute_only: false,
@@ -6766,64 +6721,15 @@ mod tests {
                 nodes: vec![1],
                 send_rewards_to: Some(destination),
             },
-            network.clone(),
-            None,
-            None,
         )
         .await
         .unwrap_err();
         assert!(
-            no_budget
+            cli_error
                 .to_string()
-                .contains("positive per-session INJ spending cap")
+                .contains(AUTOMATIC_REWARD_FORWARDING_DISABLED)
         );
-
-        let funded = crate::config::AppConfig {
-            per_session_spending_limit_inj: "1".to_owned(),
-            ..read_only
-        };
-        store.save(&funded).unwrap();
-        let compute_only = super::run_with_client(
-            &store,
-            funded.clone(),
-            MineArgs {
-                device: DeviceChoice::Cpu,
-                compute_only: true,
-                new_session: false,
-                threads: None,
-                nodes: vec![1],
-                send_rewards_to: Some(destination),
-            },
-            network.clone(),
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(compute_only.to_string().contains("compute-only mode"));
-
-        let self_destination = super::run_with_client(
-            &store,
-            funded,
-            MineArgs {
-                device: DeviceChoice::Cpu,
-                compute_only: false,
-                new_session: false,
-                threads: None,
-                nodes: vec![1],
-                send_rewards_to: Some(wallet),
-            },
-            network,
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            self_destination
-                .to_string()
-                .contains("different from the mining wallet")
-        );
+        assert!(store.read_transaction_journal().unwrap().is_none());
     }
 
     #[test]

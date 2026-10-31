@@ -163,23 +163,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
       - name: Require immutable full-SHA workflow action references
-        run: |
-          python3 - <<'PY'
-          import pathlib
-          import re
-
-          for workflow in pathlib.Path(".github/workflows").glob("*.yml"):
-              for number, line in enumerate(workflow.read_text().splitlines(), 1):
-                  match = re.match(r"\s*uses:\s*([^\s#]+)", line)
-                  if not match:
-                      continue
-                  reference = match.group(1)
-                  if reference.startswith("./"):
-                      continue
-                  assert "@" in reference, f"{workflow}:{number}: action is not pinned: {reference}"
-                  revision = reference.rsplit("@", 1)[1]
-                  assert re.fullmatch(r"[0-9a-f]{40}", revision), f"{workflow}:{number}: action ref is not a full immutable SHA: {reference}"
-          PY
+        run: python3 support/check_workflow_pins.py
+      - name: Rehearse signed release validation with synthetic artifacts and a temporary key
+        run: python3 support/release_artifacts.py self-test
       - name: Install pinned Rust toolchain components
         run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
       - name: Install pinned dependency validation tools
@@ -233,9 +219,22 @@ jobs:
           PY
       - name: Install pinned Rust toolchain components
         run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
-      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # foundry-toolchain v1.9.2
-        with:
-          version: v1.8.7
+      - name: Install Foundry v1.8.7 from its digest-pinned Linux release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/foundry_v1.8.7_linux_amd64.tar.gz"
+          curl --fail --show-error --location --retry 2 \
+            https://github.com/foundry-rs/foundry/releases/download/v1.8.7/foundry_v1.8.7_linux_amd64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' \
+            'ba470eb718e779e4b0e3f1520b5284231b1bf98e9a39de07fb8f77ed70525bcf' \
+            "$archive" | sha256sum --check --status
+          mkdir -p "$RUNNER_TEMP/foundry-v1.8.7"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/foundry-v1.8.7"
+          test -x "$RUNNER_TEMP/foundry-v1.8.7/anvil"
+          test -x "$RUNNER_TEMP/foundry-v1.8.7/forge"
+          echo "$RUNNER_TEMP/foundry-v1.8.7" >> "$GITHUB_PATH"
       - name: Verify local EVM tools
         run: forge --version && anvil --version
       - name: Run all local Anvil lifecycle tests
@@ -450,132 +449,11 @@ jobs:
           done
       - name: Validate transferred artifact and test substitution rejection
         shell: bash
-        run: |
-          set -euo pipefail
-          python3 - "$RUNNER_TEMP/unsigned-testnet-package" "$GITHUB_REF_NAME" <<'PY'
-          import hashlib
-          import pathlib
-          import re
-          import shutil
-          import sys
-          import tarfile
-          import tempfile
-          import zipfile
-
-          root = pathlib.Path(sys.argv[1])
-          tag = sys.argv[2]
-          version = re.search(r'(?m)^version = "([^"]+)"$', pathlib.Path("Cargo.toml").read_text()).group(1)
-          expected = {}
-          for target in ("macos-aarch64", "macos-x86_64", "linux-aarch64", "linux-x86_64", "windows-x86_64"):
-              binary = f"astatine-{target}.exe" if target == "windows-x86_64" else f"astatine-{target}"
-              package = f"astatine-{target}.zip" if target == "windows-x86_64" else f"astatine-{target}.tar.gz"
-              expected[f"binary.{target}"] = binary
-              expected[f"package.{target}"] = package
-          for name in ("LICENSE-MIT", "THIRD_PARTY_LICENSES.md"):
-              expected[f"license.{name}"] = name
-
-          def verify(directory):
-              assert {path.name for path in directory.iterdir()} == set(expected.values()) | {"update-manifest.txt"}, "unsigned artifact contains missing or unexpected files"
-              lines = (directory / "update-manifest.txt").read_text(encoding="utf-8").splitlines()
-              assert lines[:4] == [
-                  "astatine-update-manifest-v1",
-                  "repository=emyrinj/astatine-miner",
-                  "channel=testnet",
-                  f"version={version}",
-              ]
-              assert tag == f"v{version}", f"tag {tag} does not match package version {version}"
-              records = {}
-              for line in lines[4:]:
-                  key, value = line.split("=", 1)
-                  assert key.startswith("asset.") and key not in records, f"invalid or duplicate manifest record: {key}"
-                  filename, digest, size = value.split("|")
-                  assert pathlib.PurePosixPath(filename).name == filename, f"unsafe manifest filename: {filename}"
-                  records[key.removeprefix("asset.")] = (filename, digest, int(size))
-              assert set(records) == set(expected), "manifest asset set differs from the expected release inventory"
-              for key, filename in expected.items():
-                  recorded_name, expected_digest, expected_size = records[key]
-                  path = directory / filename
-                  assert recorded_name == filename and path.is_file(), f"missing or misnamed asset: {key}"
-                  assert path.stat().st_size <= 512 * 1024 * 1024, f"asset exceeds the signer input limit: {key}"
-                  digest_builder = hashlib.sha256()
-                  with path.open("rb") as asset:
-                      for chunk in iter(lambda: asset.read(1024 * 1024), b""):
-                          digest_builder.update(chunk)
-                  digest = digest_builder.hexdigest()
-                  assert digest == expected_digest and path.stat().st_size == expected_size, f"asset integrity mismatch: {key}"
-              for name in ("LICENSE-MIT", "THIRD_PARTY_LICENSES.md"):
-                  assert (directory / name).read_bytes() == pathlib.Path(name).read_bytes(), f"license asset differs from source: {name}"
-              for target in ("macos-aarch64", "macos-x86_64", "linux-aarch64", "linux-x86_64"):
-                  archive_name = expected[f"package.{target}"]
-                  with tarfile.open(directory / archive_name, "r:gz") as archive:
-                      members = archive.getmembers()
-                      assert len(members) == 3 and {member.name for member in members} == {"astatine", "LICENSE-MIT", "THIRD_PARTY_LICENSES.md"}, archive_name
-                      assert all(member.isfile() for member in members), f"archive contains a non-regular entry: {archive_name}"
-                      binary_member = next(member for member in members if member.name == "astatine")
-                      binary_path = directory / expected[f"binary.{target}"]
-                      assert binary_member.size == binary_path.stat().st_size, f"archived binary size mismatch: {archive_name}"
-                      assert archive.extractfile(binary_member).read(binary_member.size + 1) == binary_path.read_bytes(), f"archived binary mismatch: {archive_name}"
-                      for name in ("LICENSE-MIT", "THIRD_PARTY_LICENSES.md"):
-                          member = next(member for member in members if member.name == name)
-                          assert member.size == (directory / name).stat().st_size, f"archived license size mismatch: {archive_name}:{name}"
-                          assert archive.extractfile(member).read(member.size + 1) == (directory / name).read_bytes(), f"archived license mismatch: {archive_name}:{name}"
-              with zipfile.ZipFile(directory / expected["package.windows-x86_64"]) as archive:
-                  names = archive.namelist()
-                  assert len(names) == 3 and set(names) == {"astatine.exe", "LICENSE-MIT", "THIRD_PARTY_LICENSES.md"}
-                  binary_path = directory / expected["binary.windows-x86_64"]
-                  binary_info = archive.getinfo("astatine.exe")
-                  assert binary_info.file_size == binary_path.stat().st_size
-                  assert archive.read(binary_info) == binary_path.read_bytes()
-                  for name in ("LICENSE-MIT", "THIRD_PARTY_LICENSES.md"):
-                      info = archive.getinfo(name)
-                      assert info.file_size == (directory / name).stat().st_size
-                      assert archive.read(info) == (directory / name).read_bytes()
-
-          verify(root)
-          with tempfile.TemporaryDirectory() as temporary:
-              tampered = pathlib.Path(temporary)
-              shutil.copy2(root / "update-manifest.txt", tampered / "update-manifest.txt")
-              for filename in expected.values():
-                  shutil.copy2(root / filename, tampered / filename)
-              with (tampered / expected["binary.linux-x86_64"]).open("ab") as asset:
-                  asset.write(b"artifact substitution")
-              try:
-                  verify(tampered)
-              except (AssertionError, ValueError):
-                  pass
-              else:
-                  raise AssertionError("tampered artifact unexpectedly passed manifest verification")
-          with tempfile.TemporaryDirectory() as temporary:
-              tampered = pathlib.Path(temporary)
-              shutil.copy2(root / "update-manifest.txt", tampered / "update-manifest.txt")
-              for filename in expected.values():
-                  shutil.copy2(root / filename, tampered / filename)
-              archive_name = expected["package.linux-x86_64"]
-              with tarfile.open(tampered / archive_name, "w:gz") as archive:
-                  for name in ("astatine", "LICENSE-MIT", "THIRD_PARTY_LICENSES.md"):
-                      data = (root / (expected["binary.linux-x86_64"] if name == "astatine" else name)).read_bytes()
-                      if name == "astatine":
-                          data += b"substituted executable"
-                      info = tarfile.TarInfo(name)
-                      info.size = len(data)
-                      info.mode = 0o755 if name == "astatine" else 0o644
-                      archive.addfile(info, io.BytesIO(data))
-              package_path = tampered / archive_name
-              digest = hashlib.sha256(package_path.read_bytes()).hexdigest()
-              manifest = (tampered / "update-manifest.txt").read_text(encoding="utf-8").splitlines()
-              for index, line in enumerate(manifest):
-                  if line.startswith("asset.package.linux-x86_64="):
-                      manifest[index] = f"asset.package.linux-x86_64={archive_name}|{digest}|{package_path.stat().st_size}"
-                      break
-              (tampered / "update-manifest.txt").write_text("\n".join(manifest) + "\n", encoding="utf-8")
-              try:
-                  verify(tampered)
-              except (AssertionError, ValueError, tarfile.TarError):
-                  pass
-              else:
-                  raise AssertionError("rewritten package and manifest unexpectedly passed binary binding")
-          print("Unsigned artifact matches its manifest; raw and repackaged substitutions were rejected")
-          PY
+        run: >-
+          python3 support/release_artifacts.py verify-unsigned
+          --root "$RUNNER_TEMP/unsigned-testnet-package"
+          --tag "$GITHUB_REF_NAME"
+          --license-root "$GITHUB_WORKSPACE"
       - name: Sign manifest with protected environment key and create checksums
         shell: bash
         env:
@@ -613,6 +491,13 @@ jobs:
             update-manifest.sig > SHA256SUMS
           openssl dgst -sha256 -verify "$GITHUB_WORKSPACE/support/release-signing-public.pem" -signature update-manifest.sig update-manifest.txt
           sha256sum -c SHA256SUMS
+      - name: Re-verify the complete signed release inventory
+        run: >-
+          python3 support/release_artifacts.py verify-release
+          --root "$RUNNER_TEMP/unsigned-testnet-package"
+          --tag "$GITHUB_REF_NAME"
+          --license-root "$GITHUB_WORKSPACE"
+          --public-key support/release-signing-public.pem
       - name: Attest release assets and signed update manifest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # attest-build-provenance v4.2.2
         with:
@@ -627,8 +512,11 @@ jobs:
             ${{ runner.temp }}/unsigned-testnet-package/astatine-linux-aarch64
             ${{ runner.temp }}/unsigned-testnet-package/astatine-linux-x86_64
             ${{ runner.temp }}/unsigned-testnet-package/astatine-windows-x86_64.exe
+            ${{ runner.temp }}/unsigned-testnet-package/LICENSE-MIT
+            ${{ runner.temp }}/unsigned-testnet-package/THIRD_PARTY_LICENSES.md
             ${{ runner.temp }}/unsigned-testnet-package/update-manifest.txt
             ${{ runner.temp }}/unsigned-testnet-package/update-manifest.sig
+            ${{ runner.temp }}/unsigned-testnet-package/SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # actions/upload-artifact v7.0.2
         with:
           name: astatine-${{ github.ref_name }}-release-packages
@@ -780,12 +668,50 @@ jobs:
     environment: testnet-release-publish
     permissions:
       contents: write
+      attestations: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # actions/download-artifact v8.0.2
         with:
           name: astatine-${{ github.ref_name }}-release-packages
           path: ${{ runner.temp }}/testnet-package
+      - name: Re-verify the downloaded signed inventory before publication
+        run: >-
+          python3 support/release_artifacts.py verify-release
+          --root "$RUNNER_TEMP/testnet-package"
+          --tag "$GITHUB_REF_NAME"
+          --license-root "$GITHUB_WORKSPACE"
+          --public-key support/release-signing-public.pem
+      - name: Verify provenance for every downloaded release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          package="$RUNNER_TEMP/testnet-package"
+          for asset in \
+            astatine-macos-aarch64.tar.gz \
+            astatine-macos-x86_64.tar.gz \
+            astatine-linux-x86_64.tar.gz \
+            astatine-linux-aarch64.tar.gz \
+            astatine-windows-x86_64.zip \
+            astatine-macos-aarch64 \
+            astatine-macos-x86_64 \
+            astatine-linux-aarch64 \
+            astatine-linux-x86_64 \
+            astatine-windows-x86_64.exe \
+            LICENSE-MIT \
+            THIRD_PARTY_LICENSES.md \
+            update-manifest.txt \
+            update-manifest.sig \
+            SHA256SUMS; do
+            gh attestation verify "$package/$asset" \
+              --repo emyrinj/astatine-miner \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA" \
+              --signer-workflow emyrinj/astatine-miner/.github/workflows/ci.yml \
+              --deny-self-hosted-runners
+          done
       - name: Pin release installer links to the verified commit
         shell: bash
         run: |

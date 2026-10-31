@@ -323,15 +323,69 @@ fn latest_testnet_release(
         .filter(|release| release.prerelease && !release.draft)
         .filter_map(|release| {
             let version = release.tag_name.strip_prefix('v')?;
-            let parsed = Version::parse(version).ok()?;
+            let parsed = parse_supported_testnet_version(version).ok()?;
             let current_base_matches = parsed.major == current.major
                 && parsed.minor == current.minor
                 && parsed.patch == current.patch;
-            let testnet_channel = parsed.pre.as_str().starts_with("testnet.");
-            (current_base_matches && testnet_channel && parsed > *current)
-                .then_some((parsed, release.tag_name))
+            (current_base_matches && parsed > *current).then_some((parsed, release.tag_name))
         })
         .max_by(|(left, _), (right, _)| left.cmp(right))
+}
+
+const MAX_SUPPORTED_VERSION_COMPONENT: u64 = i32::MAX as u64;
+
+fn parse_supported_testnet_version(text: &str) -> Result<Version> {
+    let version = Version::parse(text).context("Astatine version is not valid SemVer")?;
+    if version.major > MAX_SUPPORTED_VERSION_COMPONENT
+        || version.minor > MAX_SUPPORTED_VERSION_COMPONENT
+        || version.patch > MAX_SUPPORTED_VERSION_COMPONENT
+        || !version.build.is_empty()
+    {
+        bail!("Astatine version is outside the supported numeric SemVer range");
+    }
+    let identifiers = version.pre.as_str().split('.').collect::<Vec<_>>();
+    if identifiers.len() != 2 || identifiers[0] != "testnet" {
+        bail!("Astatine prerelease identifier must be exactly testnet.N");
+    }
+    let sequence = identifiers[1];
+    if sequence.is_empty()
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+        || (sequence.len() > 1 && sequence.starts_with('0'))
+    {
+        bail!("Astatine Testnet prerelease sequence must be a canonical integer");
+    }
+    let sequence = sequence
+        .parse::<u64>()
+        .context("Astatine Testnet prerelease sequence is outside the supported range")?;
+    if sequence > MAX_SUPPORTED_VERSION_COMPONENT {
+        bail!("Astatine Testnet prerelease sequence is outside the supported range");
+    }
+    Ok(version)
+}
+
+fn parse_executable_version_output(output: &str) -> Result<Version> {
+    let line = output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix('\n'))
+        .unwrap_or(output);
+    if line.contains('\n') || line.contains('\r') {
+        bail!("executable --version output must contain exactly one version line");
+    }
+    let version = line
+        .strip_prefix("astatine ")
+        .context("executable --version output must begin with `astatine `")?;
+    parse_supported_testnet_version(version)
+        .context("executable --version output is malformed or unsupported")
+}
+
+fn verify_executable_version_output(output: &str, expected_version: &str) -> Result<()> {
+    let actual = parse_executable_version_output(output)?;
+    let expected = parse_supported_testnet_version(expected_version)
+        .context("signed manifest contains an unsupported Testnet version")?;
+    if actual != expected {
+        bail!("executable --version output does not match the signed version exactly");
+    }
+    Ok(())
 }
 
 fn verify_manifest_signature(manifest: &[u8], signature: &[u8]) -> Result<()> {
@@ -383,10 +437,8 @@ fn parse_manifest(bytes: &[u8]) -> Result<UpdateManifest> {
     let version = fields
         .remove("version")
         .context("release manifest has no version")?;
-    let parsed_version = Version::parse(&version).context("release manifest version is invalid")?;
-    if !parsed_version.pre.as_str().starts_with("testnet.") {
-        bail!("release manifest version is outside the Testnet prerelease channel");
-    }
+    parse_supported_testnet_version(&version)
+        .context("release manifest version is invalid or outside the Testnet channel")?;
 
     let mut assets = BTreeMap::new();
     for (key, value) in fields {
@@ -431,6 +483,8 @@ fn validate_manifest(manifest: &UpdateManifest, tag: &str) -> Result<()> {
     if manifest.version != expected_version {
         bail!("signed release manifest version does not match its tag");
     }
+    parse_supported_testnet_version(&manifest.version)
+        .context("signed release manifest version is not a supported Testnet SemVer")?;
     let mut expected_keys = BTreeSet::new();
     for target in TARGETS {
         let binary_key = format!("binary.{target}");
@@ -683,10 +737,8 @@ fn smoke_test_binary(path: &Path, expected_version: &str) -> Result<()> {
         bail!("authenticated update failed its --version smoke test");
     }
     let version_output = String::from_utf8_lossy(&output.stdout);
-    if !version_output.contains(expected_version) {
-        bail!("authenticated update reported a different version than its manifest");
-    }
-    Ok(())
+    verify_executable_version_output(&version_output, expected_version)
+        .context("authenticated update reported a malformed or mismatched version")
 }
 
 #[cfg(unix)]
@@ -834,8 +886,10 @@ mod tests {
     #[cfg(unix)]
     use super::stage_replacement;
     use super::{
-        GitHubRelease, ManifestAsset, UpdateLock, latest_testnet_release, parse_manifest,
-        validate_manifest, verify_asset_bytes, verify_signature_with_key,
+        GitHubRelease, ManifestAsset, UpdateLock, latest_testnet_release,
+        parse_executable_version_output, parse_manifest, parse_supported_testnet_version,
+        smoke_test_binary, validate_manifest, verify_asset_bytes, verify_executable_version_output,
+        verify_signature_with_key,
     };
     use base64::{Engine, engine::general_purpose::STANDARD};
     use sha2::Digest;
@@ -920,6 +974,19 @@ mod tests {
         let mut bad = manifest_text();
         bad = bad.replace("channel=testnet", "channel=mainnet");
         assert!(parse_manifest(bad.as_bytes()).is_err());
+
+        let bad_versions = [
+            "0.1.0-testnet.foo",
+            "0.1.0-testnet.13.extra",
+            "0.1.0-testnet.013",
+            "0.1.0+build.1",
+            "2147483648.0.0-testnet.1",
+            "0.1.0-testnet.2147483648",
+        ];
+        for version in bad_versions {
+            let bad = manifest_text().replace("0.1.0-testnet.9", version);
+            assert!(parse_manifest(bad.as_bytes()).is_err(), "{version}");
+        }
     }
 
     #[test]
@@ -983,6 +1050,105 @@ mod tests {
                 "v0.1.0-testnet.13".to_owned(),
             ))
         );
+    }
+
+    #[test]
+    fn rust_updater_only_selects_canonical_numeric_testnet_versions() {
+        let current = semver::Version::parse("0.1.0-testnet.13").unwrap();
+        let releases = [
+            ("v0.1.0-testnet.13", true),
+            ("v0.1.0-testnet.130", true),
+            ("v0.1.0-testnet.foo", true),
+            ("v0.1.0-testnet.13.extra", true),
+            ("v0.1.0-testnet.013", true),
+            ("v0.1.0+build.1", true),
+            ("v0.1.1-testnet.1", false),
+        ]
+        .into_iter()
+        .map(|(tag_name, prerelease)| GitHubRelease {
+            tag_name: tag_name.to_owned(),
+            prerelease,
+            draft: false,
+        })
+        .collect();
+        assert_eq!(
+            latest_testnet_release(releases, &current),
+            Some((
+                semver::Version::parse("0.1.0-testnet.130").unwrap(),
+                "v0.1.0-testnet.130".to_owned()
+            ))
+        );
+        for invalid in [
+            "0.1.0-testnet.foo",
+            "0.1.0-testnet.13.extra",
+            "0.1.0-testnet.013",
+        ] {
+            assert!(
+                parse_supported_testnet_version(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_version_output_must_be_one_exact_supported_version() {
+        let expected = semver::Version::parse("0.1.0-testnet.13").unwrap();
+        for output in [
+            "astatine 0.1.0-testnet.13\n",
+            "astatine 0.1.0-testnet.13\r\n",
+        ] {
+            assert_eq!(parse_executable_version_output(output).unwrap(), expected);
+            assert!(verify_executable_version_output(output, "0.1.0-testnet.13").is_ok());
+        }
+        for output in [
+            "astatine 0.1.0-testnet.130\n",
+            "astatine 0.1.0-testnet.12\n",
+        ] {
+            assert!(parse_executable_version_output(output).is_ok());
+            assert!(
+                verify_executable_version_output(output, "0.1.0-testnet.13").is_err(),
+                "{output:?} must not match .13"
+            );
+        }
+        for output in [
+            "0.1.0-testnet.13\n",
+            "astatine 0.1.0-testnet.foo\n",
+            "astatine 0.1.0-testnet.13 \n",
+            "astatine 0.1.0-testnet.13\nextra output\n",
+            "astatine 0.1.0-testnet.13\n\n",
+            "not an Astatine version\n",
+        ] {
+            assert!(
+                parse_executable_version_output(output).is_err(),
+                "{output:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_binary_smoke_rejects_substrings_malformed_output_and_extra_lines() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        use tempfile::tempdir;
+
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("astatine");
+        for (output, expected_to_pass) in [
+            ("astatine 0.1.0-testnet.13\n", true),
+            ("astatine 0.1.0-testnet.130\n", false),
+            ("astatine 0.1.0-testnet.foo\n", false),
+            ("astatine 0.1.0-testnet.12\n", false),
+            ("astatine 0.1.0-testnet.13\nextra output\n", false),
+            ("malformed version output\n", false),
+        ] {
+            fs::write(&executable, format!("#!/bin/sh\nprintf '%s' '{output}'\n")).unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(
+                smoke_test_binary(&executable, "0.1.0-testnet.13").is_ok(),
+                expected_to_pass,
+                "version output: {output:?}"
+            );
+        }
     }
 
     #[test]

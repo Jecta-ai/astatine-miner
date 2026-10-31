@@ -44,12 +44,42 @@ compare_testnet_versions() {
   '
 }
 
+verify_executable_version() {
+  executable=$1
+  expected=$2
+  output_file=$(mktemp) || return 1
+  if ! "$executable" --version > "$output_file"; then
+    rm -f "$output_file"
+    return 1
+  fi
+  line_count=$(awk 'END { print NR + 0 }' "$output_file")
+  if [ "$line_count" -ne 1 ] || ! IFS= read -r output_line < "$output_file"; then
+    rm -f "$output_file"
+    return 1
+  fi
+  rm -f "$output_file"
+  case "$output_line" in
+    "astatine "*) reported_version=${output_line#astatine } ;;
+    *) return 1 ;;
+  esac
+  [ "$(compare_testnet_versions "$reported_version" "$expected")" = 0 ]
+}
+
 if [ "${1:-}" = "--compare-testnet-versions" ]; then
   if [ "$#" -ne 3 ]; then
     printf '%s\n' 'Usage: install-unix.sh --compare-testnet-versions CURRENT CANDIDATE' >&2
     exit 2
   fi
   compare_testnet_versions "$2" "$3"
+  exit $?
+fi
+
+if [ "${1:-}" = "--verify-executable-version" ]; then
+  if [ "$#" -ne 3 ]; then
+    printf '%s\n' 'Usage: install-unix.sh --verify-executable-version EXPECTED EXECUTABLE' >&2
+    exit 2
+  fi
+  verify_executable_version "$3" "$2"
   exit $?
 fi
 
@@ -126,7 +156,10 @@ tar_entries="$(tar -tzf "$ARCHIVE")"
 expected_entries="$(printf '%s\n' astatine LICENSE-MIT THIRD_PARTY_LICENSES.md)"
 test "$tar_entries" = "$expected_entries"
 tar -xzf "$ARCHIVE" -C "$TEMP_DIR"
-"$TEMP_DIR/astatine" --version | awk -v version="$VERSION" 'index($0, version) { found = 1 } END { exit !found }'
+if ! verify_executable_version "$TEMP_DIR/astatine" "$VERSION"; then
+  printf '%s\n' 'Downloaded executable did not report the exact signed Testnet version' >&2
+  exit 1
+fi
 
 INSTALL_DIR="${HOME:?HOME is required}/.local/bin"
 LICENSE_DIR="$INSTALL_DIR/licenses"

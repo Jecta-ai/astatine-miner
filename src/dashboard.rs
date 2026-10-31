@@ -902,7 +902,7 @@ fn render_wide_header(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel,
             &format_optional_ast(model.ast_balance),
             colors,
         ),
-        metadata_line("MINED", &format_mined(model.mined_rewards), colors),
+        metadata_line("RPC MINED", &format_mined(model.mined_rewards), colors),
         metadata_line(
             "DEVICE",
             &format!(
@@ -943,7 +943,7 @@ fn render_compact(
             format_optional_ast(model.ast_balance)
         ))),
         Line::from(Span::raw(format!(
-            "MINED {}",
+            "RPC MINED {}",
             format_mined(model.mined_rewards)
         ))),
         Line::from(Span::raw(format!(
@@ -1047,6 +1047,11 @@ fn render_narrow(
     } else {
         Span::raw(mode_line)
     };
+    let balance_line = if area.width < 45 {
+        format!("AST BAL {ast_balance} AST • RPC MINED +{mined} AST")
+    } else {
+        format!("AST BALANCE {ast_balance} AST • RPC MINED +{mined} AST")
+    };
     let lines = vec![
         Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
         Line::from(mode_span),
@@ -1055,9 +1060,7 @@ fn render_narrow(
             short_address(model.wallet),
             format_optional_inj_value(model.inj_balance),
         ))),
-        Line::from(Span::raw(format!(
-            "AST BALANCE {ast_balance} AST • MINED +{mined} AST"
-        ))),
+        Line::from(Span::raw(balance_line)),
     ];
     frame.render_widget(
         Paragraph::new(lines),
@@ -1797,11 +1800,9 @@ mod tests {
         let nodes = (1..=9)
             .map(|id| node(id, NodeStatus::Mining, None))
             .collect::<Vec<_>>();
-        for (width, expected_balance_label) in [
-            (100, "AST BALANCE"),
-            (60, "AST BALANCE"),
-            (40, "AST BALANCE"),
-        ] {
+        for (width, expected_balance_label) in
+            [(100, "AST BALANCE"), (60, "AST BALANCE"), (40, "AST BAL")]
+        {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal
                 .draw(|frame| render_dashboard(frame, &model(nodes.clone()), None, false))
