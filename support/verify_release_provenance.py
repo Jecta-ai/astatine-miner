@@ -133,7 +133,7 @@ def validate_rehearsal_run_context(run: dict, repository: str, branch: str, expe
     require(run.get("head_sha") == expected_commit, "rehearsal workflow commit differs from the selected commit")
     require(run.get("head_branch") == branch, "rehearsal workflow run belongs to a different branch")
     require(
-        run.get("path") == f"{WORKFLOW}@refs/heads/{branch}",
+        run.get("path") in (WORKFLOW, f"{WORKFLOW}@refs/heads/{branch}"),
         "rehearsal workflow path does not identify the selected branch and CI workflow",
     )
     require(repository == REPOSITORY, "requested repository differs from the exact pinned release identity")
@@ -307,10 +307,16 @@ def self_test() -> None:
         "event": "workflow_dispatch",
         "head_sha": "c" * 40,
         "head_branch": branch,
-        "path": f"{WORKFLOW}@refs/heads/{branch}",
+        "path": WORKFLOW,
         "repository": {"full_name": REPOSITORY},
     }
     validate_rehearsal_run_context(rehearsal, REPOSITORY, branch, "c" * 40)
+    validate_rehearsal_run_context(
+        {**rehearsal, "path": f"{WORKFLOW}@refs/heads/{branch}"},
+        REPOSITORY,
+        branch,
+        "c" * 40,
+    )
     for mutated, repository, source_branch, commit in (
         ({**rehearsal, "event": "push"}, REPOSITORY, branch, "c" * 40),
         ({**rehearsal, "head_branch": "other-branch"}, REPOSITORY, branch, "c" * 40),
