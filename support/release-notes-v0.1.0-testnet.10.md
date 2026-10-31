@@ -28,13 +28,13 @@ Testnet.10 adds the first portable wgpu/WGSL GPU compute backend while preservin
 macOS/Linux one-command install:
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/__RELEASE_COMMIT__/support/install-unix.sh | sh
+curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/__RELEASE_COMMIT__/support/install-unix.sh | sh
 ```
 
 Windows PowerShell one-command install:
 
 ```powershell
-$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/__RELEASE_COMMIT__/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
+$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/__RELEASE_COMMIT__/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
 ```
 
 Both scripts can be downloaded and reviewed before execution; the full commands are in the README.

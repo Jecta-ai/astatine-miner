@@ -28,13 +28,13 @@ Testnet.11 improves the portable wgpu/WGSL GPU compute pipeline while preserving
 macOS/Linux one-command install:
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/__RELEASE_COMMIT__/support/install-unix.sh | sh
+curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/__RELEASE_COMMIT__/support/install-unix.sh | sh
 ```
 
 Windows PowerShell one-command install:
 
 ```powershell
-$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/__RELEASE_COMMIT__/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
+$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/__RELEASE_COMMIT__/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
 ```
 
 Both scripts can be downloaded and reviewed before execution; the full commands are in the README.
@@ -48,4 +48,4 @@ Both scripts can be downloaded and reviewed before execution; the full commands 
 - `astatine-windows-x86_64.zip`
 - `update-manifest.txt`, `update-manifest.sig`, and `SHA256SUMS`
 
-See [the Testnet.11 GPU performance report](https://github.com/emyrinj/astatine-miner/blob/__RELEASE_COMMIT__/support/testnet11-performance.md) for the retained Testnet.10 reference, sample measurements, methodology, and adapter limitations.
+See [the Testnet.11 GPU performance report](https://github.com/Jecta-ai/astatine-miner/blob/__RELEASE_COMMIT__/support/testnet11-performance.md) for the retained Testnet.10 reference, sample measurements, methodology, and adapter limitations.

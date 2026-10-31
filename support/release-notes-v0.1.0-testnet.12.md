@@ -18,7 +18,7 @@ fee, and GPU compute pipeline.
 - The fresh pre-commit Testnet.12 binary measured GPU `68.689`, `68.677`, and `68.738 MH/s` (median `68.689 MH/s`) and CPU `22.727`, `22.304`, and `22.126 MH/s` (median `22.304 MH/s`) on the same Apple M4 / Metal configuration. Across fifteen local Testnet.12 samples, the combined GPU median is `68.568 MH/s`, 0.51% below the local Testnet.11 reproduction and 0.77% below the supplied `69.102 MH/s` reference. The combined CPU median is `22.283 MH/s`, 1.18% below the local Testnet.11 reproduction. These small measured differences are not material regressions; the GPU implementation was unchanged.
 - Release-mode local activation-to-scheduled-hashing latency was 1.002 s for one selected CPU node, 1.001–1.013 s for three independently activated CPU nodes, 1.036 s maximum for nine nodes started by one atomic Coordinator transaction, and 1.040 s for one selected GPU node. Measured healthy first-two-poll intervals were 1.003 s for one, three, and nine selected nodes, with maximum concurrent reads of three. Injected transient failures retried after 2.000 s and 4.001 s; backoff is capped at 30 seconds.
 - The M4 / Metal adapter does not expose wgpu timestamp queries, so shader execution time is not isolated; report only dispatch-to-readback wall latency. NVIDIA/AMD physical GPU runtime testing remains outstanding.
-- See [the Testnet.12 performance report](https://github.com/emyrinj/astatine-miner/blob/__RELEASE_COMMIT__/support/testnet12-performance.md) for all samples, methodology, and limitations.
+- See [the Testnet.12 performance report](https://github.com/Jecta-ai/astatine-miner/blob/__RELEASE_COMMIT__/support/testnet12-performance.md) for all samples, methodology, and limitations.
 
 ### Local genesis lifecycle validation
 
@@ -37,13 +37,13 @@ fee, and GPU compute pipeline.
 macOS/Linux one-command install:
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/emyrinj/astatine-miner/__RELEASE_COMMIT__/support/install-unix.sh | sh
+curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/__RELEASE_COMMIT__/support/install-unix.sh | sh
 ```
 
 Windows PowerShell one-command install:
 
 ```powershell
-$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/emyrinj/astatine-miner/__RELEASE_COMMIT__/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
+$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/__RELEASE_COMMIT__/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
 ```
 
 Both scripts can be downloaded and reviewed before execution; the full commands are in the README.
