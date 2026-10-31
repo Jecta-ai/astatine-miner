@@ -7,6 +7,17 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release_rehearsal:
+        description: Run the unsigned release artifact and Windows package rehearsal without creating a tag
+        required: true
+        default: false
+        type: boolean
+      release_tag:
+        description: Testnet package version used by the nonpublishing rehearsal
+        required: true
+        default: v0.1.0-testnet.13
+        type: string
 
 permissions:
   contents: read
@@ -49,6 +60,15 @@ jobs:
           set -euo pipefail
           package_version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
           test "v$package_version" = "$GITHUB_REF_NAME"
+      - name: Verify workflow-dispatch rehearsal version
+        if: github.event_name == 'workflow_dispatch' && inputs.release_rehearsal
+        shell: bash
+        env:
+          RELEASE_REHEARSAL_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          package_version="$(awk -F'"' '/^version =/ { print $2; exit }' Cargo.toml)"
+          test "v$package_version" = "$RELEASE_REHEARSAL_TAG"
       - name: Install pinned Rust toolchain components
         run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
       - name: Verify native runner architecture
@@ -125,7 +145,7 @@ jobs:
           }
           if ($Prompt.ExitCode -ne 0) { throw "Windows hidden-password console smoke failed (exit code $($Prompt.ExitCode))" }
       - name: Upload native release executable
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal)
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # actions/upload-artifact v7.0.2
         with:
           name: astatine-${{ matrix.target }}
@@ -135,7 +155,7 @@ jobs:
 
   attest-native-release-binaries:
     name: Attest tested native release binaries
-    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.')
+    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.') || (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal)
     needs: [native-checks]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
@@ -255,21 +275,32 @@ jobs:
 
   build-release-package:
     name: Build unsigned Testnet release packages
-    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.')
+    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.') || (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal)
     needs: [native-checks, attest-native-release-binaries, dependency-policy, anvil-integration]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
       contents: read
+    env:
+      RELEASE_TAG: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal && inputs.release_tag) || github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
       - name: Require the release tag to identify current main
+        if: github.ref_type == 'tag'
         shell: bash
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
           main_sha="$(git rev-parse FETCH_HEAD)"
           test "$GITHUB_SHA" = "$main_sha"
+      - name: Require the nonpublishing rehearsal to use this clean source commit
+        if: github.event_name == 'workflow_dispatch' && inputs.release_rehearsal
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # actions/download-artifact v8.0.2
         with:
           path: ${{ runner.temp }}/native-binaries
@@ -311,7 +342,7 @@ jobs:
           tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner -cf - -C "$package/stage/linux-aarch64" astatine LICENSE-MIT THIRD_PARTY_LICENSES.md | gzip -n > "$package/astatine-linux-aarch64.tar.gz"
           (cd "$package/stage/windows-x86_64" && zip -X "$package/astatine-windows-x86_64.zip" astatine.exe LICENSE-MIT THIRD_PARTY_LICENSES.md)
 
-          python3 - "$package" "$GITHUB_REF_NAME" <<'PY'
+          python3 - "$package" "$RELEASE_TAG" <<'PY'
           import hashlib
           import io
           import os
@@ -402,7 +433,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # actions/upload-artifact v7.0.2
         with:
-          name: astatine-${{ github.ref_name }}-unsigned-release-packages
+          name: astatine-${{ env.RELEASE_TAG }}-unsigned-release-packages
           path: |
             ${{ runner.temp }}/testnet-package/astatine-macos-aarch64.tar.gz
             ${{ runner.temp }}/testnet-package/astatine-macos-x86_64.tar.gz
@@ -422,10 +453,12 @@ jobs:
 
   attest-unsigned-release:
     name: Verify and attest unsigned Testnet release artifacts
-    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.')
+    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.') || (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal)
     needs: [build-release-package, attest-native-release-binaries]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal && inputs.release_tag) || github.ref_name }}
     permissions:
       contents: read
       id-token: write
@@ -433,14 +466,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
       - name: Require the release tag to identify current main
+        if: github.ref_type == 'tag'
         shell: bash
         run: |
           set -euo pipefail
           git fetch --no-tags origin main
           test "$GITHUB_SHA" = "$(git rev-parse FETCH_HEAD)"
+      - name: Require the nonpublishing rehearsal to use this clean source commit
+        if: github.event_name == 'workflow_dispatch' && inputs.release_rehearsal
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # actions/download-artifact v8.0.2
         with:
-          name: astatine-${{ github.ref_name }}-unsigned-release-packages
+          name: astatine-${{ env.RELEASE_TAG }}-unsigned-release-packages
           path: ${{ runner.temp }}/unsigned-testnet-package
       - name: Verify raw platform binaries against build attestations
         shell: bash
@@ -467,7 +508,7 @@ jobs:
         run: >-
           python3 support/release_artifacts.py verify-unsigned
           --root "$RUNNER_TEMP/unsigned-testnet-package"
-          --tag "$GITHUB_REF_NAME"
+          --tag "$RELEASE_TAG"
           --license-root "$GITHUB_WORKSPACE"
       - name: Attest validated unsigned release assets
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # attest-build-provenance v4.2.2
@@ -489,21 +530,23 @@ jobs:
 
   windows-unsigned-package-smoke:
     name: Verify and execute unsigned Windows package
-    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.')
+    if: startsWith(github.ref, 'refs/tags/v0.1.0-testnet.') || (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal)
     needs: [attest-unsigned-release]
     runs-on: windows-2025
     timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_rehearsal && inputs.release_tag) || github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # actions/download-artifact v8.0.2
         with:
-          name: astatine-${{ github.ref_name }}-unsigned-release-packages
+          name: astatine-${{ env.RELEASE_TAG }}-unsigned-release-packages
           path: ${{ runner.temp }}/testnet-package
       - name: Verify and execute the Windows archive without administrator access
         shell: pwsh
         run: |
           & ./support/test-unsigned-windows-package.ps1 `
             -PackageDirectory (Join-Path $env:RUNNER_TEMP 'testnet-package') `
-            -ReleaseTag $env:GITHUB_REF_NAME `
+            -ReleaseTag $env:RELEASE_TAG `
             -Repository $env:GITHUB_REPOSITORY `
             -TemporaryDirectory $env:RUNNER_TEMP

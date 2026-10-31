@@ -15,7 +15,7 @@ import tempfile
 
 RUST_MODULUS = re.compile(r'(?m)^const RSA_MODULUS_BASE64: &str = "([^"]+)";$')
 RUST_EXPONENT = re.compile(r'(?m)^const RSA_EXPONENT_BASE64: &str = "([^"]+)";$')
-WINDOWS_KEY_XML = re.compile(r"(?m)^\s*\$KeyXml = '([^']+)'\s*$")
+WINDOWS_KEY_XML = re.compile(r"(?m)^(\s*\$KeyXml = ')([^']+)('\s*)$")
 README_FINGERPRINT = re.compile(
     r"(SHA-256 SubjectPublicKeyInfo\s+fingerprint is\s+`)[0-9a-f]{64}(`)"
 )
@@ -108,7 +108,7 @@ def verify_public_key_pins(root: pathlib.Path, expected_public_key: pathlib.Path
     windows = (root / "support/install-windows.ps1").read_text(encoding="utf-8")
     windows_match = WINDOWS_KEY_XML.search(windows)
     require(windows_match is not None, "Windows installer XML public key is missing")
-    require(xml_components(windows_match.group(1)) == (modulus_b64, exponent_b64), "Windows installer XML differs from canonical public key")
+    require(xml_components(windows_match.group(2)) == (modulus_b64, exponent_b64), "Windows installer XML differs from canonical public key")
     canonical_xml = (root / "support/release-signing-public.xml").read_text(encoding="utf-8").strip()
     require(xml_components(canonical_xml) == (modulus_b64, exponent_b64), "canonical Windows XML differs from canonical PEM")
 
@@ -153,7 +153,7 @@ def sync_public_key(root: pathlib.Path, public_key: pathlib.Path) -> str:
 
     windows_path = root / "support/install-windows.ps1"
     windows = windows_path.read_text(encoding="utf-8")
-    windows = replace_once(windows, WINDOWS_KEY_XML, f"$KeyXml = '{xml}'", "Windows XML")
+    windows = replace_once(windows, WINDOWS_KEY_XML, rf"\g<1>{xml}\g<3>", "Windows XML")
     windows_path.write_text(windows, encoding="utf-8")
 
     readme_path = root / "README.md"

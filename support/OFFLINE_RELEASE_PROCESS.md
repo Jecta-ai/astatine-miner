@@ -5,6 +5,11 @@ inventory, and emits provenance attestations. It has **no production signing
 key** and no publication job. Pushing a release tag can build and attest
 unsigned artifacts, but cannot publish a release.
 
+The workflow isolation test is a source-controlled regression tripwire, not a
+replacement for GitHub token-permission controls or keeping the production
+signing key outside GitHub and online build hosts. Repository/environment
+secret-name metadata was checked after removal; no values were requested.
+
 The release owner downloads one successful tag run, verifies its exact source
 commit and all asset attestations while online, then disconnects from the
 network and signs the local manifest. After signing, the owner reconnects,
@@ -17,7 +22,7 @@ owner public key.
 The owner-supplied RSA-3072 public key is integrated across the Rust updater,
 Unix and Windows installers, PEM/XML verifier files, release validator, and
 fingerprint check. Its SHA-256 SubjectPublicKeyInfo fingerprint is
-`e6868b04ae1d09c367906df1e1d0e6558242498bbfda0c949e75c6646da05755`; the
+`7a89234d5b269bb5372eab957e66307e321f4d9de9a550f7a2d7a6783cc50650`; the
 checked-in `support/release-key-fingerprint.txt` must contain that fingerprint,
 as one lowercase 64-character SHA-256 value. CI runs the strict pin check, which
 rejects a missing, malformed, or inconsistent fingerprint marker.
@@ -42,6 +47,46 @@ legacy key and will reject a release signed only by the new key. This process
 does not implement a bridge release or dual-key transition. If compatibility
 with an existing Testnet.12 client is required, design that migration before
 release; do not silently reuse the legacy key.
+
+## Nonpublishing release-path rehearsal (no tag)
+
+The workflow supports an explicit `workflow_dispatch` rehearsal input. It runs
+the unsigned package assembly, raw-binary and package attestations, branch-ref
+provenance verification, and native Windows package/archive smoke test. It has no
+signing key or publishing job, and it does not create or move a Git tag.
+
+From a clean checkout at the commit to rehearse:
+
+```sh
+REPOSITORY="$(tr -d '\n' < support/release-repository.txt)"
+BRANCH="feature/testnet13-rc1-remediation"
+TAG="v0.1.0-testnet.13"
+gh workflow run ci.yml --repo "$REPOSITORY" --ref "$BRANCH" \
+  -f release_rehearsal=true -f release_tag="$TAG"
+```
+
+Wait for the run to complete, then use that run's ID and head SHA to download
+and verify its unsigned artifact from a directory outside the repository:
+
+```sh
+RUN_ID="<completed-workflow-dispatch-run-id>"
+SOURCE_COMMIT="<40-character-head-SHA-from-that-run>"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/astatine-rehearsal.XXXXXX")"
+gh run download "$RUN_ID" --repo "$REPOSITORY" \
+  --name "astatine-${TAG}-unsigned-release-packages" \
+  --dir "$WORK/unsigned"
+python3 support/verify_release_provenance.py --rehearsal \
+  --artifact-dir "$WORK/unsigned" --tag "$TAG" --branch "$BRANCH" \
+  --run-id "$RUN_ID" --source-commit "$SOURCE_COMMIT" \
+  --report "$WORK/rehearsal-preflight.json"
+```
+
+Rehearsal provenance is checked against `refs/heads/$BRANCH`, the exact
+workflow-dispatch run, and source commit. The report uses a separate
+`astatine-owner-preflight-rehearsal-v1` schema and is deliberately rejected by
+both offline signing and publication tools. This verifies the build,
+attestation/provenance, and Windows package paths without exercising release-tag
+resolution, production signing, or publication.
 
 ## 1. Download and verify an unsigned CI artifact (online; no key involved)
 
@@ -69,7 +114,8 @@ python3 support/verify_release_provenance.py \
 ```
 
 The preflight requires a clean local checkout whose `HEAD` exactly matches
-`SOURCE_COMMIT`. It checks the exact tag/run/commit/repository and CI workflow
+`SOURCE_COMMIT`; it also rejects Git `assume-unchanged` and `skip-worktree`
+index flags on tracked files. It checks the exact tag/run/commit/repository and CI workflow
 path, confirms the remote tag resolves to the attested source commit, verifies
 the exact 13-file unsigned inventory, checks hashes/sizes/package members/licenses, and runs
 `gh attestation verify` for every asset. Review the command output and the

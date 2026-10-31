@@ -293,6 +293,33 @@ def self_test(repo_root: pathlib.Path) -> None:
         }
         report_path.write_text(json.dumps(preflight), encoding="utf-8")
         preflight_sha256 = sha256(report_path)
+
+        rehearsal_report = temp / "rehearsal-preflight.json"
+        rehearsal_report.write_text(
+            json.dumps({**preflight, "schema": "astatine-owner-preflight-rehearsal-v1", "source_ref": "refs/heads/main"}),
+            encoding="utf-8",
+        )
+        rehearsal_output = temp / "rehearsal-must-not-sign"
+        try:
+            sign_release(
+                input_dir=unsigned,
+                output_dir=rehearsal_output,
+                tag=tag,
+                source_commit=source_commit,
+                report_path=rehearsal_report,
+                expected_report_sha256=sha256(rehearsal_report),
+                private_key=private_key,
+                public_key=public_key,
+                confirmation="",
+                passphrase="",
+                repo_root=test_repo,
+            )
+        except OfflineSigningError:
+            pass
+        else:
+            raise AssertionError("offline signer accepted a non-signable workflow-dispatch rehearsal report")
+        require(not rehearsal_output.exists(), "rehearsal report refusal left a signed output directory")
+
         incomplete_output = temp / "incomplete-key-output"
         try:
             sign_release(

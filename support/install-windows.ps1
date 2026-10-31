@@ -101,7 +101,7 @@ try {
     Invoke-WebRequest -Uri "$Base/update-manifest.sig" -OutFile $Signature -TimeoutSec 60
     if ((Get-Item -LiteralPath $Manifest).Length -gt 2097152) { throw 'Release manifest exceeds its size limit' }
     if ((Get-Item -LiteralPath $Signature).Length -ne 384) { throw 'Release signature has an invalid length' }
-$KeyXml = '<RSAKeyValue><Modulus>kEm6xA0HF7BGDhKZlJkvGrdImcDQfezTL3jEE3Tq9LzGMI6J7iRTdFcFZolbDAbY31dlZH/klKQdYJ2GQ8pgBurFsKnVkN+Yk6njIL3/f2Ug4ZzfMdiXGquQDNxmxfRzGSj3PpH7fpekTjcBRM3fjH2j0yec1dGinvuXy79+7W4EQ8DBK/4v/8MdfjqaOq+hg4SNeKQKmIus0qGGqAb32cJaFOhzLea5K/KaWOOBtW/E1QwxFhwl78dRJPbfHacCCMiUBKnBsbXQxbfxcEtLP+Bjv9fnXQ7rU4ZQ2GCHDckkU+EXmRFzV7rc1qZmnXdADAtOY7RTWxQv7ngAhUabiXwZ+Nx8GZ3LpgUhu827kHePWl/3BVsZJAum75906v2gpBTlGdLDDHhwlGaKJ7LOE4OK4fv4+kQ5SjTFIQeKMmJeNJ+0++ioiIw6VHMz8DPB1naiWa4g0Aib5u4fKvHa3BeTq3CDIk8sZY++9LzkJLu0sCqXS3tFKpp0W/Efaed1</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
+    $KeyXml = '<RSAKeyValue><Modulus>1Qxetx4KvnfuhGEP17i09JKEg2WYQ5ExtGc8ioSsVi4zsghLCaDL2WKs0ibGyTa2Gju2x0UTGHRuUBHEaDtaAs4oirYtVwwvj5Jca14zc2ggL1ZcwBiN+B3GvTwOot+kd/QBcp+yFiGj2YdUtt9PZcIweIi0LZnbJGyl+khfWQ3iHa+1bpCzin5KLGcPFD2UevErRx/WbKJzg2qdxkGKESDLQc9panAqZTbEkYzKQhrIJBJPBuOGJZc+K+KzeLd+iLNx31UUUaRcUtJ0g3NOgIA8z3EVM6dRnbVmT1Wk5UV5RFNAujfb7ptVx7q3fzxkV7d5Fuk0VFlSU4WddWyNsGHFpZj/U/n3yh0vRzyt08yLVsYRKpKqKFvZSN/Ad4ARYto7POee4Alu6kWHALdqIwWqR9TT5IYyiCze37ZwZcU3Mqq1t6VytWdP9GMHlWVw87v7/BglcSgb+h7e7+YN9ok5BTW/eZYqd5B1/xljaiUUHanhzQ6dX2vPnCwF5jz7</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
     $Rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider
     $Rsa.FromXmlString($KeyXml)
     $ManifestBytes = [System.IO.File]::ReadAllBytes($Manifest)

@@ -79,4 +79,32 @@ assert_executable_version 'not a version\n' false
 assert_executable_version 'astatine 0.1.0-testnet.13\nextra output\n' false
 assert_executable_version 'astatine 0.1.0-testnet.13' false
 
+assert_existing_version() {
+  output=$1
+  should_pass=$2
+  expected_version=${3:-}
+  {
+    printf '%s\n' '#!/bin/sh'
+    printf "printf '%%b' '%s'\n" "$output"
+  } > "$FAKE_EXECUTABLE"
+  chmod +x "$FAKE_EXECUTABLE"
+  if [ "$should_pass" = true ]; then
+    actual_version=$(sh "$INSTALLER" --read-executable-version "$FAKE_EXECUTABLE")
+    if [ "$actual_version" != "$expected_version" ]; then
+      printf '%s\n' "Expected existing version $expected_version, got $actual_version" >&2
+      exit 1
+    fi
+  elif sh "$INSTALLER" --read-executable-version "$FAKE_EXECUTABLE" >/dev/null 2>&1; then
+    printf '%s\n' "Malformed or multiline existing version output was accepted: $output" >&2
+    exit 1
+  fi
+}
+
+assert_existing_version 'astatine 0.1.0-testnet.12\n' true '0.1.0-testnet.12'
+assert_existing_version 'astatine 0.1.0-testnet.14\n' true '0.1.0-testnet.14'
+assert_existing_version 'astatine 0.1.0-testnet.12\nastatine 0.1.0-testnet.14\n' false
+assert_existing_version 'astatine 0.1.0-testnet.12\nextra output\n' false
+assert_existing_version 'astatine 0.1.0-testnet.foo\n' false
+assert_existing_version 'astatine 0.1.0-testnet.12' false
+
 printf '%s\n' 'Unix installer SemVer ordering, executable matching, and fail-closed checks passed'

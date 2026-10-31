@@ -335,6 +335,26 @@ def self_test(repo_root: pathlib.Path) -> None:
         notes = repo_root / "support/release-notes-v0.1.0-testnet.13.md"
         confirmation = f"PUBLISH {tag} {source_commit} PREFLIGHT {preflight_sha256}"
 
+        rehearsal_preflight_path = temp / "rehearsal-preflight.json"
+        rehearsal_preflight_path.write_text(
+            json.dumps({**preflight, "schema": "astatine-owner-preflight-rehearsal-v1", "source_ref": "refs/heads/main"}),
+            encoding="utf-8",
+        )
+        try:
+            prepare_publication(
+                signed,
+                rehearsal_preflight_path,
+                tag,
+                source_commit,
+                sha256(rehearsal_preflight_path),
+                public_key,
+                test_repo,
+            )
+        except OfflineSigningError:
+            pass
+        else:
+            raise AssertionError("publisher accepted a non-signable workflow-dispatch rehearsal report")
+
         incomplete_repo = temp / "repo-incomplete-key"
         shutil.copytree(test_repo, incomplete_repo)
         (incomplete_repo / "support/release-key-fingerprint.txt").write_text(

@@ -119,7 +119,7 @@ The Testnet.11 M4/Metal reference supplied for this release is `69.102 MH/s` GPU
 
 Release manifests are authenticated by a pinned RSA-3072 key in addition to
 HTTPS. The currently embedded key's SHA-256 SubjectPublicKeyInfo fingerprint is
-`e6868b04ae1d09c367906df1e1d0e6558242498bbfda0c949e75c6646da05755`. This
+`7a89234d5b269bb5372eab957e66307e321f4d9de9a550f7a2d7a6783cc50650`. This
 owner-supplied key is integrated across the Rust updater, Unix/Windows
 installers, and release validators; `support/release-key-fingerprint.txt`
 contains the matching active fingerprint. Before signing, the offline signer

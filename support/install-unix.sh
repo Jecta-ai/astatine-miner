@@ -45,9 +45,8 @@ compare_testnet_versions() {
   '
 }
 
-verify_executable_version() {
+read_executable_version() {
   executable=$1
-  expected=$2
   output_file=$(mktemp) || return 1
   if ! "$executable" --version > "$output_file"; then
     rm -f "$output_file"
@@ -63,6 +62,18 @@ verify_executable_version() {
     "astatine "*) reported_version=${output_line#astatine } ;;
     *) return 1 ;;
   esac
+  if ! compare_testnet_versions "$reported_version" "$reported_version" >/dev/null; then
+    return 1
+  fi
+  printf '%s\n' "$reported_version"
+}
+
+verify_executable_version() {
+  executable=$1
+  expected=$2
+  if ! reported_version=$(read_executable_version "$executable"); then
+    return 1
+  fi
   [ "$(compare_testnet_versions "$reported_version" "$expected")" = 0 ]
 }
 
@@ -81,6 +92,15 @@ if [ "${1:-}" = "--verify-executable-version" ]; then
     exit 2
   fi
   verify_executable_version "$3" "$2"
+  exit $?
+fi
+
+if [ "${1:-}" = "--read-executable-version" ]; then
+  if [ "$#" -ne 2 ]; then
+    printf '%s\n' 'Usage: install-unix.sh --read-executable-version EXECUTABLE' >&2
+    exit 2
+  fi
+  read_executable_version "$2"
   exit $?
 fi
 
@@ -114,15 +134,15 @@ curl --fail --show-error --location --connect-timeout 10 --max-time 60 --max-fil
 curl --fail --show-error --location --connect-timeout 10 --max-time 60 --max-filesize 4096 "$BASE/update-manifest.sig" -o "$SIGNATURE"
 cat > "$PUBLIC_KEY" <<'PUBLIC_KEY_EOF'
 -----BEGIN PUBLIC KEY-----
-MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAkEm6xA0HF7BGDhKZlJkv
-GrdImcDQfezTL3jEE3Tq9LzGMI6J7iRTdFcFZolbDAbY31dlZH/klKQdYJ2GQ8pg
-BurFsKnVkN+Yk6njIL3/f2Ug4ZzfMdiXGquQDNxmxfRzGSj3PpH7fpekTjcBRM3f
-jH2j0yec1dGinvuXy79+7W4EQ8DBK/4v/8MdfjqaOq+hg4SNeKQKmIus0qGGqAb3
-2cJaFOhzLea5K/KaWOOBtW/E1QwxFhwl78dRJPbfHacCCMiUBKnBsbXQxbfxcEtL
-P+Bjv9fnXQ7rU4ZQ2GCHDckkU+EXmRFzV7rc1qZmnXdADAtOY7RTWxQv7ngAhUab
-iXwZ+Nx8GZ3LpgUhu827kHePWl/3BVsZJAum75906v2gpBTlGdLDDHhwlGaKJ7LO
-E4OK4fv4+kQ5SjTFIQeKMmJeNJ+0++ioiIw6VHMz8DPB1naiWa4g0Aib5u4fKvHa
-3BeTq3CDIk8sZY++9LzkJLu0sCqXS3tFKpp0W/Efaed1AgMBAAE=
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA1Qxetx4KvnfuhGEP17i0
+9JKEg2WYQ5ExtGc8ioSsVi4zsghLCaDL2WKs0ibGyTa2Gju2x0UTGHRuUBHEaDta
+As4oirYtVwwvj5Jca14zc2ggL1ZcwBiN+B3GvTwOot+kd/QBcp+yFiGj2YdUtt9P
+ZcIweIi0LZnbJGyl+khfWQ3iHa+1bpCzin5KLGcPFD2UevErRx/WbKJzg2qdxkGK
+ESDLQc9panAqZTbEkYzKQhrIJBJPBuOGJZc+K+KzeLd+iLNx31UUUaRcUtJ0g3NO
+gIA8z3EVM6dRnbVmT1Wk5UV5RFNAujfb7ptVx7q3fzxkV7d5Fuk0VFlSU4WddWyN
+sGHFpZj/U/n3yh0vRzyt08yLVsYRKpKqKFvZSN/Ad4ARYto7POee4Alu6kWHALdq
+IwWqR9TT5IYyiCze37ZwZcU3Mqq1t6VytWdP9GMHlWVw87v7/BglcSgb+h7e7+YN
+9ok5BTW/eZYqd5B1/xljaiUUHanhzQ6dX2vPnCwF5jz7AgMBAAE=
 -----END PUBLIC KEY-----
 PUBLIC_KEY_EOF
 
@@ -169,13 +189,8 @@ if [ -e "$INSTALL_DIR/astatine" ]; then
     printf '%s\n' 'Refusing to replace an existing Astatine executable that cannot be run for version verification' >&2
     exit 1
   fi
-  installed_output="$("$INSTALL_DIR/astatine" --version 2>/dev/null)" || {
-    printf '%s\n' 'Refusing to replace an existing Astatine executable whose version could not be read' >&2
-    exit 1
-  }
-  installed_version="$(printf '%s\n' "$installed_output" | awk 'NR == 1 && $1 == "astatine" { print $2 }')"
-  if [ -z "$installed_version" ]; then
-    printf '%s\n' 'Refusing to replace an existing executable with an unrecognized Astatine version' >&2
+  if ! installed_version="$(read_executable_version "$INSTALL_DIR/astatine" 2>/dev/null)"; then
+    printf '%s\n' 'Refusing to replace an existing executable with malformed or multiline version output' >&2
     exit 1
   fi
   version_order="$(compare_testnet_versions "$installed_version" "$VERSION")" || {

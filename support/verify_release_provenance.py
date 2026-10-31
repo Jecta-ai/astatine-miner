@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Network preflight for a tag's unsigned release artifacts; never opens a key."""
+"""Network preflight for tag artifacts or non-signable rehearsals; never opens a key."""
 
 from __future__ import annotations
 
@@ -78,6 +78,23 @@ def validate_local_source_checkout(repo_root: pathlib.Path, expected_commit: str
     require(status.returncode == 0, f"cannot inspect local source checkout status: {status.stderr.strip()}")
     require(not status.stdout, "local source checkout has uncommitted or untracked files")
 
+    validate_tracked_index_flags(repo_root)
+
+
+def validate_tracked_index_flags(repo_root: pathlib.Path) -> None:
+    indexed = subprocess.run(
+        ["git", "-C", str(repo_root), "ls-files", "-v", "-z"],
+        check=False,
+        capture_output=True,
+    )
+    require(indexed.returncode == 0, "cannot inspect local Git index flags")
+    entries = [entry for entry in indexed.stdout.split(b"\0") if entry]
+    require(bool(entries), "local Git index contains no tracked source files")
+    require(
+        all(entry.startswith(b"H ") for entry in entries),
+        "local source checkout has assume-unchanged, skip-worktree, or nonstandard tracked index flags",
+    )
+
 
 def validate_run_context(run: dict, repository: str, tag: str, expected_commit: str) -> None:
     run_repository = run.get("repository")
@@ -101,6 +118,28 @@ def validate_run_context(run: dict, repository: str, tag: str, expected_commit: 
     require(re.fullmatch(r"[0-9a-f]{40}", expected_commit) is not None, "source commit must be a full lowercase Git SHA")
 
 
+def validate_rehearsal_run_context(run: dict, repository: str, branch: str, expected_commit: str) -> None:
+    require(
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) is not None
+        and all(part not in ("", ".", "..") for part in branch.split("/")),
+        "rehearsal source branch name is malformed",
+    )
+    run_repository = run.get("repository")
+    if isinstance(run_repository, dict):
+        run_repository = run_repository.get("full_name")
+    require(run_repository == repository, "rehearsal workflow run belongs to a different repository")
+    require(run.get("conclusion") == "success", "rehearsal workflow run did not succeed")
+    require(run.get("event") == "workflow_dispatch", "rehearsal run must be an explicit manual dispatch")
+    require(run.get("head_sha") == expected_commit, "rehearsal workflow commit differs from the selected commit")
+    require(run.get("head_branch") == branch, "rehearsal workflow run belongs to a different branch")
+    require(
+        run.get("path") == f"{WORKFLOW}@refs/heads/{branch}",
+        "rehearsal workflow path does not identify the selected branch and CI workflow",
+    )
+    require(repository == REPOSITORY, "requested repository differs from the exact pinned release identity")
+    require(re.fullmatch(r"[0-9a-f]{40}", expected_commit) is not None, "source commit must be a full lowercase Git SHA")
+
+
 def resolve_tag_commit(repository: str, tag: str) -> str:
     reference = gh_json(["api", f"repos/{repository}/git/ref/tags/{tag}"])
     target = reference.get("object", {})
@@ -120,23 +159,12 @@ def attested_files(root: pathlib.Path) -> list[pathlib.Path]:
     return [root / filename for filename in sorted(UNSIGNED_FILES)]
 
 
-def verify_preflight(
+def verify_asset_attestations(
     root: pathlib.Path,
-    tag: str,
-    run_id: str,
+    repository: str,
+    source_ref: str,
     expected_commit: str,
-    repository: str = REPOSITORY,
-) -> dict:
-    parse_tag(tag)
-    validate_local_source_checkout(pathlib.Path(__file__).resolve().parent.parent, expected_commit)
-    validate_release(root, tag, pathlib.Path(__file__).resolve().parent.parent, None, signed=False)
-    require(re.fullmatch(r"[0-9]+", str(run_id)) is not None, "GitHub Actions run ID must be numeric")
-    run = gh_json(["api", f"repos/{repository}/actions/runs/{run_id}"])
-    validate_run_context(run, repository, tag, expected_commit)
-    tag_commit = resolve_tag_commit(repository, tag)
-    require(tag_commit == expected_commit, "remote tag does not identify the attested source commit")
-
-    source_ref = f"refs/tags/{tag}"
+) -> None:
     signer_workflow = f"{repository}/{WORKFLOW}"
     for asset in attested_files(root):
         gh_success(
@@ -156,6 +184,26 @@ def verify_preflight(
             ]
         )
 
+
+def verify_preflight(
+    root: pathlib.Path,
+    tag: str,
+    run_id: str,
+    expected_commit: str,
+    repository: str = REPOSITORY,
+) -> dict:
+    parse_tag(tag)
+    validate_local_source_checkout(pathlib.Path(__file__).resolve().parent.parent, expected_commit)
+    validate_release(root, tag, pathlib.Path(__file__).resolve().parent.parent, None, signed=False)
+    require(re.fullmatch(r"[0-9]+", str(run_id)) is not None, "GitHub Actions run ID must be numeric")
+    run = gh_json(["api", f"repos/{repository}/actions/runs/{run_id}"])
+    validate_run_context(run, repository, tag, expected_commit)
+    tag_commit = resolve_tag_commit(repository, tag)
+    require(tag_commit == expected_commit, "remote tag does not identify the attested source commit")
+
+    source_ref = f"refs/tags/{tag}"
+    verify_asset_attestations(root, repository, source_ref, expected_commit)
+
     return {
         "schema": "astatine-owner-preflight-v1",
         "repository": repository,
@@ -164,6 +212,41 @@ def verify_preflight(
         "run_id": str(run_id),
         "run_url": run.get("html_url", ""),
         "tag_commit": tag_commit,
+        "workflow": WORKFLOW,
+        "attested_assets": {
+            path.name: {"sha256": sha256(path), "size": path.stat().st_size}
+            for path in attested_files(root)
+        },
+        "verified_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def verify_rehearsal_preflight(
+    root: pathlib.Path,
+    tag: str,
+    run_id: str,
+    expected_commit: str,
+    branch: str,
+    repository: str = REPOSITORY,
+) -> dict:
+    parse_tag(tag)
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    validate_local_source_checkout(repo_root, expected_commit)
+    validate_release(root, tag, repo_root, None, signed=False)
+    require(re.fullmatch(r"[0-9]+", str(run_id)) is not None, "GitHub Actions run ID must be numeric")
+    run = gh_json(["api", f"repos/{repository}/actions/runs/{run_id}"])
+    validate_rehearsal_run_context(run, repository, branch, expected_commit)
+
+    source_ref = f"refs/heads/{branch}"
+    verify_asset_attestations(root, repository, source_ref, expected_commit)
+    return {
+        "schema": "astatine-owner-preflight-rehearsal-v1",
+        "repository": repository,
+        "tag": tag,
+        "source_commit": expected_commit,
+        "source_ref": source_ref,
+        "run_id": str(run_id),
+        "run_url": run.get("html_url", ""),
         "workflow": WORKFLOW,
         "attested_assets": {
             path.name: {"sha256": sha256(path), "size": path.stat().st_size}
@@ -218,6 +301,32 @@ def self_test() -> None:
             continue
         raise AssertionError("synthetic preflight accepted incorrect repository/tag/commit provenance")
 
+    branch = "feature/testnet13-rc1-remediation"
+    rehearsal = {
+        "conclusion": "success",
+        "event": "workflow_dispatch",
+        "head_sha": "c" * 40,
+        "head_branch": branch,
+        "path": f"{WORKFLOW}@refs/heads/{branch}",
+        "repository": {"full_name": REPOSITORY},
+    }
+    validate_rehearsal_run_context(rehearsal, REPOSITORY, branch, "c" * 40)
+    for mutated, repository, source_branch, commit in (
+        ({**rehearsal, "event": "push"}, REPOSITORY, branch, "c" * 40),
+        ({**rehearsal, "head_branch": "other-branch"}, REPOSITORY, branch, "c" * 40),
+        ({**rehearsal, "head_sha": "d" * 40}, REPOSITORY, branch, "c" * 40),
+        ({**rehearsal, "conclusion": "failure"}, REPOSITORY, branch, "c" * 40),
+        ({**rehearsal, "path": f"{WORKFLOW}@refs/tags/v0.1.0-testnet.13"}, REPOSITORY, branch, "c" * 40),
+        ({**rehearsal, "path": ".github/workflows/other.yml@refs/heads/feature/testnet13-rc1-remediation"}, REPOSITORY, branch, "c" * 40),
+        ({**rehearsal, "repository": {"full_name": "attacker.invalid/astatine-miner"}}, REPOSITORY, branch, "c" * 40),
+        (rehearsal, REPOSITORY, "../untrusted", "c" * 40),
+    ):
+        try:
+            validate_rehearsal_run_context(mutated, repository, source_branch, commit)
+        except PreflightError:
+            continue
+        raise AssertionError("synthetic rehearsal accepted incorrect workflow-dispatch provenance")
+
     with tempfile.TemporaryDirectory(prefix="astatine-provenance-checkout-test-") as temporary:
         checkout = pathlib.Path(temporary)
         subprocess.run(["git", "-C", str(checkout), "init", "-q", "-b", "main"], check=True, capture_output=True)
@@ -253,6 +362,42 @@ def self_test() -> None:
             pass
         else:
             raise AssertionError("synthetic preflight accepted a local checkout at a different commit")
+
+        source_file = checkout / "source.txt"
+        for set_flag, clear_flag in (
+            ("--assume-unchanged", "--no-assume-unchanged"),
+            ("--skip-worktree", "--no-skip-worktree"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(checkout), "update-index", set_flag, "source.txt"],
+                check=True,
+                capture_output=True,
+            )
+            source_file.write_text("modified while index flag is active\n", encoding="utf-8")
+            if set_flag == "--assume-unchanged":
+                status = subprocess.run(
+                    ["git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"],
+                    check=True,
+                    capture_output=True,
+                )
+                require(not status.stdout, "synthetic assume-unchanged fixture did not hide the modified source")
+            for validate in (
+                lambda: validate_tracked_index_flags(checkout),
+                lambda: validate_local_source_checkout(checkout, commit),
+            ):
+                try:
+                    validate()
+                except PreflightError:
+                    continue
+                raise AssertionError(f"synthetic preflight accepted a tracked file with {set_flag}")
+            subprocess.run(
+                ["git", "-C", str(checkout), "update-index", clear_flag, "source.txt"],
+                check=True,
+                capture_output=True,
+            )
+            source_file.write_text("synthetic source\n", encoding="utf-8")
+            validate_local_source_checkout(checkout, commit)
+
         (checkout / "untracked.txt").write_text("dirty\n", encoding="utf-8")
         try:
             validate_local_source_checkout(checkout, commit)
@@ -265,10 +410,12 @@ def self_test() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--rehearsal", action="store_true", help="verify a non-signable workflow-dispatch rehearsal")
     parser.add_argument("--artifact-dir", type=pathlib.Path)
     parser.add_argument("--tag")
     parser.add_argument("--run-id")
     parser.add_argument("--source-commit")
+    parser.add_argument("--branch", help="exact branch used for a workflow-dispatch rehearsal")
     parser.add_argument("--report", type=pathlib.Path)
     arguments = parser.parse_args()
     try:
@@ -278,19 +425,31 @@ def main() -> None:
             return
         for name in ("artifact_dir", "tag", "run_id", "source_commit", "report"):
             require(getattr(arguments, name) is not None, f"--{name.replace('_', '-')} is required")
-        report = verify_preflight(
-            arguments.artifact_dir,
-            arguments.tag,
-            arguments.run_id,
-            arguments.source_commit,
-        )
+        if arguments.rehearsal:
+            require(arguments.branch is not None, "--branch is required for a workflow-dispatch rehearsal")
+            report = verify_rehearsal_preflight(
+                arguments.artifact_dir,
+                arguments.tag,
+                arguments.run_id,
+                arguments.source_commit,
+                arguments.branch,
+            )
+        else:
+            require(arguments.branch is None, "--branch is only valid with --rehearsal")
+            report = verify_preflight(
+                arguments.artifact_dir,
+                arguments.tag,
+                arguments.run_id,
+                arguments.source_commit,
+            )
         write_report(arguments.report, report)
         report_digest = sha256(arguments.report)
-        print(
-            f"Verified {len(report['attested_assets'])} unsigned assets from "
-            f"{report['repository']}@{report['source_commit']} ({report['tag']}); report: {arguments.report}"
-        )
-        print(f"Record this preflight report SHA-256 for offline signing/publication: {report_digest}")
+        label = "non-signable rehearsal" if arguments.rehearsal else "release preflight"
+        print(f"Verified {len(report['attested_assets'])} unsigned assets for {label}: {report['repository']}@{report['source_commit']} ({report['tag']}); report: {arguments.report}")
+        if arguments.rehearsal:
+            print(f"Rehearsal report SHA-256 (not accepted for signing/publication): {report_digest}")
+        else:
+            print(f"Record this preflight report SHA-256 for offline signing/publication: {report_digest}")
     except (OSError, subprocess.SubprocessError, PreflightError, ValueError) as error:
         parser.exit(1, f"release provenance preflight failed: {error}\n")
 

@@ -10,6 +10,20 @@ import sys
 
 USES = re.compile(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)")
 IMMUTABLE_SHA = re.compile(r"[0-9a-f]{40}\Z")
+PRIVILEGED_WORKFLOW_PATTERNS = (
+    ("GitHub secrets context", re.compile(r"\bsecrets\b", re.IGNORECASE)),
+    ("contents write permission", re.compile(r"\bcontents\s*:\s*write\b", re.IGNORECASE)),
+    (
+        "signing environment",
+        re.compile(r"\benvironment\s*:\s*['\"]?testnet-release-signing\b", re.IGNORECASE),
+    ),
+    (
+        "publishing environment",
+        re.compile(r"\benvironment\s*:\s*['\"]?testnet-release-publish\b", re.IGNORECASE),
+    ),
+    ("signing secret name", re.compile(r"TESTNET_RELEASE_SIGNING_KEY|ASTATINE_RELEASE_SIGNING_KEY")),
+    ("automatic release operation", re.compile(r"\bgh\s+release\s+(?:create|upload|edit|delete)\b", re.IGNORECASE)),
+)
 
 
 def reference_for_line(line: str) -> str | None:
@@ -26,16 +40,10 @@ def is_pinned(reference: str) -> bool:
 
 
 def validate_signing_isolation(contents: str, workflow: pathlib.Path) -> None:
-    forbidden = (
-        "secrets.",
-        "TESTNET_RELEASE_SIGNING_KEY",
-        "ASTATINE_RELEASE_SIGNING_KEY",
-        "contents: write",
-        "gh release create",
-    )
-    for token in forbidden:
-        if token in contents:
-            raise AssertionError(f"{workflow}: workflow must not contain privileged release authority: {token}")
+    """Source-controlled tripwire; GitHub policy and offline custody remain authoritative."""
+    for description, pattern in PRIVILEGED_WORKFLOW_PATTERNS:
+        if pattern.search(contents):
+            raise AssertionError(f"{workflow}: workflow contains forbidden release authority ({description})")
 
 
 def self_test() -> None:
@@ -57,7 +65,12 @@ def self_test() -> None:
         "env: SOME_KEY: ${{ secrets.SOME_KEY }}",
         "env: TESTNET_RELEASE_SIGNING_KEY: ${{ secrets.TESTNET_RELEASE_SIGNING_KEY }}",
         "permissions: contents: write",
+        "permissions: contents : write",
+        "env: ${{ toJSON(secrets) }}",
+        "environment: testnet-release-signing",
+        "environment: testnet-release-publish",
         "run: gh release create v0.1.0-testnet.13",
+        "run: GH_TOKEN=$TOKEN gh release upload v0.1.0-testnet.13 asset.zip",
     ):
         try:
             validate_signing_isolation(privileged, pathlib.Path("synthetic-workflow.yml"))
