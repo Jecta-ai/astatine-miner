@@ -7326,6 +7326,74 @@ mod tests {
     }
 
     #[test]
+    fn v8_closed_history_only_migration_preserves_counter_and_requires_new_session_approval() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let wallet = Address::with_last_byte(0x6f);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "0.5".to_owned(),
+            ..AppConfig::default()
+        };
+        const RECORDED_AUTHORIZATION: &str = "123456789012345678";
+        const REPORTED_ACTUAL: &str = "9876543210000000";
+
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let mut closed_history = journal.state.active_session.take().unwrap();
+        let session_id = closed_history.id.clone();
+        closed_history.closed = true;
+        closed_history.authorized_exposure_wei = Some(RECORDED_AUTHORIZATION.to_owned());
+        closed_history.reported_actual_wei = Some(REPORTED_ACTUAL.to_owned());
+        journal.state.session_history.push(closed_history);
+        let mut v8: serde_json::Value = serde_json::to_value(&journal.state).unwrap();
+        v8["version"] = serde_json::json!(8);
+        drop(journal);
+        write_legacy_journal(&store, &mut v8).unwrap();
+
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(snapshot.session_id.is_none());
+        assert!(snapshot.closed);
+        assert!(snapshot.has_prior_session_history);
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        assert_eq!(migrated["version"], JOURNAL_VERSION);
+        assert!(migrated["active_session"].is_null());
+        assert_eq!(migrated["session_history"][0]["id"], session_id);
+        assert_eq!(
+            migrated["session_history"][0]["authorized_exposure_wei"], RECORDED_AUTHORIZATION,
+            "migration must retain the closed history counter instead of charging its limit"
+        );
+        assert_eq!(
+            migrated["session_history"][0]["reported_actual_wei"], REPORTED_ACTUAL,
+            "RPC-reported actual cost remains separate from authorized exposure"
+        );
+
+        let error = match TransactionManager::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            Address::with_last_byte(0x6e),
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        ) {
+            Ok(_) => panic!("ordinary mining must not create an allowance from closed history"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}")
+                .contains("previous spending-session or transaction authorization history")
+        );
+        let after_denied_mining: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        assert!(after_denied_mining["active_session"].is_null());
+        assert_eq!(
+            after_denied_mining["session_history"][0]["authorized_exposure_wei"],
+            RECORDED_AUTHORIZATION
+        );
+    }
+
+    #[test]
     fn testnet6_v3_journal_migrates_without_resetting_receipts_or_reward_history() {
         let root = tempdir().unwrap();
         let store = ConfigStore::at_root(PathBuf::from(root.path()));
