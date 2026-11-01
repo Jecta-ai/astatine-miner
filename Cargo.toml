@@ -45,7 +45,7 @@ zeroize = { version = "=1.9.1", default-features = false, features = ["alloc"] }
 libc = "=0.2.191"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "=3.6.3", default-features = false, features = ["crypto-rust", "sync-secret-service"] }
+keyring = { version = "=3.6.3", default-features = false, features = ["crypto-rust", "sync-secret-service", "vendored"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "=3.6.3", default-features = false, features = ["apple-native"] }
