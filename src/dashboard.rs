@@ -858,11 +858,17 @@ fn render_wide_header(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel,
     if area.height == 0 {
         return;
     }
-    let left_width = if model.mode(Instant::now()) == "WAITING FOR GENESIS" {
-        39.min(area.width / 2)
-    } else {
-        31.min(area.width / 2)
-    };
+    let title_width = format!(
+        "v{} • {}",
+        env!("CARGO_PKG_VERSION"),
+        model.mode(Instant::now())
+    )
+    .chars()
+    .count()
+    .saturating_add(1);
+    let left_width = title_width
+        .max(31)
+        .min(usize::from(area.width.saturating_sub(32))) as u16;
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(left_width), Constraint::Min(0)])
@@ -1021,15 +1027,15 @@ fn render_narrow(
         .unwrap_or_else(|| "--".to_owned());
     let mined = format_units(model.mined_rewards, 9);
     let mode = model.mode(Instant::now());
-    let mode_line = if mode == "WAITING FOR GENESIS" {
-        mode.to_owned()
+    let network_code = match model.network {
+        Network::Testnet => "TN",
+        Network::Mainnet => "MN",
+    };
+    let versioned_mode = format!("v{} • {mode} • {network_code}", env!("CARGO_PKG_VERSION"));
+    let mode_line = if versioned_mode.chars().count() <= usize::from(area.width) {
+        versioned_mode
     } else {
-        format!(
-            "{} • {} • {}",
-            network_name(model.network),
-            mode,
-            model.device_label
-        )
+        format!("{mode} • {network_code}")
     };
     let mode_span = if mode == "WAITING FOR GENESIS" {
         Span::styled(mode_line, style(colors, GENESIS_AMBER, false))
@@ -1045,7 +1051,8 @@ fn render_narrow(
         Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
         Line::from(mode_span),
         Line::from(Span::raw(format!(
-            "{} · INJ {}",
+            "{} · {} · {}",
+            model.device_label,
             short_address(model.wallet),
             format_optional_inj_value(model.inj_balance),
         ))),
@@ -1730,6 +1737,61 @@ mod tests {
                 "expired-window status was clipped at {width} columns: {text}"
             );
             assert!(text.contains("FINALIZE"), "{width} columns: {text}");
+        }
+    }
+
+    #[test]
+    fn long_global_status_keeps_version_and_network_metadata_readable_at_common_sizes() {
+        for status in [
+            NodeStatus::FinalizationRequired,
+            NodeStatus::FinalizationBlocked,
+        ] {
+            let view = model(vec![node(1, status, None)]);
+            let expected_wide_title = format!(
+                "v{} • {}",
+                env!("CARGO_PKG_VERSION"),
+                view.mode(Instant::now())
+            );
+            for (width, height) in [(80, 24), (100, 24), (120, 30)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| render_dashboard(frame, &view, None, false))
+                    .unwrap();
+                let text = buffer_text(&terminal);
+                assert!(
+                    text.contains(&expected_wide_title),
+                    "version/status title was clipped at {width}x{height}: {text}"
+                );
+                assert!(
+                    text.contains("NETWORK") && text.contains("Injective Testnet"),
+                    "network metadata was clipped at {width}x{height}: {text}"
+                );
+            }
+
+            let mut compact = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            compact
+                .draw(|frame| render_dashboard(frame, &view, None, false))
+                .unwrap();
+            let compact_text = buffer_text(&compact);
+            assert!(
+                compact_text.contains(&expected_wide_title),
+                "{compact_text}"
+            );
+
+            let mut narrow = Terminal::new(TestBackend::new(48, 24)).unwrap();
+            narrow
+                .draw(|frame| render_dashboard(frame, &view, None, false))
+                .unwrap();
+            let narrow_text = buffer_text(&narrow);
+            assert!(
+                narrow_text.contains(view.mode(Instant::now())),
+                "global status was clipped in narrow layout: {narrow_text}"
+            );
+            assert!(narrow_text.contains("TN"), "{narrow_text}");
+            assert!(
+                narrow_text.contains(&expected_wide_title),
+                "the complete version/status title should fit at 48 columns: {narrow_text}"
+            );
         }
     }
 

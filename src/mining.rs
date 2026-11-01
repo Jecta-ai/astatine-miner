@@ -962,7 +962,7 @@ pub(crate) async fn run_with_session_confirmation(
             return Err(error).context("inspect transaction session before mining");
         }
     };
-    if session.pending_transition.is_some() {
+    if !args.compute_only && session.pending_transition.is_some() {
         progress.fail(
             "An init spending-session change is interrupted; run astatine init to resolve it",
         );
@@ -970,7 +970,7 @@ pub(crate) async fn run_with_session_confirmation(
             "an init spending-session change is interrupted; run `astatine init` to resolve it before mining"
         );
     }
-    if !session.unresolved.is_empty() {
+    if unresolved_session_blocks_mining(args.compute_only, !session.unresolved.is_empty()) {
         progress
             .fail("An unresolved transaction requires read-only recovery; wallet remains locked");
         eprintln!("RECOVERY REQUIRED • WALLET LOCKED • mining paused");
@@ -1131,7 +1131,8 @@ async fn run_runtime(
                 return Err(error).context("check for a read-only transaction recovery journal");
             }
         };
-    let transaction_manager_mode = transaction_mode || readonly_recovery;
+    let transaction_manager_mode =
+        should_open_transaction_manager(args.compute_only, transaction_mode, readonly_recovery);
     let mut transactions = if transaction_manager_mode {
         let token = client
             .manifest
@@ -1160,7 +1161,9 @@ async fn run_runtime(
         // The test probe is only supplied by local-runtime tests. Production CLI
         // entry points refuse unresolved startup sessions and route them to the
         // dedicated read-only `astatine recover` command.
-        if manager.journal.has_unresolved() && probe_sender.is_none() {
+        if unresolved_session_blocks_mining(args.compute_only, manager.journal.has_unresolved())
+            && probe_sender.is_none()
+        {
             let unresolved = manager.journal.unresolved_transactions();
             if let Some(startup) = startup {
                 startup.fail(
@@ -2759,24 +2762,6 @@ fn record_finalization_state(
             );
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) async fn finalize_initial_expired_windows(
-    client: &NetworkClient,
-    selected: &HashSet<u8>,
-    manager: &mut TransactionManager,
-    signer: &bip32::secp256k1::ecdsa::SigningKey,
-    wallet: Address,
-    snapshot: &mut ReadSnapshot,
-    options: FinalizationOptions<'_>,
-) -> Result<bool> {
-    if !maybe_finalize_expired(client, selected, manager, signer, wallet, snapshot, options).await?
-    {
-        return Ok(false);
-    }
-    *snapshot = client.snapshot(Some(wallet)).await?;
-    Ok(true)
 }
 
 fn confirmed_action_message(label: &str, action: &ConfirmedAction) -> String {
@@ -4687,6 +4672,21 @@ fn next_poll_delay(current: Duration) -> Duration {
         .min(MAX_POLL_INTERVAL)
 }
 
+pub(crate) fn unresolved_session_blocks_mining(
+    compute_only: bool,
+    has_unresolved_transaction: bool,
+) -> bool {
+    !compute_only && has_unresolved_transaction
+}
+
+fn should_open_transaction_manager(
+    compute_only: bool,
+    transaction_mode: bool,
+    readonly_recovery: bool,
+) -> bool {
+    !compute_only && (transaction_mode || readonly_recovery)
+}
+
 fn format_inj(value: Option<U256>) -> String {
     let Some(value) = value else {
         return "unavailable".to_owned();
@@ -4732,8 +4732,9 @@ mod tests {
         dashboard_node_status, finalization_retry_delay, gpu_is_meaningfully_faster,
         history_profile_enabled, inactive_genesis_nodes, next_poll_delay, next_scheduled_slot,
         process_hashed_candidate, proof_inbox, reconcile_head_progress, revalidate_queued_proof,
-        revalidate_queued_proof_at, selected_nodes, take_observer_update, traced_node_status,
-        update_slots, worker_loop,
+        revalidate_queued_proof_at, selected_nodes, should_open_transaction_manager,
+        take_observer_update, traced_node_status, unresolved_session_blocks_mining, update_slots,
+        worker_loop,
     };
     use crate::{
         cli::{DeviceChoice, MineArgs, Network},
@@ -4815,6 +4816,14 @@ mod tests {
         assert!(!history_profile_enabled(Some("0")));
         assert!(!history_profile_enabled(Some("true")));
         assert!(history_profile_enabled(Some("1")));
+    }
+
+    #[test]
+    fn compute_only_can_continue_with_unresolved_transactions_without_opening_a_manager() {
+        assert!(!unresolved_session_blocks_mining(true, true));
+        assert!(unresolved_session_blocks_mining(false, true));
+        assert!(!should_open_transaction_manager(true, false, true));
+        assert!(!should_open_transaction_manager(true, false, false));
     }
 
     #[test]

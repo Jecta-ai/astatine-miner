@@ -403,7 +403,7 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
     let store = ConfigStore::system_default()?;
     let config = store.load()?;
     let session = TransactionJournal::inspect_session(&store, &config)?;
-    if session.pending_transition.is_some() {
+    if !args.compute_only && session.pending_transition.is_some() {
         bail!(
             "a spending-session change was interrupted; run `astatine init` to resolve it before mining"
         );
@@ -437,7 +437,7 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
         }
         return mining::run_with_session_confirmation(&store, args, true).await;
     }
-    if !session.unresolved.is_empty() {
+    if mining::unresolved_session_blocks_mining(args.compute_only, !session.unresolved.is_empty()) {
         println!("RECOVERY REQUIRED • WALLET LOCKED • mining paused");
         print_unresolved_session_blocker(
             &session,

@@ -5055,7 +5055,7 @@ fn validate_journal(state: &JournalState) -> Result<()> {
         }
         Address::from_str(&session.wallet)
             .context("historical session wallet address is invalid")?;
-        parse_inj_wei(&session.limit_wei)
+        parse_decimal_wei(&session.limit_wei)
             .context("historical session spending limit is invalid")?;
         parse_decimal_wei(
             session
@@ -5098,7 +5098,7 @@ fn validate_journal(state: &JournalState) -> Result<()> {
             if previous.id == transition.new_session_id {
                 bail!("pending session transition reuses the previous session ID");
             }
-            parse_inj_wei(&previous.limit_wei)
+            parse_decimal_wei(&previous.limit_wei)
                 .context("pending session transition has an invalid prior session limit")?;
         }
         if state.pending_authorization.is_some()
@@ -5994,7 +5994,7 @@ mod tests {
         TransactionManager, TransactionPolicyRefusalKind, TransactionStatus, encode_rlp_list,
         entry_hash, maximum_transaction_exposure, parse_decimal_wei, reward_scan_key, rlp_bytes,
         rlp_u64, rlp_u256, run_reward_scan_batch, sign_eip1559, transaction_policy_refusal,
-        unix_time_secs, validate_archive_ledger, validate_transaction_binding,
+        unix_time_secs, validate_archive_ledger, validate_journal, validate_transaction_binding,
         verify_finalization_events, verify_submission_events,
     };
     use crate::{
@@ -6003,9 +6003,8 @@ mod tests {
         contracts::{AstatineMinerRead, IERC20Read},
         diagnostics::DiagnosticBuffer,
         mining::{
-            ActiveBackend, DashboardContext, FinalizationOptions, MiningProbe, NodeSlot,
-            ObserverRefreshHandle, ObserverUpdate, finalize_initial_expired_windows,
-            start_read_only_observer, update_slots,
+            ActiveBackend, DashboardContext, MiningProbe, NodeSlot, ObserverRefreshHandle,
+            ObserverUpdate, start_read_only_observer, update_slots,
         },
         proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
         protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
@@ -7438,6 +7437,76 @@ mod tests {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("--new-session"));
+    }
+
+    #[test]
+    fn historical_session_limits_are_validated_as_decimal_wei() {
+        let wallet = Address::with_last_byte(0x75);
+        let large_inj_limit = format!("1{}", "0".repeat(42));
+        let large_wei_limit = U256::from(10_u8).pow(U256::from(60_u8)).to_string();
+
+        let history_root = tempdir().unwrap();
+        let history_store = ConfigStore::at_root(PathBuf::from(history_root.path()));
+        let history_config = AppConfig {
+            per_session_spending_limit_inj: large_inj_limit.clone(),
+            wallet_address: Some(format!("{wallet:#x}")),
+            ..AppConfig::default()
+        };
+        let mut journal =
+            TransactionJournal::open(&history_store, &history_config, wallet).unwrap();
+        let mut closed = journal.state.active_session.take().unwrap();
+        closed.closed = true;
+        assert_eq!(closed.limit_wei, large_wei_limit);
+        journal.state.session_history.push(closed);
+        journal.persist().unwrap();
+        drop(journal);
+
+        let inspected =
+            TransactionJournal::inspect_session(&history_store, &history_config).unwrap();
+        assert!(inspected.has_prior_session_history);
+
+        let mut corrupted: serde_json::Value =
+            serde_json::from_slice(&history_store.read_transaction_journal().unwrap().unwrap())
+                .unwrap();
+        corrupted["session_history"][0]["limit_wei"] = serde_json::json!("not-decimal-wei");
+        history_store
+            .write_transaction_journal(&serde_json::to_vec(&corrupted).unwrap())
+            .unwrap();
+        assert!(TransactionJournal::inspect_session(&history_store, &history_config).is_err());
+
+        let transition_root = tempdir().unwrap();
+        let transition_store = ConfigStore::at_root(PathBuf::from(transition_root.path()));
+        let previous_config = AppConfig {
+            per_session_spending_limit_inj: large_inj_limit.clone(),
+            wallet_address: Some(format!("{wallet:#x}")),
+            ..AppConfig::default()
+        };
+        let previous =
+            TransactionJournal::open(&transition_store, &previous_config, wallet).unwrap();
+        drop(previous);
+        let proposed_config = AppConfig {
+            per_session_spending_limit_inj: format!("2{}", "0".repeat(42)),
+            ..previous_config.clone()
+        };
+        let mut pending = TransactionJournal::open_for_init_session_transition(
+            &transition_store,
+            &proposed_config,
+            wallet,
+            previous_config.per_session_spending_limit_inj.clone(),
+            previous_config.wallet_address.clone(),
+        )
+        .unwrap();
+        validate_journal(&pending.state).unwrap();
+        pending
+            .state
+            .pending_session_transition
+            .as_mut()
+            .unwrap()
+            .previous_session
+            .as_mut()
+            .unwrap()
+            .limit_wei = "not-decimal-wei".to_owned();
+        assert!(validate_journal(&pending.state).is_err());
     }
 
     #[test]
@@ -10288,7 +10357,7 @@ mod tests {
         .unwrap();
         assert_eq!(network.manifest.chain_id, 1439);
         assert_eq!(network.manifest.nodes.len(), 9);
-        let mut snapshot = network.snapshot(Some(account)).await.unwrap();
+        let snapshot = network.snapshot(Some(account)).await.unwrap();
         assert_eq!(snapshot.nodes.len(), 9);
         assert!(snapshot.nodes.iter().all(|node| {
             node.state
@@ -10300,84 +10369,415 @@ mod tests {
         let store = ConfigStore::at_root(PathBuf::from(app_root.path()));
         let config = AppConfig {
             network: Network::Testnet,
+            wallet_address: Some(format!("{account:#x}")),
+            cpu_threads: 4,
             minimum_reserve_inj: "0.1".to_owned(),
             per_session_spending_limit_inj: "20".to_owned(),
             transaction_confirmations: 1,
             ..AppConfig::default()
         };
-        let mut manager = TransactionManager::open(&store, &config, account, token).unwrap();
-        let selected = HashSet::from_iter(1..=9_u8);
-        let pending_sync = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let finalization_state = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        assert!(
-            finalize_initial_expired_windows(
-                &network,
-                &selected,
-                &mut manager,
-                &signer,
-                account,
-                &mut snapshot,
-                FinalizationOptions {
-                    finalization_state: &finalization_state,
-                    dashboard: &None,
-                    pending_sync: &pending_sync,
+        store.save(&config).unwrap();
+        drop(TransactionJournal::open(&store, &config, account).unwrap());
+
+        let (probe_sender, probe_receiver) = tokio::sync::oneshot::channel();
+        let run_store = store.clone();
+        let run_config = config.clone();
+        let run_network = network.clone();
+        let run_signer = clone_signer(&signer);
+        let runtime = tokio::spawn(async move {
+            crate::mining::run_with_client(
+                &run_store,
+                run_config,
+                MineArgs {
+                    device: DeviceChoice::Cpu,
+                    compute_only: false,
+                    new_session: false,
+                    threads: NonZeroUsize::new(4),
+                    nodes: (1..=9).collect(),
+                    send_rewards_to: None,
                 },
+                run_network,
+                Some(run_signer),
+                Some(probe_sender),
             )
             .await
-            .unwrap()
-        );
+        });
+        let probe = tokio::time::timeout(Duration::from_secs(10), probe_receiver)
+            .await
+            .expect("nine-node miner runtime should start")
+            .expect("nine-node miner probe should remain connected");
 
-        let finalizations = manager
-            .journal
-            .state
+        let journal = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let state: super::JournalState =
+                    serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                        .unwrap();
+                let finalized_nodes = state
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.action == TransactionAction::FinalizeWindow
+                            && entry.window_id == 0
+                            && entry.status == TransactionStatus::MinedSuccess
+                            && entry.receipt_status == Some(true)
+                            && entry.confirmations >= u64::from(config.transaction_confirmations)
+                    })
+                    .map(|entry| entry.node_id)
+                    .collect::<HashSet<_>>();
+                if finalized_nodes.len() == 9 {
+                    return state;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("all nine expired windows should finalize and settle");
+        let finalization_order = journal
             .entries
             .iter()
-            .filter(|entry| entry.action == TransactionAction::FinalizeWindow)
+            .filter(|entry| {
+                entry.action == TransactionAction::FinalizeWindow
+                    && entry.window_id == 0
+                    && entry.status == TransactionStatus::MinedSuccess
+                    && entry.receipt_status == Some(true)
+            })
+            .map(|entry| entry.node_id)
             .collect::<Vec<_>>();
-        assert_eq!(finalizations.len(), 9);
-        assert!(finalizations.iter().all(|entry| {
-            entry.status == TransactionStatus::MinedSuccess
-                && entry.confirmations >= u64::from(config.transaction_confirmations)
+        assert_eq!(finalization_order, (1..=9).collect::<Vec<_>>());
+        assert!(
+            !journal
+                .entries
+                .iter()
+                .any(|entry| entry.status.is_unresolved())
+        );
+
+        let resumed_work = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let fresh = network.snapshot(Some(account)).await.unwrap();
+                if fresh.nodes.iter().all(|node| {
+                    node.state
+                        .as_ref()
+                        .is_some_and(|state| state.eligible && !state.finalizable)
+                }) {
+                    return fresh;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("all nine nodes should advance to eligible work after finalization");
+        assert_eq!(resumed_work.nodes.len(), 9);
+        let node_one_window = resumed_work
+            .nodes
+            .iter()
+            .find(|node| node.id == 1)
+            .and_then(|node| node.state.as_ref())
+            .unwrap()
+            .work
+            .window_id;
+        for node_id in 1..=9 {
+            let window_id = resumed_work
+                .nodes
+                .iter()
+                .find(|node| node.id == node_id)
+                .and_then(|node| node.state.as_ref())
+                .unwrap()
+                .work
+                .window_id;
+            wait_for_active_probe(&probe, node_id, window_id).await;
+        }
+        let hashes_before_resume = probe.slots[0].completed_hashes();
+        wait_for_hash_increase(&probe, 1, hashes_before_resume).await;
+        probe.proof_processing_gate.send_replace(false);
+        let resumed_proof = wait_for_journal_entry_for_window(
+            &store,
+            1,
+            TransactionAction::SubmitProof,
+            node_one_window,
+            TransactionStatus::MinedSuccess,
+        )
+        .await;
+        assert_eq!(resumed_proof.outcome.as_deref(), Some("candidate-updated"));
+
+        probe.stop_signal.request_stop();
+        let stopped = tokio::time::timeout(Duration::from_secs(15), runtime)
+            .await
+            .expect("nine-node miner runtime should stop cleanly")
+            .expect("nine-node miner task should join");
+        assert!(stopped.is_ok());
+
+        let settled_journal: super::JournalState =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        assert_eq!(
+            settled_journal
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.action == TransactionAction::FinalizeWindow
+                        && entry.window_id == 0
+                        && entry.status == TransactionStatus::MinedSuccess
+                        && entry.receipt_status == Some(true)
+                })
+                .count(),
+            9,
+            "all startup finalization transactions remain durably settled"
+        );
+        assert!(settled_journal.entries.iter().any(|entry| {
+            entry.action == TransactionAction::SubmitProof
+                && entry.status == TransactionStatus::MinedSuccess
+                && entry.outcome.as_deref() == Some("candidate-updated")
         }));
-        assert!(snapshot.nodes.iter().all(|node| {
+
+        assert!(resumed_work.nodes.iter().all(|node| {
             node.state
                 .as_ref()
                 .is_some_and(|state| state.eligible && !state.finalizable)
         }));
-        assert!(!manager.journal.has_unresolved());
+    }
 
-        let node = snapshot.nodes.iter().find(|node| node.id == 1).unwrap();
-        let state = node.state.as_ref().unwrap();
-        let header = b"all-nine-expired-autonomous-startup-proof";
-        let context = WorkContext {
-            chain_id: network.manifest.chain_id,
-            contract: node.address,
-            window_id: state.work.window_id,
-            seed: state.work.seed,
-            miner: account,
-            header: header.to_vec(),
+    #[tokio::test]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
+    async fn compute_only_hashes_with_unresolved_transaction_without_signing_or_resetting_session()
+    {
+        let root = std::env::var_os("ASTATINE_EVM_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .join("astatineEVM")
+                    .join("evm")
+            });
+        prepare_local_test_contracts(&root);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut process = Command::new("anvil")
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--chain-id",
+                "1439",
+                "--accounts",
+                "3",
+                "--silent",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Anvil must be installed for the compute-only recovery regression");
+        let _process_guard = AnvilGuard(&mut process);
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let rpc = reqwest::Client::new();
+        wait_for_anvil(&rpc, &endpoint).await;
+
+        let signer = test_signer();
+        let wallet = signer_address(&signer);
+        let unlocked_accounts =
+            rpc_request_local(&rpc, &endpoint, "eth_accounts", serde_json::json!([]))
+                .await
+                .unwrap();
+        let deployment_wallet = Address::from_str(unlocked_accounts[0].as_str().unwrap()).unwrap();
+        let token_artifact = read_artifact(&root.join("out/MockAST.sol/MockAST.json"));
+        let miner_artifact = read_artifact(&root.join("out/AstatineMiner.sol/AstatineMiner.json"));
+        let decimals = 9_u8;
+        let token_unit = U256::from(10_u8).pow(U256::from(decimals));
+        let allocation = U256::from(1_000_u64) * token_unit;
+        let reward = U256::from(100_u64) * token_unit;
+        let mut token_init = artifact_bytecode(&token_artifact);
+        token_init.extend_from_slice(&abi_uint8_word(decimals));
+        let token = deploy_unlocked(&rpc, &endpoint, deployment_wallet, &token_init).await;
+        let mint = LocalMockAST::mintCall {
+            account: deployment_wallet,
+            amount: allocation,
+        }
+        .abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(token),
+            &mint,
+            U256::ZERO,
+        )
+        .await;
+        let miner = deploy_local_miner(LocalMinerDeployment {
+            client: &rpc,
+            endpoint: &endpoint,
+            deployment_wallet,
+            token,
+            token_decimals: decimals,
+            allocation,
+            reward,
+            miner_bytecode: &artifact_bytecode(&miner_artifact),
+            initial_target: U256::MAX,
+            retarget_interval: 100,
+            window_secs: 3_600,
+        })
+        .await;
+        let approve = LocalMockAST::approveCall {
+            spender: miner,
+            amount: allocation,
+        }
+        .abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(token),
+            &approve,
+            U256::ZERO,
+        )
+        .await;
+        let fund = LocalAstatineMiner::fundASTCall { amount: allocation }.abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &fund,
+            U256::ZERO,
+        )
+        .await;
+        let activate = LocalAstatineMiner::activateGenesisCall {
+            initialSeed: B256::with_last_byte(0x79),
+        }
+        .abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &activate,
+            U256::ZERO,
+        )
+        .await;
+
+        let miner_runtime_hash = local_code_hash(&rpc, &endpoint, miner).await;
+        let token_runtime_hash = local_code_hash(&rpc, &endpoint, token).await;
+        let node_pins = (1..=9_u8)
+            .map(|node_id| (node_id, miner, miner_runtime_hash))
+            .collect::<Vec<_>>();
+        let network = NetworkClient::local_test_client_with_nodes(
+            &endpoint,
+            &node_pins,
+            token,
+            token_runtime_hash,
+            decimals,
+        )
+        .unwrap();
+        let app_root = tempdir().unwrap();
+        let store = ConfigStore::at_root(app_root.path().to_path_buf());
+        let config = AppConfig {
+            network: Network::Testnet,
+            wallet_address: Some(format!("{wallet:#x}")),
+            minimum_reserve_inj: "0".to_owned(),
+            per_session_spending_limit_inj: "1".to_owned(),
+            cpu_threads: 1,
+            ..AppConfig::default()
         };
-        let nonce = 0_u128;
-        let work_hash = WorkHasher::new(&context).unwrap().hash(nonce);
-        assert!(meets_target(work_hash, state.work.target));
-        let submitted = manager
-            .submit_proof(
-                &network,
-                &signer,
-                ProofSubmission {
-                    contract: node.address,
-                    node_id: node.id,
-                    window_id: state.work.window_id,
-                    nonce,
-                    header: header.to_vec(),
-                    work_hash,
+        store.save(&config).unwrap();
+
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let mut request = test_request();
+        let header = b"compute-only-unresolved".to_vec();
+        let proof_nonce = 7_u128;
+        request.data = AstatineMinerRead::submitSolutionCall {
+            header: Bytes::from(header.clone()),
+            nonce: proof_nonce,
+        }
+        .abi_encode();
+        let tx_hash = sign_eip1559(&signer, &request).unwrap().hash;
+        journal
+            .prepare(prepared_test_transaction(
+                &request,
+                tx_hash,
+                parse_inj_wei("1").unwrap(),
+                U256::ZERO,
+                U256::MAX,
+                Some(ProofData {
+                    nonce: proof_nonce,
+                    work_hash: B256::with_last_byte(0x7a),
+                    header,
+                }),
+            ))
+            .unwrap();
+        journal
+            .set_broadcast_state(tx_hash, TransactionStatus::Broadcast)
+            .unwrap();
+        let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        let authorized_before = journal.session_authorized_total().unwrap();
+        assert!(authorized_before > U256::ZERO);
+        drop(journal);
+        let entries_before = store.read_transaction_journal().unwrap().unwrap();
+        let nonce_before = local_pending_nonce(&rpc, &endpoint, wallet).await;
+
+        let (probe_sender, probe_receiver) = tokio::sync::oneshot::channel();
+        let run_store = store.clone();
+        let run_config = config.clone();
+        let run_network = network.clone();
+        let mut runtime = tokio::spawn(async move {
+            crate::mining::run_with_client(
+                &run_store,
+                run_config,
+                MineArgs {
+                    device: DeviceChoice::Cpu,
+                    compute_only: true,
+                    new_session: false,
+                    threads: NonZeroUsize::new(1),
+                    nodes: vec![1],
+                    send_rewards_to: None,
                 },
+                run_network,
+                None,
+                Some(probe_sender),
             )
             .await
-            .expect("eligible post-finalization proof should be signed and submitted");
-        assert!(submitted.receipt.status);
-        assert_eq!(submitted.outcome, "candidate-updated");
-        assert!(!manager.journal.has_unresolved());
+        });
+        let probe = match tokio::time::timeout(Duration::from_secs(10), probe_receiver).await {
+            Ok(Ok(probe)) => probe,
+            Ok(Err(error)) => {
+                let runtime_result = runtime.await;
+                panic!(
+                    "compute-only probe closed unexpectedly ({error}); runtime={runtime_result:?}"
+                );
+            }
+            Err(error) => panic!("compute-only probe timed out: {error}"),
+        };
+        probe.proof_processing_gate.send_replace(false);
+        wait_for_active_probe(&probe, 1, 0).await;
+        let hashes_before = probe.slots[0].completed_hashes();
+        wait_for_hash_increase(&probe, 1, hashes_before).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            local_pending_nonce(&rpc, &endpoint, wallet).await,
+            nonce_before,
+            "compute-only mining must not sign or broadcast"
+        );
+        assert_eq!(
+            store.read_transaction_journal().unwrap().unwrap(),
+            entries_before,
+            "compute-only mining must not create a session, change authorization, or rewrite history"
+        );
+        probe.stop_signal.request_stop();
+        let stopped = tokio::time::timeout(Duration::from_secs(15), &mut runtime)
+            .await
+            .expect("compute-only runtime should stop cleanly")
+            .expect("compute-only runtime task should join");
+        assert!(stopped.is_ok());
+        let inspected = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert_eq!(inspected.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(
+            inspected.authorized_exposure_wei.as_deref(),
+            Some(authorized_before.to_string().as_str())
+        );
+        assert_eq!(inspected.unresolved.len(), 1);
+        assert_eq!(inspected.unresolved[0].hash, format!("{tx_hash:#x}"));
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
