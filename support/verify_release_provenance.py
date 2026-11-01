@@ -280,22 +280,22 @@ def self_test() -> None:
         "conclusion": "success",
         "event": "push",
         "head_sha": "a" * 40,
-        "head_branch": "v0.1.0-testnet.13",
-        "path": f"{WORKFLOW}@refs/tags/v0.1.0-testnet.13",
+        "head_branch": "v0.1.0-testnet.14",
+        "path": f"{WORKFLOW}@refs/tags/v0.1.0-testnet.14",
         "repository": {"full_name": REPOSITORY},
     }
-    validate_run_context(valid, REPOSITORY, "v0.1.0-testnet.13", "a" * 40)
+    validate_run_context(valid, REPOSITORY, "v0.1.0-testnet.14", "a" * 40)
     for mutated, repository, tag, commit in (
-        ({**valid, "head_sha": "b" * 40}, REPOSITORY, "v0.1.0-testnet.13", "a" * 40),
-        ({**valid, "head_branch": "v0.1.0-testnet.14"}, REPOSITORY, "v0.1.0-testnet.13", "a" * 40),
-        ({**valid, "conclusion": "failure"}, REPOSITORY, "v0.1.0-testnet.13", "a" * 40),
-        ({**valid, "path": ".github/workflows/untrusted.yml@refs/tags/v0.1.0-testnet.13"}, REPOSITORY, "v0.1.0-testnet.13", "a" * 40),
-        ({**valid, "path": f"{WORKFLOW}@refs/heads/main"}, REPOSITORY, "v0.1.0-testnet.13", "a" * 40),
-        ({**valid, "repository": {"full_name": "attacker.invalid/astatine-miner"}}, REPOSITORY, "v0.1.0-testnet.13", "a" * 40),
-        ({**valid, "repository": {"full_name": "emyrinj/astatine-miner"}}, REPOSITORY, "v0.1.0-testnet.13", "a" * 40),
-        (valid, "attacker.invalid/astatine-miner", "v0.1.0-testnet.13", "a" * 40),
-        (valid, "emyrinj/astatine-miner", "v0.1.0-testnet.13", "a" * 40),
-        (valid, REPOSITORY, "v0.1.0-testnet.13", "b" * 40),
+        ({**valid, "head_sha": "b" * 40}, REPOSITORY, "v0.1.0-testnet.14", "a" * 40),
+        ({**valid, "head_branch": "v0.1.0-testnet.13"}, REPOSITORY, "v0.1.0-testnet.14", "a" * 40),
+        ({**valid, "conclusion": "failure"}, REPOSITORY, "v0.1.0-testnet.14", "a" * 40),
+        ({**valid, "path": ".github/workflows/untrusted.yml@refs/tags/v0.1.0-testnet.14"}, REPOSITORY, "v0.1.0-testnet.14", "a" * 40),
+        ({**valid, "path": f"{WORKFLOW}@refs/heads/main"}, REPOSITORY, "v0.1.0-testnet.14", "a" * 40),
+        ({**valid, "repository": {"full_name": "attacker.invalid/astatine-miner"}}, REPOSITORY, "v0.1.0-testnet.14", "a" * 40),
+        ({**valid, "repository": {"full_name": "emyrinj/astatine-miner"}}, REPOSITORY, "v0.1.0-testnet.14", "a" * 40),
+        (valid, "attacker.invalid/astatine-miner", "v0.1.0-testnet.14", "a" * 40),
+        (valid, "emyrinj/astatine-miner", "v0.1.0-testnet.14", "a" * 40),
+        (valid, REPOSITORY, "v0.1.0-testnet.14", "b" * 40),
     ):
         try:
             validate_run_context(mutated, repository, tag, commit)
@@ -303,7 +303,7 @@ def self_test() -> None:
             continue
         raise AssertionError("synthetic preflight accepted incorrect repository/tag/commit provenance")
 
-    branch = "feature/testnet13-rc1-remediation"
+    branch = "main"
     rehearsal = {
         "conclusion": "success",
         "event": "workflow_dispatch",
@@ -324,8 +324,8 @@ def self_test() -> None:
         ({**rehearsal, "head_branch": "other-branch"}, REPOSITORY, branch, "c" * 40),
         ({**rehearsal, "head_sha": "d" * 40}, REPOSITORY, branch, "c" * 40),
         ({**rehearsal, "conclusion": "failure"}, REPOSITORY, branch, "c" * 40),
-        ({**rehearsal, "path": f"{WORKFLOW}@refs/tags/v0.1.0-testnet.13"}, REPOSITORY, branch, "c" * 40),
-        ({**rehearsal, "path": ".github/workflows/other.yml@refs/heads/feature/testnet13-rc1-remediation"}, REPOSITORY, branch, "c" * 40),
+        ({**rehearsal, "path": f"{WORKFLOW}@refs/tags/v0.1.0-testnet.14"}, REPOSITORY, branch, "c" * 40),
+        ({**rehearsal, "path": f"{WORKFLOW}@refs/heads/other-branch"}, REPOSITORY, branch, "c" * 40),
         ({**rehearsal, "repository": {"full_name": "attacker.invalid/astatine-miner"}}, REPOSITORY, branch, "c" * 40),
         ({**rehearsal, "repository": {"full_name": "emyrinj/astatine-miner"}}, REPOSITORY, branch, "c" * 40),
         (rehearsal, REPOSITORY, "../untrusted", "c" * 40),

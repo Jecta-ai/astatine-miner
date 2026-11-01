@@ -88,7 +88,7 @@ if ($VerifyVersionOutput) {
     }
 }
 
-$Version = '0.1.0-testnet.13'
+$Version = '0.1.0-testnet.14'
 $Repository = 'Jecta-ai/astatine-miner'
 $Asset = 'astatine-windows-x86_64.zip'
 $Base = "https://github.com/$Repository/releases/download/v$Version"

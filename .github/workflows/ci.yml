@@ -16,7 +16,7 @@ on:
       release_tag:
         description: Testnet package version used by the nonpublishing rehearsal
         required: true
-        default: v0.1.0-testnet.13
+        default: v0.1.0-testnet.14
         type: string
 
 permissions:

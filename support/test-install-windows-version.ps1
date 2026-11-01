@@ -84,9 +84,9 @@ $PreviousNativeCommandPreference = $PSNativeCommandUseErrorActionPreference
 $PSNativeCommandUseErrorActionPreference = $true
 try {
     $ValidCases = @(
-        @{ Current = 'astatine 0.1.0-testnet.12'; Candidate = '0.1.0-testnet.13'; Expected = '-1' },
-        @{ Current = '0.1.0-testnet.13'; Candidate = '0.1.0-testnet.13'; Expected = '0' },
-        @{ Current = '0.1.0-testnet.14'; Candidate = '0.1.0-testnet.13'; Expected = '1' },
+        @{ Current = 'astatine 0.1.0-testnet.13'; Candidate = '0.1.0-testnet.14'; Expected = '-1' },
+        @{ Current = '0.1.0-testnet.14'; Candidate = '0.1.0-testnet.14'; Expected = '0' },
+        @{ Current = '0.1.0-testnet.15'; Candidate = '0.1.0-testnet.14'; Expected = '1' },
         @{ Current = '0.1.0-testnet.0'; Candidate = '0.1.0-testnet.1'; Expected = '-1' },
         @{ Current = '0.1.0-testnet.2147483647'; Candidate = '0.1.0-testnet.2147483646'; Expected = '1' },
         @{ Current = '0.1.0-testnet.99'; Candidate = '0.1.0'; Expected = '-1' },
@@ -123,8 +123,8 @@ try {
         }
         foreach ($Invalid in $InvalidVersions) {
             foreach ($Position in @('current', 'candidate')) {
-                $Current = if ($Position -eq 'current') { $Invalid } else { '0.1.0-testnet.12' }
-                $Candidate = if ($Position -eq 'candidate') { $Invalid } else { '0.1.0-testnet.13' }
+                $Current = if ($Position -eq 'current') { $Invalid } else { '0.1.0-testnet.13' }
+                $Candidate = if ($Position -eq 'candidate') { $Invalid } else { '0.1.0-testnet.14' }
                 $Result = Invoke-AstatineVersionComparison $Script $Current $Candidate
                 if ($Result.ExitCode -ne 2 -or [string]::IsNullOrWhiteSpace($Result.Error)) {
                     throw "$ScriptName accepted invalid $Position version '$Invalid'; exit=$($Result.ExitCode) output='$($Result.Output)' error='$($Result.Error)'"
@@ -133,23 +133,23 @@ try {
         }
 
         $ExpectedVersionOutput = Invoke-AstatineVersionOutputCheck `
-            $Script '0.1.0-testnet.13' @('astatine 0.1.0-testnet.13')
+            $Script '0.1.0-testnet.14' @('astatine 0.1.0-testnet.14')
         if ($ExpectedVersionOutput.ExitCode -ne 0 -or $ExpectedVersionOutput.Output -ne '0') {
             throw "${ScriptName} rejected its exact version output: $($ExpectedVersionOutput | ConvertTo-Json -Compress)"
         }
         foreach ($InvalidOutput in @(
-            @('astatine 0.1.0-testnet.130'),
+            @('astatine 0.1.0-testnet.140'),
             @('astatine 0.1.0-testnet.foo'),
-            @('astatine 0.1.0-testnet.12'),
-            @('astatine 0.1.0-testnet.13 '),
-            @('0.1.0-testnet.13'),
-            @(' astatine 0.1.0-testnet.13'),
+            @('astatine 0.1.0-testnet.13'),
+            @('astatine 0.1.0-testnet.14 '),
+            @('0.1.0-testnet.14'),
+            @(' astatine 0.1.0-testnet.14'),
             @('malformed version output'),
-            @('astatine 0.1.0-testnet.13', 'extra output line'),
-            @('astatine 0.1.0-testnet.13', '')
+            @('astatine 0.1.0-testnet.14', 'extra output line'),
+            @('astatine 0.1.0-testnet.14', '')
         )) {
             $RejectedOutput = Invoke-AstatineVersionOutputCheck `
-                $Script '0.1.0-testnet.13' $InvalidOutput
+                $Script '0.1.0-testnet.14' $InvalidOutput
             if ($RejectedOutput.ExitCode -ne 2 -or [string]::IsNullOrWhiteSpace($RejectedOutput.Error)) {
                 throw "${ScriptName} accepted malformed executable version output $($InvalidOutput -join '|'): $($RejectedOutput | ConvertTo-Json -Compress)"
             }

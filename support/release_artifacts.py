@@ -268,7 +268,7 @@ def build_synthetic_unsigned(root: pathlib.Path, tag: str, license_root: pathlib
 
 
 def synthetic_rehearsal(repo_root: pathlib.Path) -> None:
-    tag = "v0.1.0-testnet.13"
+    tag = "v0.1.0-testnet.14"
     with tempfile.TemporaryDirectory(prefix="astatine-release-rehearsal-") as temporary:
         temporary_root = pathlib.Path(temporary)
         good = temporary_root / "release"
@@ -354,7 +354,7 @@ def synthetic_rehearsal(repo_root: pathlib.Path) -> None:
         wrong_version_manifest = wrong_version / "update-manifest.txt"
         wrong_version_manifest.write_text(
             wrong_version_manifest.read_text(encoding="utf-8").replace(
-                "version=0.1.0-testnet.13", "version=0.1.0-testnet.14"
+                "version=0.1.0-testnet.14", "version=0.1.0-testnet.13"
             ),
             encoding="utf-8",
         )

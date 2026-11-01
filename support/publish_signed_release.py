@@ -17,6 +17,8 @@ from release_artifacts import REPOSITORY, expected_names, parse_tag, sha256, val
 from release_public_key import verify_public_key_pins
 from verify_release_provenance import validate_local_source_checkout
 
+GITHUB_API_VERSION = "2022-11-28"
+
 
 class PublicationError(ValueError):
     pass
@@ -28,6 +30,10 @@ def require(condition: bool, message: str) -> None:
 
 
 def run_gh(arguments: list[str], runner: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> subprocess.CompletedProcess:
+    if arguments[:1] == ["api"] and len(arguments) >= 2:
+        version_header = f"X-GitHub-Api-Version: {GITHUB_API_VERSION}"
+        if version_header not in arguments:
+            arguments = [arguments[0], arguments[1], "-H", version_header, *arguments[2:]]
     return runner(["gh", *arguments], check=False, capture_output=True, text=True)
 
 
@@ -42,12 +48,54 @@ def gh_json(arguments: list[str], runner: Callable[..., subprocess.CompletedProc
     return response
 
 
+def gh_json_list(
+    arguments: list[str], runner: Callable[..., subprocess.CompletedProcess] = subprocess.run
+) -> list[dict]:
+    result = run_gh(arguments, runner)
+    require(result.returncode == 0, f"GitHub CLI request failed: {result.stderr.strip()}")
+    try:
+        response = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise PublicationError(f"GitHub CLI returned malformed JSON: {error}") from error
+    require(
+        isinstance(response, list) and all(isinstance(item, dict) for item in response),
+        "GitHub CLI response must be a JSON array of objects",
+    )
+    return response
+
+
+def releases_for_tag(
+    tag: str,
+    runner: Callable[..., subprocess.CompletedProcess],
+) -> list[dict]:
+    """List all releases, including drafts hidden by the published-by-tag endpoint."""
+    matches: list[dict] = []
+    for page in range(1, 101):
+        releases = gh_json_list(
+            ["api", f"repos/{REPOSITORY}/releases?per_page=100&page={page}"],
+            runner,
+        )
+        matches.extend(release for release in releases if release.get("tag_name") == tag)
+        if len(releases) < 100:
+            return matches
+    raise PublicationError("GitHub release list exceeded the supported pagination bound")
+
+
 def ensure_release_absent(tag: str, runner: Callable[..., subprocess.CompletedProcess]) -> None:
-    result = run_gh(["api", f"repos/{REPOSITORY}/releases/tags/{tag}"], runner)
-    if result.returncode == 0:
-        raise PublicationError(f"release {tag} already exists; repeated publication is refused")
-    error = result.stderr.lower()
-    require("404" in error or "not found" in error, f"could not verify release absence: {result.stderr.strip()}")
+    matches = releases_for_tag(tag, runner)
+    if matches:
+        release = matches[0]
+        raise PublicationError(
+            f"release or draft for {tag} already exists (ID {release.get('id')}, draft={release.get('draft')}); repeated publication is refused"
+        )
+
+
+def release_by_id(
+    release_id: int,
+    runner: Callable[..., subprocess.CompletedProcess],
+) -> dict:
+    """Read a release by numeric ID; unlike release-by-tag, this includes drafts."""
+    return gh_json(["api", f"repos/{REPOSITORY}/releases/{release_id}"], runner)
 
 
 def resolve_tag_commit(
@@ -172,12 +220,14 @@ def publish_release(
             public_key,
             repo_root,
         )
-        draft = gh_json(["api", f"repos/{REPOSITORY}/releases/tags/{tag}"], runner)
+        matches = releases_for_tag(tag, runner)
+        require(len(matches) == 1, "uploaded draft could not be uniquely found by tag in the release list")
+        release_id = matches[0].get("id")
+        require(isinstance(release_id, int), "uploaded draft listing has no numeric release ID")
+        draft = release_by_id(release_id, runner)
         require(draft.get("draft") is True and draft.get("prerelease") is True, "uploaded release is not a draft prerelease")
         require(draft.get("tag_name") == tag, "uploaded draft tag differs from the requested release tag")
         remote_assets_match(draft, signed_dir)
-        release_id = draft.get("id")
-        require(isinstance(release_id, int), "draft release response has no numeric ID")
 
         # A failed or interrupted PATCH leaves the already-verified release as a
         # draft. A retry refuses to mutate it; the owner must inspect it manually.
@@ -195,7 +245,8 @@ def publish_release(
             public_key,
             repo_root,
         )
-        final = gh_json(["api", f"repos/{REPOSITORY}/releases/tags/{tag}"], runner)
+        final = release_by_id(release_id, runner)
+        require(final.get("tag_name") == tag, "published release tag differs from the requested tag")
         require(final.get("draft") is False and final.get("prerelease") is True, "release publication state is unexpected")
         remote_assets_match(final, signed_dir)
     print(f"Published signed prerelease {tag} from {source_commit}; provenance run {report['run_id']}")
@@ -204,24 +255,50 @@ def publish_release(
 class FakeGitHub:
     """Small deterministic GitHub API double used only by the synthetic test."""
 
-    def __init__(self, tag: str, source_commit: str, fail_publish: bool = False, existing: bool = False):
+    def __init__(
+        self,
+        tag: str,
+        source_commit: str,
+        fail_publish: bool = False,
+        existing: bool = False,
+        existing_draft: bool = True,
+    ):
         self.tag = tag
         self.source_commit = source_commit
         self.fail_publish = fail_publish
         self.existing = existing
         self.created = existing
-        self.draft = existing
+        self.draft = existing and existing_draft
         self.create_count = 0
         self.publish_count = 0
+        self.tag_release_lookup_count = 0
+        self.api_version_header_count = 0
         self.assets: list[dict] = []
         self.local_dir: pathlib.Path | None = None
 
     def __call__(self, arguments: list[str], **kwargs) -> subprocess.CompletedProcess:
         args = arguments[1:]
+        if args[:1] == ["api"] and f"X-GitHub-Api-Version: {GITHUB_API_VERSION}" in args:
+            self.api_version_header_count += 1
         if args[:2] == ["api", f"repos/{REPOSITORY}/git/ref/tags/{self.tag}"]:
             response = {"object": {"type": "commit", "sha": self.source_commit}}
             return subprocess.CompletedProcess(arguments, 0, json.dumps(response), "")
         if args[:2] == ["api", f"repos/{REPOSITORY}/releases/tags/{self.tag}"]:
+            self.tag_release_lookup_count += 1
+            # GitHub's published-release-by-tag endpoint does not expose drafts.
+            return subprocess.CompletedProcess(arguments, 1, "", "Not Found (HTTP 404)")
+        if len(args) > 1 and args[0] == "api" and args[1].startswith(f"repos/{REPOSITORY}/releases?"):
+            if not self.created:
+                return subprocess.CompletedProcess(arguments, 0, "[]", "")
+            response = {
+                "id": 42,
+                "tag_name": self.tag,
+                "draft": self.draft,
+                "prerelease": True,
+                "assets": self.assets,
+            }
+            return subprocess.CompletedProcess(arguments, 0, json.dumps([response]), "")
+        if args[:2] == ["api", f"repos/{REPOSITORY}/releases/42"] and "--method" not in args:
             if not self.created:
                 return subprocess.CompletedProcess(arguments, 1, "", "Not Found (HTTP 404)")
             response = {
@@ -246,7 +323,7 @@ class FakeGitHub:
                 for path in (self.local_dir / name for name in sorted(expected_names(signed=True)))
             ]
             return subprocess.CompletedProcess(arguments, 0, "created draft", "")
-        if args[:3] == ["api", f"repos/{REPOSITORY}/releases/42", "--method"]:
+        if args[:2] == ["api", f"repos/{REPOSITORY}/releases/42"] and "--method" in args:
             self.publish_count += 1
             if self.fail_publish:
                 return subprocess.CompletedProcess(arguments, 1, "", "simulated interrupted publication")
@@ -259,7 +336,7 @@ def self_test(repo_root: pathlib.Path) -> None:
     import release_artifacts
     import release_public_key
 
-    tag = "v0.1.0-testnet.13"
+    tag = "v0.1.0-testnet.14"
     source_commit = "b" * 40
     with tempfile.TemporaryDirectory(prefix="astatine-publish-test-") as temporary:
         temp = pathlib.Path(temporary)
@@ -332,7 +409,7 @@ def self_test(repo_root: pathlib.Path) -> None:
             passphrase="",
             repo_root=test_repo,
         )
-        notes = repo_root / "support/release-notes-v0.1.0-testnet.13.md"
+        notes = repo_root / "support/release-notes-v0.1.0-testnet.14.md"
         confirmation = f"PUBLISH {tag} {source_commit} PREFLIGHT {preflight_sha256}"
 
         rehearsal_preflight_path = temp / "rehearsal-preflight.json"
@@ -395,6 +472,30 @@ def self_test(repo_root: pathlib.Path) -> None:
         else:
             raise AssertionError("publisher accepted an unsigned artifact set")
         require(unsigned_fake.create_count == 0, "publisher attempted an upload without a valid owner signature")
+        draft_by_id = FakeGitHub(tag, source_commit)
+        publish_release(
+            signed_dir=signed,
+            preflight_report=preflight_path,
+            tag=tag,
+            source_commit=source_commit,
+            expected_report_sha256=preflight_sha256,
+            public_key=public_key,
+            notes_template=notes,
+            confirmation=confirmation,
+            repo_root=test_repo,
+            runner=draft_by_id,
+        )
+        require(
+            draft_by_id.create_count == 1
+            and draft_by_id.publish_count == 1
+            and not draft_by_id.draft
+            and draft_by_id.tag_release_lookup_count == 0,
+            "publisher must read back the newly created draft by list/numeric ID, not the published-release-by-tag endpoint",
+        )
+        require(
+            draft_by_id.api_version_header_count >= 4,
+            "release listing, numeric-ID readback, tag resolution, and publication must use an explicit GitHub REST API version",
+        )
 
         mismatched_report = FakeGitHub(tag, source_commit)
         try:
@@ -455,6 +556,10 @@ def self_test(repo_root: pathlib.Path) -> None:
         else:
             raise AssertionError("publisher accepted a repeated publication attempt")
         require(repeated.create_count == 0, "repeated publication mutated the existing release")
+        require(
+            repeated.tag_release_lookup_count == 0,
+            "existing drafts must be detected in the release list without relying on the by-tag endpoint",
+        )
 
 
 def main() -> None:
@@ -477,7 +582,7 @@ def main() -> None:
         for name in ("release_dir", "preflight_report", "tag", "source_commit", "verified_preflight_sha256"):
             require(getattr(args, name) is not None, f"--{name.replace('_', '-')} is required")
         validate_local_source_checkout(repo_root, args.source_commit)
-        notes_file = args.notes_file or repo_root / "support/release-notes-v0.1.0-testnet.13.md"
+        notes_file = args.notes_file or repo_root / "support/release-notes-v0.1.0-testnet.14.md"
         report = prepare_publication(
             args.release_dir,
             args.preflight_report,

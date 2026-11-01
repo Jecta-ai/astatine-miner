@@ -392,17 +392,6 @@ impl Dashboard {
         self.signal.clone()
     }
 
-    pub async fn suspend(&mut self) -> Result<()> {
-        self.stop_active().await
-    }
-
-    pub fn resume(&mut self, hash_counter: Arc<AtomicU64>) -> Result<()> {
-        if self.active.is_none() {
-            self.start_active(hash_counter)?;
-        }
-        Ok(())
-    }
-
     pub async fn stop(&mut self) -> Result<()> {
         self.update(|model| model.stopping = true);
         self.stop_active().await
@@ -1719,6 +1708,29 @@ mod tests {
         assert!(text.contains("WINDOW"));
         assert!(text.contains("9 selected / 9 total"));
         assert!(!text.contains("10  "));
+    }
+
+    #[test]
+    fn expired_windows_explain_zero_hashrate_in_wide_compact_and_narrow_layouts() {
+        let nodes = (1..=9)
+            .map(|id| node(id, NodeStatus::FinalizationRequired, None))
+            .collect::<Vec<_>>();
+        let mut view = model(nodes);
+        view.hashrate = 0.0;
+        view.current_action = Some("0 H/s expected • all selected windows expired".to_owned());
+
+        for (width, height) in [(100, 24), (60, 24), (48, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_dashboard(frame, &view, None, false))
+                .unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("0 H/s expected"),
+                "expired-window status was clipped at {width} columns: {text}"
+            );
+            assert!(text.contains("FINALIZE"), "{width} columns: {text}");
+        }
     }
 
     #[test]

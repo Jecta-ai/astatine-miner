@@ -32,7 +32,7 @@ use tokio::{
     time::{Instant, MissedTickBehavior, interval, sleep},
 };
 
-const JOURNAL_VERSION: u32 = 7;
+const JOURNAL_VERSION: u32 = 8;
 const ARCHIVE_VERSION: u32 = 1;
 const MAX_JOURNAL_ENTRIES: usize = 4_096;
 const ARCHIVE_TRIGGER_ENTRIES: usize = 64;
@@ -48,7 +48,7 @@ const REWARD_SCAN_RETRY_MAX: Duration = Duration::from_secs(30);
 const REWARD_EMPTY_SCAN_RETRY_BASE_SECS: u64 = 60;
 const REWARD_EMPTY_SCAN_RETRY_MAX_SECS: u64 = 3_600;
 const SUBMISSION_FEE_WEI: u128 = 10_000_000_000_000_000;
-pub(crate) const AUTOMATIC_REWARD_FORWARDING_DISABLED: &str = "automatic AST reward forwarding is disabled in Testnet.13 because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually from your wallet";
+pub(crate) const AUTOMATIC_REWARD_FORWARDING_DISABLED: &str = "automatic AST reward forwarding is disabled in Testnet.14 because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually from your wallet";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Eip1559Request {
@@ -192,7 +192,7 @@ impl TransactionStatus {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SpendingSession {
     id: String,
@@ -205,6 +205,43 @@ struct SpendingSession {
     #[serde(alias = "verified_actual_wei")]
     reported_actual_wei: Option<String>,
     closed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingSessionTransition {
+    previous_config_limit_inj: String,
+    #[serde(default)]
+    previous_config_wallet: Option<String>,
+    proposed_config_limit_inj: String,
+    previous_session: Option<SpendingSession>,
+    new_session_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingSessionTransitionSummary {
+    pub previous_config_limit_inj: String,
+    pub proposed_config_limit_inj: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UnresolvedTransactionSummary {
+    pub hash: String,
+    pub node_id: u8,
+    pub window_id: u64,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SessionJournalSnapshot {
+    pub session_id: Option<String>,
+    pub wallet: Option<String>,
+    pub limit_wei: Option<String>,
+    pub authorized_exposure_wei: Option<String>,
+    pub closed: bool,
+    pub has_prior_session_history: bool,
+    pub unresolved: Vec<UnresolvedTransactionSummary>,
+    pub pending_transition: Option<PendingSessionTransitionSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -343,6 +380,10 @@ struct JournalArchive {
 struct JournalState {
     version: u32,
     active_session: Option<SpendingSession>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_session_transition: Option<PendingSessionTransition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    session_history: Vec<SpendingSession>,
     entries: Vec<TransactionEntry>,
     #[serde(default)]
     pending_authorization: Option<PendingAuthorization>,
@@ -367,6 +408,8 @@ impl Default for JournalState {
         Self {
             version: JOURNAL_VERSION,
             active_session: None,
+            pending_session_transition: None,
+            session_history: Vec::new(),
             entries: Vec::new(),
             pending_authorization: None,
             proof_attempted_through: HashMap::new(),
@@ -380,6 +423,21 @@ impl Default for JournalState {
     }
 }
 
+fn retain_closed_session_history(state: &mut JournalState, session: Option<SpendingSession>) {
+    let Some(mut session) = session else {
+        return;
+    };
+    if state
+        .session_history
+        .iter()
+        .any(|existing| existing.id == session.id)
+    {
+        return;
+    }
+    session.closed = true;
+    state.session_history.push(session);
+}
+
 fn zero_wei_string() -> String {
     "0".to_owned()
 }
@@ -391,6 +449,10 @@ fn migrate_journal(
 ) -> Result<(JournalState, bool)> {
     if state.version == JOURNAL_VERSION {
         return Ok((state, false));
+    }
+    if state.version == 7 {
+        state.version = JOURNAL_VERSION;
+        return Ok((state, true));
     }
     if state.version == 6 {
         state.version = JOURNAL_VERSION;
@@ -486,6 +548,181 @@ pub struct TransactionJournal {
 }
 
 impl TransactionJournal {
+    pub(crate) fn unresolved_transactions(&self) -> Vec<UnresolvedTransactionSummary> {
+        self.state
+            .entries
+            .iter()
+            .filter(|entry| entry.status.is_unresolved())
+            .map(|entry| UnresolvedTransactionSummary {
+                hash: entry.transaction_hash.clone(),
+                node_id: entry.node_id,
+                window_id: entry.window_id,
+                status: format!("{:?}", entry.status),
+            })
+            .collect()
+    }
+
+    pub(crate) fn inspect_session(
+        store: &ConfigStore,
+        config: &AppConfig,
+    ) -> Result<SessionJournalSnapshot> {
+        let _lock = store.lock_transaction_journal()?;
+        let Some(contents) = store.read_transaction_journal()? else {
+            return Ok(SessionJournalSnapshot::default());
+        };
+        let state: JournalState =
+            serde_json::from_slice(&contents).context("decode transaction journal")?;
+        let wallet = state
+            .active_session
+            .as_ref()
+            .and_then(|session| (!session.wallet.is_empty()).then_some(session.wallet.as_str()))
+            .or_else(|| {
+                state
+                    .entries
+                    .iter()
+                    .find_map(|entry| (!entry.wallet.is_empty()).then_some(entry.wallet.as_str()))
+            })
+            .or_else(|| {
+                state.session_history.iter().rev().find_map(|session| {
+                    (!session.wallet.is_empty()).then_some(session.wallet.as_str())
+                })
+            })
+            .or(config.wallet_address.as_deref())
+            .map(Address::from_str)
+            .transpose()
+            .context("transaction journal wallet address is invalid")?
+            .context("transaction journal recovery requires the original wallet address")?;
+        let (mut state, _) = migrate_journal(state, wallet, config.transaction_confirmations)?;
+        validate_archive_ledger(store, &state, None)?;
+        initialize_session_accounting(store, &mut state)?;
+        validate_journal(&state)?;
+
+        let active_session = state.active_session.as_ref();
+        let session_wallet = active_session
+            .and_then(|session| (!session.wallet.is_empty()).then_some(session.wallet.clone()))
+            .or_else(|| {
+                state
+                    .entries
+                    .iter()
+                    .find_map(|entry| (!entry.wallet.is_empty()).then_some(entry.wallet.clone()))
+            })
+            .or_else(|| {
+                state.session_history.iter().rev().find_map(|session| {
+                    (!session.wallet.is_empty()).then_some(session.wallet.clone())
+                })
+            })
+            .unwrap_or_else(|| format!("{wallet:#x}"));
+        let authorized = active_session
+            .and_then(|session| session.authorized_exposure_wei.as_deref())
+            .map(parse_decimal_wei)
+            .transpose()?
+            .unwrap_or(U256::ZERO);
+        let has_prior_session_history = !state.session_history.is_empty()
+            || !state.entries.is_empty()
+            || !state.archives.is_empty()
+            || !authorized.is_zero();
+        let unresolved = state
+            .entries
+            .iter()
+            .filter(|entry| entry.status.is_unresolved())
+            .map(|entry| UnresolvedTransactionSummary {
+                hash: entry.transaction_hash.clone(),
+                node_id: entry.node_id,
+                window_id: entry.window_id,
+                status: format!("{:?}", entry.status),
+            })
+            .collect();
+        Ok(SessionJournalSnapshot {
+            session_id: active_session.map(|session| session.id.clone()),
+            wallet: Some(session_wallet),
+            limit_wei: active_session.map(|session| session.limit_wei.clone()),
+            authorized_exposure_wei: active_session
+                .and_then(|session| session.authorized_exposure_wei.clone()),
+            closed: active_session.is_none_or(|session| session.closed),
+            has_prior_session_history,
+            unresolved,
+            pending_transition: state.pending_session_transition.as_ref().map(|pending| {
+                PendingSessionTransitionSummary {
+                    previous_config_limit_inj: pending.previous_config_limit_inj.clone(),
+                    proposed_config_limit_inj: pending.proposed_config_limit_inj.clone(),
+                }
+            }),
+        })
+    }
+
+    pub(crate) fn resolve_pending_session_transition(
+        store: &ConfigStore,
+        config: &mut AppConfig,
+        complete: bool,
+    ) -> Result<bool> {
+        let _lock = store.lock_transaction_journal()?;
+        let Some(contents) = store.read_transaction_journal()? else {
+            return Ok(false);
+        };
+        let mut state: JournalState =
+            serde_json::from_slice(&contents).context("decode transaction journal")?;
+        let Some(pending) = state.pending_session_transition.clone() else {
+            return Ok(false);
+        };
+        validate_journal(&state)?;
+        validate_archive_ledger(store, &state, None)?;
+        if state
+            .entries
+            .iter()
+            .any(|entry| entry.status.is_unresolved())
+            || state.pending_authorization.is_some()
+            || state
+                .entries
+                .iter()
+                .any(|entry| entry.session_id == pending.new_session_id)
+        {
+            bail!(
+                "interrupted spending-session change has transaction activity; use read-only recovery before resolving it"
+            );
+        }
+        if state
+            .active_session
+            .as_ref()
+            .is_none_or(|session| session.id != pending.new_session_id)
+        {
+            bail!("interrupted spending-session change no longer matches the journal session");
+        }
+
+        let restore_session = if complete {
+            let session_wallet = state
+                .active_session
+                .as_ref()
+                .filter(|session| !session.wallet.is_empty())
+                .map(|session| session.wallet.as_str())
+                .context("interrupted spending-session change has no selected wallet")?;
+            let session_wallet = Address::from_str(session_wallet)
+                .context("interrupted spending-session wallet is invalid")?;
+            config.per_session_spending_limit_inj = pending.proposed_config_limit_inj.clone();
+            config.wallet_address = Some(format!("{session_wallet:#x}"));
+            false
+        } else {
+            config.per_session_spending_limit_inj = pending.previous_config_limit_inj.clone();
+            config.wallet_address = pending
+                .previous_session
+                .as_ref()
+                .filter(|session| !session.wallet.is_empty())
+                .map(|session| session.wallet.clone())
+                .or_else(|| pending.previous_config_wallet.clone());
+            true
+        };
+        config.validate()?;
+        store.save(config)?;
+        if restore_session {
+            state.active_session = pending.previous_session;
+        } else {
+            retain_closed_session_history(&mut state, pending.previous_session);
+        }
+        state.pending_session_transition = None;
+        let journal = serde_json::to_vec_pretty(&state).context("serialize transaction journal")?;
+        store.write_transaction_journal(&journal)?;
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub fn open(store: &ConfigStore, config: &AppConfig, wallet: Address) -> Result<Self> {
         Self::open_with_history_telemetry(
@@ -514,6 +751,44 @@ impl TransactionJournal {
         authorize_new_session: bool,
         force_new_session: bool,
     ) -> Result<Self> {
+        Self::open_internal(
+            store,
+            config,
+            wallet,
+            history_telemetry,
+            authorize_new_session,
+            force_new_session,
+            None,
+        )
+    }
+
+    pub(crate) fn open_for_init_session_transition(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        previous_config_limit_inj: String,
+        previous_config_wallet: Option<String>,
+    ) -> Result<Self> {
+        Self::open_internal(
+            store,
+            config,
+            wallet,
+            Arc::new(HistoryTelemetry::default()),
+            true,
+            true,
+            Some((previous_config_limit_inj, previous_config_wallet)),
+        )
+    }
+
+    fn open_internal(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        history_telemetry: Arc<HistoryTelemetry>,
+        authorize_new_session: bool,
+        force_new_session: bool,
+        transition_previous_config: Option<(String, Option<String>)>,
+    ) -> Result<Self> {
         let _open_timer = history_telemetry.timer(HistoryDuration::JournalOpen);
         if config.network != Network::Testnet {
             bail!("transaction signing is disabled outside Injective Testnet");
@@ -527,6 +802,11 @@ impl TransactionJournal {
         };
         let (mut state, mut migrated) =
             migrate_journal(state, wallet, config.transaction_confirmations)?;
+        if state.pending_session_transition.is_some() {
+            bail!(
+                "an interrupted spending-session change must be resolved by `astatine init` before mining"
+            );
+        }
         let archive_validation = {
             let _archive_validation_timer =
                 history_telemetry.timer(HistoryDuration::ArchiveValidation);
@@ -551,6 +831,7 @@ impl TransactionJournal {
             _lock: lock,
             history_telemetry: Arc::clone(&history_telemetry),
         };
+        let previous_session = journal.state.active_session.clone();
         let has_unresolved = journal.has_unresolved();
         if force_new_session && has_unresolved {
             bail!("cannot start a new spending session while a transaction is unresolved");
@@ -566,7 +847,8 @@ impl TransactionJournal {
                     .iter()
                     .any(|entry| entry.session_id == session.id)
             });
-        let has_prior_authorization = !journal.state.entries.is_empty()
+        let has_prior_session_history = !journal.state.session_history.is_empty()
+            || !journal.state.entries.is_empty()
             || !journal.state.archives.is_empty()
             || journal
                 .state
@@ -604,10 +886,13 @@ impl TransactionJournal {
         if force_new_session {
             resume_session = false;
         }
-        if !limit.is_zero() && !resume_session && has_prior_authorization && !authorize_new_session
+        if !limit.is_zero()
+            && !resume_session
+            && has_prior_session_history
+            && !authorize_new_session
         {
             bail!(
-                "a previous spending session already has signed transaction authorizations; use `astatine mine --new-session` to explicitly begin a separate session"
+                "previous spending-session or transaction authorization history exists; use `astatine mine --new-session` to explicitly begin a separate session"
             );
         }
         if resume_session {
@@ -628,10 +913,105 @@ impl TransactionJournal {
                 closed: false,
             });
         }
+        if let Some((previous_config_limit_inj, previous_config_wallet)) =
+            transition_previous_config
+        {
+            if has_unresolved {
+                bail!(
+                    "cannot change the spending limit while a previous transaction is unresolved; run `astatine recover` first"
+                );
+            }
+            let session = journal
+                .state
+                .active_session
+                .as_ref()
+                .context("new spending session was not created for the approved transition")?;
+            journal.state.pending_session_transition = Some(PendingSessionTransition {
+                previous_config_limit_inj,
+                previous_config_wallet,
+                proposed_config_limit_inj: config.per_session_spending_limit_inj.clone(),
+                previous_session,
+                new_session_id: session.id.clone(),
+            });
+        } else if !limit.is_zero() && !resume_session {
+            retain_closed_session_history(&mut journal.state, previous_session);
+        }
         if migrated || (!limit.is_zero() && !resume_session) {
             journal.persist()?;
         }
         Ok(journal)
+    }
+
+    pub(crate) fn finish_init_session_transition(&mut self, config: &AppConfig) -> Result<()> {
+        let pending = self
+            .state
+            .pending_session_transition
+            .clone()
+            .context("transaction journal has no pending init session transition")?;
+        let session = self
+            .state
+            .active_session
+            .as_ref()
+            .context("pending init session transition has no active session")?;
+        if session.id != pending.new_session_id
+            || parse_inj_wei(&config.per_session_spending_limit_inj)?
+                != parse_inj_wei(&pending.proposed_config_limit_inj)?
+            || config
+                .wallet_address
+                .as_deref()
+                .and_then(|value| Address::from_str(value).ok())
+                .is_none_or(|wallet| Address::from_str(&session.wallet).ok() != Some(wallet))
+        {
+            bail!(
+                "init spending-session transition does not match the saved wallet and spending-limit configuration"
+            );
+        }
+        if self.has_unresolved()
+            || self
+                .state
+                .entries
+                .iter()
+                .any(|entry| entry.session_id == pending.new_session_id)
+            || self.state.pending_authorization.is_some()
+        {
+            bail!("new spending session acquired transaction activity before init committed");
+        }
+        retain_closed_session_history(&mut self.state, pending.previous_session);
+        self.state.pending_session_transition = None;
+        self.persist()
+    }
+
+    pub(crate) fn rollback_init_session_transition(
+        &mut self,
+        config: &mut AppConfig,
+    ) -> Result<()> {
+        let pending = self
+            .state
+            .pending_session_transition
+            .clone()
+            .context("transaction journal has no pending init session transition")?;
+        if self.has_unresolved()
+            || self
+                .state
+                .entries
+                .iter()
+                .any(|entry| entry.session_id == pending.new_session_id)
+            || self.state.pending_authorization.is_some()
+        {
+            bail!("cannot roll back an init session transition after transaction activity");
+        }
+        config.per_session_spending_limit_inj = pending.previous_config_limit_inj;
+        config.wallet_address = pending
+            .previous_session
+            .as_ref()
+            .filter(|session| !session.wallet.is_empty())
+            .map(|session| session.wallet.clone())
+            .or(pending.previous_config_wallet);
+        config.validate()?;
+        self.store.save(config)?;
+        self.state.active_session = pending.previous_session;
+        self.state.pending_session_transition = None;
+        self.persist()
     }
 
     fn persist(&self) -> Result<()> {
@@ -1905,6 +2285,7 @@ fn set_forwarding_source_status(
 
 pub struct TransactionManager {
     pub journal: TransactionJournal,
+    read_only_recovery: bool,
     wallet: Address,
     ast_token: Address,
     chain_id: u64,
@@ -2106,6 +2487,35 @@ impl TransactionManager {
         )
     }
 
+    pub(crate) fn open_for_read_only_recovery(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        ast_token: Address,
+        history_telemetry: Arc<HistoryTelemetry>,
+    ) -> Result<Self> {
+        let summary = TransactionJournal::inspect_session(store, config)?;
+        if summary.pending_transition.is_some() {
+            bail!("a spending-session change is interrupted; run `astatine init` before recovery");
+        }
+        let mut recovery_config = config.clone();
+        if let Some(limit_wei) = summary.limit_wei {
+            recovery_config.per_session_spending_limit_inj =
+                wei_as_inj(parse_decimal_wei(&limit_wei)?);
+        }
+        let mut manager = Self::open_with_session_policy(
+            store,
+            &recovery_config,
+            wallet,
+            ast_token,
+            history_telemetry,
+            false,
+            false,
+        )?;
+        manager.read_only_recovery = true;
+        Ok(manager)
+    }
+
     fn open_with_session_policy(
         store: &ConfigStore,
         config: &AppConfig,
@@ -2125,6 +2535,7 @@ impl TransactionManager {
         )?;
         Ok(Self {
             journal,
+            read_only_recovery: false,
             wallet,
             ast_token,
             chain_id: 1439,
@@ -2376,7 +2787,7 @@ impl TransactionManager {
                 )
         }) {
             self.report_warning(
-                "a legacy automatic AST forwarding intent remains in the journal; Testnet.13 will only monitor existing transfers and will not sign or broadcast new ones",
+                "a legacy automatic AST forwarding intent remains in the journal; Testnet.14 will only monitor existing transfers and will not sign or broadcast new ones",
             );
         }
         Ok(())
@@ -3326,12 +3737,20 @@ impl TransactionManager {
         }
     }
 
+    fn require_signing_enabled(&self) -> Result<()> {
+        if self.read_only_recovery {
+            bail!("read-only transaction recovery cannot sign or broadcast transactions");
+        }
+        Ok(())
+    }
+
     pub async fn submit_proof(
         &mut self,
         client: &NetworkClient,
         signer: &SigningKey,
         submission: ProofSubmission,
     ) -> Result<ConfirmedAction> {
+        self.require_signing_enabled()?;
         if signer_address(signer) != self.wallet {
             self.record_proof_metric(submission.node_id, ProofMetric::SignerIdentityMismatch);
             bail!("unlocked signer does not match the configured wallet");
@@ -3374,6 +3793,7 @@ impl TransactionManager {
         node_id: u8,
         window_id: u64,
     ) -> Result<ConfirmedAction> {
+        self.require_signing_enabled()?;
         if signer_address(signer) != self.wallet {
             bail!("unlocked signer does not match the configured wallet");
         }
@@ -3440,6 +3860,7 @@ impl TransactionManager {
         value: U256,
         data: Vec<u8>,
     ) -> Result<ConfirmedAction> {
+        self.require_signing_enabled()?;
         if intent.action == TransactionAction::ForwardReward {
             bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
         }
@@ -4592,10 +5013,12 @@ fn validate_journal(state: &JournalState) -> Result<()> {
     if state.version != JOURNAL_VERSION {
         bail!("transaction journal schema is unsupported");
     }
+    let mut session_ids = HashSet::new();
     if let Some(session) = &state.active_session {
         if session.id.is_empty() {
             bail!("transaction journal session ID is empty");
         }
+        session_ids.insert(session.id.as_str());
         if !session.wallet.is_empty() {
             Address::from_str(&session.wallet)
                 .context("journal session wallet address is invalid")?;
@@ -4622,6 +5045,74 @@ fn validate_journal(state: &JournalState) -> Result<()> {
                 .context("journal session has no RPC-reported actual-cost counter")?,
         )
         .context("journal session RPC-reported actual-cost counter is invalid")?;
+    }
+    for session in &state.session_history {
+        if session.id.is_empty() || !session_ids.insert(session.id.as_str()) {
+            bail!("transaction journal session history has an empty or duplicate session ID");
+        }
+        if !session.closed {
+            bail!("transaction journal session history contains an open session");
+        }
+        Address::from_str(&session.wallet)
+            .context("historical session wallet address is invalid")?;
+        parse_inj_wei(&session.limit_wei)
+            .context("historical session spending limit is invalid")?;
+        parse_decimal_wei(
+            session
+                .authorized_exposure_wei
+                .as_deref()
+                .context("historical session has no cumulative authorization counter")?,
+        )
+        .context("historical session authorization counter is invalid")?;
+        parse_decimal_wei(
+            session
+                .reported_actual_wei
+                .as_deref()
+                .context("historical session has no RPC-reported actual-cost counter")?,
+        )
+        .context("historical session RPC-reported actual-cost counter is invalid")?;
+    }
+    if let Some(transition) = &state.pending_session_transition {
+        parse_inj_wei(&transition.previous_config_limit_inj)
+            .context("pending session transition has an invalid previous limit")?;
+        let proposed_limit = parse_inj_wei(&transition.proposed_config_limit_inj)
+            .context("pending session transition has an invalid proposed limit")?;
+        let session = state
+            .active_session
+            .as_ref()
+            .context("pending session transition has no active session")?;
+        if transition.new_session_id.is_empty()
+            || transition.new_session_id != session.id
+            || parse_decimal_wei(&session.limit_wei)? != proposed_limit
+            || !parse_decimal_wei(
+                session
+                    .authorized_exposure_wei
+                    .as_deref()
+                    .context("pending session has no authorization counter")?,
+            )?
+            .is_zero()
+        {
+            bail!("pending session transition does not match its new session");
+        }
+        if let Some(previous) = &transition.previous_session {
+            if previous.id == transition.new_session_id {
+                bail!("pending session transition reuses the previous session ID");
+            }
+            parse_inj_wei(&previous.limit_wei)
+                .context("pending session transition has an invalid prior session limit")?;
+        }
+        if state.pending_authorization.is_some()
+            || state
+                .entries
+                .iter()
+                .any(|entry| entry.status.is_unresolved())
+            || state
+                .entries
+                .iter()
+                .any(|entry| entry.session_id == transition.new_session_id)
+        {
+            bail!("pending session transition overlaps transaction activity");
+        }
     }
     if let Some(pending) = &state.pending_authorization {
         B256::from_str(&pending.request_hash)
@@ -5177,6 +5668,8 @@ fn validate_archive_ledger(
         let archive_state = JournalState {
             version: JOURNAL_VERSION,
             active_session: None,
+            pending_session_transition: None,
+            session_history: Vec::new(),
             entries: archive.entries.clone(),
             pending_authorization: None,
             proof_attempted_through: state.proof_attempted_through.clone(),
@@ -5464,6 +5957,18 @@ fn parse_decimal_wei(value: &str) -> Result<U256> {
     U256::from_str_radix(value, 10).context("transaction journal amount is not decimal wei")
 }
 
+fn wei_as_inj(value: U256) -> String {
+    let scale = U256::from(10_u8).pow(U256::from(18_u8));
+    let whole = value / scale;
+    let fractional = format!("{:0>18}", (value % scale));
+    let fractional = fractional.trim_end_matches('0');
+    if fractional.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fractional}")
+    }
+}
+
 fn new_session_id() -> String {
     let mut bytes = [0_u8; 16];
     thread_rng().fill_bytes(&mut bytes);
@@ -5499,8 +6004,8 @@ mod tests {
         diagnostics::DiagnosticBuffer,
         mining::{
             ActiveBackend, DashboardContext, FinalizationOptions, MiningProbe, NodeSlot,
-            ObserverUpdate, finalize_initial_expired_windows, start_read_only_observer,
-            update_slots,
+            ObserverRefreshHandle, ObserverUpdate, finalize_initial_expired_windows,
+            start_read_only_observer, update_slots,
         },
         proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
         protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
@@ -6284,6 +6789,47 @@ mod tests {
     }
 
     #[test]
+    fn testnet13_v7_journal_migrates_without_resetting_session_authorization() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let wallet = Address::with_last_byte(0x76);
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            wallet_address: Some(format!("{wallet:#x}")),
+            ..AppConfig::default()
+        };
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        journal
+            .state
+            .active_session
+            .as_mut()
+            .unwrap()
+            .authorized_exposure_wei = Some("123456789".to_owned());
+        journal.state.version = 7;
+        journal.persist().unwrap();
+        drop(journal);
+
+        let migrated = TransactionJournal::open(&store, &config, wallet).unwrap();
+        assert_eq!(migrated.state.version, JOURNAL_VERSION);
+        assert_eq!(migrated.state.session_history.len(), 0);
+        assert_eq!(
+            migrated.state.active_session.as_ref().unwrap().id,
+            session_id
+        );
+        assert_eq!(
+            migrated
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some("123456789")
+        );
+    }
+
+    #[test]
     fn testnet6_v3_journal_migrates_without_resetting_receipts_or_reward_history() {
         let root = tempdir().unwrap();
         let store = ConfigStore::at_root(PathBuf::from(root.path()));
@@ -6830,6 +7376,230 @@ mod tests {
         assert_ne!(session.id, old_session);
         assert_eq!(session.authorized_exposure_wei.as_deref(), Some("0"));
         assert_eq!(new_session.state.entries.len(), 1);
+        assert_eq!(new_session.state.session_history.len(), 1);
+        assert_eq!(new_session.state.session_history[0].id, old_session);
+        assert_eq!(
+            new_session.state.session_history[0]
+                .authorized_exposure_wei
+                .as_deref(),
+            Some("1000")
+        );
+    }
+
+    #[test]
+    fn orphaned_session_authorization_survives_new_sessions_and_still_requires_explicit_reset() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let wallet = Address::with_last_byte(0x70);
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let mut original = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let original_id = original.state.active_session.as_ref().unwrap().id.clone();
+        original
+            .state
+            .active_session
+            .as_mut()
+            .unwrap()
+            .authorized_exposure_wei = Some("750000000000000000".to_owned());
+        original.close_session().unwrap();
+        drop(original);
+
+        let mut first_new = TransactionJournal::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            Arc::new(HistoryTelemetry::default()),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(first_new.state.session_history.len(), 1);
+        assert_eq!(first_new.state.session_history[0].id, original_id);
+        assert_eq!(
+            first_new.state.session_history[0]
+                .authorized_exposure_wei
+                .as_deref(),
+            Some("750000000000000000")
+        );
+        first_new.close_session().unwrap();
+        drop(first_new);
+
+        let error = match TransactionJournal::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        ) {
+            Ok(_) => panic!("archived session authorization must require explicit reset consent"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("--new-session"));
+    }
+
+    #[test]
+    fn interrupted_init_session_transition_can_be_completed_or_rolled_back_atomically() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let previous_wallet = Address::with_last_byte(0x71);
+        let proposed_wallet = Address::with_last_byte(0x72);
+        let previous_config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            wallet_address: Some(format!("{previous_wallet:#x}")),
+            ..AppConfig::default()
+        };
+        store.save(&previous_config).unwrap();
+        let old_journal =
+            TransactionJournal::open(&store, &previous_config, previous_wallet).unwrap();
+        assert!(
+            serde_json::to_value(&old_journal.state)
+                .unwrap()
+                .get("pending_session_transition")
+                .is_none(),
+            "ordinary journals must keep the pre-transition schema shape for safe v13 reads"
+        );
+        assert!(
+            serde_json::to_value(&old_journal.state)
+                .unwrap()
+                .get("session_history")
+                .is_none(),
+            "empty session history must not alter the existing journal schema shape"
+        );
+        let old_session_id = old_journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        drop(old_journal);
+
+        let proposed_config = AppConfig {
+            per_session_spending_limit_inj: "2".to_owned(),
+            wallet_address: Some(format!("{proposed_wallet:#x}")),
+            ..previous_config.clone()
+        };
+        let pending = TransactionJournal::open_for_init_session_transition(
+            &store,
+            &proposed_config,
+            proposed_wallet,
+            previous_config.per_session_spending_limit_inj.clone(),
+            previous_config.wallet_address.clone(),
+        )
+        .unwrap();
+        let proposed_session_id = pending.state.active_session.as_ref().unwrap().id.clone();
+        assert_ne!(proposed_session_id, old_session_id);
+        assert!(pending.state.pending_session_transition.is_some());
+        store.save(&proposed_config).unwrap();
+        drop(pending);
+
+        let mining_error = match TransactionJournal::open(&store, &proposed_config, proposed_wallet)
+        {
+            Ok(_) => panic!("mining must not open a pending init session transition"),
+            Err(error) => error,
+        };
+        assert!(format!("{mining_error:#}").contains("interrupted spending-session change"));
+
+        let mut interrupted_config = store.load().unwrap();
+        assert!(
+            TransactionJournal::resolve_pending_session_transition(
+                &store,
+                &mut interrupted_config,
+                false
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            interrupted_config.per_session_spending_limit_inj,
+            previous_config.per_session_spending_limit_inj
+        );
+        assert_eq!(
+            interrupted_config.wallet_address,
+            previous_config.wallet_address
+        );
+        let rolled_back = TransactionJournal::inspect_session(&store, &interrupted_config).unwrap();
+        assert_eq!(
+            rolled_back.session_id.as_deref(),
+            Some(old_session_id.as_str())
+        );
+        assert_eq!(
+            rolled_back.wallet.as_deref(),
+            Some(format!("{previous_wallet:#x}").as_str())
+        );
+        assert!(rolled_back.pending_transition.is_none());
+
+        let pending = TransactionJournal::open_for_init_session_transition(
+            &store,
+            &proposed_config,
+            proposed_wallet,
+            previous_config.per_session_spending_limit_inj.clone(),
+            previous_config.wallet_address.clone(),
+        )
+        .unwrap();
+        let committed_session_id = pending.state.active_session.as_ref().unwrap().id.clone();
+        drop(pending);
+
+        // Simulate a crash immediately after the journal transition was written,
+        // before the proposed config reached disk; completing must recover both.
+        let mut interrupted_config = store.load().unwrap();
+        assert!(
+            TransactionJournal::resolve_pending_session_transition(
+                &store,
+                &mut interrupted_config,
+                true
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            interrupted_config.per_session_spending_limit_inj,
+            proposed_config.per_session_spending_limit_inj
+        );
+        assert_eq!(
+            interrupted_config.wallet_address,
+            proposed_config.wallet_address
+        );
+        let completed = TransactionJournal::inspect_session(&store, &interrupted_config).unwrap();
+        assert_eq!(
+            completed.session_id.as_deref(),
+            Some(committed_session_id.as_str())
+        );
+        assert_eq!(
+            completed.wallet.as_deref(),
+            Some(format!("{proposed_wallet:#x}").as_str())
+        );
+        assert!(completed.pending_transition.is_none());
+        let committed =
+            TransactionJournal::open(&store, &interrupted_config, proposed_wallet).unwrap();
+        assert_eq!(committed.state.session_history.len(), 1);
+        assert_eq!(committed.state.session_history[0].id, old_session_id);
+    }
+
+    #[test]
+    fn read_only_recovery_manager_cannot_sign_or_broadcast() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let wallet = Address::with_last_byte(0x73);
+        let token = Address::with_last_byte(0x74);
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            wallet_address: Some(format!("{wallet:#x}")),
+            ..AppConfig::default()
+        };
+        let journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        drop(journal);
+
+        let manager = TransactionManager::open_for_read_only_recovery(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+        )
+        .unwrap();
+        assert!(manager.require_signing_enabled().is_err());
     }
 
     #[test]
@@ -11280,7 +12050,15 @@ mod tests {
             )
             .await;
             assert!(first_rewarding_finalization.receipt_status.unwrap());
-            wait_for_verified_reward(&network, &store, 1, 1, &probe.history_telemetry).await;
+            wait_for_verified_reward(
+                &network,
+                &store,
+                1,
+                1,
+                &probe.observer_refresh,
+                &probe.history_telemetry,
+            )
+            .await;
             let rewarded_snapshot = network.snapshot(Some(account)).await.unwrap();
             assert!(rewarded_snapshot
                 .ast_balance
@@ -11427,12 +12205,21 @@ mod tests {
                         .as_ref()
                         .is_some_and(|state| state.work.window_id > node3_finalization_window)
             }));
-            wait_for_verified_reward(&network, &store, 1, 2, &probe.history_telemetry).await;
+            wait_for_verified_reward(
+                &network,
+                &store,
+                1,
+                2,
+                &probe.observer_refresh,
+                &probe.history_telemetry,
+            )
+            .await;
             wait_for_verified_reward(
                 &network,
                 &store,
                 3,
                 node3_finalization_window,
+                &probe.observer_refresh,
                 &probe.history_telemetry,
             )
             .await;
@@ -14068,9 +14855,11 @@ mod tests {
         store: &ConfigStore,
         node_id: u8,
         window_id: u64,
+        observer_refresh: &ObserverRefreshHandle,
         telemetry: &HistoryTelemetry,
     ) {
         let verified = tokio::time::timeout(Duration::from_secs(60), async {
+            let mut next_refresh = Instant::now();
             loop {
                 if let Some(contents) = store.read_transaction_journal().unwrap() {
                     let journal: super::JournalState = serde_json::from_slice(&contents).unwrap();
@@ -14086,6 +14875,10 @@ mod tests {
                     }) {
                         return;
                     }
+                }
+                if Instant::now() >= next_refresh {
+                    observer_refresh.force_refresh();
+                    next_refresh = Instant::now() + Duration::from_millis(250);
                 }
                 sleep(Duration::from_millis(25)).await;
             }
