@@ -85,7 +85,7 @@ jobs:
       - name: Unit tests
         env:
           ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc') && '1' || '' }}
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1
       - name: Native credential-store behavior and fail-closed handling
         env:
           ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc') && '1' || '' }}
