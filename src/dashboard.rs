@@ -261,6 +261,18 @@ impl DashboardModel {
         } else if self
             .selected_nodes
             .iter()
+            .any(|node| node.status_at(now) == NodeStatus::Finalizing)
+        {
+            "FINALIZING"
+        } else if self
+            .selected_nodes
+            .iter()
+            .any(|node| node.status_at(now) == NodeStatus::Confirming)
+        {
+            "CONFIRMING"
+        } else if self
+            .selected_nodes
+            .iter()
             .any(|node| node.status_at(now) == NodeStatus::WaitingForChain)
         {
             "WAITING FOR CHAIN"
@@ -390,17 +402,6 @@ impl Dashboard {
 
     pub fn signal(&self) -> DashboardSignal {
         self.signal.clone()
-    }
-
-    pub async fn suspend(&mut self) -> Result<()> {
-        self.stop_active().await
-    }
-
-    pub fn resume(&mut self, hash_counter: Arc<AtomicU64>) -> Result<()> {
-        if self.active.is_none() {
-            self.start_active(hash_counter)?;
-        }
-        Ok(())
     }
 
     pub async fn stop(&mut self) -> Result<()> {
@@ -869,11 +870,17 @@ fn render_wide_header(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel,
     if area.height == 0 {
         return;
     }
-    let left_width = if model.mode(Instant::now()) == "WAITING FOR GENESIS" {
-        39.min(area.width / 2)
-    } else {
-        31.min(area.width / 2)
-    };
+    let title_width = format!(
+        "v{} • {}",
+        env!("CARGO_PKG_VERSION"),
+        model.mode(Instant::now())
+    )
+    .chars()
+    .count()
+    .saturating_add(1);
+    let left_width = title_width
+        .max(31)
+        .min(usize::from(area.width.saturating_sub(32))) as u16;
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(left_width), Constraint::Min(0)])
@@ -1032,15 +1039,15 @@ fn render_narrow(
         .unwrap_or_else(|| "--".to_owned());
     let mined = format_units(model.mined_rewards, 9);
     let mode = model.mode(Instant::now());
-    let mode_line = if mode == "WAITING FOR GENESIS" {
-        mode.to_owned()
+    let network_code = match model.network {
+        Network::Testnet => "TN",
+        Network::Mainnet => "MN",
+    };
+    let versioned_mode = format!("v{} • {mode} • {network_code}", env!("CARGO_PKG_VERSION"));
+    let mode_line = if versioned_mode.chars().count() <= usize::from(area.width) {
+        versioned_mode
     } else {
-        format!(
-            "{} • {} • {}",
-            network_name(model.network),
-            mode,
-            model.device_label
-        )
+        format!("{mode} • {network_code}")
     };
     let mode_span = if mode == "WAITING FOR GENESIS" {
         Span::styled(mode_line, style(colors, GENESIS_AMBER, false))
@@ -1056,7 +1063,8 @@ fn render_narrow(
         Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
         Line::from(mode_span),
         Line::from(Span::raw(format!(
-            "{} · INJ {}",
+            "{} · {} · {}",
+            model.device_label,
             short_address(model.wallet),
             format_optional_inj_value(model.inj_balance),
         ))),
@@ -1364,6 +1372,7 @@ fn version_mode_line(model: &DashboardModel, colors: bool) -> Line<'static> {
     let mode = model.mode(Instant::now());
     let mode_color = match mode {
         "LIVE MINING" => EMERALD,
+        "CONFIRMING" | "FINALIZING" => AMBER,
         "RECOVERING"
         | "STOPPING"
         | "WAITING FOR CHAIN"
@@ -1662,6 +1671,7 @@ mod tests {
             .draw(|frame| render_dashboard(frame, &view, None, false))
             .unwrap();
         let text = buffer_text(&terminal);
+        assert_eq!(view.mode(Instant::now()), "FINALIZING");
         let one = text.find("01    WAITING").unwrap();
         let three = text.find("03    FINALIZING").unwrap();
         let seven = text.find("07    ● MINING").unwrap();
@@ -1719,6 +1729,84 @@ mod tests {
         assert!(text.contains("WINDOW"));
         assert!(text.contains("9 selected / 9 total"));
         assert!(!text.contains("10  "));
+    }
+
+    #[test]
+    fn expired_windows_explain_zero_hashrate_in_wide_compact_and_narrow_layouts() {
+        let nodes = (1..=9)
+            .map(|id| node(id, NodeStatus::FinalizationRequired, None))
+            .collect::<Vec<_>>();
+        let mut view = model(nodes);
+        view.hashrate = 0.0;
+        view.current_action = Some("0 H/s expected • all selected windows expired".to_owned());
+
+        for (width, height) in [(100, 24), (60, 24), (48, 24)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_dashboard(frame, &view, None, false))
+                .unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("0 H/s expected"),
+                "expired-window status was clipped at {width} columns: {text}"
+            );
+            assert!(text.contains("FINALIZE"), "{width} columns: {text}");
+        }
+    }
+
+    #[test]
+    fn long_global_status_keeps_version_and_network_metadata_readable_at_common_sizes() {
+        for status in [
+            NodeStatus::FinalizationRequired,
+            NodeStatus::FinalizationBlocked,
+        ] {
+            let view = model(vec![node(1, status, None)]);
+            let expected_wide_title = format!(
+                "v{} • {}",
+                env!("CARGO_PKG_VERSION"),
+                view.mode(Instant::now())
+            );
+            for (width, height) in [(80, 24), (100, 24), (120, 30)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| render_dashboard(frame, &view, None, false))
+                    .unwrap();
+                let text = buffer_text(&terminal);
+                assert!(
+                    text.contains(&expected_wide_title),
+                    "version/status title was clipped at {width}x{height}: {text}"
+                );
+                assert!(
+                    text.contains("NETWORK") && text.contains("Injective Testnet"),
+                    "network metadata was clipped at {width}x{height}: {text}"
+                );
+            }
+
+            let mut compact = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            compact
+                .draw(|frame| render_dashboard(frame, &view, None, false))
+                .unwrap();
+            let compact_text = buffer_text(&compact);
+            assert!(
+                compact_text.contains(&expected_wide_title),
+                "{compact_text}"
+            );
+
+            let mut narrow = Terminal::new(TestBackend::new(48, 24)).unwrap();
+            narrow
+                .draw(|frame| render_dashboard(frame, &view, None, false))
+                .unwrap();
+            let narrow_text = buffer_text(&narrow);
+            assert!(
+                narrow_text.contains(view.mode(Instant::now())),
+                "global status was clipped in narrow layout: {narrow_text}"
+            );
+            assert!(narrow_text.contains("TN"), "{narrow_text}");
+            assert!(
+                narrow_text.contains(&expected_wide_title),
+                "the complete version/status title should fit at 48 columns: {narrow_text}"
+            );
+        }
     }
 
     #[test]
@@ -1935,7 +2023,12 @@ mod tests {
         let mut view = model(vec![node(1, NodeStatus::Mining, None)]);
         assert_eq!(view.mode(Instant::now()), "LIVE MINING");
         view.selected_nodes[0].status = NodeStatus::Confirming;
-        assert_eq!(view.mode(Instant::now()), "LIVE MINING");
+        assert_eq!(view.mode(Instant::now()), "CONFIRMING");
+        view.selected_nodes.push(node(2, NodeStatus::Mining, None));
+        assert_eq!(view.mode(Instant::now()), "CONFIRMING");
+        view.selected_nodes[0].status = NodeStatus::Finalizing;
+        assert_eq!(view.mode(Instant::now()), "FINALIZING");
+        view.selected_nodes.pop();
         view.selected_nodes[0].status = NodeStatus::Syncing;
         assert_eq!(view.mode(Instant::now()), "LIVE MINING");
         view.selected_nodes[0].status = NodeStatus::Mining;
@@ -1991,6 +2084,7 @@ mod tests {
     #[test]
     fn transaction_exposure_and_critical_footer_are_displayed_without_guessing() {
         let mut view = model(vec![node(1, NodeStatus::Confirming, None)]);
+        assert_eq!(view.mode(Instant::now()), "CONFIRMING");
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
             .draw(|frame| {

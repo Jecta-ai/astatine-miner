@@ -41,6 +41,21 @@ const NEW_KEYSTORE_SCRYPT_P: u32 = 1;
 type Aes128Ctr = Ctr128BE<Aes128>;
 
 pub fn create_interactive(store: &ConfigStore, config: &mut AppConfig) -> Result<Address> {
+    create_interactive_with_persistence(store, config, true)
+}
+
+pub(crate) fn create_interactive_staged(
+    store: &ConfigStore,
+    config: &mut AppConfig,
+) -> Result<Address> {
+    create_interactive_with_persistence(store, config, false)
+}
+
+fn create_interactive_with_persistence(
+    store: &ConfigStore,
+    config: &mut AppConfig,
+    persist_config: bool,
+) -> Result<Address> {
     let mnemonic =
         Mnemonic::generate_in_with(&mut thread_rng(), Language::English, WordCount::Words24)
             .context("generate a BIP-39 recovery phrase")?;
@@ -52,7 +67,7 @@ pub fn create_interactive(store: &ConfigStore, config: &mut AppConfig) -> Result
 
     let signer = derive_signer(phrase.as_str(), "", DEFAULT_DERIVATION_PATH)?;
     let password = prompt_new_password()?;
-    let address = store_signer(store, config, &signer, password.as_bytes())?;
+    let address = store_signer(store, config, &signer, password.as_bytes(), persist_config)?;
     println!("Encrypted Ethereum V3 wallet created: {address:#x}");
     Ok(address)
 }
@@ -62,8 +77,25 @@ pub fn import_interactive(
     config: &mut AppConfig,
     args: ImportArgs,
 ) -> Result<Address> {
+    import_interactive_with_persistence(store, config, args, true)
+}
+
+pub(crate) fn import_interactive_staged(
+    store: &ConfigStore,
+    config: &mut AppConfig,
+    args: ImportArgs,
+) -> Result<Address> {
+    import_interactive_with_persistence(store, config, args, false)
+}
+
+fn import_interactive_with_persistence(
+    store: &ConfigStore,
+    config: &mut AppConfig,
+    args: ImportArgs,
+    persist_config: bool,
+) -> Result<Address> {
     if let Some(path) = args.keystore {
-        return import_keystore(store, config, &path);
+        return import_keystore(store, config, &path, persist_config);
     }
 
     let phrase = Zeroizing::new(rpassword::prompt_password(
@@ -85,7 +117,7 @@ pub fn import_interactive(
         &args.derivation_path,
     )?;
     let password = prompt_new_password()?;
-    let address = store_signer(store, config, &signer, password.as_bytes())?;
+    let address = store_signer(store, config, &signer, password.as_bytes(), persist_config)?;
     println!("Encrypted Ethereum V3 wallet imported: {address:#x}");
     Ok(address)
 }
@@ -174,6 +206,7 @@ fn store_signer(
     config: &mut AppConfig,
     signer: &SigningKey,
     password: &[u8],
+    persist_config: bool,
 ) -> Result<Address> {
     let address = signer_address(signer);
     let private_key = Zeroizing::new(signer.to_bytes());
@@ -184,14 +217,19 @@ fn store_signer(
 
     let destination = store.store_keystore(address, &contents)?;
     config.wallet_address = Some(format!("{address:#x}"));
-    if let Err(error) = store.save(config) {
+    if persist_config && let Err(error) = store.save(config) {
         let _ = fs::remove_file(&destination);
         return Err(error).context("save selected wallet configuration");
     }
     Ok(address)
 }
 
-fn import_keystore(store: &ConfigStore, config: &mut AppConfig, source: &Path) -> Result<Address> {
+fn import_keystore(
+    store: &ConfigStore,
+    config: &mut AppConfig,
+    source: &Path,
+    persist_config: bool,
+) -> Result<Address> {
     let contents = read_regular_limited(source, MAX_KEYSTORE_BYTES, false)
         .context("read external Ethereum V3 keyfile")?;
     if contents.is_empty() {
@@ -214,7 +252,7 @@ fn import_keystore(store: &ConfigStore, config: &mut AppConfig, source: &Path) -
 
     let destination = store.store_keystore(address, &contents)?;
     config.wallet_address = Some(format!("{address:#x}"));
-    if let Err(error) = store.save(config) {
+    if persist_config && let Err(error) = store.save(config) {
         let _ = fs::remove_file(&destination);
         return Err(error).context("save imported wallet configuration");
     }
@@ -585,7 +623,7 @@ mod tests {
         let signer = derive_signer(TEST_PHRASE, "", DEFAULT_DERIVATION_PATH).unwrap();
         let address = signer_address(&signer);
         let mut config = AppConfig::default();
-        store_signer(&store, &mut config, &signer, TEST_PASSWORD.as_bytes()).unwrap();
+        store_signer(&store, &mut config, &signer, TEST_PASSWORD.as_bytes(), true).unwrap();
 
         let keyfile = store.read_keystore(address).unwrap();
         let embedded_address = validate_v3_keystore(&keyfile).unwrap();
@@ -632,6 +670,34 @@ mod tests {
         assert_eq!(
             config.wallet_address.as_deref(),
             Some(format!("{address:#x}").as_str())
+        );
+    }
+
+    #[test]
+    fn staged_wallet_creation_writes_the_keystore_without_persisting_selection() {
+        let temp = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(temp.path()));
+        let signer = derive_signer(TEST_PHRASE, "", DEFAULT_DERIVATION_PATH).unwrap();
+        let address = signer_address(&signer);
+        let mut config = AppConfig::default();
+
+        store_signer(
+            &store,
+            &mut config,
+            &signer,
+            TEST_PASSWORD.as_bytes(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.wallet_address.as_deref(),
+            Some(format!("{address:#x}").as_str())
+        );
+        assert_eq!(store.load().unwrap().wallet_address, None);
+        assert_eq!(
+            validate_v3_keystore(&store.read_keystore(address).unwrap()).unwrap(),
+            address
         );
     }
 
@@ -700,7 +766,7 @@ mod tests {
         let mut config = AppConfig::default();
         let password = "twelve-chars";
         validate_new_password(password).unwrap();
-        store_signer(&store, &mut config, &signer, password.as_bytes()).unwrap();
+        store_signer(&store, &mut config, &signer, password.as_bytes(), true).unwrap();
 
         let keyfile = store.read_keystore(address).unwrap();
         let decrypted = decrypt_v3_keystore(&keyfile, password.as_bytes()).unwrap();
@@ -802,7 +868,7 @@ mod tests {
         let store = ConfigStore::at_root(PathBuf::from(temp.path()));
         let signer = derive_signer(TEST_PHRASE, "", DEFAULT_DERIVATION_PATH).unwrap();
         let mut config = AppConfig::default();
-        store_signer(&store, &mut config, &signer, TEST_PASSWORD.as_bytes()).unwrap();
+        store_signer(&store, &mut config, &signer, TEST_PASSWORD.as_bytes(), true).unwrap();
         let bytes = store.read_keystore(signer_address(&signer)).unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         value["crypto"]["kdfparams"]["n"] = serde_json::Value::from(1_u64 << 30);

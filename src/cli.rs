@@ -15,6 +15,7 @@ pub struct Cli {
 pub enum Command {
     Init(InitArgs),
     Mine(MineArgs),
+    Recover,
     Wallet(WalletCommand),
     NetworkUse(Network),
     GetRpc {
@@ -239,8 +240,12 @@ fn command() -> ClapCommand {
                         .long("send-rewards-to")
                         .value_name("ADDRESS")
                         .value_parser(parse_reward_destination)
-                        .help("Disabled in Testnet.13: RPC reward evidence cannot authorize AST transfers"),
+                        .help("Disabled in Testnet.14: RPC reward evidence cannot authorize AST transfers"),
                 ),
+        )
+        .subcommand(
+            ClapCommand::new("recover")
+                .about("Read-only recovery for unresolved Testnet transactions; never signs or broadcasts"),
         )
         .subcommand(
             ClapCommand::new("get")
@@ -435,6 +440,7 @@ fn parse_matches(matches: &ArgMatches) -> Command {
             send_rewards_to: args.get_one::<Address>("send-rewards-to").copied(),
             new_session: args.get_flag("new-session"),
         }),
+        Some(("recover", _)) => Command::Recover,
         Some(("wallet", args)) => match args.subcommand() {
             Some(("create", _)) => Command::Wallet(WalletCommand::Create),
             Some(("import", args)) => Command::Wallet(WalletCommand::Import(ImportArgs {
@@ -774,6 +780,10 @@ mod tests {
 
     #[test]
     fn parses_rpc_management_and_explicit_new_session_commands() {
+        assert_eq!(
+            try_parse_from(["astatine", "recover"]).unwrap().command,
+            Command::Recover
+        );
         assert_eq!(
             try_parse_from(["astatine", "get", "rpc"]).unwrap().command,
             Command::GetRpc { network: None }

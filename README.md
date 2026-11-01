@@ -6,20 +6,20 @@ The protocol has nine independent mining nodes, each with its own work and windo
 
 ## Install
 
-Testnet.13 candidate installers verify the signed release manifest and the platform archive digest before installation. No root or administrator access is required. The installer replaces only the executable and license notices; configuration, wallets, and transaction journals are left untouched. The manifest is signed with the RSA release key pinned in the client and installer scripts.
+Testnet.14 candidate installers verify the signed release manifest and the platform archive digest before installation. No root or administrator access is required. The installer replaces only the executable and license notices; configuration, wallets, and transaction journals are left untouched. The manifest is signed with the RSA release key pinned in the client and installer scripts.
 
 ### macOS and Linux
 
 Requires `curl`, `openssl`, `tar`, and `install`. Supported targets are Apple Silicon and Intel macOS, plus x86_64 and aarch64 Linux (glibc 2.35 or later).
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.13/support/install-unix.sh | sh
+curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.14/support/install-unix.sh | sh
 ```
 
 To download and review the installer before executing it:
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.13/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
+curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.14/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
 less "$HOME/astatine-install-unix.sh"
 sh "$HOME/astatine-install-unix.sh"
 ```
@@ -31,14 +31,14 @@ Apple Silicon requires macOS 11 or later; Intel requires macOS 10.12 or later. T
 Supported target: Windows 10 or later, x86_64. The executable is installed under your user profile.
 
 ```powershell
-$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.13/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
+$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.14/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
 ```
 
 To download and review the PowerShell installer before executing it:
 
 ```powershell
 $Installer = Join-Path $env:TEMP 'astatine-install.ps1'
-Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.13/support/install-windows.ps1' -OutFile $Installer
+Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.14/support/install-windows.ps1' -OutFile $Installer
 Get-Content -LiteralPath $Installer -Raw
 # After reviewing the script:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
@@ -73,7 +73,7 @@ Every GPU candidate is rehashed with the canonical Rust `WorkHasher` before it e
 
 ### Starting before genesis
 
-Testnet.12 can be started before selected mining contracts activate. Verified, inactive nodes show `WAIT GENESIS`; when all selected nodes are inactive the dashboard shows `WAITING FOR GENESIS`. The observer checks selected inactive nodes approximately once per second with read-only `work()` calls and a bounded three-node concurrency limit. Active nodes keep the normal observer cadence.
+Testnet.14 can be started before selected mining contracts activate. Verified, inactive nodes show `WAIT GENESIS`; when all selected nodes are inactive the dashboard shows `WAITING FOR GENESIS`. The observer checks selected inactive nodes approximately once per second with read-only `work()` calls and a bounded three-node concurrency limit. Active nodes keep the normal observer cadence.
 
 An activation candidate triggers the existing canonical full-snapshot path. The miner rechecks the chain ID, pinned runtime code, ABI coherence and canonical Rust/Solidity `computeWorkHash` parity before publishing eligible work to the existing node scheduler. Partial activation is handled independently per node; nine-node atomic Coordinator activation is discovered by the same mechanism. The CLI never calls `activateGenesis()` or the Coordinator, never asks the user to restart, and does not create mining nonce ranges or paid transactions for unstarted nodes. There is no new init configuration.
 
@@ -81,7 +81,7 @@ An activation candidate triggers the existing canonical full-snapshot path. The 
 astatine mine --device gpu --nodes 1,2,3,4,5,6,7,8,9
 ```
 
-The existing proof verification, spending cap, minimum reserve, transaction journal, recovery, and reorganization handling remain in force after activation. Automatic AST reward forwarding is disabled in Testnet.13 because the selected RPC can fabricate reward evidence.
+The existing proof verification, spending cap, minimum reserve, transaction journal, recovery, and reorganization handling remain in force after activation. Automatic AST reward forwarding remains disabled because the selected RPC can fabricate reward evidence.
 
 Inspect local compute adapters and run their real shader self-test without connecting to RPC or unlocking a wallet:
 
@@ -150,7 +150,9 @@ gh attestation verify astatine-linux-x86_64.tar.gz \
 ```sh
 astatine init
 astatine mine
+astatine recover
 astatine mine --device cpu
+astatine mine --new-session
 astatine mine --device gpu --nodes 1,2,3,4,5,6,7,8,9
 astatine mine --device auto --nodes 1,3,5
 astatine mine --device gpu --compute-only
@@ -160,9 +162,11 @@ astatine update
 astatine update --check
 ```
 
-`astatine init` configures the wallet, network, RPC, CPU budget, reserve, authorization cap, and confirmation depth. Startup shows configuration, RPC/deployment checks, transaction recovery, wallet unlock, initial work, worker preparation and when historical reward reconciliation is scheduled; detailed history counters are hidden during ordinary startup. Historical reward reconciliation runs in the background so live proof work can continue while older events are checked against the selected RPC. Interactive terminals use a subtle spinner, while redirected output uses plain-text progress. The mining dashboard shows live node state, RPC-reported INJ and AST balances, RPC-reported rewards for the current invocation, hashrate, transaction state, cumulative maximum authorization, remaining authorization budget, and RPC-reported actual cost. It distinguishes proof checking, signed-but-not-yet-broadcast, broadcast/confirmation, chain waiting, required/retrying finalization, and policy-blocked finalization. Autonomous mining retains the best queued proof per node in a bounded inbox, revalidates it against current work, and reports bounded per-node proof-pipeline counters on exit. `--compute-only` hashes locally without unlocking a wallet or sending transactions. Use `--nodes 1,3,5` to restrict mining to selected nodes.
+`astatine init` configures the wallet, network, RPC, CPU budget, reserve, authorization cap, and confirmation depth. On first setup the safe cap remains 0 INJ until you enter or select a positive amount; 0.5 INJ is shown as a suggested starting allowance. The prompt explains that the value is the maximum INJ authorization for one session—not an upfront charge—and that prior authorization is never refunded. Starting a new positive-cap session requires a separate explicit confirmation. Re-enabling paid transactions for an existing session also requires confirmation and preserves its remaining allowance. If an unresolved transaction exists, paid `astatine mine` reports `RECOVERY REQUIRED • WALLET LOCKED`, lists the transaction details, and refuses to start. `astatine mine --compute-only` can still hash verified work without unlocking, signing, changing a session, or broadcasting. Run `astatine recover` to reconcile against the original session; it never unlocks the wallet, signs, broadcasts, or starts a new session. After it reports `RECOVERY COMPLETE • WALLET LOCKED`, start a fresh paid `astatine mine` process to enter the wallet password and resume signing. Historical reward reconciliation runs in the background so live proof work can continue while older events are checked against the selected RPC. Interactive terminals use a subtle spinner, while redirected output uses plain-text progress. The mining dashboard shows live node state, RPC-reported INJ and AST balances, RPC-reported rewards for the current invocation, hashrate, transaction state, cumulative maximum authorization, remaining authorization budget, and RPC-reported actual cost. It distinguishes proof checking, signed-but-not-yet-broadcast, broadcast/confirmation, chain waiting, required/retrying finalization, and policy-blocked finalization. When every selected window is expired, it immediately explains that 0 H/s is expected while finalization proceeds. Autonomous mining retains the best queued proof per node in a bounded inbox, revalidates it against current work, and reports bounded per-node proof-pipeline counters on exit. Use `--nodes 1,3,5` to restrict mining to selected nodes.
 
-Automatic AST reward forwarding is disabled in Testnet.13. Passing `--send-rewards-to ADDRESS` is rejected with an explanation: a selected RPC can fabricate a mutually consistent proof receipt, payout events, balances, and confirmations, which could otherwise authorize a real AST transfer from the mining wallet. Reward reconciliation and the `MINED` display remain available, but they are based on selected-RPC data and are not independent proof of payout. Verify a reward through an independent trusted source before making any manual transfer.
+Standalone `astatine wallet create` and `astatine wallet import` cannot replace the selected wallet while a paid session is open or transaction recovery/session transition is pending. Use `astatine init` to stage a wallet change with its own explicit spending-session approval.
+
+Automatic AST reward forwarding remains disabled. Passing `--send-rewards-to ADDRESS` is rejected with an explanation: a selected RPC can fabricate a mutually consistent proof receipt, payout events, balances, and confirmations, which could otherwise authorize a real AST transfer from the mining wallet. Reward reconciliation and the `MINED` display remain available, but they are based on selected-RPC data and are not independent proof of payout. Verify a reward through an independent trusted source before making any manual transfer.
 
 Set `ASTATINE_HISTORY_PROFILE=1` before `astatine mine` (or `$env:ASTATINE_HISTORY_PROFILE='1'` in PowerShell) to print aggregate history profiling at startup and shutdown for developer diagnostics. The profile contains counters and timings only. Normal startup continues to display actionable transaction/RPC warnings and the background reward-verification status without the aggregate dump.
 
@@ -170,7 +174,13 @@ New encrypted Ethereum V3 keystores require passwords of at least 12 Unicode cha
 
 **Transaction costs and authorization cap:** Each proof submission pays a `0.01 INJ` fee. Finalizing a window consumes INJ gas, including when the window is empty or another miner wins. For every signed transaction, Astatine durably charges `gas_limit × max_fee_per_gas + transaction_value` against the session cap before producing the signature. That maximum authorization is cumulative and is never refunded or reduced by RPC receipts, reported gas usage, or a completed transaction. The dashboard separates maximum authorized exposure from RPC-reported actual costs. A positive cap authorizes spending; the default zero cap disables signing. Use `astatine mine --new-session` to explicitly start a separate session after a prior spending session has been closed. It is refused while transactions are unresolved. Mainnet transaction signing is disabled.
 
-The spending journal is stored locally with private file permissions, atomic writes, and archive checks. The cap's integrity assumes that the local journal and archives have not been intentionally rewritten: Astatine does not have an independent cryptographic or hardware-backed monotonic anchor for them. A process running as the same OS account (or an administrator/root user) can rewrite valid journal data, so the cap is not a defense against a compromised same-account environment. It is a per-session cap, not a lifetime spending limit; explicitly starting a new session authorizes a separate cap.
+Journal schema v9 authenticates the full journal with HMAC-SHA-256 and keeps its key and latest revision checkpoint in the OS credential store: macOS Keychain, Windows Credential Manager, or the Linux Secret Service. The credential store must be available; Linux headless systems need an unlocked Secret Service session. A missing, unavailable, or mismatched journal/checkpoint fails closed and does not create an empty journal or fresh allowance. Restoring an older journal is rejected while its matching credential-store checkpoint remains intact. The checkpoint is not a hardware monotonic counter: rolling back or compromising both the journal and the OS credential store, or malware running as the same OS user, is outside this protection. Restore a matching trusted journal and credential-store backup if integrity validation fails.
+
+During the first authenticated migration, an active positive-cap legacy session is conservatively charged its full cap. If it has no unresolved transactions, it is closed and a new session requires explicit approval; if unresolved transactions remain, it is available only for read-only recovery. For an interrupted initialization transition, the previous session is sealed separately while the proposed session's zero authorization counter is preserved. Already-closed historical session-history entries retain their recorded cumulative authorization counters; they cannot be resumed or silently used to grant fresh spending authorization. Their presence blocks ordinary mining from silently creating a new positive allowance, and any new positive session requires explicit user approval. Authorized exposure records the maximum amount reserved before signing, not actual INJ spent; receipt-reported actual costs are tracked separately and never refund or reduce that authorization. v1-v6 active-session accounting is reconstructed from retained transactions, pending reservations, and validated archives where available; historical sessions without counters are initialized conservatively. Missing or inconsistent v7/v8 counters are rejected. The cap remains per-session, not a lifetime spending limit.
+
+The v2 credential checkpoint stores the journal revision and authenticated-state digest, and its OS credential entry is scoped to the SHA-256 identity of the canonical configuration data-root path. Keep that path unchanged when upgrading. Copying or moving the configuration tree, changing `XDG_CONFIG_HOME`, or restoring only `journal.json` does not transfer its checkpoint and fails closed; the application does not create a replacement key or allowance. For backup recovery, restore the matching journal and credential-store entry together at the original canonical data root. If that credential entry is unavailable, do not delete the journal or keyring entry; mining and recovery remain blocked until a trusted matching backup is restored. Compute-only mining does not open the transaction manager and remains available. Earlier unpublished v9 candidate checkpoints that did not authenticate the revision are not silently upgraded or reset; Testnet.13 v7/v8 journals follow the conservative migration above.
+
+A valid authenticated journal with an older revision is reported as rollback; an authentication failure is reported separately without guessing whether corruption was accidental or intentional. The checkpoint is software anti-rollback protection, not a hardware monotonic counter; restoring or compromising both the journal and its OS credential-store entry is outside the guarantee.
 
 ## RPC Configuration & Trust
 
@@ -212,8 +222,10 @@ false reward evidence must not authorize a transfer. The bundled archival
 endpoint is only a historical-log fallback with the bundled primary. It is not
 silently substituted when a custom primary is selected. The local session
 authorization cap does not depend on receipt correctness: receipts never
-replenish signing authority. Cap integrity assumes the same-account local
-journal and archives have not been intentionally rewritten.
+replenish signing authority. Journal changes and stale snapshots are rejected
+when the OS credential-store checkpoint is intact. The credential store itself
+is the trust boundary; it does not provide hardware-backed anti-rollback if the
+entire user credential store is also restored or compromised.
 
 ## License
 

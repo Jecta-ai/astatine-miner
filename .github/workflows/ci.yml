@@ -16,7 +16,7 @@ on:
       release_tag:
         description: Testnet package version used by the nonpublishing rehearsal
         required: true
-        default: v0.1.0-testnet.13
+        default: v0.1.0-testnet.14
         type: string
 
 permissions:
@@ -83,7 +83,13 @@ jobs:
       - name: Check
         run: cargo check --locked
       - name: Unit tests
-        run: cargo test --locked
+        env:
+          ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc') && '1' || '' }}
+        run: cargo test --locked -- --test-threads=1
+      - name: Native credential-store behavior and fail-closed handling
+        env:
+          ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc') && '1' || '' }}
+        run: cargo test --locked config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped -- --exact --nocapture
       - name: Unix installer downgrade checks
         shell: bash
         run: sh support/test-install-unix-version.sh

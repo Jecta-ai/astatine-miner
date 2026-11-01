@@ -53,6 +53,7 @@ def main() -> None:
         "support/publish_signed_release.py",
         "support/release_public_key.py",
         "support/release-notes-v0.1.0-testnet.13.md",
+        "support/release-notes-v0.1.0-testnet.14.md",
         "support/release-notes-v0.1.0-testnet.9.md",
         "support/release-notes-v0.1.0-testnet.10.md",
         "support/release-notes-v0.1.0-testnet.11.md",
@@ -85,8 +86,8 @@ def main() -> None:
         and 'assert!(parse_manifest(legacy_repository.as_bytes()).is_err())' in updater,
         "updater tests must reject manifests from the old repository",
     )
-    release_notes = (ROOT / "support/release-notes-v0.1.0-testnet.13.md").read_text(encoding="utf-8")
-    require("__RELEASE_REPOSITORY__" in release_notes, "Testnet.13 release notes must receive the canonical repository during publication")
+    release_notes = (ROOT / "support/release-notes-v0.1.0-testnet.14.md").read_text(encoding="utf-8")
+    require("__RELEASE_REPOSITORY__" in release_notes, "Testnet.14 release notes must receive the canonical repository during publication")
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     require("$GITHUB_REPOSITORY" in workflow, "workflow provenance checks must bind the GitHub repository context")
     require("--repo " + LEGACY_REPOSITORY not in workflow, "workflow must not retain a stale hardcoded GitHub owner/repository")

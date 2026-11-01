@@ -19,6 +19,7 @@ use alloy_sol_types::{SolCall, SolEvent};
 use anyhow::{Context, Result, anyhow, bail};
 use bip32::secp256k1::ecdsa::SigningKey;
 use rand::{RngCore, thread_rng};
+use ring::hmac::{self, HMAC_SHA256};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -31,8 +32,11 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time::{Instant, MissedTickBehavior, interval, sleep},
 };
+use zeroize::Zeroizing;
 
-const JOURNAL_VERSION: u32 = 7;
+const JOURNAL_VERSION: u32 = 9;
+const JOURNAL_ANCHOR_VERSION: u32 = 2;
+const JOURNAL_ANCHOR_BYTES: usize = 4 + 8 + 32 + 32;
 const ARCHIVE_VERSION: u32 = 1;
 const MAX_JOURNAL_ENTRIES: usize = 4_096;
 const ARCHIVE_TRIGGER_ENTRIES: usize = 64;
@@ -48,7 +52,7 @@ const REWARD_SCAN_RETRY_MAX: Duration = Duration::from_secs(30);
 const REWARD_EMPTY_SCAN_RETRY_BASE_SECS: u64 = 60;
 const REWARD_EMPTY_SCAN_RETRY_MAX_SECS: u64 = 3_600;
 const SUBMISSION_FEE_WEI: u128 = 10_000_000_000_000_000;
-pub(crate) const AUTOMATIC_REWARD_FORWARDING_DISABLED: &str = "automatic AST reward forwarding is disabled in Testnet.13 because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually from your wallet";
+pub(crate) const AUTOMATIC_REWARD_FORWARDING_DISABLED: &str = "automatic AST reward forwarding is disabled in Testnet.14 because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually from your wallet";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Eip1559Request {
@@ -192,7 +196,7 @@ impl TransactionStatus {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SpendingSession {
     id: String,
@@ -205,6 +209,43 @@ struct SpendingSession {
     #[serde(alias = "verified_actual_wei")]
     reported_actual_wei: Option<String>,
     closed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingSessionTransition {
+    previous_config_limit_inj: String,
+    #[serde(default)]
+    previous_config_wallet: Option<String>,
+    proposed_config_limit_inj: String,
+    previous_session: Option<SpendingSession>,
+    new_session_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingSessionTransitionSummary {
+    pub previous_config_limit_inj: String,
+    pub proposed_config_limit_inj: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UnresolvedTransactionSummary {
+    pub hash: String,
+    pub node_id: u8,
+    pub window_id: u64,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SessionJournalSnapshot {
+    pub session_id: Option<String>,
+    pub wallet: Option<String>,
+    pub limit_wei: Option<String>,
+    pub authorized_exposure_wei: Option<String>,
+    pub closed: bool,
+    pub has_prior_session_history: bool,
+    pub unresolved: Vec<UnresolvedTransactionSummary>,
+    pub pending_transition: Option<PendingSessionTransitionSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -340,9 +381,22 @@ struct JournalArchive {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+struct JournalIntegrity {
+    revision: u64,
+    tag: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct JournalState {
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    integrity: Option<JournalIntegrity>,
     active_session: Option<SpendingSession>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_session_transition: Option<PendingSessionTransition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    session_history: Vec<SpendingSession>,
     entries: Vec<TransactionEntry>,
     #[serde(default)]
     pending_authorization: Option<PendingAuthorization>,
@@ -366,7 +420,10 @@ impl Default for JournalState {
     fn default() -> Self {
         Self {
             version: JOURNAL_VERSION,
+            integrity: None,
             active_session: None,
+            pending_session_transition: None,
+            session_history: Vec::new(),
             entries: Vec::new(),
             pending_authorization: None,
             proof_attempted_through: HashMap::new(),
@@ -380,6 +437,229 @@ impl Default for JournalState {
     }
 }
 
+struct JournalAuthenticator {
+    key: Zeroizing<[u8; 32]>,
+    revision: u64,
+    checkpoint_revision: u64,
+    checkpoint_present: bool,
+    checkpoint_digest: Option<[u8; 32]>,
+    authenticated_digest: Option<[u8; 32]>,
+}
+
+impl JournalAuthenticator {
+    fn new() -> Self {
+        let mut key = Zeroizing::new([0_u8; 32]);
+        thread_rng().fill_bytes(&mut key[..]);
+        Self {
+            key,
+            revision: 0,
+            checkpoint_revision: 0,
+            checkpoint_present: false,
+            checkpoint_digest: None,
+            authenticated_digest: None,
+        }
+    }
+
+    fn from_checkpoint(contents: &[u8]) -> Result<Self> {
+        if contents.len() != JOURNAL_ANCHOR_BYTES {
+            bail!("OS transaction-journal checkpoint has an invalid length");
+        }
+        let version = u32::from_be_bytes(
+            contents[0..4]
+                .try_into()
+                .context("decode OS transaction-journal checkpoint version")?,
+        );
+        if version != JOURNAL_ANCHOR_VERSION {
+            bail!("OS transaction-journal checkpoint schema is unsupported");
+        }
+        let revision = u64::from_be_bytes(
+            contents[4..12]
+                .try_into()
+                .context("decode OS transaction-journal checkpoint revision")?,
+        );
+        let mut key = Zeroizing::new([0_u8; 32]);
+        key.copy_from_slice(&contents[12..44]);
+        let mut digest = [0_u8; 32];
+        digest.copy_from_slice(&contents[44..76]);
+        let checkpoint_digest = if revision == 0 {
+            if digest != [0_u8; 32] {
+                bail!("empty OS transaction-journal checkpoint has a state digest");
+            }
+            None
+        } else {
+            Some(digest)
+        };
+        Ok(Self {
+            key,
+            revision,
+            checkpoint_revision: revision,
+            checkpoint_present: true,
+            checkpoint_digest,
+            authenticated_digest: None,
+        })
+    }
+
+    fn for_empty_journal(store: &ConfigStore) -> Result<Self> {
+        match store.read_journal_anchor()? {
+            Some(contents) => {
+                let authenticator = Self::from_checkpoint(&contents)?;
+                if authenticator.checkpoint_revision != 0 {
+                    bail!(
+                        "transaction journal is missing but its OS credential-store checkpoint records prior history; restore the matching trusted journal and checkpoint before mining or recovery"
+                    );
+                }
+                Ok(authenticator)
+            }
+            None => Ok(Self::new()),
+        }
+    }
+
+    fn for_existing_journal(store: &ConfigStore, state: &JournalState) -> Result<Self> {
+        let checkpoint = store.read_journal_anchor()?;
+        if state.version == JOURNAL_VERSION {
+            let contents = checkpoint.context(
+                "authenticated transaction journal has no OS credential-store checkpoint; restore a matching trusted journal and checkpoint before mining or recovery",
+            )?;
+            let mut authenticator = Self::from_checkpoint(&contents)?;
+            authenticator.verify_state(state)?;
+            return Ok(authenticator);
+        }
+        if let Some(contents) = checkpoint {
+            let authenticator = Self::from_checkpoint(&contents)?;
+            if authenticator.checkpoint_revision != 0 {
+                bail!(
+                    "transaction journal predates the OS credential-store checkpoint and may be a stale snapshot; restore a matching trusted journal and checkpoint before mining or recovery"
+                );
+            }
+            return Ok(authenticator);
+        }
+        Ok(Self::new())
+    }
+
+    fn verify_state(&mut self, state: &JournalState) -> Result<()> {
+        let integrity = state
+            .integrity
+            .as_ref()
+            .context("authenticated transaction journal has no integrity record")?;
+        if integrity.revision == 0 {
+            bail!("authenticated transaction journal has an invalid revision");
+        }
+        if integrity.revision < self.checkpoint_revision {
+            bail!(
+                "transaction journal revision {} is older than the protected authorization checkpoint {}; refusing rollback",
+                integrity.revision,
+                self.checkpoint_revision
+            );
+        }
+        let tag = hex::decode(&integrity.tag)
+            .context("transaction journal authentication tag is malformed")?;
+        if tag.len() != 32 {
+            bail!("transaction journal authentication tag has an invalid length");
+        }
+        let payload = journal_authentication_payload(state)?;
+        let state_digest = journal_payload_digest(&payload);
+        if integrity.revision == self.checkpoint_revision
+            && self.checkpoint_digest != Some(state_digest)
+        {
+            bail!(
+                "transaction journal state digest does not match the OS credential-store checkpoint; refusing an authenticated fork"
+            );
+        }
+        let key = hmac::Key::new(HMAC_SHA256, &self.key[..]);
+        hmac::verify(&key, &payload, &tag)
+            .map_err(|_| {
+                anyhow!(
+                    "transaction journal authentication failed; accidental corruption and unauthorized modification cannot be distinguished, so mining and recovery are blocked until a matching trusted journal and credential-store checkpoint are restored"
+                )
+            })?;
+        self.revision = integrity.revision;
+        self.authenticated_digest = Some(state_digest);
+        Ok(())
+    }
+
+    fn sync_checkpoint(&mut self, store: &ConfigStore) -> Result<()> {
+        if self.checkpoint_revision == self.revision && self.checkpoint_present {
+            return Ok(());
+        }
+        let digest = self.authenticated_digest.unwrap_or([0_u8; 32]);
+        let mut contents = Zeroizing::new(Vec::with_capacity(JOURNAL_ANCHOR_BYTES));
+        contents.extend_from_slice(&JOURNAL_ANCHOR_VERSION.to_be_bytes());
+        contents.extend_from_slice(&self.revision.to_be_bytes());
+        contents.extend_from_slice(&self.key[..]);
+        contents.extend_from_slice(&digest);
+        store.write_journal_anchor(&contents)?;
+        self.checkpoint_revision = self.revision;
+        self.checkpoint_present = true;
+        self.checkpoint_digest = self.authenticated_digest;
+        Ok(())
+    }
+
+    fn persist(&mut self, store: &ConfigStore, state: &mut JournalState) -> Result<usize> {
+        self.sync_checkpoint(store)?;
+        let revision = self
+            .revision
+            .checked_add(1)
+            .context("transaction journal revision overflow")?;
+        let mut persisted = state.clone();
+        persisted.integrity = Some(JournalIntegrity {
+            revision,
+            tag: String::new(),
+        });
+        let payload = journal_authentication_payload(&persisted)?;
+        let state_digest = journal_payload_digest(&payload);
+        let signature = hmac::sign(&hmac::Key::new(HMAC_SHA256, &self.key[..]), &payload);
+        persisted
+            .integrity
+            .as_mut()
+            .context("transaction journal integrity record disappeared")?
+            .tag = hex::encode(signature.as_ref());
+        let contents = serde_json::to_vec_pretty(&persisted)
+            .context("serialize authenticated transaction journal")?;
+        store.write_transaction_journal(&contents)?;
+
+        *state = persisted;
+        self.revision = revision;
+        self.authenticated_digest = Some(state_digest);
+        self.sync_checkpoint(store)?;
+        Ok(contents.len())
+    }
+}
+
+fn journal_authentication_payload(state: &JournalState) -> Result<Vec<u8>> {
+    let mut authenticated = state.clone();
+    authenticated
+        .integrity
+        .as_mut()
+        .context("transaction journal has no integrity record to authenticate")?
+        .tag
+        .clear();
+    let canonical = serde_json::to_value(&authenticated)
+        .context("canonicalize transaction journal for authentication")?;
+    serde_json::to_vec(&canonical).context("serialize transaction journal authentication payload")
+}
+
+fn journal_payload_digest(payload: &[u8]) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, payload);
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(digest.as_ref());
+    output
+}
+
+fn retain_closed_session_history(state: &mut JournalState, session: Option<SpendingSession>) {
+    let Some(mut session) = session else {
+        return;
+    };
+    if state
+        .session_history
+        .iter()
+        .any(|existing| existing.id == session.id)
+    {
+        return;
+    }
+    session.closed = true;
+    state.session_history.push(session);
+}
+
 fn zero_wei_string() -> String {
     "0".to_owned()
 }
@@ -391,6 +671,26 @@ fn migrate_journal(
 ) -> Result<(JournalState, bool)> {
     if state.version == JOURNAL_VERSION {
         return Ok((state, false));
+    }
+    if matches!(state.version, 7 | 8) {
+        if state
+            .active_session
+            .iter()
+            .chain(state.session_history.iter())
+            .any(|session| session.authorized_exposure_wei.is_none())
+            || state
+                .pending_session_transition
+                .as_ref()
+                .and_then(|transition| transition.previous_session.as_ref())
+                .is_some_and(|session| session.authorized_exposure_wei.is_none())
+        {
+            bail!(
+                "legacy journal schema {} is missing its cumulative authorization counter; restore an intact trusted journal backup before mining or recovery",
+                state.version
+            );
+        }
+        state.version = JOURNAL_VERSION;
+        return Ok((state, true));
     }
     if state.version == 6 {
         state.version = JOURNAL_VERSION;
@@ -481,11 +781,221 @@ fn reward_payout_id(contract: Address, window_id: u64, wallet: Address) -> Strin
 pub struct TransactionJournal {
     store: ConfigStore,
     state: JournalState,
+    authenticator: JournalAuthenticator,
     _lock: File,
     history_telemetry: Arc<HistoryTelemetry>,
 }
 
 impl TransactionJournal {
+    pub(crate) fn unresolved_transactions(&self) -> Vec<UnresolvedTransactionSummary> {
+        self.state
+            .entries
+            .iter()
+            .filter(|entry| entry.status.is_unresolved())
+            .map(|entry| UnresolvedTransactionSummary {
+                hash: entry.transaction_hash.clone(),
+                node_id: entry.node_id,
+                window_id: entry.window_id,
+                status: format!("{:?}", entry.status),
+            })
+            .collect()
+    }
+
+    pub(crate) fn inspect_session(
+        store: &ConfigStore,
+        config: &AppConfig,
+    ) -> Result<SessionJournalSnapshot> {
+        let _lock = store.lock_transaction_journal()?;
+        Self::inspect_session_locked(store, config)
+    }
+
+    pub(crate) fn inspect_session_and_lock(
+        store: &ConfigStore,
+        config: &AppConfig,
+    ) -> Result<(SessionJournalSnapshot, File)> {
+        let lock = store.lock_transaction_journal()?;
+        let snapshot = Self::inspect_session_locked(store, config)?;
+        Ok((snapshot, lock))
+    }
+
+    fn inspect_session_locked(
+        store: &ConfigStore,
+        config: &AppConfig,
+    ) -> Result<SessionJournalSnapshot> {
+        let Some(contents) = store.read_transaction_journal()? else {
+            JournalAuthenticator::for_empty_journal(store)?;
+            return Ok(SessionJournalSnapshot::default());
+        };
+        let state: JournalState =
+            serde_json::from_slice(&contents).context("decode transaction journal")?;
+        let source_version = state.version;
+        let mut authenticator = JournalAuthenticator::for_existing_journal(store, &state)?;
+        let wallet = state
+            .active_session
+            .as_ref()
+            .and_then(|session| (!session.wallet.is_empty()).then_some(session.wallet.as_str()))
+            .or_else(|| {
+                state
+                    .entries
+                    .iter()
+                    .find_map(|entry| (!entry.wallet.is_empty()).then_some(entry.wallet.as_str()))
+            })
+            .or_else(|| {
+                state.session_history.iter().rev().find_map(|session| {
+                    (!session.wallet.is_empty()).then_some(session.wallet.as_str())
+                })
+            })
+            .or(config.wallet_address.as_deref())
+            .map(Address::from_str)
+            .transpose()
+            .context("transaction journal wallet address is invalid")?
+            .context("transaction journal recovery requires the original wallet address")?;
+        let (mut state, migrated) =
+            migrate_journal(state, wallet, config.transaction_confirmations)?;
+        validate_archive_ledger(store, &state, None)?;
+        let mut changed = initialize_session_accounting(
+            store,
+            &mut state,
+            source_version <= 6,
+            source_version <= 6,
+        )?;
+        if migrated {
+            changed |= seal_unanchored_session_allowances(&mut state)?;
+            changed |= initialize_legacy_history_accounting(&mut state, source_version)?;
+        }
+        validate_journal(&state)?;
+        authenticator.sync_checkpoint(store)?;
+        if migrated || changed {
+            authenticator.persist(store, &mut state)?;
+        }
+
+        let active_session = state.active_session.as_ref();
+        let session_wallet = active_session
+            .and_then(|session| (!session.wallet.is_empty()).then_some(session.wallet.clone()))
+            .or_else(|| {
+                state
+                    .entries
+                    .iter()
+                    .find_map(|entry| (!entry.wallet.is_empty()).then_some(entry.wallet.clone()))
+            })
+            .or_else(|| {
+                state.session_history.iter().rev().find_map(|session| {
+                    (!session.wallet.is_empty()).then_some(session.wallet.clone())
+                })
+            })
+            .unwrap_or_else(|| format!("{wallet:#x}"));
+        let authorized = active_session
+            .and_then(|session| session.authorized_exposure_wei.as_deref())
+            .map(parse_decimal_wei)
+            .transpose()?
+            .unwrap_or(U256::ZERO);
+        let has_prior_session_history = !state.session_history.is_empty()
+            || !state.entries.is_empty()
+            || !state.archives.is_empty()
+            || !authorized.is_zero();
+        let unresolved = state
+            .entries
+            .iter()
+            .filter(|entry| entry.status.is_unresolved())
+            .map(|entry| UnresolvedTransactionSummary {
+                hash: entry.transaction_hash.clone(),
+                node_id: entry.node_id,
+                window_id: entry.window_id,
+                status: format!("{:?}", entry.status),
+            })
+            .collect();
+        Ok(SessionJournalSnapshot {
+            session_id: active_session.map(|session| session.id.clone()),
+            wallet: Some(session_wallet),
+            limit_wei: active_session.map(|session| session.limit_wei.clone()),
+            authorized_exposure_wei: active_session
+                .and_then(|session| session.authorized_exposure_wei.clone()),
+            closed: active_session.is_none_or(|session| session.closed),
+            has_prior_session_history,
+            unresolved,
+            pending_transition: state.pending_session_transition.as_ref().map(|pending| {
+                PendingSessionTransitionSummary {
+                    previous_config_limit_inj: pending.previous_config_limit_inj.clone(),
+                    proposed_config_limit_inj: pending.proposed_config_limit_inj.clone(),
+                }
+            }),
+        })
+    }
+
+    pub(crate) fn resolve_pending_session_transition(
+        store: &ConfigStore,
+        config: &mut AppConfig,
+        complete: bool,
+    ) -> Result<bool> {
+        let _lock = store.lock_transaction_journal()?;
+        let Some(contents) = store.read_transaction_journal()? else {
+            return Ok(false);
+        };
+        let mut state: JournalState =
+            serde_json::from_slice(&contents).context("decode transaction journal")?;
+        let mut authenticator = JournalAuthenticator::for_existing_journal(store, &state)?;
+        let Some(pending) = state.pending_session_transition.clone() else {
+            return Ok(false);
+        };
+        validate_journal(&state)?;
+        validate_archive_ledger(store, &state, None)?;
+        if state
+            .entries
+            .iter()
+            .any(|entry| entry.status.is_unresolved())
+            || state.pending_authorization.is_some()
+            || state
+                .entries
+                .iter()
+                .any(|entry| entry.session_id == pending.new_session_id)
+        {
+            bail!(
+                "interrupted spending-session change has transaction activity; use read-only recovery before resolving it"
+            );
+        }
+        if state
+            .active_session
+            .as_ref()
+            .is_none_or(|session| session.id != pending.new_session_id)
+        {
+            bail!("interrupted spending-session change no longer matches the journal session");
+        }
+
+        let restore_session = if complete {
+            let session_wallet = state
+                .active_session
+                .as_ref()
+                .filter(|session| !session.wallet.is_empty())
+                .map(|session| session.wallet.as_str())
+                .context("interrupted spending-session change has no selected wallet")?;
+            let session_wallet = Address::from_str(session_wallet)
+                .context("interrupted spending-session wallet is invalid")?;
+            config.per_session_spending_limit_inj = pending.proposed_config_limit_inj.clone();
+            config.wallet_address = Some(format!("{session_wallet:#x}"));
+            false
+        } else {
+            config.per_session_spending_limit_inj = pending.previous_config_limit_inj.clone();
+            config.wallet_address = pending
+                .previous_session
+                .as_ref()
+                .filter(|session| !session.wallet.is_empty())
+                .map(|session| session.wallet.clone())
+                .or_else(|| pending.previous_config_wallet.clone());
+            true
+        };
+        config.validate()?;
+        store.save(config)?;
+        if restore_session {
+            state.active_session = pending.previous_session;
+        } else {
+            retain_closed_session_history(&mut state, pending.previous_session);
+        }
+        state.pending_session_transition = None;
+        validate_journal(&state)?;
+        authenticator.persist(store, &mut state)?;
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub fn open(store: &ConfigStore, config: &AppConfig, wallet: Address) -> Result<Self> {
         Self::open_with_history_telemetry(
@@ -514,19 +1024,71 @@ impl TransactionJournal {
         authorize_new_session: bool,
         force_new_session: bool,
     ) -> Result<Self> {
+        Self::open_internal(
+            store,
+            config,
+            wallet,
+            history_telemetry,
+            authorize_new_session,
+            force_new_session,
+            None,
+        )
+    }
+
+    pub(crate) fn open_for_init_session_transition(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        previous_config_limit_inj: String,
+        previous_config_wallet: Option<String>,
+    ) -> Result<Self> {
+        Self::open_internal(
+            store,
+            config,
+            wallet,
+            Arc::new(HistoryTelemetry::default()),
+            true,
+            true,
+            Some((previous_config_limit_inj, previous_config_wallet)),
+        )
+    }
+
+    fn open_internal(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        history_telemetry: Arc<HistoryTelemetry>,
+        authorize_new_session: bool,
+        force_new_session: bool,
+        transition_previous_config: Option<(String, Option<String>)>,
+    ) -> Result<Self> {
         let _open_timer = history_telemetry.timer(HistoryDuration::JournalOpen);
         if config.network != Network::Testnet {
             bail!("transaction signing is disabled outside Injective Testnet");
         }
         let limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
         let lock = store.lock_transaction_journal()?;
-        let state = match store.read_transaction_journal()? {
-            Some(contents) => serde_json::from_slice::<JournalState>(&contents)
-                .context("decode transaction journal")?,
-            None => JournalState::default(),
+        let (state, mut authenticator, source_version) = match store.read_transaction_journal()? {
+            Some(contents) => {
+                let state = serde_json::from_slice::<JournalState>(&contents)
+                    .context("decode transaction journal")?;
+                let source_version = state.version;
+                let authenticator = JournalAuthenticator::for_existing_journal(store, &state)?;
+                (state, authenticator, source_version)
+            }
+            None => (
+                JournalState::default(),
+                JournalAuthenticator::for_empty_journal(store)?,
+                JOURNAL_VERSION,
+            ),
         };
         let (mut state, mut migrated) =
             migrate_journal(state, wallet, config.transaction_confirmations)?;
+        if state.pending_session_transition.is_some() {
+            bail!(
+                "an interrupted spending-session change must be resolved by `astatine init` before mining"
+            );
+        }
         let archive_validation = {
             let _archive_validation_timer =
                 history_telemetry.timer(HistoryDuration::ArchiveValidation);
@@ -536,8 +1098,18 @@ impl TransactionJournal {
             history_telemetry.add(HistoryCounter::ArchiveValidationFailures, 1);
             return Err(error);
         }
-        migrated |= initialize_session_accounting(store, &mut state)?;
+        migrated |= initialize_session_accounting(
+            store,
+            &mut state,
+            source_version <= 6,
+            source_version <= 6,
+        )?;
+        if source_version < JOURNAL_VERSION {
+            migrated |= seal_unanchored_session_allowances(&mut state)?;
+            migrated |= initialize_legacy_history_accounting(&mut state, source_version)?;
+        }
         validate_journal(&state)?;
+        authenticator.sync_checkpoint(store)?;
         if state.pending_authorization.take().is_some() {
             // The raw signature is never broadcast until its hash and full intent
             // are persisted. An orphan reservation can therefore be retired on
@@ -548,12 +1120,28 @@ impl TransactionJournal {
         let mut journal = Self {
             store: store.clone(),
             state,
+            authenticator,
             _lock: lock,
             history_telemetry: Arc::clone(&history_telemetry),
         };
+        let previous_session = journal.state.active_session.clone();
         let has_unresolved = journal.has_unresolved();
         if force_new_session && has_unresolved {
             bail!("cannot start a new spending session while a transaction is unresolved");
+        }
+        if !authorize_new_session
+            && journal
+                .state
+                .active_session
+                .as_ref()
+                .is_some_and(|session| {
+                    Address::from_str(&session.wallet)
+                        .is_ok_and(|session_wallet| session_wallet != wallet)
+                })
+        {
+            bail!(
+                "active spending session is bound to a different wallet; explicitly confirm a new session before changing its wallet"
+            );
         }
         let has_active_entries = journal
             .state
@@ -566,7 +1154,8 @@ impl TransactionJournal {
                     .iter()
                     .any(|entry| entry.session_id == session.id)
             });
-        let has_prior_authorization = !journal.state.entries.is_empty()
+        let has_prior_session_history = !journal.state.session_history.is_empty()
+            || !journal.state.entries.is_empty()
             || !journal.state.archives.is_empty()
             || journal
                 .state
@@ -604,11 +1193,13 @@ impl TransactionJournal {
         if force_new_session {
             resume_session = false;
         }
-        if !limit.is_zero() && !resume_session && has_prior_authorization && !authorize_new_session
-        {
-            bail!(
-                "a previous spending session already has signed transaction authorizations; use `astatine mine --new-session` to explicitly begin a separate session"
-            );
+        if !limit.is_zero() && !resume_session && !authorize_new_session {
+            if has_prior_session_history {
+                bail!(
+                    "previous spending-session or transaction authorization history exists; use `astatine mine --new-session` to explicitly begin a separate session"
+                );
+            }
+            bail!("a new positive spending session requires explicit authorization");
         }
         if resume_session {
             if !limit.is_zero()
@@ -628,27 +1219,123 @@ impl TransactionJournal {
                 closed: false,
             });
         }
+        if let Some((previous_config_limit_inj, previous_config_wallet)) =
+            transition_previous_config
+        {
+            if has_unresolved {
+                bail!(
+                    "cannot change the spending limit while a previous transaction is unresolved; run `astatine recover` first"
+                );
+            }
+            let session = journal
+                .state
+                .active_session
+                .as_ref()
+                .context("new spending session was not created for the approved transition")?;
+            journal.state.pending_session_transition = Some(PendingSessionTransition {
+                previous_config_limit_inj,
+                previous_config_wallet,
+                proposed_config_limit_inj: config.per_session_spending_limit_inj.clone(),
+                previous_session,
+                new_session_id: session.id.clone(),
+            });
+        } else if !limit.is_zero() && !resume_session {
+            retain_closed_session_history(&mut journal.state, previous_session);
+        }
         if migrated || (!limit.is_zero() && !resume_session) {
             journal.persist()?;
         }
         Ok(journal)
     }
 
-    fn persist(&self) -> Result<()> {
+    pub(crate) fn finish_init_session_transition(&mut self, config: &AppConfig) -> Result<()> {
+        let pending = self
+            .state
+            .pending_session_transition
+            .clone()
+            .context("transaction journal has no pending init session transition")?;
+        let session = self
+            .state
+            .active_session
+            .as_ref()
+            .context("pending init session transition has no active session")?;
+        if session.id != pending.new_session_id
+            || parse_inj_wei(&config.per_session_spending_limit_inj)?
+                != parse_inj_wei(&pending.proposed_config_limit_inj)?
+            || config
+                .wallet_address
+                .as_deref()
+                .and_then(|value| Address::from_str(value).ok())
+                .is_none_or(|wallet| Address::from_str(&session.wallet).ok() != Some(wallet))
+        {
+            bail!(
+                "init spending-session transition does not match the saved wallet and spending-limit configuration"
+            );
+        }
+        if self.has_unresolved()
+            || self
+                .state
+                .entries
+                .iter()
+                .any(|entry| entry.session_id == pending.new_session_id)
+            || self.state.pending_authorization.is_some()
+        {
+            bail!("new spending session acquired transaction activity before init committed");
+        }
+        retain_closed_session_history(&mut self.state, pending.previous_session);
+        self.state.pending_session_transition = None;
+        self.persist()
+    }
+
+    pub(crate) fn rollback_init_session_transition(
+        &mut self,
+        config: &mut AppConfig,
+    ) -> Result<()> {
+        let pending = self
+            .state
+            .pending_session_transition
+            .clone()
+            .context("transaction journal has no pending init session transition")?;
+        if self.has_unresolved()
+            || self
+                .state
+                .entries
+                .iter()
+                .any(|entry| entry.session_id == pending.new_session_id)
+            || self.state.pending_authorization.is_some()
+        {
+            bail!("cannot roll back an init session transition after transaction activity");
+        }
+        config.per_session_spending_limit_inj = pending.previous_config_limit_inj;
+        config.wallet_address = pending
+            .previous_session
+            .as_ref()
+            .filter(|session| !session.wallet.is_empty())
+            .map(|session| session.wallet.clone())
+            .or(pending.previous_config_wallet);
+        config.validate()?;
+        self.store.save(config)?;
+        self.state.active_session = pending.previous_session;
+        self.state.pending_session_transition = None;
+        self.persist()
+    }
+
+    fn persist(&mut self) -> Result<()> {
         let _persist_timer = self
             .history_telemetry
             .timer(HistoryDuration::JournalPersistence);
-        let contents =
-            serde_json::to_vec_pretty(&self.state).context("serialize transaction journal")?;
-        if let Err(error) = self.store.write_transaction_journal(&contents) {
-            self.history_telemetry
-                .add(HistoryCounter::JournalWriteFailures, 1);
-            return Err(error);
-        }
+        let bytes = match self.authenticator.persist(&self.store, &mut self.state) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.history_telemetry
+                    .add(HistoryCounter::JournalWriteFailures, 1);
+                return Err(error);
+            }
+        };
         self.history_telemetry.add(HistoryCounter::JournalWrites, 1);
         self.history_telemetry.add(
             HistoryCounter::JournalWriteBytes,
-            u64::try_from(contents.len()).unwrap_or(u64::MAX),
+            u64::try_from(bytes).unwrap_or(u64::MAX),
         );
         Ok(())
     }
@@ -1847,7 +2534,7 @@ impl TransactionJournal {
             .next_archive_sequence
             .checked_add(1)
             .context("archive sequence overflow")?;
-        initialize_session_accounting(&self.store, &mut self.state)?;
+        initialize_session_accounting(&self.store, &mut self.state, false, false)?;
         self.persist()?;
         Ok(entries.len())
     }
@@ -1905,6 +2592,7 @@ fn set_forwarding_source_status(
 
 pub struct TransactionManager {
     pub journal: TransactionJournal,
+    read_only_recovery: bool,
     wallet: Address,
     ast_token: Address,
     chain_id: u64,
@@ -2087,6 +2775,7 @@ impl TransactionManager {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn open_with_session_authorization(
         store: &ConfigStore,
         config: &AppConfig,
@@ -2106,7 +2795,36 @@ impl TransactionManager {
         )
     }
 
-    fn open_with_session_policy(
+    pub(crate) fn open_for_read_only_recovery(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        ast_token: Address,
+        history_telemetry: Arc<HistoryTelemetry>,
+    ) -> Result<Self> {
+        let summary = TransactionJournal::inspect_session(store, config)?;
+        if summary.pending_transition.is_some() {
+            bail!("a spending-session change is interrupted; run `astatine init` before recovery");
+        }
+        let mut recovery_config = config.clone();
+        if let Some(limit_wei) = summary.limit_wei {
+            recovery_config.per_session_spending_limit_inj =
+                wei_as_inj(parse_decimal_wei(&limit_wei)?);
+        }
+        let mut manager = Self::open_with_session_policy(
+            store,
+            &recovery_config,
+            wallet,
+            ast_token,
+            history_telemetry,
+            false,
+            false,
+        )?;
+        manager.read_only_recovery = true;
+        Ok(manager)
+    }
+
+    pub(crate) fn open_with_session_policy(
         store: &ConfigStore,
         config: &AppConfig,
         wallet: Address,
@@ -2125,6 +2843,7 @@ impl TransactionManager {
         )?;
         Ok(Self {
             journal,
+            read_only_recovery: false,
             wallet,
             ast_token,
             chain_id: 1439,
@@ -2376,7 +3095,7 @@ impl TransactionManager {
                 )
         }) {
             self.report_warning(
-                "a legacy automatic AST forwarding intent remains in the journal; Testnet.13 will only monitor existing transfers and will not sign or broadcast new ones",
+                "a legacy automatic AST forwarding intent remains in the journal; Testnet.14 will only monitor existing transfers and will not sign or broadcast new ones",
             );
         }
         Ok(())
@@ -3326,12 +4045,20 @@ impl TransactionManager {
         }
     }
 
+    fn require_signing_enabled(&self) -> Result<()> {
+        if self.read_only_recovery {
+            bail!("read-only transaction recovery cannot sign or broadcast transactions");
+        }
+        Ok(())
+    }
+
     pub async fn submit_proof(
         &mut self,
         client: &NetworkClient,
         signer: &SigningKey,
         submission: ProofSubmission,
     ) -> Result<ConfirmedAction> {
+        self.require_signing_enabled()?;
         if signer_address(signer) != self.wallet {
             self.record_proof_metric(submission.node_id, ProofMetric::SignerIdentityMismatch);
             bail!("unlocked signer does not match the configured wallet");
@@ -3374,6 +4101,7 @@ impl TransactionManager {
         node_id: u8,
         window_id: u64,
     ) -> Result<ConfirmedAction> {
+        self.require_signing_enabled()?;
         if signer_address(signer) != self.wallet {
             bail!("unlocked signer does not match the configured wallet");
         }
@@ -3440,6 +4168,7 @@ impl TransactionManager {
         value: U256,
         data: Vec<u8>,
     ) -> Result<ConfirmedAction> {
+        self.require_signing_enabled()?;
         if intent.action == TransactionAction::ForwardReward {
             bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
         }
@@ -4592,10 +5321,21 @@ fn validate_journal(state: &JournalState) -> Result<()> {
     if state.version != JOURNAL_VERSION {
         bail!("transaction journal schema is unsupported");
     }
+    if let Some(integrity) = &state.integrity {
+        let invalid_tag = match hex::decode(&integrity.tag) {
+            Ok(tag) => tag.len() != 32,
+            Err(_) => true,
+        };
+        if integrity.revision == 0 || invalid_tag {
+            bail!("transaction journal integrity record is invalid");
+        }
+    }
+    let mut session_ids = HashSet::new();
     if let Some(session) = &state.active_session {
         if session.id.is_empty() {
             bail!("transaction journal session ID is empty");
         }
+        session_ids.insert(session.id.as_str());
         if !session.wallet.is_empty() {
             Address::from_str(&session.wallet)
                 .context("journal session wallet address is invalid")?;
@@ -4622,6 +5362,74 @@ fn validate_journal(state: &JournalState) -> Result<()> {
                 .context("journal session has no RPC-reported actual-cost counter")?,
         )
         .context("journal session RPC-reported actual-cost counter is invalid")?;
+    }
+    for session in &state.session_history {
+        if session.id.is_empty() || !session_ids.insert(session.id.as_str()) {
+            bail!("transaction journal session history has an empty or duplicate session ID");
+        }
+        if !session.closed {
+            bail!("transaction journal session history contains an open session");
+        }
+        Address::from_str(&session.wallet)
+            .context("historical session wallet address is invalid")?;
+        parse_decimal_wei(&session.limit_wei)
+            .context("historical session spending limit is invalid")?;
+        parse_decimal_wei(
+            session
+                .authorized_exposure_wei
+                .as_deref()
+                .context("historical session has no cumulative authorization counter")?,
+        )
+        .context("historical session authorization counter is invalid")?;
+        parse_decimal_wei(
+            session
+                .reported_actual_wei
+                .as_deref()
+                .context("historical session has no RPC-reported actual-cost counter")?,
+        )
+        .context("historical session RPC-reported actual-cost counter is invalid")?;
+    }
+    if let Some(transition) = &state.pending_session_transition {
+        parse_inj_wei(&transition.previous_config_limit_inj)
+            .context("pending session transition has an invalid previous limit")?;
+        let proposed_limit = parse_inj_wei(&transition.proposed_config_limit_inj)
+            .context("pending session transition has an invalid proposed limit")?;
+        let session = state
+            .active_session
+            .as_ref()
+            .context("pending session transition has no active session")?;
+        if transition.new_session_id.is_empty()
+            || transition.new_session_id != session.id
+            || parse_decimal_wei(&session.limit_wei)? != proposed_limit
+            || !parse_decimal_wei(
+                session
+                    .authorized_exposure_wei
+                    .as_deref()
+                    .context("pending session has no authorization counter")?,
+            )?
+            .is_zero()
+        {
+            bail!("pending session transition does not match its new session");
+        }
+        if let Some(previous) = &transition.previous_session {
+            if previous.id == transition.new_session_id {
+                bail!("pending session transition reuses the previous session ID");
+            }
+            parse_decimal_wei(&previous.limit_wei)
+                .context("pending session transition has an invalid prior session limit")?;
+        }
+        if state.pending_authorization.is_some()
+            || state
+                .entries
+                .iter()
+                .any(|entry| entry.status.is_unresolved())
+            || state
+                .entries
+                .iter()
+                .any(|entry| entry.session_id == transition.new_session_id)
+        {
+            bail!("pending session transition overlaps transaction activity");
+        }
     }
     if let Some(pending) = &state.pending_authorization {
         B256::from_str(&pending.request_hash)
@@ -5176,7 +5984,10 @@ fn validate_archive_ledger(
         }
         let archive_state = JournalState {
             version: JOURNAL_VERSION,
+            integrity: None,
             active_session: None,
+            pending_session_transition: None,
+            session_history: Vec::new(),
             entries: archive.entries.clone(),
             pending_authorization: None,
             proof_attempted_through: state.proof_attempted_through.clone(),
@@ -5240,7 +6051,12 @@ fn validate_archive_ledger(
     Ok(())
 }
 
-fn initialize_session_accounting(store: &ConfigStore, state: &mut JournalState) -> Result<bool> {
+fn initialize_session_accounting(
+    store: &ConfigStore,
+    state: &mut JournalState,
+    allow_missing_authorization: bool,
+    repair_underreported_authorization: bool,
+) -> Result<bool> {
     let Some(session_id) = state
         .active_session
         .as_ref()
@@ -5297,11 +6113,21 @@ fn initialize_session_accounting(store: &ConfigStore, state: &mut JournalState) 
             let recorded =
                 parse_decimal_wei(recorded).context("session authorization counter is invalid")?;
             if recorded < authorized {
+                if !repair_underreported_authorization {
+                    bail!(
+                        "session authorization counter is below preserved transaction exposure; refusing to repair a potentially rolled-back allowance"
+                    );
+                }
                 session.authorized_exposure_wei = Some(authorized.to_string());
                 changed = true;
             }
         }
         None => {
+            if !allow_missing_authorization {
+                bail!(
+                    "active session is missing its mandatory cumulative authorization counter; refusing to initialize it as zero"
+                );
+            }
             session.authorized_exposure_wei = Some(authorized.to_string());
             changed = true;
         }
@@ -5318,6 +6144,78 @@ fn initialize_session_accounting(store: &ConfigStore, state: &mut JournalState) 
         }
         None => {
             session.reported_actual_wei = Some(reported_actual.to_string());
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn seal_unanchored_session_allowances(state: &mut JournalState) -> Result<bool> {
+    if let Some(previous) = state
+        .pending_session_transition
+        .as_mut()
+        .and_then(|transition| transition.previous_session.as_mut())
+    {
+        let has_unresolved = state
+            .entries
+            .iter()
+            .any(|entry| entry.session_id == previous.id && entry.status.is_unresolved());
+        return seal_legacy_session_allowance(previous, has_unresolved);
+    }
+    let Some(session) = state.active_session.as_mut() else {
+        return Ok(false);
+    };
+    let has_unresolved = state
+        .entries
+        .iter()
+        .any(|entry| entry.session_id == session.id && entry.status.is_unresolved());
+    seal_legacy_session_allowance(session, has_unresolved)
+}
+
+fn seal_legacy_session_allowance(
+    session: &mut SpendingSession,
+    has_unresolved: bool,
+) -> Result<bool> {
+    let limit = parse_decimal_wei(&session.limit_wei)
+        .context("legacy session spending limit is invalid")?;
+    if limit.is_zero() {
+        return Ok(false);
+    }
+    let recorded = session
+        .authorized_exposure_wei
+        .as_deref()
+        .context("legacy paid session has no reconstructed authorization counter")
+        .and_then(parse_decimal_wei)?;
+    let conservative = recorded.max(limit);
+    let mut changed = false;
+    if recorded < conservative {
+        session.authorized_exposure_wei = Some(conservative.to_string());
+        changed = true;
+    }
+    if !has_unresolved && !session.closed {
+        session.closed = true;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn initialize_legacy_history_accounting(
+    state: &mut JournalState,
+    source_version: u32,
+) -> Result<bool> {
+    if source_version > 6 {
+        return Ok(false);
+    }
+    let mut changed = false;
+    for session in &mut state.session_history {
+        if session.authorized_exposure_wei.is_none() {
+            let limit = parse_decimal_wei(&session.limit_wei)
+                .context("legacy historical session spending limit is invalid")?;
+            session.authorized_exposure_wei = Some(limit.to_string());
+            changed = true;
+        }
+        if session.reported_actual_wei.is_none() {
+            session.reported_actual_wei = Some("0".to_owned());
             changed = true;
         }
     }
@@ -5464,6 +6362,18 @@ fn parse_decimal_wei(value: &str) -> Result<U256> {
     U256::from_str_radix(value, 10).context("transaction journal amount is not decimal wei")
 }
 
+fn wei_as_inj(value: U256) -> String {
+    let scale = U256::from(10_u8).pow(U256::from(18_u8));
+    let whole = value / scale;
+    let fractional = format!("{:0>18}", (value % scale));
+    let fractional = fractional.trim_end_matches('0');
+    if fractional.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fractional}")
+    }
+}
+
 fn new_session_id() -> String {
     let mut bytes = [0_u8; 16];
     thread_rng().fill_bytes(&mut bytes);
@@ -5489,7 +6399,7 @@ mod tests {
         TransactionManager, TransactionPolicyRefusalKind, TransactionStatus, encode_rlp_list,
         entry_hash, maximum_transaction_exposure, parse_decimal_wei, reward_scan_key, rlp_bytes,
         rlp_u64, rlp_u256, run_reward_scan_batch, sign_eip1559, transaction_policy_refusal,
-        unix_time_secs, validate_archive_ledger, validate_transaction_binding,
+        unix_time_secs, validate_archive_ledger, validate_journal, validate_transaction_binding,
         verify_finalization_events, verify_submission_events,
     };
     use crate::{
@@ -5498,9 +6408,8 @@ mod tests {
         contracts::{AstatineMinerRead, IERC20Read},
         diagnostics::DiagnosticBuffer,
         mining::{
-            ActiveBackend, DashboardContext, FinalizationOptions, MiningProbe, NodeSlot,
-            ObserverUpdate, finalize_initial_expired_windows, start_read_only_observer,
-            update_slots,
+            ActiveBackend, DashboardContext, MiningProbe, NodeSlot, ObserverRefreshHandle,
+            ObserverUpdate, start_read_only_observer, update_slots,
         },
         proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
         protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
@@ -5517,7 +6426,7 @@ mod tests {
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         num::NonZeroUsize,
-        path::PathBuf,
+        path::{Path, PathBuf},
         process::{Child, Command, Stdio},
         str::FromStr,
         sync::{
@@ -5647,6 +6556,84 @@ mod tests {
             confirmations_required: 2,
             created_unix_secs: window_id,
         }
+    }
+
+    fn sync_test_active_authorization(journal: &mut TransactionJournal) -> anyhow::Result<()> {
+        let session = journal
+            .state
+            .active_session
+            .as_ref()
+            .context("test journal has no active session")?;
+        let session_id = session.id.clone();
+        let recorded = session
+            .authorized_exposure_wei
+            .as_deref()
+            .map(parse_decimal_wei)
+            .transpose()?
+            .unwrap_or(U256::ZERO);
+        let mut total = U256::ZERO;
+        for entry in &journal.state.entries {
+            if entry.session_id == session_id {
+                total = total
+                    .checked_add(parse_decimal_wei(&entry.maximum_exposure_wei)?)
+                    .context("test journal authorization total overflow")?;
+            }
+        }
+        for meta in &journal.state.archives {
+            let contents = journal.store.read_transaction_archive(&meta.file_name)?;
+            let archive: super::JournalArchive = serde_json::from_slice(&contents)?;
+            for entry in archive.entries {
+                if entry.session_id == session_id {
+                    total = total
+                        .checked_add(parse_decimal_wei(&entry.maximum_exposure_wei)?)
+                        .context("test archive authorization total overflow")?;
+                }
+            }
+        }
+        if let Some(pending) = &journal.state.pending_authorization
+            && pending.session_id == session_id
+        {
+            total = total
+                .checked_add(parse_decimal_wei(&pending.maximum_exposure_wei)?)
+                .context("test pending authorization total overflow")?;
+        }
+        journal
+            .state
+            .active_session
+            .as_mut()
+            .context("test journal has no active session")?
+            .authorized_exposure_wei = Some(recorded.max(total).to_string());
+        Ok(())
+    }
+
+    fn write_legacy_journal(
+        store: &ConfigStore,
+        state: &mut serde_json::Value,
+    ) -> anyhow::Result<()> {
+        state
+            .as_object_mut()
+            .context("test legacy journal is not an object")?
+            .remove("integrity");
+        store.clear_journal_anchor_for_test()?;
+        store.write_transaction_journal(&serde_json::to_vec(state)?)
+    }
+
+    fn copy_test_data_root(source: &Path, destination: &Path) -> anyhow::Result<()> {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                copy_test_data_root(&source_path, &destination_path)?;
+            } else if file_type.is_file() {
+                std::fs::copy(source_path, destination_path)?;
+            } else {
+                anyhow::bail!("test data root contains an unsupported file type");
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -6256,6 +7243,7 @@ mod tests {
             )
         }));
         manager.journal.state.entries = entries;
+        sync_test_active_authorization(&mut manager.journal).unwrap();
         manager
             .journal
             .state
@@ -6280,6 +7268,128 @@ mod tests {
         assert_eq!(
             restarted.journal.state.archives[0].entry_count,
             archived as u32
+        );
+    }
+
+    #[test]
+    fn testnet13_v7_journal_requires_a_fresh_approval_after_authenticated_migration() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let wallet = Address::with_last_byte(0x76);
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            wallet_address: Some(format!("{wallet:#x}")),
+            ..AppConfig::default()
+        };
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        journal
+            .state
+            .active_session
+            .as_mut()
+            .unwrap()
+            .authorized_exposure_wei = Some("123456789".to_owned());
+        journal.state.version = 7;
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&journal.state).unwrap()).unwrap();
+        drop(journal);
+        write_legacy_journal(&store, &mut legacy).unwrap();
+
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert_eq!(snapshot.session_id.as_deref(), Some(session_id.as_str()));
+        assert!(snapshot.closed);
+        assert!(snapshot.has_prior_session_history);
+        assert_eq!(
+            snapshot.authorized_exposure_wei.as_deref(),
+            Some("1000000000000000000")
+        );
+        let error = match TransactionJournal::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        ) {
+            Ok(_) => panic!("migrated v7 authorization must require a deliberate new session"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("--new-session"));
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        assert_eq!(migrated["version"], JOURNAL_VERSION);
+        assert_eq!(
+            migrated["active_session"]["authorized_exposure_wei"],
+            "1000000000000000000"
+        );
+        assert_eq!(migrated["active_session"]["closed"], true);
+    }
+
+    #[test]
+    fn v8_closed_history_only_migration_preserves_counter_and_requires_new_session_approval() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let wallet = Address::with_last_byte(0x6f);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "0.5".to_owned(),
+            ..AppConfig::default()
+        };
+        const RECORDED_AUTHORIZATION: &str = "123456789012345678";
+        const REPORTED_ACTUAL: &str = "9876543210000000";
+
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let mut closed_history = journal.state.active_session.take().unwrap();
+        let session_id = closed_history.id.clone();
+        closed_history.closed = true;
+        closed_history.authorized_exposure_wei = Some(RECORDED_AUTHORIZATION.to_owned());
+        closed_history.reported_actual_wei = Some(REPORTED_ACTUAL.to_owned());
+        journal.state.session_history.push(closed_history);
+        let mut v8: serde_json::Value = serde_json::to_value(&journal.state).unwrap();
+        v8["version"] = serde_json::json!(8);
+        drop(journal);
+        write_legacy_journal(&store, &mut v8).unwrap();
+
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(snapshot.session_id.is_none());
+        assert!(snapshot.closed);
+        assert!(snapshot.has_prior_session_history);
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        assert_eq!(migrated["version"], JOURNAL_VERSION);
+        assert!(migrated["active_session"].is_null());
+        assert_eq!(migrated["session_history"][0]["id"], session_id);
+        assert_eq!(
+            migrated["session_history"][0]["authorized_exposure_wei"], RECORDED_AUTHORIZATION,
+            "migration must retain the closed history counter instead of charging its limit"
+        );
+        assert_eq!(
+            migrated["session_history"][0]["reported_actual_wei"], REPORTED_ACTUAL,
+            "RPC-reported actual cost remains separate from authorized exposure"
+        );
+
+        let error = match TransactionManager::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            Address::with_last_byte(0x6e),
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        ) {
+            Ok(_) => panic!("ordinary mining must not create an allowance from closed history"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}")
+                .contains("previous spending-session or transaction authorization history")
+        );
+        let after_denied_mining: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        assert!(after_denied_mining["active_session"].is_null());
+        assert_eq!(
+            after_denied_mining["session_history"][0]["authorized_exposure_wei"],
+            RECORDED_AUTHORIZATION
         );
     }
 
@@ -6326,9 +7436,7 @@ mod tests {
             .unwrap()
             .remove("receipt_verification");
         drop(journal);
-        store
-            .write_transaction_journal(&serde_json::to_vec(&legacy).unwrap())
-            .unwrap();
+        write_legacy_journal(&store, &mut legacy).unwrap();
 
         let migrated = TransactionJournal::open(&store, &config, wallet).unwrap();
         assert_eq!(migrated.state.version, JOURNAL_VERSION);
@@ -6404,9 +7512,7 @@ mod tests {
                 .remove("receipt_verification");
         }
         drop(journal);
-        store
-            .write_transaction_journal(&serde_json::to_vec(&legacy).unwrap())
-            .unwrap();
+        write_legacy_journal(&store, &mut legacy).unwrap();
 
         let mut migrated = TransactionJournal::open(&store, &config, wallet).unwrap();
         let entry = &migrated.state.entries[0];
@@ -6420,7 +7526,7 @@ mod tests {
         assert_eq!(entry.actual_cost_wei.as_deref(), Some("100"));
         assert_eq!(
             migrated.session_authorized_total().unwrap(),
-            U256::from(2_000)
+            U256::from(1_000_000_000_000_000_000_u128)
         );
         assert!(migrated.has_unresolved());
         assert_eq!(migrated.pending_exposure().unwrap(), U256::from(1_000));
@@ -6671,7 +7777,377 @@ mod tests {
     }
 
     #[test]
-    fn valid_counter_rewrite_cannot_lower_authorization_while_journaled_entries_remain() {
+    fn journal_and_checkpoint_crash_boundaries_never_authorize_an_unpersisted_signature() {
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x9b);
+        let request = test_request();
+        let intent = TransactionIntent {
+            contract: request.to,
+            node_id: 1,
+            window_id: 12,
+            action: TransactionAction::SubmitProof,
+            proof: Some(ProofData {
+                nonce: 12,
+                work_hash: B256::with_last_byte(12),
+                header: b"persistence-boundary".to_vec(),
+            }),
+            reward_destination: None,
+            forwarding: None,
+        };
+        let maximum = maximum_transaction_exposure(&request).unwrap();
+
+        let initial_checkpoint_root = tempdir().unwrap();
+        let initial_checkpoint_store =
+            ConfigStore::at_root(PathBuf::from(initial_checkpoint_root.path()));
+        initial_checkpoint_store
+            .fail_journal_anchor_write_before_for_test(0)
+            .unwrap();
+        assert!(TransactionJournal::open(&initial_checkpoint_store, &config, wallet).is_err());
+        assert!(
+            initial_checkpoint_store
+                .read_transaction_journal()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            initial_checkpoint_store
+                .read_journal_anchor()
+                .unwrap()
+                .is_none()
+        );
+
+        use crate::config::AtomicWriteFailPoint as FailPoint;
+        let fail_points = [
+            FailPoint::BeforeWrite,
+            FailPoint::BeforeFileSync,
+            FailPoint::BeforeRename,
+            FailPoint::AfterRename,
+            FailPoint::BeforeDirectorySync,
+            FailPoint::AfterDirectorySync,
+        ];
+        for point in fail_points {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(PathBuf::from(root.path()));
+            let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+            let original = store.read_transaction_journal().unwrap().unwrap();
+            store
+                .fail_atomic_write_for_test(
+                    root.path().join("transactions").join("journal.json"),
+                    point,
+                )
+                .unwrap();
+            assert!(
+                journal
+                    .authorize_exposure(
+                        &request,
+                        &intent,
+                        parse_inj_wei("1").unwrap(),
+                        U256::ZERO,
+                        U256::MAX,
+                    )
+                    .is_err(),
+                "authorization must stop at injected journal boundary {point:?}"
+            );
+            let durable = store.read_transaction_journal().unwrap().unwrap();
+            let renamed = matches!(
+                point,
+                FailPoint::AfterRename
+                    | FailPoint::BeforeDirectorySync
+                    | FailPoint::AfterDirectorySync
+            );
+            assert_eq!(
+                durable != original,
+                renamed,
+                "journal bytes must reflect whether boundary {point:?} occurred before or after rename"
+            );
+            drop(journal);
+
+            let recovered = TransactionJournal::open(&store, &config, wallet).unwrap();
+            assert_eq!(
+                recovered.session_authorized_total().unwrap(),
+                if renamed { maximum } else { U256::ZERO },
+                "restart must retain any durable reservation after {point:?}"
+            );
+            assert!(recovered.state.pending_authorization.is_none());
+            let final_journal: serde_json::Value =
+                serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                    .unwrap();
+            let checkpoint = store.read_journal_anchor().unwrap().unwrap();
+            assert_eq!(
+                u64::from_be_bytes(checkpoint[4..12].try_into().unwrap()),
+                final_journal["integrity"]["revision"].as_u64().unwrap(),
+                "journal and credential checkpoint must agree after recovery from {point:?}"
+            );
+        }
+
+        let checkpoint_root = tempdir().unwrap();
+        let checkpoint_store = ConfigStore::at_root(PathBuf::from(checkpoint_root.path()));
+        let mut checkpoint_journal =
+            TransactionJournal::open(&checkpoint_store, &config, wallet).unwrap();
+        checkpoint_store
+            .fail_journal_anchor_write_before_for_test(0)
+            .unwrap();
+        assert!(
+            checkpoint_journal
+                .authorize_exposure(
+                    &request,
+                    &intent,
+                    parse_inj_wei("1").unwrap(),
+                    U256::ZERO,
+                    U256::MAX,
+                )
+                .is_err()
+        );
+        let durable: serde_json::Value = serde_json::from_slice(
+            &checkpoint_store
+                .read_transaction_journal()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            durable["active_session"]["authorized_exposure_wei"],
+            maximum.to_string()
+        );
+        assert!(durable["pending_authorization"].is_object());
+        let checkpoint_before_restart = checkpoint_store.read_journal_anchor().unwrap().unwrap();
+        assert_eq!(
+            u64::from_be_bytes(checkpoint_before_restart[4..12].try_into().unwrap()),
+            1,
+            "the OS checkpoint must remain behind when its post-journal write fails"
+        );
+        drop(checkpoint_journal);
+
+        let recovered = TransactionJournal::open(&checkpoint_store, &config, wallet).unwrap();
+        assert_eq!(recovered.session_authorized_total().unwrap(), maximum);
+        assert!(recovered.state.pending_authorization.is_none());
+        let final_journal: serde_json::Value = serde_json::from_slice(
+            &checkpoint_store
+                .read_transaction_journal()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let final_checkpoint = checkpoint_store.read_journal_anchor().unwrap().unwrap();
+        assert_eq!(
+            u64::from_be_bytes(final_checkpoint[4..12].try_into().unwrap()),
+            final_journal["integrity"]["revision"].as_u64().unwrap(),
+            "restart must promote the authenticated journal before any later signing"
+        );
+
+        let checkpoint_after_write_root = tempdir().unwrap();
+        let checkpoint_after_write_store =
+            ConfigStore::at_root(PathBuf::from(checkpoint_after_write_root.path()));
+        let mut checkpoint_after_write_journal =
+            TransactionJournal::open(&checkpoint_after_write_store, &config, wallet).unwrap();
+        checkpoint_after_write_store
+            .fail_journal_anchor_write_after_persist_for_test(0)
+            .unwrap();
+        assert!(
+            checkpoint_after_write_journal
+                .authorize_exposure(
+                    &request,
+                    &intent,
+                    parse_inj_wei("1").unwrap(),
+                    U256::ZERO,
+                    U256::MAX,
+                )
+                .is_err()
+        );
+        let durable_checkpoint = checkpoint_after_write_store
+            .read_journal_anchor()
+            .unwrap()
+            .unwrap();
+        let durable_journal: serde_json::Value = serde_json::from_slice(
+            &checkpoint_after_write_store
+                .read_transaction_journal()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            u64::from_be_bytes(durable_checkpoint[4..12].try_into().unwrap()),
+            durable_journal["integrity"]["revision"].as_u64().unwrap(),
+            "a reported post-write checkpoint failure can leave the new checkpoint durable"
+        );
+        assert_eq!(
+            durable_journal["active_session"]["authorized_exposure_wei"],
+            maximum.to_string()
+        );
+        drop(checkpoint_after_write_journal);
+        let recovered =
+            TransactionJournal::open(&checkpoint_after_write_store, &config, wallet).unwrap();
+        assert_eq!(recovered.session_authorized_total().unwrap(), maximum);
+        assert!(recovered.state.pending_authorization.is_none());
+    }
+
+    #[test]
+    fn init_transition_config_and_journal_failures_remain_recoverable() {
+        use crate::config::AtomicWriteFailPoint as FailPoint;
+
+        fn begin_transition(
+            root: &Path,
+            previous: &AppConfig,
+            proposed: &AppConfig,
+            previous_wallet: Address,
+            proposed_wallet: Address,
+        ) -> (ConfigStore, TransactionJournal, String, String) {
+            let store = ConfigStore::at_root(PathBuf::from(root));
+            store.save(previous).unwrap();
+            drop(TransactionJournal::open(&store, previous, previous_wallet).unwrap());
+            let transition = TransactionJournal::open_for_init_session_transition(
+                &store,
+                proposed,
+                proposed_wallet,
+                previous.per_session_spending_limit_inj.clone(),
+                previous.wallet_address.clone(),
+            )
+            .unwrap();
+            let pending = transition
+                .state
+                .pending_session_transition
+                .as_ref()
+                .unwrap();
+            let previous_id = pending.previous_session.as_ref().unwrap().id.clone();
+            let proposed_id = pending.new_session_id.clone();
+            (store, transition, previous_id, proposed_id)
+        }
+
+        let points = [
+            FailPoint::BeforeWrite,
+            FailPoint::BeforeFileSync,
+            FailPoint::BeforeRename,
+            FailPoint::AfterRename,
+            FailPoint::BeforeDirectorySync,
+            FailPoint::AfterDirectorySync,
+        ];
+        let previous_wallet = Address::with_last_byte(0x9c);
+        let proposed_wallet = Address::with_last_byte(0x9d);
+        let previous = AppConfig {
+            wallet_address: Some(format!("{previous_wallet:#x}")),
+            per_session_spending_limit_inj: "0.5".to_owned(),
+            ..AppConfig::default()
+        };
+        let proposed = AppConfig {
+            wallet_address: Some(format!("{proposed_wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..previous.clone()
+        };
+
+        for point in points {
+            let root = tempdir().unwrap();
+            let (store, mut transition, previous_id, _) = begin_transition(
+                root.path(),
+                &previous,
+                &proposed,
+                previous_wallet,
+                proposed_wallet,
+            );
+            store
+                .fail_atomic_write_for_test(root.path().join("config.toml"), point)
+                .unwrap();
+            assert!(
+                store.save(&proposed).is_err(),
+                "proposed configuration save must report injected {point:?} failure"
+            );
+            let mut rollback_config = proposed.clone();
+            transition
+                .rollback_init_session_transition(&mut rollback_config)
+                .unwrap();
+            assert_eq!(rollback_config, previous);
+            assert_eq!(store.load().unwrap(), previous);
+            drop(transition);
+            let recovered = TransactionJournal::inspect_session(&store, &previous).unwrap();
+            assert!(recovered.pending_transition.is_none());
+            assert_eq!(recovered.session_id.as_deref(), Some(previous_id.as_str()));
+        }
+
+        for point in points {
+            let root = tempdir().unwrap();
+            let (store, mut transition, previous_id, _) = begin_transition(
+                root.path(),
+                &previous,
+                &proposed,
+                previous_wallet,
+                proposed_wallet,
+            );
+            store.save(&proposed).unwrap();
+            store
+                .fail_atomic_write_for_test(root.path().join("config.toml"), point)
+                .unwrap();
+            let mut rollback_config = proposed.clone();
+            assert!(
+                transition
+                    .rollback_init_session_transition(&mut rollback_config)
+                    .is_err(),
+                "rollback configuration save must report injected {point:?} failure"
+            );
+            drop(transition);
+
+            let mut recovered_config = store.load().unwrap();
+            assert!(
+                TransactionJournal::resolve_pending_session_transition(
+                    &store,
+                    &mut recovered_config,
+                    false,
+                )
+                .unwrap()
+            );
+            assert_eq!(recovered_config, previous);
+            let recovered = TransactionJournal::inspect_session(&store, &recovered_config).unwrap();
+            assert!(recovered.pending_transition.is_none());
+            assert_eq!(recovered.session_id.as_deref(), Some(previous_id.as_str()));
+        }
+
+        for point in points {
+            let root = tempdir().unwrap();
+            let (store, mut transition, _, proposed_id) = begin_transition(
+                root.path(),
+                &previous,
+                &proposed,
+                previous_wallet,
+                proposed_wallet,
+            );
+            store.save(&proposed).unwrap();
+            store
+                .fail_atomic_write_for_test(
+                    root.path().join("transactions").join("journal.json"),
+                    point,
+                )
+                .unwrap();
+            assert!(
+                transition
+                    .finish_init_session_transition(&proposed)
+                    .is_err(),
+                "transition finalization must report injected journal {point:?} failure"
+            );
+            drop(transition);
+
+            let pending = TransactionJournal::inspect_session(&store, &proposed).unwrap();
+            if pending.pending_transition.is_some() {
+                let mut recovered_config = proposed.clone();
+                assert!(
+                    TransactionJournal::resolve_pending_session_transition(
+                        &store,
+                        &mut recovered_config,
+                        true,
+                    )
+                    .unwrap()
+                );
+                assert_eq!(recovered_config, proposed);
+            }
+            let recovered = TransactionJournal::inspect_session(&store, &proposed).unwrap();
+            assert!(recovered.pending_transition.is_none());
+            assert_eq!(recovered.session_id.as_deref(), Some(proposed_id.as_str()));
+            assert_eq!(recovered.authorized_exposure_wei.as_deref(), Some("0"));
+        }
+    }
+
+    #[test]
+    fn journaled_counter_rewrite_is_rejected_even_when_entries_remain() {
         let root = tempdir().unwrap();
         let store = ConfigStore::at_root(PathBuf::from(root.path()));
         let config = AppConfig {
@@ -6697,10 +8173,11 @@ mod tests {
                 }),
             ))
             .unwrap();
+        assert_eq!(journal.session_authorized_total().unwrap(), maximum);
         drop(journal);
 
-        // The JSON remains syntactically valid; the retained signed-intent entry
-        // is the surviving source used to repair this underreported counter.
+        // The JSON remains syntactically valid, but the external MAC/checkpoint
+        // must reject it instead of treating journal entries as a repair source.
         let mut rewritten: serde_json::Value =
             serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
         rewritten["active_session"]["authorized_exposure_wei"] = serde_json::json!("0");
@@ -6708,18 +8185,10 @@ mod tests {
             .write_transaction_journal(&serde_json::to_vec(&rewritten).unwrap())
             .unwrap();
 
-        let reopened = TransactionJournal::open(&store, &config, wallet).unwrap();
-        assert_eq!(reopened.session_authorized_total().unwrap(), maximum);
-        assert_eq!(
-            reopened
-                .state
-                .active_session
-                .as_ref()
-                .unwrap()
-                .authorized_exposure_wei
-                .as_deref(),
-            Some(maximum.to_string().as_str()),
-            "retained transaction entries must repair a validly rewritten-low counter"
+        let error = TransactionJournal::inspect_session(&store, &config).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("authentication")
+                || format!("{error:#}").contains("state digest")
         );
     }
 
@@ -6830,6 +8299,1037 @@ mod tests {
         assert_ne!(session.id, old_session);
         assert_eq!(session.authorized_exposure_wei.as_deref(), Some("0"));
         assert_eq!(new_session.state.entries.len(), 1);
+        assert_eq!(new_session.state.session_history.len(), 1);
+        assert_eq!(new_session.state.session_history[0].id, old_session);
+        assert_eq!(
+            new_session.state.session_history[0]
+                .authorized_exposure_wei
+                .as_deref(),
+            Some("1000")
+        );
+    }
+
+    #[test]
+    fn wallet_mismatch_cannot_replace_an_unused_paid_session_without_authorization() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "0.5".to_owned(),
+            wallet_address: Some(format!("{:#x}", Address::with_last_byte(0x71))),
+            ..AppConfig::default()
+        };
+        let original_wallet = Address::with_last_byte(0x71);
+        let replacement_wallet = Address::with_last_byte(0x72);
+        let original = TransactionManager::open_with_session_authorization(
+            &store,
+            &config,
+            original_wallet,
+            Address::with_last_byte(0x88),
+            Arc::new(HistoryTelemetry::default()),
+            true,
+        )
+        .unwrap();
+        let original_session_id = original
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        drop(original);
+
+        let replacement = TransactionManager::open_with_session_authorization(
+            &store,
+            &config,
+            replacement_wallet,
+            Address::with_last_byte(0x88),
+            Arc::new(HistoryTelemetry::default()),
+            false,
+        );
+        assert!(
+            replacement.is_err(),
+            "an active session bound to another wallet must require explicit new-session authorization"
+        );
+        drop(replacement);
+        let current = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert_eq!(
+            current.session_id.as_deref(),
+            Some(original_session_id.as_str())
+        );
+    }
+
+    #[test]
+    fn hmac_must_authenticate_revision_to_prevent_relabelled_snapshot_rollback() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let wallet = Address::with_last_byte(0x91);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "0.5".to_owned(),
+            ..AppConfig::default()
+        };
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        let mut stale: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        journal
+            .state
+            .active_session
+            .as_mut()
+            .unwrap()
+            .authorized_exposure_wei = Some("250000000000000000".to_owned());
+        journal.persist().unwrap();
+        let latest: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        let latest_revision = latest["integrity"]["revision"].as_u64().unwrap();
+        assert!(latest_revision > stale["integrity"]["revision"].as_u64().unwrap());
+        drop(journal);
+
+        let stale_state: super::JournalState = serde_json::from_value(stale.clone()).unwrap();
+        stale["integrity"]["revision"] = serde_json::json!(latest_revision);
+        let relabelled_state: super::JournalState = serde_json::from_value(stale.clone()).unwrap();
+        assert_ne!(
+            super::journal_authentication_payload(&stale_state).unwrap(),
+            super::journal_authentication_payload(&relabelled_state).unwrap(),
+            "the journal revision must be part of the HMAC payload"
+        );
+        store
+            .write_transaction_journal(&serde_json::to_vec(&stale).unwrap())
+            .unwrap();
+        let error = TransactionJournal::inspect_session(&store, &config)
+            .expect_err("revision relabeling must not authenticate a stale financial state");
+        assert!(
+            format!("{error:#}").contains("authentication")
+                || format!("{error:#}").contains("state digest")
+        );
+
+        let mut counter_and_revision = stale;
+        counter_and_revision["active_session"]["authorized_exposure_wei"] =
+            serde_json::json!("100000000000000000");
+        store
+            .write_transaction_journal(&serde_json::to_vec(&counter_and_revision).unwrap())
+            .unwrap();
+        assert!(
+            TransactionJournal::inspect_session(&store, &config).is_err(),
+            "changing revision and authorization together must still fail authentication"
+        );
+        let manager = TransactionManager::open_with_session_authorization(
+            &store,
+            &config,
+            wallet,
+            Address::with_last_byte(0x92),
+            Arc::new(HistoryTelemetry::default()),
+            false,
+        );
+        assert!(manager.is_err());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &store.read_transaction_journal().unwrap().unwrap()
+            )
+            .unwrap()["active_session"]["id"],
+            session_id
+        );
+    }
+
+    #[test]
+    fn malformed_or_relabelled_journal_integrity_fails_closed() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "0.5".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x90);
+        drop(TransactionJournal::open(&store, &config, wallet).unwrap());
+        let valid: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        let revision = valid["integrity"]["revision"].as_u64().unwrap();
+
+        let mut mutations = Vec::new();
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("integrity");
+        mutations.push(("missing integrity", missing));
+        let mut zero_revision = valid.clone();
+        zero_revision["integrity"]["revision"] = serde_json::json!(0);
+        mutations.push(("zero revision", zero_revision));
+        let mut future_revision = valid.clone();
+        future_revision["integrity"]["revision"] = serde_json::json!(revision + 1);
+        mutations.push(("unauthenticated future revision", future_revision));
+        let mut malformed_tag = valid.clone();
+        malformed_tag["integrity"]["tag"] = serde_json::json!("not-hex");
+        mutations.push(("malformed authentication tag", malformed_tag));
+        let mut short_tag = valid.clone();
+        short_tag["integrity"]["tag"] = serde_json::json!("00");
+        mutations.push(("short authentication tag", short_tag));
+
+        for (label, mutation) in mutations {
+            store
+                .write_transaction_journal(&serde_json::to_vec(&mutation).unwrap())
+                .unwrap();
+            let error = TransactionJournal::inspect_session(&store, &config).expect_err(&format!(
+                "{label} must not open or reconstruct a paid session"
+            ));
+            if label == "unauthenticated future revision" {
+                assert!(
+                    format!("{error:#}").contains("authentication"),
+                    "a future revision that bypasses checkpoint equality must fail HMAC verification: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copied_data_root_cannot_fork_a_session_checkpoint_or_spending_cap() {
+        let root_a = tempdir().unwrap();
+        let store_a = ConfigStore::at_root(PathBuf::from(root_a.path()));
+        let wallet = Address::with_last_byte(0x93);
+        let token = Address::with_last_byte(0x94);
+        let contract = Address::with_last_byte(0x95);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "0.5".to_owned(),
+            ..AppConfig::default()
+        };
+        store_a.save(&config).unwrap();
+        drop(TransactionJournal::open(&store_a, &config, wallet).unwrap());
+        let mut manager_a = TransactionManager::open_with_session_authorization(
+            &store_a,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+        )
+        .unwrap();
+
+        let root_b = tempdir().unwrap();
+        copy_test_data_root(root_a.path(), root_b.path()).unwrap();
+        let store_b = ConfigStore::at_root(PathBuf::from(root_b.path()));
+        let copied_journal = store_b.read_transaction_journal().unwrap().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let manager_b_barrier = barrier.clone();
+        let manager_b_store = store_b.clone();
+        let manager_b_config = config.clone();
+        let manager_b = std::thread::spawn(move || {
+            manager_b_barrier.wait();
+            TransactionManager::open_with_session_authorization(
+                &manager_b_store,
+                &manager_b_config,
+                wallet,
+                token,
+                Arc::new(HistoryTelemetry::default()),
+                false,
+            )
+        });
+        barrier.wait();
+        let mut request = test_request();
+        request.to = contract;
+        request.value = U256::from(SUBMISSION_FEE_WEI);
+        request.gas_limit = 1;
+        request.max_fee_per_gas = U256::from(290_000_000_000_000_000_u128);
+        let maximum = maximum_transaction_exposure(&request).unwrap();
+        assert_eq!(maximum, U256::from(300_000_000_000_000_000_u128));
+        let intent = TransactionIntent {
+            contract,
+            node_id: 1,
+            window_id: 7,
+            action: TransactionAction::SubmitProof,
+            proof: Some(ProofData {
+                nonce: 7,
+                work_hash: B256::with_last_byte(7),
+                header: b"cross-root-session-fork".to_vec(),
+            }),
+            reward_destination: None,
+            forwarding: None,
+        };
+        let authorized = manager_a
+            .journal
+            .authorize_exposure(
+                &request,
+                &intent,
+                parse_inj_wei("0.5").unwrap(),
+                U256::ZERO,
+                U256::MAX,
+            )
+            .unwrap();
+        let manager_b = manager_b.join().unwrap();
+        assert!(
+            manager_b.is_err(),
+            "a copied-root manager racing a live manager must not reuse the original checkpoint"
+        );
+        assert_eq!(authorized, maximum);
+        assert!(store_b.read_journal_anchor().unwrap().is_none());
+        assert_eq!(
+            store_b.read_transaction_journal().unwrap().unwrap(),
+            copied_journal
+        );
+        assert_eq!(
+            manager_a.budget_remaining().unwrap(),
+            parse_inj_wei("0.2").unwrap()
+        );
+        drop(manager_a);
+        let state_a = TransactionJournal::inspect_session(&store_a, &config).unwrap();
+        assert_eq!(
+            state_a.authorized_exposure_wei.as_deref(),
+            Some(maximum.to_string().as_str())
+        );
+        assert!(
+            TransactionManager::open_with_session_authorization(
+                &store_b,
+                &config,
+                wallet,
+                token,
+                Arc::new(HistoryTelemetry::default()),
+                false,
+            )
+            .is_err(),
+            "restarting a copied root must not silently create a replacement checkpoint"
+        );
+        assert!(store_b.read_journal_anchor().unwrap().is_none());
+        assert_eq!(
+            store_b.read_transaction_journal().unwrap().unwrap(),
+            copied_journal
+        );
+    }
+
+    #[test]
+    fn manager_never_creates_a_positive_session_without_authorization() {
+        let empty_root = tempdir().unwrap();
+        let empty_store = ConfigStore::at_root(PathBuf::from(empty_root.path()));
+        let wallet = Address::with_last_byte(0x96);
+        let token = Address::with_last_byte(0x97);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "0.5".to_owned(),
+            ..AppConfig::default()
+        };
+        assert!(
+            TransactionManager::open_with_session_authorization(
+                &empty_store,
+                &config,
+                wallet,
+                token,
+                Arc::new(HistoryTelemetry::default()),
+                false,
+            )
+            .is_err(),
+            "a manager caller without authorization must not create the first positive session"
+        );
+        let authorized = TransactionManager::open_with_session_authorization(
+            &empty_store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+            true,
+        )
+        .unwrap();
+        let original_session_id = authorized
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        drop(authorized);
+
+        let closed_store_root = tempdir().unwrap();
+        let closed_store = ConfigStore::at_root(PathBuf::from(closed_store_root.path()));
+        let mut journal = TransactionJournal::open(&closed_store, &config, wallet).unwrap();
+        let closed_session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        journal.close_session().unwrap();
+        drop(journal);
+        assert!(
+            TransactionManager::open_with_session_authorization(
+                &closed_store,
+                &config,
+                wallet,
+                token,
+                Arc::new(HistoryTelemetry::default()),
+                false,
+            )
+            .is_err(),
+            "a closed unused session must not be replaced without authorization"
+        );
+        let wallet_mismatch = TransactionManager::open_with_session_authorization(
+            &closed_store,
+            &config,
+            Address::with_last_byte(0x98),
+            token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+        );
+        assert!(
+            wallet_mismatch.is_err(),
+            "a closed unused session must not change wallets without authorization"
+        );
+        let new = TransactionManager::open_with_session_authorization(
+            &closed_store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+            true,
+        )
+        .unwrap();
+        assert_ne!(
+            new.journal.state.active_session.as_ref().unwrap().id,
+            closed_session_id
+        );
+        assert_eq!(new.journal.state.session_history[0].id, closed_session_id);
+        assert_ne!(original_session_id, closed_session_id);
+    }
+
+    #[test]
+    fn unresolved_transaction_blocks_standalone_wallet_changes() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let wallet = Address::with_last_byte(0x9e);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "0.5".to_owned(),
+            ..AppConfig::default()
+        };
+        let request = test_request();
+        let proof = ProofData {
+            nonce: 15,
+            work_hash: B256::with_last_byte(15),
+            header: b"standalone-wallet-recovery-lock".to_vec(),
+        };
+        let intent = TransactionIntent {
+            contract: request.to,
+            node_id: 1,
+            window_id: 4,
+            action: TransactionAction::SubmitProof,
+            proof: Some(proof.clone()),
+            reward_destination: None,
+            forwarding: None,
+        };
+        let maximum = maximum_transaction_exposure(&request).unwrap();
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        journal
+            .authorize_exposure(
+                &request,
+                &intent,
+                parse_inj_wei("0.5").unwrap(),
+                U256::ZERO,
+                U256::MAX,
+            )
+            .unwrap();
+        let signed = sign_eip1559(&test_signer(), &request).unwrap();
+        journal
+            .prepare(prepared_test_transaction(
+                &request,
+                signed.hash,
+                parse_inj_wei("0.5").unwrap(),
+                U256::ZERO,
+                U256::MAX,
+                Some(proof),
+            ))
+            .unwrap();
+        assert_eq!(journal.session_authorized_total().unwrap(), maximum);
+        drop(journal);
+
+        let error = crate::commands::ensure_standalone_wallet_change_allowed(&store, &config)
+            .expect_err("wallet create/import must be blocked while recovery is unresolved");
+        assert!(format!("{error:#}").contains("transaction recovery"));
+    }
+
+    #[test]
+    fn v8_interrupted_init_transition_migrates_and_can_be_completed_or_rolled_back() {
+        fn fixture(
+            root: &Path,
+            previous: &AppConfig,
+            proposed: &AppConfig,
+            old_wallet: Address,
+            new_wallet: Address,
+        ) -> (ConfigStore, String, String) {
+            let store = ConfigStore::at_root(PathBuf::from(root));
+            store.save(previous).unwrap();
+            drop(TransactionJournal::open(&store, previous, old_wallet).unwrap());
+            let pending = TransactionJournal::open_for_init_session_transition(
+                &store,
+                proposed,
+                new_wallet,
+                previous.per_session_spending_limit_inj.clone(),
+                previous.wallet_address.clone(),
+            )
+            .unwrap();
+            let old_id = pending
+                .state
+                .pending_session_transition
+                .as_ref()
+                .unwrap()
+                .previous_session
+                .as_ref()
+                .unwrap()
+                .id
+                .clone();
+            let new_id = pending.state.active_session.as_ref().unwrap().id.clone();
+            let mut v8: serde_json::Value =
+                serde_json::from_slice(&serde_json::to_vec(&pending.state).unwrap()).unwrap();
+            v8["version"] = serde_json::json!(8);
+            v8.as_object_mut().unwrap().remove("integrity");
+            drop(pending);
+            write_legacy_journal(&store, &mut v8).unwrap();
+            (store, old_id, new_id)
+        }
+
+        let wallet_a = Address::with_last_byte(0x99);
+        let wallet_b = Address::with_last_byte(0x9a);
+        let previous = AppConfig {
+            wallet_address: Some(format!("{wallet_a:#x}")),
+            per_session_spending_limit_inj: "0.5".to_owned(),
+            ..AppConfig::default()
+        };
+        let proposed = AppConfig {
+            wallet_address: Some(format!("{wallet_b:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..previous.clone()
+        };
+
+        let complete_root = tempdir().unwrap();
+        let (complete_store, old_id, proposed_id) = fixture(
+            complete_root.path(),
+            &previous,
+            &proposed,
+            wallet_a,
+            wallet_b,
+        );
+        let pending = TransactionJournal::inspect_session(&complete_store, &previous).unwrap();
+        assert!(pending.pending_transition.is_some());
+        assert_eq!(pending.session_id.as_deref(), Some(proposed_id.as_str()));
+        assert_eq!(pending.authorized_exposure_wei.as_deref(), Some("0"));
+        let mut config = previous.clone();
+        assert!(
+            TransactionJournal::resolve_pending_session_transition(
+                &complete_store,
+                &mut config,
+                true
+            )
+            .unwrap()
+        );
+        assert_eq!(config, proposed);
+        let completed = TransactionJournal::inspect_session(&complete_store, &config).unwrap();
+        assert!(completed.pending_transition.is_none());
+        assert_eq!(completed.session_id.as_deref(), Some(proposed_id.as_str()));
+        let completed_state: serde_json::Value =
+            serde_json::from_slice(&complete_store.read_transaction_journal().unwrap().unwrap())
+                .unwrap();
+        assert_eq!(
+            completed_state["active_session"]["authorized_exposure_wei"],
+            "0"
+        );
+        assert_eq!(completed_state["session_history"][0]["id"], old_id);
+        assert_eq!(
+            completed_state["session_history"][0]["authorized_exposure_wei"],
+            "500000000000000000"
+        );
+
+        let rollback_root = tempdir().unwrap();
+        let (rollback_store, rollback_old_id, rollback_new_id) = fixture(
+            rollback_root.path(),
+            &previous,
+            &proposed,
+            wallet_a,
+            wallet_b,
+        );
+        rollback_store.save(&proposed).unwrap();
+        let pending = TransactionJournal::inspect_session(&rollback_store, &proposed).unwrap();
+        assert!(pending.pending_transition.is_some());
+        assert_eq!(
+            pending.session_id.as_deref(),
+            Some(rollback_new_id.as_str())
+        );
+        let mut config = proposed.clone();
+        assert!(
+            TransactionJournal::resolve_pending_session_transition(
+                &rollback_store,
+                &mut config,
+                false
+            )
+            .unwrap()
+        );
+        assert_eq!(config, previous);
+        let rolled_back = TransactionJournal::inspect_session(&rollback_store, &config).unwrap();
+        assert!(rolled_back.pending_transition.is_none());
+        assert_eq!(
+            rolled_back.session_id.as_deref(),
+            Some(rollback_old_id.as_str())
+        );
+        assert!(rolled_back.closed);
+        assert_eq!(
+            rolled_back.authorized_exposure_wei.as_deref(),
+            Some("500000000000000000")
+        );
+    }
+
+    #[test]
+    fn empty_entry_session_counter_rewrite_and_snapshot_replay_fail_closed() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x73);
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let snapshot = store.read_transaction_journal().unwrap().unwrap();
+        journal
+            .state
+            .active_session
+            .as_mut()
+            .unwrap()
+            .authorized_exposure_wei = Some("123456789".to_owned());
+        journal.persist().unwrap();
+        drop(journal);
+
+        let mut rewritten: serde_json::Value =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        let authorized_snapshot = store.read_transaction_journal().unwrap().unwrap();
+        rewritten["active_session"]["authorized_exposure_wei"] = serde_json::json!("0");
+        store
+            .write_transaction_journal(&serde_json::to_vec(&rewritten).unwrap())
+            .unwrap();
+        assert!(
+            TransactionJournal::inspect_session(&store, &config).is_err(),
+            "an empty-entry session's only authorization record must not be trusted after a numeric rewrite"
+        );
+
+        let mut missing_counter: serde_json::Value =
+            serde_json::from_slice(&authorized_snapshot).unwrap();
+        missing_counter["active_session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("authorized_exposure_wei");
+        store
+            .write_transaction_journal(&serde_json::to_vec(&missing_counter).unwrap())
+            .unwrap();
+        assert!(
+            TransactionJournal::inspect_session(&store, &config).is_err(),
+            "omitting the only authorization counter must fail closed"
+        );
+
+        store.write_transaction_journal(&snapshot).unwrap();
+        assert!(
+            TransactionJournal::inspect_session(&store, &config).is_err(),
+            "restoring an older valid journal snapshot must not roll back its secure checkpoint"
+        );
+    }
+
+    #[test]
+    fn v8_missing_or_underreported_counter_is_not_migrated_as_zero() {
+        let missing_root = tempdir().unwrap();
+        let missing_store = ConfigStore::at_root(PathBuf::from(missing_root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x74);
+        drop(TransactionJournal::open(&missing_store, &config, wallet).unwrap());
+        let mut missing: serde_json::Value =
+            serde_json::from_slice(&missing_store.read_transaction_journal().unwrap().unwrap())
+                .unwrap();
+        missing["version"] = serde_json::json!(8);
+        missing["active_session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("authorized_exposure_wei");
+        write_legacy_journal(&missing_store, &mut missing).unwrap();
+        let missing_error = TransactionJournal::inspect_session(&missing_store, &config)
+            .expect_err("v8 without its required counter must fail closed");
+        assert!(
+            format!("{missing_error:#}").contains("missing its cumulative authorization counter")
+        );
+
+        let lower_root = tempdir().unwrap();
+        let lower_store = ConfigStore::at_root(PathBuf::from(lower_root.path()));
+        let mut journal = TransactionJournal::open(&lower_store, &config, wallet).unwrap();
+        let request = test_request();
+        let tx_hash = sign_eip1559(&test_signer(), &request).unwrap().hash;
+        journal
+            .prepare(prepared_test_transaction(
+                &request,
+                tx_hash,
+                U256::from(1_000_000_000_000_000_000_u128),
+                U256::ZERO,
+                U256::MAX,
+                Some(ProofData {
+                    nonce: 10,
+                    work_hash: B256::with_last_byte(10),
+                    header: b"v8-underreported-counter".to_vec(),
+                }),
+            ))
+            .unwrap();
+        let mut lower: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&journal.state).unwrap()).unwrap();
+        lower["version"] = serde_json::json!(8);
+        lower["active_session"]["authorized_exposure_wei"] = serde_json::json!("0");
+        drop(journal);
+        write_legacy_journal(&lower_store, &mut lower).unwrap();
+
+        let lower_error = TransactionJournal::inspect_session(&lower_store, &config)
+            .expect_err("v8 below its retained signed intent must fail closed");
+        assert!(format!("{lower_error:#}").contains("below preserved transaction exposure"));
+    }
+
+    #[test]
+    fn missing_journal_or_credential_checkpoint_never_creates_a_fresh_session() {
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x75);
+
+        let missing_journal_root = tempdir().unwrap();
+        let missing_journal_store =
+            ConfigStore::at_root(PathBuf::from(missing_journal_root.path()));
+        drop(TransactionJournal::open(&missing_journal_store, &config, wallet).unwrap());
+        std::fs::remove_file(
+            missing_journal_root
+                .path()
+                .join("transactions")
+                .join("journal.json"),
+        )
+        .unwrap();
+        assert!(
+            TransactionJournal::inspect_session(&missing_journal_store, &config).is_err(),
+            "a surviving secure checkpoint must prevent an empty journal from becoming a new allowance"
+        );
+
+        let missing_checkpoint_root = tempdir().unwrap();
+        let missing_checkpoint_store =
+            ConfigStore::at_root(PathBuf::from(missing_checkpoint_root.path()));
+        drop(TransactionJournal::open(&missing_checkpoint_store, &config, wallet).unwrap());
+        missing_checkpoint_store
+            .clear_journal_anchor_for_test()
+            .unwrap();
+        let error = TransactionJournal::inspect_session(&missing_checkpoint_store, &config)
+            .expect_err("a v9 journal without its OS credential checkpoint must fail closed");
+        assert!(format!("{error:#}").contains("OS credential-store checkpoint"));
+    }
+
+    #[test]
+    fn unauthenticated_v1_checkpoint_is_not_silently_upgraded_or_reset() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "0.5".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x76);
+        drop(TransactionJournal::open(&store, &config, wallet).unwrap());
+        let journal_before = store.read_transaction_journal().unwrap().unwrap();
+        let current_anchor = store.read_journal_anchor().unwrap().unwrap();
+        let revision = u64::from_be_bytes(current_anchor[4..12].try_into().unwrap());
+        let v1_checkpoint = serde_json::json!({
+            "version": 1,
+            "key_hex": hex::encode(&current_anchor[12..44]),
+            "revision": revision,
+        });
+        store
+            .write_journal_anchor(&serde_json::to_vec(&v1_checkpoint).unwrap())
+            .unwrap();
+
+        let error = TransactionJournal::inspect_session(&store, &config)
+            .expect_err("a checkpoint whose revision was not authenticated must fail closed");
+        assert!(
+            format!("{error:#}").contains("invalid length")
+                || format!("{error:#}").contains("schema is unsupported")
+        );
+        assert_eq!(
+            store.read_transaction_journal().unwrap().unwrap(),
+            journal_before,
+            "an unsupported checkpoint must not rewrite/reset the authenticated journal"
+        );
+    }
+
+    #[test]
+    fn orphaned_session_authorization_survives_new_sessions_and_still_requires_explicit_reset() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let wallet = Address::with_last_byte(0x70);
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let mut original = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let original_id = original.state.active_session.as_ref().unwrap().id.clone();
+        original
+            .state
+            .active_session
+            .as_mut()
+            .unwrap()
+            .authorized_exposure_wei = Some("750000000000000000".to_owned());
+        original.close_session().unwrap();
+        drop(original);
+
+        let mut first_new = TransactionJournal::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            Arc::new(HistoryTelemetry::default()),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(first_new.state.session_history.len(), 1);
+        assert_eq!(first_new.state.session_history[0].id, original_id);
+        assert_eq!(
+            first_new.state.session_history[0]
+                .authorized_exposure_wei
+                .as_deref(),
+            Some("750000000000000000")
+        );
+        first_new.close_session().unwrap();
+        drop(first_new);
+
+        let error = match TransactionJournal::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        ) {
+            Ok(_) => panic!("archived session authorization must require explicit reset consent"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("--new-session"));
+    }
+
+    #[test]
+    fn historical_session_limits_are_validated_as_decimal_wei() {
+        let wallet = Address::with_last_byte(0x75);
+        let large_inj_limit = format!("1{}", "0".repeat(42));
+        let large_wei_limit = U256::from(10_u8).pow(U256::from(60_u8)).to_string();
+
+        let history_root = tempdir().unwrap();
+        let history_store = ConfigStore::at_root(PathBuf::from(history_root.path()));
+        let history_config = AppConfig {
+            per_session_spending_limit_inj: large_inj_limit.clone(),
+            wallet_address: Some(format!("{wallet:#x}")),
+            ..AppConfig::default()
+        };
+        let mut journal =
+            TransactionJournal::open(&history_store, &history_config, wallet).unwrap();
+        let mut closed = journal.state.active_session.take().unwrap();
+        closed.closed = true;
+        assert_eq!(closed.limit_wei, large_wei_limit);
+        journal.state.session_history.push(closed);
+        journal.persist().unwrap();
+        drop(journal);
+
+        let inspected =
+            TransactionJournal::inspect_session(&history_store, &history_config).unwrap();
+        assert!(inspected.has_prior_session_history);
+
+        let mut corrupted: serde_json::Value =
+            serde_json::from_slice(&history_store.read_transaction_journal().unwrap().unwrap())
+                .unwrap();
+        corrupted["session_history"][0]["limit_wei"] = serde_json::json!("not-decimal-wei");
+        history_store
+            .write_transaction_journal(&serde_json::to_vec(&corrupted).unwrap())
+            .unwrap();
+        assert!(TransactionJournal::inspect_session(&history_store, &history_config).is_err());
+
+        let transition_root = tempdir().unwrap();
+        let transition_store = ConfigStore::at_root(PathBuf::from(transition_root.path()));
+        let previous_config = AppConfig {
+            per_session_spending_limit_inj: large_inj_limit.clone(),
+            wallet_address: Some(format!("{wallet:#x}")),
+            ..AppConfig::default()
+        };
+        let previous =
+            TransactionJournal::open(&transition_store, &previous_config, wallet).unwrap();
+        drop(previous);
+        let proposed_config = AppConfig {
+            per_session_spending_limit_inj: format!("2{}", "0".repeat(42)),
+            ..previous_config.clone()
+        };
+        let mut pending = TransactionJournal::open_for_init_session_transition(
+            &transition_store,
+            &proposed_config,
+            wallet,
+            previous_config.per_session_spending_limit_inj.clone(),
+            previous_config.wallet_address.clone(),
+        )
+        .unwrap();
+        validate_journal(&pending.state).unwrap();
+        pending
+            .state
+            .pending_session_transition
+            .as_mut()
+            .unwrap()
+            .previous_session
+            .as_mut()
+            .unwrap()
+            .limit_wei = "not-decimal-wei".to_owned();
+        assert!(validate_journal(&pending.state).is_err());
+    }
+
+    #[test]
+    fn interrupted_init_session_transition_can_be_completed_or_rolled_back_atomically() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let previous_wallet = Address::with_last_byte(0x71);
+        let proposed_wallet = Address::with_last_byte(0x72);
+        let previous_config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            wallet_address: Some(format!("{previous_wallet:#x}")),
+            ..AppConfig::default()
+        };
+        store.save(&previous_config).unwrap();
+        let old_journal =
+            TransactionJournal::open(&store, &previous_config, previous_wallet).unwrap();
+        assert!(
+            serde_json::to_value(&old_journal.state)
+                .unwrap()
+                .get("pending_session_transition")
+                .is_none(),
+            "ordinary journals must keep the pre-transition schema shape for safe v13 reads"
+        );
+        assert!(
+            serde_json::to_value(&old_journal.state)
+                .unwrap()
+                .get("session_history")
+                .is_none(),
+            "empty session history must not alter the existing journal schema shape"
+        );
+        let old_session_id = old_journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        drop(old_journal);
+
+        let proposed_config = AppConfig {
+            per_session_spending_limit_inj: "2".to_owned(),
+            wallet_address: Some(format!("{proposed_wallet:#x}")),
+            ..previous_config.clone()
+        };
+        let pending = TransactionJournal::open_for_init_session_transition(
+            &store,
+            &proposed_config,
+            proposed_wallet,
+            previous_config.per_session_spending_limit_inj.clone(),
+            previous_config.wallet_address.clone(),
+        )
+        .unwrap();
+        let proposed_session_id = pending.state.active_session.as_ref().unwrap().id.clone();
+        assert_ne!(proposed_session_id, old_session_id);
+        assert!(pending.state.pending_session_transition.is_some());
+        store.save(&proposed_config).unwrap();
+        drop(pending);
+
+        let mining_error = match TransactionJournal::open(&store, &proposed_config, proposed_wallet)
+        {
+            Ok(_) => panic!("mining must not open a pending init session transition"),
+            Err(error) => error,
+        };
+        assert!(format!("{mining_error:#}").contains("interrupted spending-session change"));
+
+        let mut interrupted_config = store.load().unwrap();
+        assert!(
+            TransactionJournal::resolve_pending_session_transition(
+                &store,
+                &mut interrupted_config,
+                false
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            interrupted_config.per_session_spending_limit_inj,
+            previous_config.per_session_spending_limit_inj
+        );
+        assert_eq!(
+            interrupted_config.wallet_address,
+            previous_config.wallet_address
+        );
+        let rolled_back = TransactionJournal::inspect_session(&store, &interrupted_config).unwrap();
+        assert_eq!(
+            rolled_back.session_id.as_deref(),
+            Some(old_session_id.as_str())
+        );
+        assert_eq!(
+            rolled_back.wallet.as_deref(),
+            Some(format!("{previous_wallet:#x}").as_str())
+        );
+        assert!(rolled_back.pending_transition.is_none());
+
+        let pending = TransactionJournal::open_for_init_session_transition(
+            &store,
+            &proposed_config,
+            proposed_wallet,
+            previous_config.per_session_spending_limit_inj.clone(),
+            previous_config.wallet_address.clone(),
+        )
+        .unwrap();
+        let committed_session_id = pending.state.active_session.as_ref().unwrap().id.clone();
+        drop(pending);
+
+        // Simulate a crash immediately after the journal transition was written,
+        // before the proposed config reached disk; completing must recover both.
+        let mut interrupted_config = store.load().unwrap();
+        assert!(
+            TransactionJournal::resolve_pending_session_transition(
+                &store,
+                &mut interrupted_config,
+                true
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            interrupted_config.per_session_spending_limit_inj,
+            proposed_config.per_session_spending_limit_inj
+        );
+        assert_eq!(
+            interrupted_config.wallet_address,
+            proposed_config.wallet_address
+        );
+        let completed = TransactionJournal::inspect_session(&store, &interrupted_config).unwrap();
+        assert_eq!(
+            completed.session_id.as_deref(),
+            Some(committed_session_id.as_str())
+        );
+        assert_eq!(
+            completed.wallet.as_deref(),
+            Some(format!("{proposed_wallet:#x}").as_str())
+        );
+        assert!(completed.pending_transition.is_none());
+        let committed =
+            TransactionJournal::open(&store, &interrupted_config, proposed_wallet).unwrap();
+        assert_eq!(committed.state.session_history.len(), 1);
+        assert_eq!(committed.state.session_history[0].id, old_session_id);
+    }
+
+    #[test]
+    fn read_only_recovery_manager_cannot_sign_or_broadcast() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let wallet = Address::with_last_byte(0x73);
+        let token = Address::with_last_byte(0x74);
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            wallet_address: Some(format!("{wallet:#x}")),
+            ..AppConfig::default()
+        };
+        let journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        drop(journal);
+
+        let manager = TransactionManager::open_for_read_only_recovery(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+        )
+        .unwrap();
+        assert!(manager.require_signing_enabled().is_err());
     }
 
     #[test]
@@ -7213,6 +9713,7 @@ mod tests {
                 entry
             })
             .collect();
+        sync_test_active_authorization(&mut manager.journal).unwrap();
         manager.journal.persist().unwrap();
         let writes_before_monitor = telemetry.count(HistoryCounter::JournalWrites);
 
@@ -7325,6 +9826,7 @@ mod tests {
                 .state
                 .proof_attempted_through
                 .insert(format!("{contract:#x}"), count.saturating_sub(1) as u64);
+            sync_test_active_authorization(&mut manager.journal).unwrap();
             manager.journal.persist().unwrap();
             let snapshot = crate::rpc::ReadSnapshot {
                 block: crate::rpc::BlockSnapshot {
@@ -7676,6 +10178,7 @@ mod tests {
             .state
             .proof_attempted_through
             .insert(format!("{contract:#x}"), 0);
+        sync_test_active_authorization(&mut manager.journal).unwrap();
         manager.journal.persist().unwrap();
         let snapshot = crate::rpc::ReadSnapshot {
             block: crate::rpc::BlockSnapshot {
@@ -7869,6 +10372,7 @@ mod tests {
             .state
             .proof_attempted_through
             .insert(format!("{contract:#x}"), 0);
+        sync_test_active_authorization(&mut manager.journal).unwrap();
         manager.journal.persist().unwrap();
         assert!(
             manager
@@ -8133,6 +10637,7 @@ mod tests {
             .state
             .proof_attempted_through
             .insert(format!("{contract:#x}"), 0);
+        sync_test_active_authorization(&mut first_manager.journal).unwrap();
         first_manager.journal.persist().unwrap();
 
         assert!(
@@ -8598,9 +11103,7 @@ mod tests {
             entry.remove(key);
         }
         drop(journal);
-        store
-            .write_transaction_journal(&serde_json::to_vec(&legacy).unwrap())
-            .unwrap();
+        write_legacy_journal(&store, &mut legacy).unwrap();
 
         let migrated = TransactionJournal::open(&store, &config, wallet).unwrap();
         assert_eq!(migrated.state.version, super::JOURNAL_VERSION);
@@ -8688,6 +11191,7 @@ mod tests {
                 created_unix_secs: index as u64,
             })
             .collect();
+        sync_test_active_authorization(&mut journal).unwrap();
         let archived = journal.archive_settled().unwrap();
         assert_eq!(
             archived,
@@ -8759,6 +11263,7 @@ mod tests {
                 )
             })
             .collect();
+        sync_test_active_authorization(&mut journal).unwrap();
         assert_eq!(journal.archive_settled().unwrap(), ARCHIVE_TRIGGER_ENTRIES);
         let archive = journal.state.archives[0].file_name.clone();
         drop(journal);
@@ -9518,7 +12023,7 @@ mod tests {
         .unwrap();
         assert_eq!(network.manifest.chain_id, 1439);
         assert_eq!(network.manifest.nodes.len(), 9);
-        let mut snapshot = network.snapshot(Some(account)).await.unwrap();
+        let snapshot = network.snapshot(Some(account)).await.unwrap();
         assert_eq!(snapshot.nodes.len(), 9);
         assert!(snapshot.nodes.iter().all(|node| {
             node.state
@@ -9530,84 +12035,417 @@ mod tests {
         let store = ConfigStore::at_root(PathBuf::from(app_root.path()));
         let config = AppConfig {
             network: Network::Testnet,
+            wallet_address: Some(format!("{account:#x}")),
+            cpu_threads: 4,
             minimum_reserve_inj: "0.1".to_owned(),
             per_session_spending_limit_inj: "20".to_owned(),
             transaction_confirmations: 1,
             ..AppConfig::default()
         };
-        let mut manager = TransactionManager::open(&store, &config, account, token).unwrap();
-        let selected = HashSet::from_iter(1..=9_u8);
-        let pending_sync = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        let finalization_state = Arc::new(std::sync::RwLock::new(HashMap::new()));
-        assert!(
-            finalize_initial_expired_windows(
-                &network,
-                &selected,
-                &mut manager,
-                &signer,
-                account,
-                &mut snapshot,
-                FinalizationOptions {
-                    finalization_state: &finalization_state,
-                    dashboard: &None,
-                    pending_sync: &pending_sync,
+        store.save(&config).unwrap();
+        drop(TransactionJournal::open(&store, &config, account).unwrap());
+
+        let (probe_sender, probe_receiver) = tokio::sync::oneshot::channel();
+        let run_store = store.clone();
+        let run_config = config.clone();
+        let run_network = network.clone();
+        let run_signer = clone_signer(&signer);
+        let runtime = tokio::spawn(async move {
+            crate::mining::run_with_client(
+                &run_store,
+                run_config,
+                MineArgs {
+                    device: DeviceChoice::Cpu,
+                    compute_only: false,
+                    new_session: false,
+                    threads: NonZeroUsize::new(4),
+                    nodes: (1..=9).collect(),
+                    send_rewards_to: None,
                 },
+                run_network,
+                Some(run_signer),
+                Some(probe_sender),
+                true,
             )
             .await
-            .unwrap()
-        );
+        });
+        let probe = tokio::time::timeout(Duration::from_secs(10), probe_receiver)
+            .await
+            .expect("nine-node miner runtime should start")
+            .expect("nine-node miner probe should remain connected");
 
-        let finalizations = manager
-            .journal
-            .state
+        let journal = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let state: super::JournalState =
+                    serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                        .unwrap();
+                let finalized_nodes = state
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.action == TransactionAction::FinalizeWindow
+                            && entry.window_id == 0
+                            && entry.status == TransactionStatus::MinedSuccess
+                            && entry.receipt_status == Some(true)
+                            && entry.confirmations >= u64::from(config.transaction_confirmations)
+                    })
+                    .map(|entry| entry.node_id)
+                    .collect::<HashSet<_>>();
+                if finalized_nodes.len() == 9 {
+                    return state;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("all nine expired windows should finalize and settle");
+        let finalization_order = journal
             .entries
             .iter()
-            .filter(|entry| entry.action == TransactionAction::FinalizeWindow)
+            .filter(|entry| {
+                entry.action == TransactionAction::FinalizeWindow
+                    && entry.window_id == 0
+                    && entry.status == TransactionStatus::MinedSuccess
+                    && entry.receipt_status == Some(true)
+            })
+            .map(|entry| entry.node_id)
             .collect::<Vec<_>>();
-        assert_eq!(finalizations.len(), 9);
-        assert!(finalizations.iter().all(|entry| {
-            entry.status == TransactionStatus::MinedSuccess
-                && entry.confirmations >= u64::from(config.transaction_confirmations)
+        assert_eq!(finalization_order, (1..=9).collect::<Vec<_>>());
+        assert!(
+            !journal
+                .entries
+                .iter()
+                .any(|entry| entry.status.is_unresolved())
+        );
+
+        let resumed_work = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let fresh = network.snapshot(Some(account)).await.unwrap();
+                if fresh.nodes.iter().all(|node| {
+                    node.state
+                        .as_ref()
+                        .is_some_and(|state| state.eligible && !state.finalizable)
+                }) {
+                    return fresh;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("all nine nodes should advance to eligible work after finalization");
+        assert_eq!(resumed_work.nodes.len(), 9);
+        let node_one_window = resumed_work
+            .nodes
+            .iter()
+            .find(|node| node.id == 1)
+            .and_then(|node| node.state.as_ref())
+            .unwrap()
+            .work
+            .window_id;
+        for node_id in 1..=9 {
+            let window_id = resumed_work
+                .nodes
+                .iter()
+                .find(|node| node.id == node_id)
+                .and_then(|node| node.state.as_ref())
+                .unwrap()
+                .work
+                .window_id;
+            wait_for_active_probe(&probe, node_id, window_id).await;
+        }
+        let hashes_before_resume = probe.slots[0].completed_hashes();
+        wait_for_hash_increase(&probe, 1, hashes_before_resume).await;
+        probe.proof_processing_gate.send_replace(false);
+        let resumed_proof = wait_for_journal_entry_for_window(
+            &store,
+            1,
+            TransactionAction::SubmitProof,
+            node_one_window,
+            TransactionStatus::MinedSuccess,
+        )
+        .await;
+        assert_eq!(resumed_proof.outcome.as_deref(), Some("candidate-updated"));
+
+        probe.stop_signal.request_stop();
+        let stopped = tokio::time::timeout(Duration::from_secs(15), runtime)
+            .await
+            .expect("nine-node miner runtime should stop cleanly")
+            .expect("nine-node miner task should join");
+        assert!(stopped.is_ok());
+
+        let settled_journal: super::JournalState =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        assert_eq!(
+            settled_journal
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.action == TransactionAction::FinalizeWindow
+                        && entry.window_id == 0
+                        && entry.status == TransactionStatus::MinedSuccess
+                        && entry.receipt_status == Some(true)
+                })
+                .count(),
+            9,
+            "all startup finalization transactions remain durably settled"
+        );
+        assert!(settled_journal.entries.iter().any(|entry| {
+            entry.action == TransactionAction::SubmitProof
+                && entry.status == TransactionStatus::MinedSuccess
+                && entry.outcome.as_deref() == Some("candidate-updated")
         }));
-        assert!(snapshot.nodes.iter().all(|node| {
+
+        assert!(resumed_work.nodes.iter().all(|node| {
             node.state
                 .as_ref()
                 .is_some_and(|state| state.eligible && !state.finalizable)
         }));
-        assert!(!manager.journal.has_unresolved());
+    }
 
-        let node = snapshot.nodes.iter().find(|node| node.id == 1).unwrap();
-        let state = node.state.as_ref().unwrap();
-        let header = b"all-nine-expired-autonomous-startup-proof";
-        let context = WorkContext {
-            chain_id: network.manifest.chain_id,
-            contract: node.address,
-            window_id: state.work.window_id,
-            seed: state.work.seed,
-            miner: account,
-            header: header.to_vec(),
+    #[tokio::test]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
+    async fn compute_only_hashes_with_unresolved_transaction_without_signing_or_resetting_session()
+    {
+        let root = std::env::var_os("ASTATINE_EVM_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .join("astatineEVM")
+                    .join("evm")
+            });
+        prepare_local_test_contracts(&root);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut process = Command::new("anvil")
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--chain-id",
+                "1439",
+                "--accounts",
+                "3",
+                "--silent",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Anvil must be installed for the compute-only recovery regression");
+        let _process_guard = AnvilGuard(&mut process);
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let rpc = reqwest::Client::new();
+        wait_for_anvil(&rpc, &endpoint).await;
+
+        let signer = test_signer();
+        let wallet = signer_address(&signer);
+        let unlocked_accounts =
+            rpc_request_local(&rpc, &endpoint, "eth_accounts", serde_json::json!([]))
+                .await
+                .unwrap();
+        let deployment_wallet = Address::from_str(unlocked_accounts[0].as_str().unwrap()).unwrap();
+        let token_artifact = read_artifact(&root.join("out/MockAST.sol/MockAST.json"));
+        let miner_artifact = read_artifact(&root.join("out/AstatineMiner.sol/AstatineMiner.json"));
+        let decimals = 9_u8;
+        let token_unit = U256::from(10_u8).pow(U256::from(decimals));
+        let allocation = U256::from(1_000_u64) * token_unit;
+        let reward = U256::from(100_u64) * token_unit;
+        let mut token_init = artifact_bytecode(&token_artifact);
+        token_init.extend_from_slice(&abi_uint8_word(decimals));
+        let token = deploy_unlocked(&rpc, &endpoint, deployment_wallet, &token_init).await;
+        let mint = LocalMockAST::mintCall {
+            account: deployment_wallet,
+            amount: allocation,
+        }
+        .abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(token),
+            &mint,
+            U256::ZERO,
+        )
+        .await;
+        let miner = deploy_local_miner(LocalMinerDeployment {
+            client: &rpc,
+            endpoint: &endpoint,
+            deployment_wallet,
+            token,
+            token_decimals: decimals,
+            allocation,
+            reward,
+            miner_bytecode: &artifact_bytecode(&miner_artifact),
+            initial_target: U256::MAX,
+            retarget_interval: 100,
+            window_secs: 3_600,
+        })
+        .await;
+        let approve = LocalMockAST::approveCall {
+            spender: miner,
+            amount: allocation,
+        }
+        .abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(token),
+            &approve,
+            U256::ZERO,
+        )
+        .await;
+        let fund = LocalAstatineMiner::fundASTCall { amount: allocation }.abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &fund,
+            U256::ZERO,
+        )
+        .await;
+        let activate = LocalAstatineMiner::activateGenesisCall {
+            initialSeed: B256::with_last_byte(0x79),
+        }
+        .abi_encode();
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &activate,
+            U256::ZERO,
+        )
+        .await;
+
+        let miner_runtime_hash = local_code_hash(&rpc, &endpoint, miner).await;
+        let token_runtime_hash = local_code_hash(&rpc, &endpoint, token).await;
+        let node_pins = (1..=9_u8)
+            .map(|node_id| (node_id, miner, miner_runtime_hash))
+            .collect::<Vec<_>>();
+        let network = NetworkClient::local_test_client_with_nodes(
+            &endpoint,
+            &node_pins,
+            token,
+            token_runtime_hash,
+            decimals,
+        )
+        .unwrap();
+        let app_root = tempdir().unwrap();
+        let store = ConfigStore::at_root(app_root.path().to_path_buf());
+        let config = AppConfig {
+            network: Network::Testnet,
+            wallet_address: Some(format!("{wallet:#x}")),
+            minimum_reserve_inj: "0".to_owned(),
+            per_session_spending_limit_inj: "1".to_owned(),
+            cpu_threads: 1,
+            ..AppConfig::default()
         };
-        let nonce = 0_u128;
-        let work_hash = WorkHasher::new(&context).unwrap().hash(nonce);
-        assert!(meets_target(work_hash, state.work.target));
-        let submitted = manager
-            .submit_proof(
-                &network,
-                &signer,
-                ProofSubmission {
-                    contract: node.address,
-                    node_id: node.id,
-                    window_id: state.work.window_id,
-                    nonce,
-                    header: header.to_vec(),
-                    work_hash,
+        store.save(&config).unwrap();
+
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let mut request = test_request();
+        let header = b"compute-only-unresolved".to_vec();
+        let proof_nonce = 7_u128;
+        request.data = AstatineMinerRead::submitSolutionCall {
+            header: Bytes::from(header.clone()),
+            nonce: proof_nonce,
+        }
+        .abi_encode();
+        let tx_hash = sign_eip1559(&signer, &request).unwrap().hash;
+        journal
+            .prepare(prepared_test_transaction(
+                &request,
+                tx_hash,
+                parse_inj_wei("1").unwrap(),
+                U256::ZERO,
+                U256::MAX,
+                Some(ProofData {
+                    nonce: proof_nonce,
+                    work_hash: B256::with_last_byte(0x7a),
+                    header,
+                }),
+            ))
+            .unwrap();
+        journal
+            .set_broadcast_state(tx_hash, TransactionStatus::Broadcast)
+            .unwrap();
+        let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        let authorized_before = journal.session_authorized_total().unwrap();
+        assert!(authorized_before > U256::ZERO);
+        drop(journal);
+        let entries_before = store.read_transaction_journal().unwrap().unwrap();
+        let nonce_before = local_pending_nonce(&rpc, &endpoint, wallet).await;
+
+        let (probe_sender, probe_receiver) = tokio::sync::oneshot::channel();
+        let run_store = store.clone();
+        let run_config = config.clone();
+        let run_network = network.clone();
+        let mut runtime = tokio::spawn(async move {
+            crate::mining::run_with_client(
+                &run_store,
+                run_config,
+                MineArgs {
+                    device: DeviceChoice::Cpu,
+                    compute_only: true,
+                    new_session: false,
+                    threads: NonZeroUsize::new(1),
+                    nodes: vec![1],
+                    send_rewards_to: None,
                 },
+                run_network,
+                None,
+                Some(probe_sender),
+                false,
             )
             .await
-            .expect("eligible post-finalization proof should be signed and submitted");
-        assert!(submitted.receipt.status);
-        assert_eq!(submitted.outcome, "candidate-updated");
-        assert!(!manager.journal.has_unresolved());
+        });
+        let probe = match tokio::time::timeout(Duration::from_secs(10), probe_receiver).await {
+            Ok(Ok(probe)) => probe,
+            Ok(Err(error)) => {
+                let runtime_result = runtime.await;
+                panic!(
+                    "compute-only probe closed unexpectedly ({error}); runtime={runtime_result:?}"
+                );
+            }
+            Err(error) => panic!("compute-only probe timed out: {error}"),
+        };
+        probe.proof_processing_gate.send_replace(false);
+        wait_for_active_probe(&probe, 1, 0).await;
+        let hashes_before = probe.slots[0].completed_hashes();
+        wait_for_hash_increase(&probe, 1, hashes_before).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            local_pending_nonce(&rpc, &endpoint, wallet).await,
+            nonce_before,
+            "compute-only mining must not sign or broadcast"
+        );
+        assert_eq!(
+            store.read_transaction_journal().unwrap().unwrap(),
+            entries_before,
+            "compute-only mining must not create a session, change authorization, or rewrite history"
+        );
+        probe.stop_signal.request_stop();
+        let stopped = tokio::time::timeout(Duration::from_secs(15), &mut runtime)
+            .await
+            .expect("compute-only runtime should stop cleanly")
+            .expect("compute-only runtime task should join");
+        assert!(stopped.is_ok());
+        let inspected = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert_eq!(inspected.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(
+            inspected.authorized_exposure_wei.as_deref(),
+            Some(authorized_before.to_string().as_str())
+        );
+        assert_eq!(inspected.unresolved.len(), 1);
+        assert_eq!(inspected.unresolved[0].hash, format!("{tx_hash:#x}"));
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9970,6 +12808,7 @@ mod tests {
                     run_network,
                     supplied_signer,
                     Some(probe_tx),
+                    transaction_mode,
                 )
                 .await
             });
@@ -10914,6 +13753,7 @@ mod tests {
                     run_network,
                     Some(run_signer),
                     Some(probe_tx),
+                    !gpu_compute_only,
                 )
                 .await
             });
@@ -11280,7 +14120,15 @@ mod tests {
             )
             .await;
             assert!(first_rewarding_finalization.receipt_status.unwrap());
-            wait_for_verified_reward(&network, &store, 1, 1, &probe.history_telemetry).await;
+            wait_for_verified_reward(
+                &network,
+                &store,
+                1,
+                1,
+                &probe.observer_refresh,
+                &probe.history_telemetry,
+            )
+            .await;
             let rewarded_snapshot = network.snapshot(Some(account)).await.unwrap();
             assert!(rewarded_snapshot
                 .ast_balance
@@ -11427,12 +14275,21 @@ mod tests {
                         .as_ref()
                         .is_some_and(|state| state.work.window_id > node3_finalization_window)
             }));
-            wait_for_verified_reward(&network, &store, 1, 2, &probe.history_telemetry).await;
+            wait_for_verified_reward(
+                &network,
+                &store,
+                1,
+                2,
+                &probe.observer_refresh,
+                &probe.history_telemetry,
+            )
+            .await;
             wait_for_verified_reward(
                 &network,
                 &store,
                 3,
                 node3_finalization_window,
+                &probe.observer_refresh,
                 &probe.history_telemetry,
             )
             .await;
@@ -11559,6 +14416,7 @@ mod tests {
                     recovery_network,
                     Some(recovery_signer),
                     Some(recovery_probe_tx),
+                    false,
                 )
                 .await
             });
@@ -12569,6 +15427,7 @@ mod tests {
                     run_network,
                     Some(run_signer),
                     Some(probe_tx),
+                    true,
                 )
                 .await
             });
@@ -14068,9 +16927,11 @@ mod tests {
         store: &ConfigStore,
         node_id: u8,
         window_id: u64,
+        observer_refresh: &ObserverRefreshHandle,
         telemetry: &HistoryTelemetry,
     ) {
         let verified = tokio::time::timeout(Duration::from_secs(60), async {
+            let mut next_refresh = Instant::now();
             loop {
                 if let Some(contents) = store.read_transaction_journal().unwrap() {
                     let journal: super::JournalState = serde_json::from_slice(&contents).unwrap();
@@ -14086,6 +16947,10 @@ mod tests {
                     }) {
                         return;
                     }
+                }
+                if Instant::now() >= next_refresh {
+                    observer_refresh.force_refresh();
+                    next_refresh = Instant::now() + Duration::from_millis(250);
                 }
                 sleep(Duration::from_millis(25)).await;
             }

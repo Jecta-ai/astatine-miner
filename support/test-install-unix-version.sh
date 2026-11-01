@@ -11,9 +11,9 @@ assert_order() {
   fi
 }
 
-assert_order 0.1.0-testnet.12 0.1.0-testnet.13 -1
-assert_order 0.1.0-testnet.13 0.1.0-testnet.13 0
-assert_order 0.1.0-testnet.14 0.1.0-testnet.13 1
+assert_order 0.1.0-testnet.13 0.1.0-testnet.14 -1
+assert_order 0.1.0-testnet.14 0.1.0-testnet.14 0
+assert_order 0.1.0-testnet.15 0.1.0-testnet.14 1
 assert_order 0.1.0-testnet.0 0.1.0-testnet.1 -1
 assert_order 0.1.0-testnet.2147483647 0.1.0-testnet.2147483646 1
 assert_order 0.1.1-testnet.1 0.1.0-testnet.99 1
@@ -25,7 +25,7 @@ assert_order 0.1.0-testnet.99 0.1.0  -1
 assert_order 0.1.0 0.1.0-testnet.99 1
 
 assert_invalid() {
-  if sh "$INSTALLER" --compare-testnet-versions "$1" 0.1.0-testnet.13 >/dev/null 2>&1; then
+  if sh "$INSTALLER" --compare-testnet-versions "$1" 0.1.0-testnet.14 >/dev/null 2>&1; then
     printf '%s\n' "Invalid installed version must be rejected: $1" >&2
     exit 1
   fi
@@ -62,22 +62,22 @@ assert_executable_version() {
   } > "$FAKE_EXECUTABLE"
   chmod +x "$FAKE_EXECUTABLE"
   if [ "$should_pass" = true ]; then
-    sh "$INSTALLER" --verify-executable-version 0.1.0-testnet.13 "$FAKE_EXECUTABLE"
-  elif sh "$INSTALLER" --verify-executable-version 0.1.0-testnet.13 "$FAKE_EXECUTABLE" >/dev/null 2>&1; then
+    sh "$INSTALLER" --verify-executable-version 0.1.0-testnet.14 "$FAKE_EXECUTABLE"
+  elif sh "$INSTALLER" --verify-executable-version 0.1.0-testnet.14 "$FAKE_EXECUTABLE" >/dev/null 2>&1; then
     printf '%s\n' "Malformed or mismatched executable version output was accepted: $output" >&2
     exit 1
   fi
 }
 
-assert_executable_version 'astatine 0.1.0-testnet.13\n' true
-assert_executable_version 'astatine 0.1.0-testnet.130\n' false
+assert_executable_version 'astatine 0.1.0-testnet.14\n' true
+assert_executable_version 'astatine 0.1.0-testnet.140\n' false
 assert_executable_version 'astatine 0.1.0-testnet.foo\n' false
-assert_executable_version 'astatine 0.1.0-testnet.12\n' false
-assert_executable_version 'astatine 0.1.0-testnet.13 \n' false
-assert_executable_version '0.1.0-testnet.13\n' false
+assert_executable_version 'astatine 0.1.0-testnet.13\n' false
+assert_executable_version 'astatine 0.1.0-testnet.14 \n' false
+assert_executable_version '0.1.0-testnet.14\n' false
 assert_executable_version 'not a version\n' false
-assert_executable_version 'astatine 0.1.0-testnet.13\nextra output\n' false
-assert_executable_version 'astatine 0.1.0-testnet.13' false
+assert_executable_version 'astatine 0.1.0-testnet.14\nextra output\n' false
+assert_executable_version 'astatine 0.1.0-testnet.14' false
 
 assert_existing_version() {
   output=$1

@@ -202,7 +202,7 @@ def self_test(repo_root: pathlib.Path) -> None:
     import release_artifacts
     import release_public_key
 
-    tag = "v0.1.0-testnet.13"
+    tag = "v0.1.0-testnet.14"
     source_commit = "a" * 40
     with tempfile.TemporaryDirectory(prefix="astatine-offline-sign-test-") as temporary:
         temp = pathlib.Path(temporary)

@@ -59,8 +59,8 @@ From a clean checkout at the commit to rehearse:
 
 ```sh
 REPOSITORY="$(tr -d '\n' < support/release-repository.txt)"
-BRANCH="feature/testnet13-rc1-remediation"
-TAG="v0.1.0-testnet.13"
+BRANCH="main"
+TAG="v0.1.0-testnet.14"
 gh workflow run ci.yml --repo "$REPOSITORY" --ref "$BRANCH" \
   -f release_rehearsal=true -f release_tag="$TAG"
 ```
@@ -95,7 +95,7 @@ shown by GitHub. Keep the working directory outside the repository:
 
 ```sh
 REPOSITORY="$(tr -d '\n' < support/release-repository.txt)"
-TAG="v0.1.0-testnet.13"
+TAG="v0.1.0-testnet.14"
 RUN_ID="<successful-tag-workflow-run-id>"
 SOURCE_COMMIT="<40-character-source-commit-from-that-run>"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/astatine-release.XXXXXX")"
@@ -160,8 +160,19 @@ requires the clean checkout to remain at `SOURCE_COMMIT` and has no private-key
 input. It revalidates the signed manifest, hashes, allowlist,
 package contents, preflight report and source tag, creates a **draft** release,
 checks all uploaded asset digests, and only then makes the draft a prerelease.
-It refuses to overwrite an existing release. An interrupted upload remains a
-draft and a retry refuses to mutate it; inspect and resolve that draft manually.
+Before creating the draft, and again after upload, immediately before
+publication, and after publication, it verifies that the remote tag still
+resolves to `SOURCE_COMMIT`. For an existing tag, the GitHub release API may
+report the default branch in `target_commitish`; the publisher deliberately
+does not use that field as source proof. It binds the release to the separately
+verified protected tag ref, source provenance, and signed assets. It refuses to proceed unless an active,
+non-bypassable tag ruleset covers the exact tag and blocks updates. Keep the
+`Protect Astatine release tags` ruleset active for the entire publication window;
+it covers `refs/tags/v0.1.0-testnet.*` and denies update/deletion without bypass
+actors. The checks reduce race exposure; repository owners must not alter or
+disable the ruleset while publishing. The publisher refuses to overwrite an
+existing release. An interrupted upload remains a draft and a retry refuses to
+mutate it; inspect and resolve that draft manually.
 
 ```sh
 python3 support/publish_signed_release.py \
@@ -171,7 +182,7 @@ python3 support/publish_signed_release.py \
   --source-commit "$SOURCE_COMMIT" \
   --verified-preflight-sha256 "<same SHA-256 recorded during online verification>" \
   --public-key support/release-signing-public.pem \
-  --notes-file support/release-notes-v0.1.0-testnet.13.md
+  --notes-file support/release-notes-v0.1.0-testnet.14.md
 ```
 
 The script prompts for `PUBLISH <tag> <source-commit> PREFLIGHT <report-sha256>`.

@@ -1010,7 +1010,7 @@ mod tests {
 
     #[test]
     fn selects_highest_compatible_numeric_testnet_prerelease() {
-        let current = semver::Version::parse("0.1.0-testnet.12").unwrap();
+        let current = semver::Version::parse("0.1.0-testnet.13").unwrap();
         let releases = vec![
             GitHubRelease {
                 tag_name: "v0.1.0-testnet.8".to_owned(),
@@ -1038,6 +1038,11 @@ mod tests {
                 draft: false,
             },
             GitHubRelease {
+                tag_name: "v0.1.0-testnet.14".to_owned(),
+                prerelease: true,
+                draft: false,
+            },
+            GitHubRelease {
                 tag_name: "v0.2.0-testnet.10".to_owned(),
                 prerelease: true,
                 draft: false,
@@ -1051,18 +1056,18 @@ mod tests {
         assert_eq!(
             latest_testnet_release(releases, &current),
             Some((
-                semver::Version::parse("0.1.0-testnet.13").unwrap(),
-                "v0.1.0-testnet.13".to_owned(),
+                semver::Version::parse("0.1.0-testnet.14").unwrap(),
+                "v0.1.0-testnet.14".to_owned(),
             ))
         );
     }
 
     #[test]
     fn rust_updater_only_selects_canonical_numeric_testnet_versions() {
-        let current = semver::Version::parse("0.1.0-testnet.13").unwrap();
+        let current = semver::Version::parse("0.1.0-testnet.14").unwrap();
         let releases = [
-            ("v0.1.0-testnet.13", true),
-            ("v0.1.0-testnet.130", true),
+            ("v0.1.0-testnet.14", true),
+            ("v0.1.0-testnet.140", true),
             ("v0.1.0-testnet.foo", true),
             ("v0.1.0-testnet.13.extra", true),
             ("v0.1.0-testnet.013", true),
@@ -1079,8 +1084,8 @@ mod tests {
         assert_eq!(
             latest_testnet_release(releases, &current),
             Some((
-                semver::Version::parse("0.1.0-testnet.130").unwrap(),
-                "v0.1.0-testnet.130".to_owned()
+                semver::Version::parse("0.1.0-testnet.140").unwrap(),
+                "v0.1.0-testnet.140".to_owned()
             ))
         );
         for invalid in [
@@ -1097,30 +1102,30 @@ mod tests {
 
     #[test]
     fn executable_version_output_must_be_one_exact_supported_version() {
-        let expected = semver::Version::parse("0.1.0-testnet.13").unwrap();
+        let expected = semver::Version::parse("0.1.0-testnet.14").unwrap();
         for output in [
-            "astatine 0.1.0-testnet.13\n",
-            "astatine 0.1.0-testnet.13\r\n",
+            "astatine 0.1.0-testnet.14\n",
+            "astatine 0.1.0-testnet.14\r\n",
         ] {
             assert_eq!(parse_executable_version_output(output).unwrap(), expected);
-            assert!(verify_executable_version_output(output, "0.1.0-testnet.13").is_ok());
+            assert!(verify_executable_version_output(output, "0.1.0-testnet.14").is_ok());
         }
         for output in [
-            "astatine 0.1.0-testnet.130\n",
-            "astatine 0.1.0-testnet.12\n",
+            "astatine 0.1.0-testnet.140\n",
+            "astatine 0.1.0-testnet.13\n",
         ] {
             assert!(parse_executable_version_output(output).is_ok());
             assert!(
-                verify_executable_version_output(output, "0.1.0-testnet.13").is_err(),
-                "{output:?} must not match .13"
+                verify_executable_version_output(output, "0.1.0-testnet.14").is_err(),
+                "{output:?} must not match .14"
             );
         }
         for output in [
-            "0.1.0-testnet.13\n",
+            "0.1.0-testnet.14\n",
             "astatine 0.1.0-testnet.foo\n",
-            "astatine 0.1.0-testnet.13 \n",
-            "astatine 0.1.0-testnet.13\nextra output\n",
-            "astatine 0.1.0-testnet.13\n\n",
+            "astatine 0.1.0-testnet.14 \n",
+            "astatine 0.1.0-testnet.14\nextra output\n",
+            "astatine 0.1.0-testnet.14\n\n",
             "not an Astatine version\n",
         ] {
             assert!(
@@ -1139,17 +1144,17 @@ mod tests {
         let directory = tempdir().unwrap();
         let executable = directory.path().join("astatine");
         for (output, expected_to_pass) in [
-            ("astatine 0.1.0-testnet.13\n", true),
-            ("astatine 0.1.0-testnet.130\n", false),
+            ("astatine 0.1.0-testnet.14\n", true),
+            ("astatine 0.1.0-testnet.140\n", false),
             ("astatine 0.1.0-testnet.foo\n", false),
-            ("astatine 0.1.0-testnet.12\n", false),
-            ("astatine 0.1.0-testnet.13\nextra output\n", false),
+            ("astatine 0.1.0-testnet.13\n", false),
+            ("astatine 0.1.0-testnet.14\nextra output\n", false),
             ("malformed version output\n", false),
         ] {
             fs::write(&executable, format!("#!/bin/sh\nprintf '%s' '{output}'\n")).unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
             assert_eq!(
-                smoke_test_binary(&executable, "0.1.0-testnet.13").is_ok(),
+                smoke_test_binary(&executable, "0.1.0-testnet.14").is_ok(),
                 expected_to_pass,
                 "version output: {output:?}"
             );

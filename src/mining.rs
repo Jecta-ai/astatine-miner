@@ -16,10 +16,10 @@ use crate::{
     rpc::{BlockSnapshot, NetworkClient, NodeState, ReadSnapshot, is_transient_rpc_error},
     startup::{CtrlCSignal, StartupProgress, race_with_ctrl_c},
     transaction::{
-        AUTOMATIC_REWARD_FORWARDING_DISABLED, ConfirmedAction, ProofSubmission, TransactionAction,
-        TransactionActivityState, TransactionDashboardState, TransactionManager,
-        TransactionPolicyRefusalKind, is_stale_transaction_preflight, mined_transaction_reverted,
-        transaction_policy_refusal,
+        AUTOMATIC_REWARD_FORWARDING_DISABLED, ConfirmedAction, ProofSubmission,
+        SessionJournalSnapshot, TransactionAction, TransactionActivityState,
+        TransactionDashboardState, TransactionManager, TransactionPolicyRefusalKind,
+        is_stale_transaction_preflight, mined_transaction_reverted, transaction_policy_refusal,
     },
     wallet::{selected_address, unlock_selected_interactive},
 };
@@ -706,18 +706,6 @@ impl ProofInboxReceiver {
     }
 }
 
-fn should_unlock_recovered_wallet(
-    transaction_mode: bool,
-    spending_limit: U256,
-    signer_is_unlocked: bool,
-    has_unresolved_transaction: bool,
-) -> bool {
-    transaction_mode
-        && !spending_limit.is_zero()
-        && !signer_is_unlocked
-        && !has_unresolved_transaction
-}
-
 struct MiningWorkers {
     stop: Arc<AtomicBool>,
     workers: Vec<thread::JoinHandle<()>>,
@@ -759,6 +747,7 @@ enum BackendEvent {
 struct StartupControl<'a> {
     ctrl_c: &'a mut CtrlCSignal,
     progress: Option<&'a StartupProgress>,
+    new_session_authorized: bool,
 }
 
 impl MiningWorkers {
@@ -936,7 +925,24 @@ impl Drop for ReadOnlyObserver {
     }
 }
 
-pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
+#[cfg(test)]
+pub(crate) async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
+    if args.new_session {
+        bail!(
+            "`--new-session` requires explicit spending authorization through the interactive CLI"
+        );
+    }
+    run_with_session_confirmation(store, args, false).await
+}
+
+pub(crate) async fn run_with_session_confirmation(
+    store: &ConfigStore,
+    args: MineArgs,
+    new_session_authorized: bool,
+) -> Result<()> {
+    if args.new_session && !new_session_authorized {
+        bail!("a new spending session requires explicit interactive authorization");
+    }
     if args.send_rewards_to.is_some() {
         bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
     }
@@ -950,6 +956,39 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
             return Err(error);
         }
     };
+    let session = if args.compute_only {
+        SessionJournalSnapshot::default()
+    } else {
+        match crate::transaction::TransactionJournal::inspect_session(store, &config) {
+            Ok(session) => session,
+            Err(error) => {
+                progress.fail(format!("Transaction session inspection failed: {error:#}"));
+                return Err(error).context("inspect transaction session before mining");
+            }
+        }
+    };
+    if !args.compute_only && session.pending_transition.is_some() {
+        progress.fail(
+            "An init spending-session change is interrupted; run astatine init to resolve it",
+        );
+        bail!(
+            "an init spending-session change is interrupted; run `astatine init` to resolve it before mining"
+        );
+    }
+    if unresolved_session_blocks_mining(args.compute_only, !session.unresolved.is_empty()) {
+        progress
+            .fail("An unresolved transaction requires read-only recovery; wallet remains locked");
+        eprintln!("RECOVERY REQUIRED • WALLET LOCKED • mining paused");
+        for entry in &session.unresolved {
+            eprintln!(
+                "  {} • node {:02} window {} • {}",
+                entry.hash, entry.node_id, entry.window_id, entry.status
+            );
+        }
+        bail!(
+            "run `astatine recover`; after it completes, start a fresh `astatine mine` process to unlock the wallet"
+        );
+    }
     progress.complete("Configuration loaded");
     progress.set_network(match config.network {
         crate::cli::Network::Testnet => "Injective EVM Testnet",
@@ -958,6 +997,11 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
     if !args.compute_only && config.network != crate::cli::Network::Testnet {
         progress.fail("Autonomous transaction signing is disabled outside Injective Testnet");
         bail!("autonomous transaction signing is disabled outside Injective Testnet");
+    }
+    if new_session_authorized
+        && (args.compute_only || parse_inj_wei(&config.per_session_spending_limit_inj)?.is_zero())
+    {
+        bail!("new spending-session authorization requires transaction mode and a positive cap");
     }
     progress.begin("Checking selected wallet");
     if let Err(error) = selected_address(&config) {
@@ -990,6 +1034,7 @@ pub async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
         StartupControl {
             ctrl_c: &mut ctrl_c,
             progress: Some(&progress),
+            new_session_authorized,
         },
     )
     .await
@@ -1003,6 +1048,7 @@ pub(crate) async fn run_with_client(
     client: NetworkClient,
     supplied_signer: Option<bip32::secp256k1::ecdsa::SigningKey>,
     probe_sender: Option<tokio::sync::oneshot::Sender<MiningProbe>>,
+    new_session_authorized: bool,
 ) -> Result<()> {
     let mut ctrl_c: CtrlCSignal = Box::pin(tokio::signal::ctrl_c());
     run_runtime(
@@ -1015,6 +1061,7 @@ pub(crate) async fn run_with_client(
         StartupControl {
             ctrl_c: &mut ctrl_c,
             progress: None,
+            new_session_authorized,
         },
     )
     .await
@@ -1032,6 +1079,7 @@ async fn run_runtime(
     let StartupControl {
         ctrl_c,
         progress: startup,
+        new_session_authorized,
     } = startup_control;
     if args.send_rewards_to.is_some() {
         bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
@@ -1097,7 +1145,8 @@ async fn run_runtime(
                 return Err(error).context("check for a read-only transaction recovery journal");
             }
         };
-    let transaction_manager_mode = transaction_mode || readonly_recovery;
+    let transaction_manager_mode =
+        should_open_transaction_manager(args.compute_only, transaction_mode, readonly_recovery);
     let mut transactions = if transaction_manager_mode {
         let token = client
             .manifest
@@ -1105,12 +1154,13 @@ async fn run_runtime(
             .as_ref()
             .context("AST token pin is missing from the Testnet manifest")?;
         let ast_token = crate::deployment::parse_address(&token.address)?;
-        let mut manager = match TransactionManager::open_with_session_authorization(
+        let mut manager = match TransactionManager::open_with_session_policy(
             store,
             &config,
             address,
             ast_token,
             client.history_telemetry(),
+            new_session_authorized,
             args.new_session,
         ) {
             Ok(manager) => manager,
@@ -1123,6 +1173,29 @@ async fn run_runtime(
                 return Err(error).context("open transaction journal for startup recovery");
             }
         };
+        // The test probe is only supplied by local-runtime tests. Production CLI
+        // entry points refuse unresolved startup sessions and route them to the
+        // dedicated read-only `astatine recover` command.
+        if unresolved_session_blocks_mining(args.compute_only, manager.journal.has_unresolved())
+            && probe_sender.is_none()
+        {
+            let unresolved = manager.journal.unresolved_transactions();
+            if let Some(startup) = startup {
+                startup.fail(
+                    "An unresolved transaction appeared during startup; wallet remains locked",
+                );
+            }
+            eprintln!("RECOVERY REQUIRED • WALLET LOCKED • mining paused");
+            for entry in unresolved {
+                eprintln!(
+                    "  {} • node {:02} window {} • {}",
+                    entry.hash, entry.node_id, entry.window_id, entry.status
+                );
+            }
+            bail!(
+                "run `astatine recover`; after it completes, start a fresh `astatine mine` process to unlock the wallet"
+            );
+        }
         manager.configure_reward_forwarding(args.send_rewards_to)?;
         manager.set_proof_telemetry(Arc::clone(&proof_telemetry));
         manager.set_proof_attempt_guard(Arc::clone(&proof_attempt_guard));
@@ -1188,7 +1261,7 @@ async fn run_runtime(
         );
     }
     let mut supplied_signer = supplied_signer;
-    let mut signer = if transaction_mode {
+    let signer = if transaction_mode {
         if let Some(signer) = supplied_signer.take() {
             Some(signer)
         } else if signing_ready {
@@ -1695,53 +1768,6 @@ async fn run_runtime(
                         if proof_receiver.has_pending() {
                             last_snapshot = snapshot;
                             continue 'mining_loop;
-                        }
-                        if let Some(manager) = transactions.as_ref()
-                            && should_unlock_recovered_wallet(
-                                transaction_mode,
-                                spending_limit,
-                                signer.is_some(),
-                                manager.journal.has_unresolved(),
-                            )
-                        {
-                            if let Some(dashboard) = dashboard.as_mut()
-                                && let Err(error) = dashboard.suspend().await
-                            {
-                                fatal_error = Some(error.context("suspend dashboard for wallet unlock"));
-                                break;
-                            }
-                            let unlock_result = unlock_selected_interactive(store, &config);
-                            if let Some(dashboard) = dashboard.as_mut()
-                                && let Err(error) = dashboard.resume(Arc::clone(&total_hashes))
-                            {
-                                fatal_error = Some(error.context("resume dashboard after wallet unlock"));
-                                break;
-                            }
-                            let recovered_signer = match unlock_result {
-                                Ok(recovered_signer)
-                                    if crate::wallet::signer_address(&recovered_signer) == address =>
-                                {
-                                    recovered_signer
-                                }
-                                Ok(_) => {
-                                    fatal_error = Some(anyhow!(
-                                        "unlocked signer does not match the selected wallet"
-                                    ));
-                                    break;
-                                }
-                                Err(error) => {
-                                    fatal_error = Some(
-                                        error.context("unlock selected wallet after transaction recovery"),
-                                    );
-                                    break;
-                                }
-                            };
-                            signer = Some(recovered_signer);
-                            proof_receiver.set_paused(false);
-                            report_mining_info(
-                                &dashboard,
-                                "Transaction recovery settled; autonomous Testnet signing is resuming.",
-                            );
                         }
                         snapshot = observer.latest_snapshot().unwrap_or(snapshot);
                         if let (Some(manager), Some(signer)) =
@@ -2753,24 +2779,6 @@ fn record_finalization_state(
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn finalize_initial_expired_windows(
-    client: &NetworkClient,
-    selected: &HashSet<u8>,
-    manager: &mut TransactionManager,
-    signer: &bip32::secp256k1::ecdsa::SigningKey,
-    wallet: Address,
-    snapshot: &mut ReadSnapshot,
-    options: FinalizationOptions<'_>,
-) -> Result<bool> {
-    if !maybe_finalize_expired(client, selected, manager, signer, wallet, snapshot, options).await?
-    {
-        return Ok(false);
-    }
-    *snapshot = client.snapshot(Some(wallet)).await?;
-    Ok(true)
-}
-
 fn confirmed_action_message(label: &str, action: &ConfirmedAction) -> String {
     let effective_price = action
         .receipt
@@ -3638,7 +3646,18 @@ fn dashboard_model(
             reward,
         });
     }
-    let current_action = nodes.iter().find_map(|node| {
+    let selected_windows_expired = !nodes.is_empty()
+        && nodes.iter().all(|node| {
+            matches!(
+                node.status,
+                NodeStatus::FinalizationRequired
+                    | NodeStatus::FinalizationRetrying
+                    | NodeStatus::FinalizationBlocked
+                    | NodeStatus::Finalizing
+                    | NodeStatus::Syncing
+            )
+        });
+    let detail_action = nodes.iter().find_map(|node| {
         let window_id = node.window_id?;
         match (node.status, finalization_state.get(&node.id)) {
             (
@@ -3685,6 +3704,14 @@ fn dashboard_model(
             _ => None,
         }
     });
+    let current_action = if selected_windows_expired {
+        Some(match detail_action {
+            Some(action) => format!("0 H/s expected • all selected windows expired • {action}"),
+            None => "0 H/s expected • all selected windows expired".to_owned(),
+        })
+    } else {
+        detail_action
+    };
     DashboardModel {
         network: context.network,
         chain_id: context.chain_id,
@@ -3928,17 +3955,32 @@ fn apply_transaction_state_to_model(model: &mut DashboardModel, state: &Transact
             TransactionActivityState::Confirming => "Confirming transaction",
             TransactionActivityState::Recovering => "Recovering transaction",
         };
-        format!(
-            "Node {:02} window #{} • {action}...",
-            activity.node_id, activity.window_id
-        )
+        let chain_window = model
+            .selected_nodes
+            .iter()
+            .find(|node| node.id == activity.node_id)
+            .and_then(|node| node.window_id);
+        match chain_window {
+            Some(current) if current > activity.window_id => format!(
+                "Node {:02} • {action} for older window #{}; chain now at #{}",
+                activity.node_id, activity.window_id, current
+            ),
+            Some(current) if current != activity.window_id => format!(
+                "Node {:02} • {action} for window #{}; chain reports #{}",
+                activity.node_id, activity.window_id, current
+            ),
+            _ => format!(
+                "Node {:02} window #{} • {action}...",
+                activity.node_id, activity.window_id
+            ),
+        }
     });
     if transaction_action.is_some() {
         model.current_action = transaction_action;
     } else if model.current_action.as_deref().is_some_and(|action| {
         action.contains("Confirming transaction")
             || action.contains("Signed; awaiting RPC broadcast")
-            || action.contains("Finalizing window...")
+            || action.contains("Finalizing window")
             || action.contains("Recovering transaction")
     }) {
         model.current_action = None;
@@ -4645,6 +4687,21 @@ fn next_poll_delay(current: Duration) -> Duration {
         .min(MAX_POLL_INTERVAL)
 }
 
+pub(crate) fn unresolved_session_blocks_mining(
+    compute_only: bool,
+    has_unresolved_transaction: bool,
+) -> bool {
+    !compute_only && has_unresolved_transaction
+}
+
+fn should_open_transaction_manager(
+    compute_only: bool,
+    transaction_mode: bool,
+    readonly_recovery: bool,
+) -> bool {
+    !compute_only && (transaction_mode || readonly_recovery)
+}
+
 fn format_inj(value: Option<U256>) -> String {
     let Some(value) = value else {
         return "unavailable".to_owned();
@@ -4685,13 +4742,14 @@ mod tests {
         ActiveBackend, DashboardContext, FinalizationState, HashedCandidate, HashingContext,
         MiningWorkerContext, NodeSlot, NonceAllocator, ObserverUpdate,
         PENDING_PROOF_CANDIDATE_CAPACITY, PendingDashboardSync, ProofFound, SnapshotFreshness,
-        activate_cpu_fallback, apply_genesis_poll_error, clear_genesis_poll_error,
-        compare_snapshot_freshness, dashboard_model, dashboard_node_status,
-        finalization_retry_delay, gpu_is_meaningfully_faster, history_profile_enabled,
-        inactive_genesis_nodes, next_poll_delay, next_scheduled_slot, process_hashed_candidate,
-        proof_inbox, reconcile_head_progress, revalidate_queued_proof, revalidate_queued_proof_at,
-        selected_nodes, should_unlock_recovered_wallet, take_observer_update, traced_node_status,
-        update_slots, worker_loop,
+        activate_cpu_fallback, apply_genesis_poll_error, apply_transaction_state_to_model,
+        clear_genesis_poll_error, compare_snapshot_freshness, dashboard_model,
+        dashboard_node_status, finalization_retry_delay, gpu_is_meaningfully_faster,
+        history_profile_enabled, inactive_genesis_nodes, next_poll_delay, next_scheduled_slot,
+        process_hashed_candidate, proof_inbox, reconcile_head_progress, revalidate_queued_proof,
+        revalidate_queued_proof_at, selected_nodes, should_open_transaction_manager,
+        take_observer_update, traced_node_status, unresolved_session_blocks_mining, update_slots,
+        worker_loop,
     };
     use crate::{
         cli::{DeviceChoice, MineArgs, Network},
@@ -4706,7 +4764,7 @@ mod tests {
             ReadSnapshot, WorkInfo,
         },
         transaction::{
-            AUTOMATIC_REWARD_FORWARDING_DISABLED, TransactionActivityState,
+            AUTOMATIC_REWARD_FORWARDING_DISABLED, TransactionActivity, TransactionActivityState,
             TransactionDashboardState,
         },
     };
@@ -4773,6 +4831,14 @@ mod tests {
         assert!(!history_profile_enabled(Some("0")));
         assert!(!history_profile_enabled(Some("true")));
         assert!(history_profile_enabled(Some("1")));
+    }
+
+    #[test]
+    fn compute_only_can_continue_with_unresolved_transactions_without_opening_a_manager() {
+        assert!(!unresolved_session_blocks_mining(true, true));
+        assert!(unresolved_session_blocks_mining(false, true));
+        assert!(!should_open_transaction_manager(true, false, true));
+        assert!(!should_open_transaction_manager(true, false, false));
     }
 
     #[test]
@@ -5184,7 +5250,7 @@ mod tests {
     #[test]
     fn dashboard_distinguishes_required_retrying_and_blocked_finalization_from_chain_wait() {
         let wallet = Address::with_last_byte(9);
-        let selected = HashSet::from([1_u8]);
+        let selected = (1_u8..=9).collect::<HashSet<_>>();
         let slots = Arc::new((1..=9).map(NodeSlot::new).collect::<Vec<_>>());
         let schedule = Arc::new(RwLock::new(Vec::new()));
         let mut state = eligible_state();
@@ -5196,17 +5262,19 @@ mod tests {
             native_balance_error: None,
             ast_balance: None,
             ast_balance_error: None,
-            nodes: vec![NodeView {
-                id: 1,
-                address: Address::with_last_byte(1),
-                pin: ContractPinStatus {
-                    runtime_verified: true,
-                    abi_verified: true,
+            nodes: (1_u8..=9)
+                .map(|id| NodeView {
+                    id,
+                    address: Address::with_last_byte(id),
+                    pin: ContractPinStatus {
+                        runtime_verified: true,
+                        abi_verified: true,
+                        error: None,
+                    },
+                    state: Some(state.clone()),
                     error: None,
-                },
-                state: Some(state.clone()),
-                error: None,
-            }],
+                })
+                .collect(),
         };
         let finalization_state = Arc::new(RwLock::new(HashMap::new()));
         let context = DashboardContext {
@@ -5232,6 +5300,13 @@ mod tests {
             NodeStatus::FinalizationRequired
         );
         assert_eq!(required.mode(Instant::now()), "FINALIZATION REQUIRED");
+        assert!(
+            required
+                .current_action
+                .as_deref()
+                .is_some_and(|action| action.contains("0 H/s expected")),
+            "all nine expired windows should explain the zero hashrate immediately"
+        );
 
         finalization_state
             .write()
@@ -5289,13 +5364,83 @@ mod tests {
         state.eligible = true;
         state.finalizable = false;
         let mut waiting_snapshot = snapshot.clone();
-        waiting_snapshot.nodes[0].state = Some(state);
+        for node in &mut waiting_snapshot.nodes {
+            node.state = Some(state.clone());
+        }
         let waiting = dashboard_model(&context, &waiting_snapshot, Instant::now());
         assert_eq!(
             waiting.selected_nodes[0].status,
             NodeStatus::WaitingForChain
         );
         assert_eq!(waiting.mode(Instant::now()), "WAITING FOR CHAIN");
+    }
+
+    #[test]
+    fn dashboard_labels_an_in_flight_transaction_for_an_older_window() {
+        let wallet = Address::with_last_byte(9);
+        let selected = HashSet::from([1_u8]);
+        let slots = Arc::new((1..=9).map(NodeSlot::new).collect::<Vec<_>>());
+        let schedule = Arc::new(RwLock::new(Vec::new()));
+        let transaction_state = Arc::new(RwLock::new(TransactionDashboardState {
+            activities: vec![TransactionActivity {
+                node_id: 1,
+                window_id: 7,
+                state: TransactionActivityState::Recovering,
+            }],
+            ..TransactionDashboardState::default()
+        }));
+        let context = DashboardContext {
+            network: Network::Testnet,
+            chain_id: 1439,
+            address: wallet,
+            active_backend: Arc::new(RwLock::new(ActiveBackend::Cpu { threads: 1 })),
+            spending_limit: U256::from(1),
+            transaction_mode: true,
+            compute_only: false,
+            workers_started: Arc::new(AtomicBool::new(true)),
+            total_hashes: Arc::new(AtomicU64::new(0)),
+            selected,
+            slots,
+            schedule,
+            transaction_state: Arc::clone(&transaction_state),
+            pending_sync: Arc::new(RwLock::new(HashMap::new())),
+            finalization_state: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let mut current_work = eligible_state();
+        current_work.work.window_id = 8;
+        let snapshot = ReadSnapshot {
+            block: test_block(108, 150),
+            native_balance: Some(U256::from(100)),
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![NodeView {
+                id: 1,
+                address: Address::with_last_byte(1),
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(current_work),
+                error: None,
+            }],
+        };
+        let mut model = dashboard_model(&context, &snapshot, Instant::now());
+        apply_transaction_state_to_model(
+            &mut model,
+            &transaction_state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let action = model.current_action.as_deref().unwrap();
+        assert!(action.contains("older window #7"), "{action}");
+        assert!(action.contains("chain now at #8"), "{action}");
+        apply_transaction_state_to_model(&mut model, &TransactionDashboardState::default());
+        assert_eq!(
+            model.current_action, None,
+            "resolved activity must clear its footer action"
+        );
     }
 
     #[test]
@@ -6589,41 +6734,6 @@ mod tests {
         assert_eq!(finalization_retry_delay(u8::MAX), super::MAX_POLL_INTERVAL);
     }
 
-    #[test]
-    fn recovered_transaction_enables_autonomous_unlock_only_after_settlement() {
-        let positive_limit = U256::from(1);
-        assert!(!should_unlock_recovered_wallet(
-            true,
-            positive_limit,
-            false,
-            true
-        ));
-        assert!(should_unlock_recovered_wallet(
-            true,
-            positive_limit,
-            false,
-            false
-        ));
-        assert!(!should_unlock_recovered_wallet(
-            true,
-            U256::ZERO,
-            false,
-            false
-        ));
-        assert!(!should_unlock_recovered_wallet(
-            false,
-            positive_limit,
-            false,
-            false
-        ));
-        assert!(!should_unlock_recovered_wallet(
-            true,
-            positive_limit,
-            true,
-            false
-        ));
-    }
-
     #[tokio::test]
     async fn autonomous_mining_requires_a_selected_wallet_before_connecting() {
         let temp = tempdir().unwrap();
@@ -6702,6 +6812,7 @@ mod tests {
                 network.clone(),
                 None,
                 None,
+                false,
             )
             .await
             .unwrap_err();
