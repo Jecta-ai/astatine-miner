@@ -16,10 +16,10 @@ use crate::{
     rpc::{BlockSnapshot, NetworkClient, NodeState, ReadSnapshot, is_transient_rpc_error},
     startup::{CtrlCSignal, StartupProgress, race_with_ctrl_c},
     transaction::{
-        AUTOMATIC_REWARD_FORWARDING_DISABLED, ConfirmedAction, ProofSubmission, TransactionAction,
-        TransactionActivityState, TransactionDashboardState, TransactionManager,
-        TransactionPolicyRefusalKind, is_stale_transaction_preflight, mined_transaction_reverted,
-        transaction_policy_refusal,
+        AUTOMATIC_REWARD_FORWARDING_DISABLED, ConfirmedAction, ProofSubmission,
+        SessionJournalSnapshot, TransactionAction, TransactionActivityState,
+        TransactionDashboardState, TransactionManager, TransactionPolicyRefusalKind,
+        is_stale_transaction_preflight, mined_transaction_reverted, transaction_policy_refusal,
     },
     wallet::{selected_address, unlock_selected_interactive},
 };
@@ -747,6 +747,7 @@ enum BackendEvent {
 struct StartupControl<'a> {
     ctrl_c: &'a mut CtrlCSignal,
     progress: Option<&'a StartupProgress>,
+    new_session_authorized: bool,
 }
 
 impl MiningWorkers {
@@ -937,9 +938,9 @@ pub(crate) async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
 pub(crate) async fn run_with_session_confirmation(
     store: &ConfigStore,
     args: MineArgs,
-    new_session_confirmed: bool,
+    new_session_authorized: bool,
 ) -> Result<()> {
-    if args.new_session != new_session_confirmed {
+    if args.new_session && !new_session_authorized {
         bail!("a new spending session requires explicit interactive authorization");
     }
     if args.send_rewards_to.is_some() {
@@ -955,11 +956,15 @@ pub(crate) async fn run_with_session_confirmation(
             return Err(error);
         }
     };
-    let session = match crate::transaction::TransactionJournal::inspect_session(store, &config) {
-        Ok(session) => session,
-        Err(error) => {
-            progress.fail(format!("Transaction session inspection failed: {error:#}"));
-            return Err(error).context("inspect transaction session before mining");
+    let session = if args.compute_only {
+        SessionJournalSnapshot::default()
+    } else {
+        match crate::transaction::TransactionJournal::inspect_session(store, &config) {
+            Ok(session) => session,
+            Err(error) => {
+                progress.fail(format!("Transaction session inspection failed: {error:#}"));
+                return Err(error).context("inspect transaction session before mining");
+            }
         }
     };
     if !args.compute_only && session.pending_transition.is_some() {
@@ -993,6 +998,11 @@ pub(crate) async fn run_with_session_confirmation(
         progress.fail("Autonomous transaction signing is disabled outside Injective Testnet");
         bail!("autonomous transaction signing is disabled outside Injective Testnet");
     }
+    if new_session_authorized
+        && (args.compute_only || parse_inj_wei(&config.per_session_spending_limit_inj)?.is_zero())
+    {
+        bail!("new spending-session authorization requires transaction mode and a positive cap");
+    }
     progress.begin("Checking selected wallet");
     if let Err(error) = selected_address(&config) {
         progress.fail(format!("Selected wallet check failed: {error:#}"));
@@ -1024,6 +1034,7 @@ pub(crate) async fn run_with_session_confirmation(
         StartupControl {
             ctrl_c: &mut ctrl_c,
             progress: Some(&progress),
+            new_session_authorized,
         },
     )
     .await
@@ -1049,6 +1060,7 @@ pub(crate) async fn run_with_client(
         StartupControl {
             ctrl_c: &mut ctrl_c,
             progress: None,
+            new_session_authorized: false,
         },
     )
     .await
@@ -1066,6 +1078,7 @@ async fn run_runtime(
     let StartupControl {
         ctrl_c,
         progress: startup,
+        new_session_authorized,
     } = startup_control;
     if args.send_rewards_to.is_some() {
         bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
@@ -1146,7 +1159,7 @@ async fn run_runtime(
             address,
             ast_token,
             client.history_telemetry(),
-            args.new_session,
+            new_session_authorized,
         ) {
             Ok(manager) => manager,
             Err(error) => {

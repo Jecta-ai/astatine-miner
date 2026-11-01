@@ -261,6 +261,18 @@ impl DashboardModel {
         } else if self
             .selected_nodes
             .iter()
+            .any(|node| node.status_at(now) == NodeStatus::Finalizing)
+        {
+            "FINALIZING"
+        } else if self
+            .selected_nodes
+            .iter()
+            .any(|node| node.status_at(now) == NodeStatus::Confirming)
+        {
+            "CONFIRMING"
+        } else if self
+            .selected_nodes
+            .iter()
             .any(|node| node.status_at(now) == NodeStatus::WaitingForChain)
         {
             "WAITING FOR CHAIN"
@@ -1360,6 +1372,7 @@ fn version_mode_line(model: &DashboardModel, colors: bool) -> Line<'static> {
     let mode = model.mode(Instant::now());
     let mode_color = match mode {
         "LIVE MINING" => EMERALD,
+        "CONFIRMING" | "FINALIZING" => AMBER,
         "RECOVERING"
         | "STOPPING"
         | "WAITING FOR CHAIN"
@@ -1658,6 +1671,7 @@ mod tests {
             .draw(|frame| render_dashboard(frame, &view, None, false))
             .unwrap();
         let text = buffer_text(&terminal);
+        assert_eq!(view.mode(Instant::now()), "FINALIZING");
         let one = text.find("01    WAITING").unwrap();
         let three = text.find("03    FINALIZING").unwrap();
         let seven = text.find("07    ● MINING").unwrap();
@@ -2009,7 +2023,12 @@ mod tests {
         let mut view = model(vec![node(1, NodeStatus::Mining, None)]);
         assert_eq!(view.mode(Instant::now()), "LIVE MINING");
         view.selected_nodes[0].status = NodeStatus::Confirming;
-        assert_eq!(view.mode(Instant::now()), "LIVE MINING");
+        assert_eq!(view.mode(Instant::now()), "CONFIRMING");
+        view.selected_nodes.push(node(2, NodeStatus::Mining, None));
+        assert_eq!(view.mode(Instant::now()), "CONFIRMING");
+        view.selected_nodes[0].status = NodeStatus::Finalizing;
+        assert_eq!(view.mode(Instant::now()), "FINALIZING");
+        view.selected_nodes.pop();
         view.selected_nodes[0].status = NodeStatus::Syncing;
         assert_eq!(view.mode(Instant::now()), "LIVE MINING");
         view.selected_nodes[0].status = NodeStatus::Mining;
@@ -2065,6 +2084,7 @@ mod tests {
     #[test]
     fn transaction_exposure_and_critical_footer_are_displayed_without_guessing() {
         let mut view = model(vec![node(1, NodeStatus::Confirming, None)]);
+        assert_eq!(view.mode(Instant::now()), "CONFIRMING");
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
             .draw(|frame| {

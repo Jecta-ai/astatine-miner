@@ -25,12 +25,14 @@ pub async fn dispatch(command: Command) -> Result<()> {
         Command::Wallet(WalletCommand::Create) => {
             let store = ConfigStore::system_default()?;
             let mut config = store.load()?;
+            let _wallet_change_guard = ensure_standalone_wallet_change_allowed(&store, &config)?;
             wallet::create_interactive(&store, &mut config)?;
             Ok(())
         }
         Command::Wallet(WalletCommand::Import(args)) => {
             let store = ConfigStore::system_default()?;
             let mut config = store.load()?;
+            let _wallet_change_guard = ensure_standalone_wallet_change_allowed(&store, &config)?;
             wallet::import_interactive(&store, &mut config, args)?;
             Ok(())
         }
@@ -314,6 +316,11 @@ async fn run_init(args: InitArgs) -> Result<()> {
             session_snapshot.authorized_exposure_wei.as_deref(),
             session_snapshot.session_id.is_some(),
             wallet_changed,
+            session_snapshot
+                .wallet
+                .as_deref()
+                .or(previous_config.wallet_address.as_deref()),
+            config.wallet_address.as_deref(),
         )?
     {
         let existing_session_is_resumable =
@@ -402,7 +409,11 @@ async fn run_init(args: InitArgs) -> Result<()> {
 async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
     let store = ConfigStore::system_default()?;
     let config = store.load()?;
-    let session = TransactionJournal::inspect_session(&store, &config)?;
+    let session = if args.compute_only {
+        SessionJournalSnapshot::default()
+    } else {
+        TransactionJournal::inspect_session(&store, &config)?
+    };
     if !args.compute_only && session.pending_transition.is_some() {
         bail!(
             "a spending-session change was interrupted; run `astatine init` to resolve it before mining"
@@ -424,13 +435,20 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
                 "no new spending session was started; run `astatine recover`, then rerun `astatine mine --new-session`"
             );
         }
+        let selected_wallet = config
+            .wallet_address
+            .as_deref()
+            .and_then(|address| Address::from_str(address).ok());
+        let wallet_changed = mine_session_wallet_changed(&session, selected_wallet);
         let previous_limit = session_effective_limit(&session, &config)?;
         if !prompt_new_session_confirmation(
             &previous_limit,
             &config.per_session_spending_limit_inj,
             session.authorized_exposure_wei.as_deref(),
             session.session_id.is_some(),
-            false,
+            wallet_changed,
+            session.wallet.as_deref(),
+            config.wallet_address.as_deref(),
         )? {
             println!("Cancelled. No spending session was changed.");
             return Ok(());
@@ -450,6 +468,11 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
     }
     let configured_limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
     if !args.compute_only && !configured_limit.is_zero() {
+        let selected_wallet = config
+            .wallet_address
+            .as_deref()
+            .and_then(|address| Address::from_str(address).ok());
+        let wallet_changed = mine_session_wallet_changed(&session, selected_wallet);
         if let Some(session_limit) = session.limit_wei.as_deref() {
             let session_limit = U256::from_str_radix(session_limit, 10)
                 .context("journal session limit is invalid")?;
@@ -459,7 +482,7 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
                 );
             }
         }
-        if mine_requires_session_confirmation(&session, configured_limit) {
+        if mine_requires_session_confirmation(&session, configured_limit, selected_wallet) {
             if session.has_prior_session_history {
                 bail!(
                     "previous spending-session or transaction authorization history exists; run `astatine mine --new-session` and confirm before starting another allowance"
@@ -471,10 +494,15 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
                 &config.per_session_spending_limit_inj,
                 session.authorized_exposure_wei.as_deref(),
                 session.session_id.is_some(),
-                false,
+                wallet_changed,
+                session.wallet.as_deref(),
+                config.wallet_address.as_deref(),
             )? {
                 println!("Cancelled. No spending session was changed.");
                 return Ok(());
+            }
+            if wallet_changed {
+                return mining::run_with_session_confirmation(&store, args, true).await;
             }
         }
     }
@@ -607,8 +635,54 @@ fn declined_new_session_limit(current_limit: &str, existing_session_is_resumable
 fn mine_requires_session_confirmation(
     session: &SessionJournalSnapshot,
     configured_limit: U256,
+    selected_wallet: Option<Address>,
 ) -> bool {
-    !configured_limit.is_zero() && (session.session_id.is_none() || session.closed)
+    !configured_limit.is_zero()
+        && (session.session_id.is_none()
+            || session.closed
+            || mine_session_wallet_changed(session, selected_wallet))
+}
+
+fn mine_session_wallet_changed(
+    session: &SessionJournalSnapshot,
+    selected_wallet: Option<Address>,
+) -> bool {
+    session.session_id.is_some()
+        && session
+            .wallet
+            .as_deref()
+            .and_then(|wallet| Address::from_str(wallet).ok())
+            != selected_wallet
+}
+
+fn ensure_standalone_wallet_change_allowed(
+    store: &ConfigStore,
+    config: &AppConfig,
+) -> Result<std::fs::File> {
+    let (session, journal_lock) = TransactionJournal::inspect_session_and_lock(store, config)?;
+    if session.pending_transition.is_some() {
+        bail!("wallet changes are blocked while an init spending-session transition is pending");
+    }
+    if !session.unresolved.is_empty() {
+        bail!(
+            "wallet changes are blocked during transaction recovery; run `astatine recover` first"
+        );
+    }
+    if session.session_id.is_some()
+        && !session.closed
+        && session
+            .limit_wei
+            .as_deref()
+            .map(|limit| U256::from_str_radix(limit, 10))
+            .transpose()
+            .context("journal session spending limit is invalid")?
+            .is_some_and(|limit| !limit.is_zero())
+    {
+        bail!(
+            "wallet create/import cannot replace a wallet bound to an open paid session; run `astatine init` to approve the wallet and spending-session change together"
+        );
+    }
+    Ok(journal_lock)
 }
 
 fn session_effective_limit(session: &SessionJournalSnapshot, config: &AppConfig) -> Result<String> {
@@ -630,6 +704,8 @@ fn prompt_new_session_confirmation(
     previous_authorization_wei: Option<&str>,
     has_previous_session: bool,
     wallet_changed: bool,
+    previous_wallet: Option<&str>,
+    selected_wallet: Option<&str>,
 ) -> Result<bool> {
     let previous_used = previous_authorization_wei
         .map(|value| {
@@ -653,7 +729,12 @@ fn prompt_new_session_confirmation(
         "Previous transaction history and authorization records remain saved; prior authorization is not refunded."
     );
     if wallet_changed {
-        println!("The new session will be bound to the newly selected wallet.");
+        println!(
+            "Wallet change: {} → {}.",
+            previous_wallet.unwrap_or("not selected"),
+            selected_wallet.unwrap_or("not selected")
+        );
+        println!("The new session will be bound to the selected wallet above.");
     }
     prompt_yes_no(
         &format!("Start a new spending session with {proposed_limit} INJ?"),
@@ -1112,9 +1193,9 @@ fn chain_id(network: Network) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_init_rpc, declined_new_session_limit, mine_requires_session_confirmation,
-        persist_rpc_override, redact_rpc_url, requires_new_paid_session, select_rpc_override,
-        should_confirm_existing_session_resume,
+        configure_init_rpc, declined_new_session_limit, ensure_standalone_wallet_change_allowed,
+        mine_requires_session_confirmation, persist_rpc_override, redact_rpc_url,
+        requires_new_paid_session, select_rpc_override, should_confirm_existing_session_resume,
     };
     use crate::{
         cli::Network,
@@ -1231,18 +1312,94 @@ mod tests {
         let no_session = SessionJournalSnapshot::default();
         assert!(mine_requires_session_confirmation(
             &no_session,
-            current_limit
+            current_limit,
+            Some(Address::with_last_byte(0xa1))
         ));
-        assert!(!mine_requires_session_confirmation(&no_session, U256::ZERO));
+        assert!(!mine_requires_session_confirmation(
+            &no_session,
+            U256::ZERO,
+            Some(Address::with_last_byte(0xa1))
+        ));
         let open_session = SessionJournalSnapshot {
             session_id: Some("existing-session".to_owned()),
+            wallet: Some(format!("{:#x}", Address::with_last_byte(0xa1))),
             closed: false,
             ..SessionJournalSnapshot::default()
         };
         assert!(!mine_requires_session_confirmation(
             &open_session,
-            current_limit
+            current_limit,
+            Some(Address::with_last_byte(0xa1))
         ));
+        assert!(mine_requires_session_confirmation(
+            &open_session,
+            current_limit,
+            Some(Address::with_last_byte(0xa2))
+        ));
+    }
+
+    #[test]
+    fn standalone_wallet_selection_is_blocked_for_an_open_paid_session() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(root.path().to_path_buf());
+        let wallet = Address::with_last_byte(0xa1);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "0.5".to_owned(),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        drop(TransactionJournal::open(&store, &config, wallet).unwrap());
+
+        let error = ensure_standalone_wallet_change_allowed(&store, &config).unwrap_err();
+        assert!(format!("{error:#}").contains("astatine init"));
+    }
+
+    #[test]
+    fn standalone_wallet_selection_is_blocked_during_a_pending_transition() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(root.path().to_path_buf());
+        let wallet = Address::with_last_byte(0xa2);
+        let previous = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        store.save(&previous).unwrap();
+        drop(TransactionJournal::open(&store, &previous, wallet).unwrap());
+        let proposed = AppConfig {
+            per_session_spending_limit_inj: "2".to_owned(),
+            ..previous.clone()
+        };
+        drop(
+            TransactionJournal::open_for_init_session_transition(
+                &store,
+                &proposed,
+                wallet,
+                previous.per_session_spending_limit_inj.clone(),
+                previous.wallet_address.clone(),
+            )
+            .unwrap(),
+        );
+
+        let error = ensure_standalone_wallet_change_allowed(&store, &previous).unwrap_err();
+        assert!(format!("{error:#}").contains("transition is pending"));
+    }
+
+    #[test]
+    fn standalone_wallet_selection_holds_the_journal_lock_until_config_is_saved() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(root.path().to_path_buf());
+        let config = AppConfig::default();
+        store.save(&config).unwrap();
+        let guard = ensure_standalone_wallet_change_allowed(&store, &config).unwrap();
+
+        assert!(
+            TransactionJournal::open(&store, &config, Address::with_last_byte(0xa3)).is_err(),
+            "a paid session must not begin between the wallet-change check and config persistence"
+        );
+        drop(guard);
+        assert!(TransactionJournal::open(&store, &config, Address::with_last_byte(0xa3)).is_ok());
     }
 
     #[tokio::test]
@@ -1294,19 +1451,12 @@ mod tests {
         };
         store.save(&config).unwrap();
         drop(TransactionJournal::open(&store, &config, wallet_address).unwrap());
-        let mut journal_state: serde_json::Value =
-            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        let journal = store.read_transaction_journal().unwrap().unwrap();
+        let journal_state: serde_json::Value = serde_json::from_slice(&journal).unwrap();
         let session_id = journal_state["active_session"]["id"]
             .as_str()
             .unwrap()
             .to_owned();
-        journal_state["active_session"]["authorized_exposure_wei"] =
-            serde_json::Value::String("123".to_owned());
-        journal_state["active_session"]["reported_actual_wei"] =
-            serde_json::Value::String("7".to_owned());
-        let journal = serde_json::to_vec(&journal_state).unwrap();
-        store.write_transaction_journal(&journal).unwrap();
-
         let (endpoint, server) = mock_chain_id_rpc("0x59f");
         configure_init_rpc(&mut config, Some(&endpoint))
             .await
@@ -1362,11 +1512,8 @@ mod tests {
         let persisted: serde_json::Value =
             serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
         assert_eq!(persisted["active_session"]["id"], session_id);
-        assert_eq!(
-            persisted["active_session"]["authorized_exposure_wei"],
-            "123"
-        );
-        assert_eq!(persisted["active_session"]["reported_actual_wei"], "7");
+        assert_eq!(persisted["active_session"]["authorized_exposure_wei"], "0");
+        assert_eq!(persisted["active_session"]["reported_actual_wei"], "0");
     }
 
     #[test]

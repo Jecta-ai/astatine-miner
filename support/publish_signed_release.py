@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import pathlib
 import re
@@ -117,6 +118,72 @@ def resolve_tag_commit(
     raise PublicationError("remote tag nesting exceeds the supported resolution depth")
 
 
+def ensure_release_tag_protected(
+    tag: str,
+    runner: Callable[..., subprocess.CompletedProcess],
+) -> None:
+    tag_ref = f"refs/tags/{tag}"
+    summaries: list[dict] = []
+    for page in range(1, 101):
+        rulesets = gh_json_list(
+            ["api", f"repos/{REPOSITORY}/rulesets?includes_parents=true&per_page=100&page={page}"],
+            runner,
+        )
+        summaries.extend(rulesets)
+        if len(rulesets) < 100:
+            break
+    else:
+        raise PublicationError("repository ruleset list exceeded the supported pagination bound")
+
+    for summary in summaries:
+        ruleset_id = summary.get("id")
+        if (
+            summary.get("target") != "tag"
+            or summary.get("enforcement") != "active"
+            or not isinstance(ruleset_id, int)
+        ):
+            continue
+        ruleset = gh_json(["api", f"repos/{REPOSITORY}/rulesets/{ruleset_id}"], runner)
+        conditions = ruleset.get("conditions")
+        ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
+        includes = ref_name.get("include") if isinstance(ref_name, dict) else None
+        excludes = ref_name.get("exclude") if isinstance(ref_name, dict) else None
+        rules = ruleset.get("rules")
+        bypass_actors = ruleset.get("bypass_actors")
+        protected_rule_types = {
+            rule.get("type") for rule in rules if isinstance(rule, dict)
+        } if isinstance(rules, list) else set()
+        protects_ref = (
+            ruleset.get("target") == "tag"
+            and ruleset.get("enforcement") == "active"
+            and isinstance(includes, list)
+            and any(isinstance(pattern, str) and fnmatch.fnmatchcase(tag_ref, pattern) for pattern in includes)
+            and isinstance(excludes, list)
+            and not any(isinstance(pattern, str) and fnmatch.fnmatchcase(tag_ref, pattern) for pattern in excludes)
+            and {"update", "deletion"}.issubset(protected_rule_types)
+            and bypass_actors == []
+            and ruleset.get("current_user_can_bypass") == "never"
+        )
+        if protects_ref:
+            return
+    raise PublicationError(
+        f"release tag {tag} is not covered by an active, non-bypassable tag-update protection ruleset"
+    )
+
+
+def verify_release_tag_binding(
+    tag: str,
+    source_commit: str,
+    runner: Callable[..., subprocess.CompletedProcess],
+) -> None:
+    ensure_release_tag_protected(tag, runner)
+    tag_commit = resolve_tag_commit(REPOSITORY, tag, runner)
+    require(
+        tag_commit == source_commit,
+        "remote release tag no longer points to the provenance-verified source commit",
+    )
+
+
 def remote_assets_match(release: dict, signed_dir: pathlib.Path) -> None:
     assets = release.get("assets")
     require(isinstance(assets, list), "GitHub release response has no asset list")
@@ -170,8 +237,7 @@ def publish_release(
         public_key,
         repo_root,
     )
-    tag_commit = resolve_tag_commit(REPOSITORY, tag, runner)
-    require(tag_commit == source_commit, "remote release tag does not point to the provenance-verified source commit")
+    verify_release_tag_binding(tag, source_commit, runner)
     ensure_release_absent(tag, runner)
 
     expected_confirmation = f"PUBLISH {tag} {source_commit} PREFLIGHT {expected_report_sha256}"
@@ -203,6 +269,8 @@ def publish_release(
                 "--prerelease",
                 "--draft",
                 "--verify-tag",
+                "--target",
+                source_commit,
             ],
             runner,
         )
@@ -220,6 +288,7 @@ def publish_release(
             public_key,
             repo_root,
         )
+        verify_release_tag_binding(tag, source_commit, runner)
         matches = releases_for_tag(tag, runner)
         require(len(matches) == 1, "uploaded draft could not be uniquely found by tag in the release list")
         release_id = matches[0].get("id")
@@ -227,7 +296,12 @@ def publish_release(
         draft = release_by_id(release_id, runner)
         require(draft.get("draft") is True and draft.get("prerelease") is True, "uploaded release is not a draft prerelease")
         require(draft.get("tag_name") == tag, "uploaded draft tag differs from the requested release tag")
+        require(
+            draft.get("target_commitish") == source_commit,
+            "uploaded draft target does not identify the provenance-verified source commit",
+        )
         remote_assets_match(draft, signed_dir)
+        verify_release_tag_binding(tag, source_commit, runner)
 
         # A failed or interrupted PATCH leaves the already-verified release as a
         # draft. A retry refuses to mutate it; the owner must inspect it manually.
@@ -236,6 +310,7 @@ def publish_release(
             runner,
         )
         require(publish.returncode == 0, f"release remains a draft; publication transition failed: {publish.stderr.strip()}")
+        verify_release_tag_binding(tag, source_commit, runner)
         prepare_publication(
             signed_dir,
             preflight_report,
@@ -248,7 +323,12 @@ def publish_release(
         final = release_by_id(release_id, runner)
         require(final.get("tag_name") == tag, "published release tag differs from the requested tag")
         require(final.get("draft") is False and final.get("prerelease") is True, "release publication state is unexpected")
+        require(
+            final.get("target_commitish") == source_commit,
+            "published release target does not identify the provenance-verified source commit",
+        )
         remote_assets_match(final, signed_dir)
+        verify_release_tag_binding(tag, source_commit, runner)
     print(f"Published signed prerelease {tag} from {source_commit}; provenance run {report['run_id']}")
 
 
@@ -262,9 +342,15 @@ class FakeGitHub:
         fail_publish: bool = False,
         existing: bool = False,
         existing_draft: bool = True,
+        mutate_tag_on_resolution: int | None = None,
+        tag_update_protected: bool = True,
     ):
         self.tag = tag
         self.source_commit = source_commit
+        self.tag_commit = source_commit
+        self.tag_resolution_count = 0
+        self.mutate_tag_on_resolution = mutate_tag_on_resolution
+        self.tag_update_protected = tag_update_protected
         self.fail_publish = fail_publish
         self.existing = existing
         self.created = existing
@@ -275,13 +361,35 @@ class FakeGitHub:
         self.api_version_header_count = 0
         self.assets: list[dict] = []
         self.local_dir: pathlib.Path | None = None
+        self.target_commitish = source_commit
 
     def __call__(self, arguments: list[str], **kwargs) -> subprocess.CompletedProcess:
         args = arguments[1:]
         if args[:1] == ["api"] and f"X-GitHub-Api-Version: {GITHUB_API_VERSION}" in args:
             self.api_version_header_count += 1
+        if len(args) > 1 and args[0] == "api" and args[1].startswith(f"repos/{REPOSITORY}/rulesets?"):
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                json.dumps([{"id": 7, "target": "tag", "enforcement": "active"}]),
+                "",
+            )
+        if args[:2] == ["api", f"repos/{REPOSITORY}/rulesets/7"]:
+            response = {
+                "id": 7,
+                "target": "tag",
+                "enforcement": "active",
+                "conditions": {"ref_name": {"include": ["refs/tags/v0.1.0-testnet.*"], "exclude": []}},
+                "rules": ([{"type": "update"}, {"type": "deletion"}] if self.tag_update_protected else []),
+                "bypass_actors": [],
+                "current_user_can_bypass": "never",
+            }
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(response), "")
         if args[:2] == ["api", f"repos/{REPOSITORY}/git/ref/tags/{self.tag}"]:
-            response = {"object": {"type": "commit", "sha": self.source_commit}}
+            self.tag_resolution_count += 1
+            if self.tag_resolution_count == self.mutate_tag_on_resolution:
+                self.tag_commit = "c" * 40
+            response = {"object": {"type": "commit", "sha": self.tag_commit}}
             return subprocess.CompletedProcess(arguments, 0, json.dumps(response), "")
         if args[:2] == ["api", f"repos/{REPOSITORY}/releases/tags/{self.tag}"]:
             self.tag_release_lookup_count += 1
@@ -293,6 +401,7 @@ class FakeGitHub:
             response = {
                 "id": 42,
                 "tag_name": self.tag,
+                "target_commitish": self.target_commitish,
                 "draft": self.draft,
                 "prerelease": True,
                 "assets": self.assets,
@@ -304,6 +413,7 @@ class FakeGitHub:
             response = {
                 "id": 42,
                 "tag_name": self.tag,
+                "target_commitish": self.target_commitish,
                 "draft": self.draft,
                 "prerelease": True,
                 "assets": self.assets,
@@ -495,6 +605,60 @@ def self_test(repo_root: pathlib.Path) -> None:
         require(
             draft_by_id.api_version_header_count >= 4,
             "release listing, numeric-ID readback, tag resolution, and publication must use an explicit GitHub REST API version",
+        )
+
+        for resolution in (2, 3, 4, 5):
+            moved_tag = FakeGitHub(
+                tag,
+                source_commit,
+                mutate_tag_on_resolution=resolution,
+            )
+            try:
+                publish_release(
+                    signed_dir=signed,
+                    preflight_report=preflight_path,
+                    tag=tag,
+                    source_commit=source_commit,
+                    expected_report_sha256=preflight_sha256,
+                    public_key=public_key,
+                    notes_template=notes,
+                    confirmation=confirmation,
+                    repo_root=test_repo,
+                    runner=moved_tag,
+                )
+            except PublicationError:
+                pass
+            else:
+                raise AssertionError(
+                    f"publisher accepted a tag moved at verification step {resolution}"
+                )
+            expected_publish_count = 0 if resolution < 4 else 1
+            require(
+                moved_tag.publish_count == expected_publish_count,
+                f"a tag mutation at verification step {resolution} must be detected at the expected publication boundary",
+            )
+
+        unprotected_tag = FakeGitHub(tag, source_commit, tag_update_protected=False)
+        try:
+            publish_release(
+                signed_dir=signed,
+                preflight_report=preflight_path,
+                tag=tag,
+                source_commit=source_commit,
+                expected_report_sha256=preflight_sha256,
+                public_key=public_key,
+                notes_template=notes,
+                confirmation=confirmation,
+                repo_root=test_repo,
+                runner=unprotected_tag,
+            )
+        except PublicationError:
+            pass
+        else:
+            raise AssertionError("publisher accepted a release tag without update protection")
+        require(
+            unprotected_tag.create_count == 0,
+            "publisher must check non-bypassable tag update protection before draft creation",
         )
 
         mismatched_report = FakeGitHub(tag, source_commit)

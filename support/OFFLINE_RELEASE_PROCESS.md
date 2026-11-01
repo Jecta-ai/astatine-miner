@@ -160,8 +160,18 @@ requires the clean checkout to remain at `SOURCE_COMMIT` and has no private-key
 input. It revalidates the signed manifest, hashes, allowlist,
 package contents, preflight report and source tag, creates a **draft** release,
 checks all uploaded asset digests, and only then makes the draft a prerelease.
-It refuses to overwrite an existing release. An interrupted upload remains a
-draft and a retry refuses to mutate it; inspect and resolve that draft manually.
+Before creating the draft, and again after upload, immediately before
+publication, and after publication, it verifies that the remote tag still
+resolves to `SOURCE_COMMIT`. Draft creation explicitly sets `--target
+SOURCE_COMMIT`; the publisher also checks the draft and final release
+`target_commitish` binding. It refuses to proceed unless an active,
+non-bypassable tag ruleset covers the exact tag and blocks updates. Keep the
+`Protect Astatine release tags` ruleset active for the entire publication window;
+it covers `refs/tags/v0.1.0-testnet.*` and denies update/deletion without bypass
+actors. The checks reduce race exposure; repository owners must not alter or
+disable the ruleset while publishing. The publisher refuses to overwrite an
+existing release. An interrupted upload remains a draft and a retry refuses to
+mutate it; inspect and resolve that draft manually.
 
 ```sh
 python3 support/publish_signed_release.py \

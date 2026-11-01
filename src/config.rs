@@ -1,6 +1,6 @@
 use crate::cli::Network;
 use alloy_primitives::{Address, U256};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 #[cfg(any(unix, windows))]
@@ -23,6 +23,11 @@ const MAX_TRANSACTION_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024;
 const WEI_PER_INJ: u128 = 1_000_000_000_000_000_000;
 const DEFAULT_TRANSACTION_CONFIRMATIONS: u8 = 2;
 const MAX_TRANSACTION_CONFIRMATIONS: u8 = 12;
+
+#[cfg(test)]
+static TEST_JOURNAL_ANCHORS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>,
+> = std::sync::OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -236,6 +241,94 @@ impl ConfigStore {
         }
         let path = self.transaction_journal_path()?;
         atomic_write(&path, data, true).context("atomically write private transaction journal")
+    }
+
+    pub(crate) fn read_journal_anchor(&self) -> Result<Option<Vec<u8>>> {
+        #[cfg(test)]
+        {
+            return Ok(TEST_JOURNAL_ANCHORS
+                .get_or_init(Default::default)
+                .lock()
+                .map_err(|_| anyhow!("test journal-anchor mutex was poisoned"))?
+                .get(&self.root)
+                .cloned());
+        }
+
+        #[cfg(all(
+            not(test),
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
+        ))]
+        {
+            let entry = Self::journal_anchor_entry()?;
+            match entry.get_secret() {
+                Ok(secret) => Ok(Some(secret)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(error) => Err(anyhow!(error)).context(
+                    "read the transaction authorization checkpoint from the OS credential store",
+                ),
+            }
+        }
+
+        #[cfg(all(
+            not(test),
+            not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+        ))]
+        {
+            bail!("transaction signing requires a supported OS credential store")
+        }
+    }
+
+    pub(crate) fn write_journal_anchor(&self, data: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        {
+            TEST_JOURNAL_ANCHORS
+                .get_or_init(Default::default)
+                .lock()
+                .map_err(|_| anyhow!("test journal-anchor mutex was poisoned"))?
+                .insert(self.root.clone(), data.to_vec());
+            Ok(())
+        }
+
+        #[cfg(all(
+            not(test),
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
+        ))]
+        {
+            Self::journal_anchor_entry()?
+                .set_secret(data)
+                .map_err(anyhow::Error::new)
+                .context(
+                    "write the transaction authorization checkpoint to the OS credential store",
+                )
+        }
+
+        #[cfg(all(
+            not(test),
+            not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+        ))]
+        {
+            bail!("transaction signing requires a supported OS credential store")
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_journal_anchor_for_test(&self) -> Result<()> {
+        TEST_JOURNAL_ANCHORS
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| anyhow!("test journal-anchor mutex was poisoned"))?
+            .remove(&self.root);
+        Ok(())
+    }
+
+    #[cfg(all(
+        not(test),
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
+    fn journal_anchor_entry() -> Result<keyring::Entry> {
+        keyring::Entry::new("ai.jecta.astatine.transaction-journal", "per-user")
+            .map_err(anyhow::Error::new)
+            .context("open the OS credential-store entry for the transaction journal")
     }
 
     pub(crate) fn write_transaction_archive(&self, name: &str, data: &[u8]) -> Result<()> {
