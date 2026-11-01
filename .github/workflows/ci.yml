@@ -83,7 +83,13 @@ jobs:
       - name: Check
         run: cargo check --locked
       - name: Unit tests
+        env:
+          ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc') && '1' || '' }}
         run: cargo test --locked
+      - name: Native credential-store behavior and fail-closed handling
+        env:
+          ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE: ${{ (matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc') && '1' || '' }}
+        run: cargo test --locked config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped -- --exact --nocapture
       - name: Unix installer downgrade checks
         shell: bash
         run: sh support/test-install-unix-version.sh

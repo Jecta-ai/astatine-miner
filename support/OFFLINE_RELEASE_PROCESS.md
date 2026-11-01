@@ -162,9 +162,10 @@ package contents, preflight report and source tag, creates a **draft** release,
 checks all uploaded asset digests, and only then makes the draft a prerelease.
 Before creating the draft, and again after upload, immediately before
 publication, and after publication, it verifies that the remote tag still
-resolves to `SOURCE_COMMIT`. Draft creation explicitly sets `--target
-SOURCE_COMMIT`; the publisher also checks the draft and final release
-`target_commitish` binding. It refuses to proceed unless an active,
+resolves to `SOURCE_COMMIT`. For an existing tag, the GitHub release API may
+report the default branch in `target_commitish`; the publisher deliberately
+does not use that field as source proof. It binds the release to the separately
+verified protected tag ref, source provenance, and signed assets. It refuses to proceed unless an active,
 non-bypassable tag ruleset covers the exact tag and blocks updates. Keep the
 `Protect Astatine release tags` ruleset active for the entire publication window;
 it covers `refs/tags/v0.1.0-testnet.*` and denies update/deletion without bypass

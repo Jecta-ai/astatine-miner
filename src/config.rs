@@ -1,8 +1,9 @@
 use crate::cli::Network;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, U256, hex};
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(any(unix, windows))]
 use std::fs::File;
 use std::{
@@ -12,8 +13,10 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{Arc, OnceLock},
 };
 use tempfile::{NamedTempFile, PersistError};
+use zeroize::Zeroizing;
 
 const CONFIG_FILE: &str = "config.toml";
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
@@ -26,8 +29,36 @@ const MAX_TRANSACTION_CONFIRMATIONS: u8 = 12;
 
 #[cfg(test)]
 static TEST_JOURNAL_ANCHORS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<u8>>>,
+    std::sync::Mutex<std::collections::HashMap<String, Zeroizing<Vec<u8>>>>,
 > = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_JOURNAL_ANCHOR_WRITE_FAILURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, TestJournalAnchorWriteFailure>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct TestJournalAnchorWriteFailure {
+    successful_writes: usize,
+    after_persist: bool,
+}
+
+#[cfg(test)]
+static TEST_ATOMIC_WRITE_FAILURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, AtomicWriteFailPoint>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AtomicWriteFailPoint {
+    BeforeWrite,
+    BeforeFileSync,
+    BeforeRename,
+    AfterRename,
+    BeforeDirectorySync,
+    AfterDirectorySync,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -146,18 +177,23 @@ fn default_transaction_confirmations() -> u8 {
 #[derive(Clone, Debug)]
 pub struct ConfigStore {
     root: PathBuf,
+    anchor_scope: Arc<OnceLock<std::result::Result<String, String>>>,
 }
 
 impl ConfigStore {
     pub fn system_default() -> Result<Self> {
         Ok(Self {
             root: system_config_dir()?,
+            anchor_scope: Arc::new(OnceLock::new()),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn at_root(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            anchor_scope: Arc::new(OnceLock::new()),
+        }
     }
 
     pub fn wallet_dir(&self) -> PathBuf {
@@ -243,15 +279,16 @@ impl ConfigStore {
         atomic_write(&path, data, true).context("atomically write private transaction journal")
     }
 
-    pub(crate) fn read_journal_anchor(&self) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn read_journal_anchor(&self) -> Result<Option<Zeroizing<Vec<u8>>>> {
         #[cfg(test)]
         {
+            let account = self.journal_anchor_account()?;
             return Ok(TEST_JOURNAL_ANCHORS
                 .get_or_init(Default::default)
                 .lock()
                 .map_err(|_| anyhow!("test journal-anchor mutex was poisoned"))?
-                .get(&self.root)
-                .cloned());
+                .get(&account)
+                .map(|secret| Zeroizing::new(secret.to_vec())));
         }
 
         #[cfg(all(
@@ -259,14 +296,7 @@ impl ConfigStore {
             any(target_os = "linux", target_os = "macos", target_os = "windows")
         ))]
         {
-            let entry = Self::journal_anchor_entry()?;
-            match entry.get_secret() {
-                Ok(secret) => Ok(Some(secret)),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(error) => Err(anyhow!(error)).context(
-                    "read the transaction authorization checkpoint from the OS credential store",
-                ),
-            }
+            self.read_journal_anchor_from_platform()
         }
 
         #[cfg(all(
@@ -278,14 +308,66 @@ impl ConfigStore {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn read_journal_anchor_from_os_for_test(
+        &self,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        self.read_journal_anchor_from_platform()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_journal_anchor_to_os_for_test(&self, data: &[u8]) -> Result<()> {
+        self.journal_anchor_entry()?
+            .set_secret(data)
+            .map_err(anyhow::Error::new)
+            .context("write the transaction authorization checkpoint to the OS credential store")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn read_journal_anchor_from_platform(&self) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let entry = self.journal_anchor_entry()?;
+        match entry.get_secret() {
+            Ok(secret) => Ok(Some(Zeroizing::new(secret))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(anyhow!(error)).context(
+                "read the transaction authorization checkpoint from the OS credential store",
+            ),
+        }
+    }
+
     pub(crate) fn write_journal_anchor(&self, data: &[u8]) -> Result<()> {
         #[cfg(test)]
         {
+            let account = self.journal_anchor_account()?;
+            let failure = {
+                let mut failures = TEST_JOURNAL_ANCHOR_WRITE_FAILURES
+                    .get_or_init(Default::default)
+                    .lock()
+                    .map_err(|_| anyhow!("test journal-anchor failure mutex was poisoned"))?;
+                match failures.get_mut(&account) {
+                    Some(failure) if failure.successful_writes == 0 => {
+                        let failure = *failure;
+                        failures.remove(&account);
+                        Some(failure.after_persist)
+                    }
+                    Some(failure) => {
+                        failure.successful_writes -= 1;
+                        None
+                    }
+                    None => None,
+                }
+            };
+            if failure == Some(false) {
+                bail!("injected OS credential-store checkpoint write failure");
+            }
             TEST_JOURNAL_ANCHORS
                 .get_or_init(Default::default)
                 .lock()
                 .map_err(|_| anyhow!("test journal-anchor mutex was poisoned"))?
-                .insert(self.root.clone(), data.to_vec());
+                .insert(account, Zeroizing::new(data.to_vec()));
+            if failure == Some(true) {
+                bail!("injected failure after OS credential-store checkpoint persistence");
+            }
             Ok(())
         }
 
@@ -294,7 +376,7 @@ impl ConfigStore {
             any(target_os = "linux", target_os = "macos", target_os = "windows")
         ))]
         {
-            Self::journal_anchor_entry()?
+            self.journal_anchor_entry()?
                 .set_secret(data)
                 .map_err(anyhow::Error::new)
                 .context(
@@ -313,22 +395,93 @@ impl ConfigStore {
 
     #[cfg(test)]
     pub(crate) fn clear_journal_anchor_for_test(&self) -> Result<()> {
+        let account = self.journal_anchor_account()?;
         TEST_JOURNAL_ANCHORS
             .get_or_init(Default::default)
             .lock()
             .map_err(|_| anyhow!("test journal-anchor mutex was poisoned"))?
-            .remove(&self.root);
+            .remove(&account);
+        TEST_JOURNAL_ANCHOR_WRITE_FAILURES
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| anyhow!("test journal-anchor failure mutex was poisoned"))?
+            .remove(&account);
         Ok(())
     }
 
-    #[cfg(all(
-        not(test),
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
-    ))]
-    fn journal_anchor_entry() -> Result<keyring::Entry> {
-        keyring::Entry::new("ai.jecta.astatine.transaction-journal", "per-user")
-            .map_err(anyhow::Error::new)
-            .context("open the OS credential-store entry for the transaction journal")
+    #[cfg(test)]
+    pub(crate) fn fail_journal_anchor_write_before_for_test(
+        &self,
+        successful_writes: usize,
+    ) -> Result<()> {
+        let account = self.journal_anchor_account()?;
+        TEST_JOURNAL_ANCHOR_WRITE_FAILURES
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| anyhow!("test journal-anchor failure mutex was poisoned"))?
+            .insert(
+                account,
+                TestJournalAnchorWriteFailure {
+                    successful_writes,
+                    after_persist: false,
+                },
+            );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_journal_anchor_write_after_persist_for_test(
+        &self,
+        successful_writes: usize,
+    ) -> Result<()> {
+        let account = self.journal_anchor_account()?;
+        TEST_JOURNAL_ANCHOR_WRITE_FAILURES
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| anyhow!("test journal-anchor failure mutex was poisoned"))?
+            .insert(
+                account,
+                TestJournalAnchorWriteFailure {
+                    successful_writes,
+                    after_persist: true,
+                },
+            );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_atomic_write_for_test(
+        &self,
+        path: PathBuf,
+        point: AtomicWriteFailPoint,
+    ) -> Result<()> {
+        TEST_ATOMIC_WRITE_FAILURES
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| anyhow!("test atomic-write failure mutex was poisoned"))?
+            .insert(path, point);
+        Ok(())
+    }
+
+    fn journal_anchor_account(&self) -> Result<String> {
+        self.anchor_scope
+            .get_or_init(|| {
+                canonical_root_identity(&self.root)
+                    .map(|identity| hex::encode(Sha256::digest(identity)))
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .clone()
+            .map_err(anyhow::Error::msg)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn journal_anchor_entry(&self) -> Result<keyring::Entry> {
+        keyring::Entry::new(
+            "ai.jecta.astatine.transaction-journal",
+            &self.journal_anchor_account()?,
+        )
+        .map_err(anyhow::Error::new)
+        .context("open the OS credential-store entry for the transaction journal")
     }
 
     pub(crate) fn write_transaction_archive(&self, name: &str, data: &[u8]) -> Result<()> {
@@ -401,8 +554,12 @@ impl ConfigStore {
                 bail!("transaction journal lock is a reparse point");
             }
         }
-        file.try_lock()
-            .context("another astatine mining process already holds the transaction journal")?;
+        file.try_lock().with_context(|| {
+            format!(
+                "another astatine mining process already holds the transaction journal at {}",
+                path.display()
+            )
+        })?;
         Ok(file)
     }
 
@@ -429,6 +586,31 @@ impl ConfigStore {
         ensure_private_directory(&directory)?;
         Ok(directory.join(name))
     }
+}
+
+#[cfg(unix)]
+fn canonical_root_identity(root: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let canonical = fs::canonicalize(root).context("canonicalize transaction data root")?;
+    Ok(canonical.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(windows)]
+fn canonical_root_identity(root: &Path) -> Result<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let canonical = fs::canonicalize(root).context("canonicalize transaction data root")?;
+    Ok(canonical
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn canonical_root_identity(_root: &Path) -> Result<Vec<u8>> {
+    bail!("transaction signing requires a supported canonical data-root identity")
 }
 
 fn system_config_dir() -> Result<PathBuf> {
@@ -752,20 +934,45 @@ fn atomic_write(path: &Path, data: &[u8], replace: bool) -> Result<()> {
             .set_permissions(fs::Permissions::from_mode(0o600))
             .context("restrict temporary file permissions")?;
     }
+    #[cfg(test)]
+    fail_atomic_write_if_requested(path, AtomicWriteFailPoint::BeforeWrite)?;
     temporary.write_all(data).context("write staged file")?;
+    #[cfg(test)]
+    fail_atomic_write_if_requested(path, AtomicWriteFailPoint::BeforeFileSync)?;
     temporary
         .as_file()
         .sync_all()
         .context("flush staged file")?;
+    #[cfg(test)]
+    fail_atomic_write_if_requested(path, AtomicWriteFailPoint::BeforeRename)?;
     if replace {
         persist_replace(temporary, path)?;
     } else {
         persist_create(temporary, path)?;
     }
+    #[cfg(test)]
+    fail_atomic_write_if_requested(path, AtomicWriteFailPoint::AfterRename)?;
+    #[cfg(test)]
+    fail_atomic_write_if_requested(path, AtomicWriteFailPoint::BeforeDirectorySync)?;
     #[cfg(unix)]
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .context("flush containing directory")?;
+    #[cfg(test)]
+    fail_atomic_write_if_requested(path, AtomicWriteFailPoint::AfterDirectorySync)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn fail_atomic_write_if_requested(path: &Path, point: AtomicWriteFailPoint) -> Result<()> {
+    let mut failures = TEST_ATOMIC_WRITE_FAILURES
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| anyhow!("test atomic-write failure mutex was poisoned"))?;
+    if failures.get(path) == Some(&point) {
+        failures.remove(path);
+        bail!("injected atomic-write failure at {point:?}");
+    }
     Ok(())
 }
 
@@ -973,6 +1180,154 @@ transaction_confirmations = 2
             ConfigStore::at_root(junction)
                 .save(&AppConfig::default())
                 .is_err()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn native_journal_anchor_persists_across_processes_and_is_root_scoped() {
+        const CHILD_ROOT_ENV: &str = "ASTATINE_NATIVE_ANCHOR_TEST_ROOT";
+        const EXPECT_UNAVAILABLE_ENV: &str = "ASTATINE_NATIVE_ANCHOR_EXPECT_UNAVAILABLE";
+        const TEST_SECRET: &[u8] = b"disposable-native-journal-anchor-test";
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
+            let store = ConfigStore::at_root(PathBuf::from(root));
+            if std::env::var_os(EXPECT_UNAVAILABLE_ENV).is_some() {
+                let error = store
+                    .read_journal_anchor_from_os_for_test()
+                    .expect_err("an unavailable Secret Service must fail closed, not look empty");
+                assert!(
+                    !format!("{error:#}").is_empty(),
+                    "an unavailable credential store must return a useful error"
+                );
+                assert!(
+                    store
+                        .write_journal_anchor_to_os_for_test(TEST_SECRET)
+                        .is_err(),
+                    "an unavailable Secret Service must reject checkpoint writes"
+                );
+                return;
+            }
+            let secret = store
+                .read_journal_anchor_from_os_for_test()
+                .expect("child process could not read the disposable OS credential")
+                .expect("disposable OS credential was absent in the child process");
+            assert_eq!(&secret[..], TEST_SECRET);
+            return;
+        }
+
+        struct DeleteCredentialOnDrop(keyring::Entry);
+        impl Drop for DeleteCredentialOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.delete_credential();
+            }
+        }
+
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let store_a = ConfigStore::at_root(root_a.path().to_path_buf());
+        let store_b = ConfigStore::at_root(root_b.path().to_path_buf());
+        assert_ne!(
+            store_a.journal_anchor_account().unwrap(),
+            store_b.journal_anchor_account().unwrap(),
+            "separate canonical data roots must use separate credential entries"
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            let unavailable_root = tempfile::tempdir().unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped",
+                ])
+                .env(CHILD_ROOT_ENV, unavailable_root.path())
+                .env(EXPECT_UNAVAILABLE_ENV, "1")
+                .env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    "unix:path=/definitely-unavailable-astatine-test-bus",
+                )
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "headless Secret Service access must fail closed: {}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+        }
+
+        let credential = store_a.journal_anchor_entry().unwrap();
+        let _cleanup = DeleteCredentialOnDrop(credential);
+        let require_native = std::env::var_os("ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE")
+            .is_some_and(|value| !value.is_empty());
+
+        match _cleanup.0.get_secret() {
+            Err(keyring::Error::NoEntry) => {}
+            Err(error) => {
+                let app_error = store_a.read_journal_anchor_from_os_for_test().unwrap_err();
+                assert!(
+                    !format!("{app_error:#}").is_empty(),
+                    "OS credential-store access failures must propagate instead of falling back"
+                );
+                if require_native {
+                    panic!("required native credential store is unavailable: {error}");
+                }
+                eprintln!(
+                    "native credential store unavailable; production-equivalent reads failed closed: {error}"
+                );
+                return;
+            }
+            Ok(_) => {
+                panic!("unique temporary data-root credential unexpectedly already exists")
+            }
+        }
+
+        eprintln!(
+            "native credential store is available; checking persistent writes and data-root isolation"
+        );
+        let secret = super::Zeroizing::new(TEST_SECRET.to_vec());
+        if let Err(error) = store_a.write_journal_anchor_to_os_for_test(&secret) {
+            let app_error = store_a.read_journal_anchor_from_os_for_test().unwrap_err();
+            assert!(
+                !format!("{app_error:#}").is_empty(),
+                "failed OS credential writes must propagate instead of falling back"
+            );
+            if require_native {
+                panic!(
+                    "required native credential store could not write a disposable entry: {error}"
+                );
+            }
+            eprintln!(
+                "native credential store could not write; production-equivalent operations failed closed: {error}"
+            );
+            return;
+        }
+
+        assert_eq!(
+            &store_a
+                .read_journal_anchor_from_os_for_test()
+                .unwrap()
+                .unwrap()[..],
+            TEST_SECRET
+        );
+        assert!(
+            store_b
+                .read_journal_anchor_from_os_for_test()
+                .unwrap()
+                .is_none()
+        );
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped",
+            ])
+            .env(CHILD_ROOT_ENV, root_a.path())
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "OS credential did not persist across process restart: {}",
+            String::from_utf8_lossy(&child.stderr)
         );
     }
 

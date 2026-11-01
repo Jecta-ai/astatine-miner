@@ -501,9 +501,7 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
                 println!("Cancelled. No spending session was changed.");
                 return Ok(());
             }
-            if wallet_changed {
-                return mining::run_with_session_confirmation(&store, args, true).await;
-            }
+            return mining::run_with_session_confirmation(&store, args, true).await;
         }
     }
     mining::run_with_session_confirmation(&store, args, false).await
@@ -655,7 +653,7 @@ fn mine_session_wallet_changed(
             != selected_wallet
 }
 
-fn ensure_standalone_wallet_change_allowed(
+pub(crate) fn ensure_standalone_wallet_change_allowed(
     store: &ConfigStore,
     config: &AppConfig,
 ) -> Result<std::fs::File> {

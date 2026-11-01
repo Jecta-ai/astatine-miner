@@ -269,8 +269,6 @@ def publish_release(
                 "--prerelease",
                 "--draft",
                 "--verify-tag",
-                "--target",
-                source_commit,
             ],
             runner,
         )
@@ -296,10 +294,6 @@ def publish_release(
         draft = release_by_id(release_id, runner)
         require(draft.get("draft") is True and draft.get("prerelease") is True, "uploaded release is not a draft prerelease")
         require(draft.get("tag_name") == tag, "uploaded draft tag differs from the requested release tag")
-        require(
-            draft.get("target_commitish") == source_commit,
-            "uploaded draft target does not identify the provenance-verified source commit",
-        )
         remote_assets_match(draft, signed_dir)
         verify_release_tag_binding(tag, source_commit, runner)
 
@@ -323,10 +317,6 @@ def publish_release(
         final = release_by_id(release_id, runner)
         require(final.get("tag_name") == tag, "published release tag differs from the requested tag")
         require(final.get("draft") is False and final.get("prerelease") is True, "release publication state is unexpected")
-        require(
-            final.get("target_commitish") == source_commit,
-            "published release target does not identify the provenance-verified source commit",
-        )
         remote_assets_match(final, signed_dir)
         verify_release_tag_binding(tag, source_commit, runner)
     print(f"Published signed prerelease {tag} from {source_commit}; provenance run {report['run_id']}")
@@ -361,7 +351,9 @@ class FakeGitHub:
         self.api_version_header_count = 0
         self.assets: list[dict] = []
         self.local_dir: pathlib.Path | None = None
-        self.target_commitish = source_commit
+        # GitHub may return the default branch here for a release attached to an
+        # existing tag; provenance is bound to the separately verified tag ref.
+        self.target_commitish = "main"
 
     def __call__(self, arguments: list[str], **kwargs) -> subprocess.CompletedProcess:
         args = arguments[1:]
@@ -605,6 +597,28 @@ def self_test(repo_root: pathlib.Path) -> None:
         require(
             draft_by_id.api_version_header_count >= 4,
             "release listing, numeric-ID readback, tag resolution, and publication must use an explicit GitHub REST API version",
+        )
+
+        existing_tag_main_target = FakeGitHub(tag, source_commit)
+        publish_release(
+            signed_dir=signed,
+            preflight_report=preflight_path,
+            tag=tag,
+            source_commit=source_commit,
+            expected_report_sha256=preflight_sha256,
+            public_key=public_key,
+            notes_template=notes,
+            confirmation=confirmation,
+            repo_root=test_repo,
+            runner=existing_tag_main_target,
+        )
+        require(
+            existing_tag_main_target.tag_commit == source_commit
+            and existing_tag_main_target.create_count == 1
+            and existing_tag_main_target.publish_count == 1
+            and not existing_tag_main_target.draft
+            and existing_tag_main_target.target_commitish == "main",
+            "publisher must bind an existing tag to its verified ref SHA rather than target_commitish",
         )
 
         for resolution in (2, 3, 4, 5):

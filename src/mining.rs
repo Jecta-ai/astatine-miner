@@ -1048,6 +1048,7 @@ pub(crate) async fn run_with_client(
     client: NetworkClient,
     supplied_signer: Option<bip32::secp256k1::ecdsa::SigningKey>,
     probe_sender: Option<tokio::sync::oneshot::Sender<MiningProbe>>,
+    new_session_authorized: bool,
 ) -> Result<()> {
     let mut ctrl_c: CtrlCSignal = Box::pin(tokio::signal::ctrl_c());
     run_runtime(
@@ -1060,7 +1061,7 @@ pub(crate) async fn run_with_client(
         StartupControl {
             ctrl_c: &mut ctrl_c,
             progress: None,
-            new_session_authorized: false,
+            new_session_authorized,
         },
     )
     .await
@@ -1153,13 +1154,14 @@ async fn run_runtime(
             .as_ref()
             .context("AST token pin is missing from the Testnet manifest")?;
         let ast_token = crate::deployment::parse_address(&token.address)?;
-        let mut manager = match TransactionManager::open_with_session_authorization(
+        let mut manager = match TransactionManager::open_with_session_policy(
             store,
             &config,
             address,
             ast_token,
             client.history_telemetry(),
             new_session_authorized,
+            args.new_session,
         ) {
             Ok(manager) => manager,
             Err(error) => {
@@ -6810,6 +6812,7 @@ mod tests {
                 network.clone(),
                 None,
                 None,
+                false,
             )
             .await
             .unwrap_err();
