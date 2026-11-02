@@ -719,9 +719,15 @@ async fn run_recover() -> Result<()> {
         client.history_telemetry(),
     )?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut ctrl_c: crate::startup::CtrlCSignal = Box::pin(tokio::signal::ctrl_c());
     let mut last_status = Vec::new();
     loop {
-        manager.reconcile(&client).await?;
+        if !reconcile_recovery_or_interrupt(&mut manager, &client, &mut ctrl_c).await? {
+            println!(
+                "RECOVERY PAUSED • WALLET LOCKED\nNo spending session was changed. Rerun `astatine recover` to continue read-only verification."
+            );
+            return Ok(());
+        }
         let unresolved = manager.journal.unresolved_transactions();
         if unresolved.is_empty() {
             println!("RECOVERY COMPLETE • WALLET LOCKED");
@@ -746,6 +752,24 @@ async fn run_recover() -> Result<()> {
             );
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+pub(crate) async fn reconcile_recovery_or_interrupt(
+    manager: &mut TransactionManager,
+    client: &NetworkClient,
+    ctrl_c: &mut crate::startup::CtrlCSignal,
+) -> Result<bool> {
+    tokio::select! {
+        biased;
+        signal = ctrl_c.as_mut() => {
+            signal.context("listen for Ctrl+C during transaction recovery")?;
+            Ok(false)
+        }
+        result = manager.reconcile(client) => {
+            result?;
+            Ok(true)
+        }
     }
 }
 

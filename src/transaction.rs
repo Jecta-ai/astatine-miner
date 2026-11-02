@@ -737,15 +737,55 @@ fn retain_closed_session_history(state: &mut JournalState, session: Option<Spend
 }
 
 fn journal_entry_wallet(state: &JournalState, entry: &TransactionEntry) -> Option<Address> {
-    if !entry.wallet.is_empty() {
-        return Address::from_str(&entry.wallet).ok();
-    }
-    state
+    let entry_wallet = if entry.wallet.is_empty() {
+        None
+    } else {
+        Some(Address::from_str(&entry.wallet).ok()?)
+    };
+    let session_wallet = state
         .active_session
         .iter()
         .chain(state.session_history.iter())
         .find(|session| session.id == entry.session_id && !session.wallet.is_empty())
-        .and_then(|session| Address::from_str(&session.wallet).ok())
+        .and_then(|session| Address::from_str(&session.wallet).ok());
+    match (entry_wallet, session_wallet) {
+        (Some(entry_wallet), Some(session_wallet)) if entry_wallet != session_wallet => None,
+        (Some(entry_wallet), _) => Some(entry_wallet),
+        (None, session_wallet) => session_wallet,
+    }
+}
+
+fn validate_recovery_wallet_identity(state: &JournalState, wallet: Address) -> Result<()> {
+    if let Some(session) = state.active_session.as_ref()
+        && !session.wallet.is_empty()
+        && Address::from_str(&session.wallet)
+            .context("active recovery session wallet address is invalid")?
+            != wallet
+    {
+        bail!(
+            "selected recovery wallet {wallet:#x} does not match active journal session wallet {}",
+            session.wallet
+        );
+    }
+    for entry in state
+        .entries
+        .iter()
+        .filter(|entry| entry.status.is_unresolved())
+    {
+        let bound_wallet = journal_entry_wallet(state, entry).with_context(|| {
+            format!(
+                "unresolved transaction {} has no verifiable wallet binding",
+                entry.transaction_hash
+            )
+        })?;
+        if bound_wallet != wallet {
+            bail!(
+                "selected recovery wallet {wallet:#x} does not match unresolved transaction {} wallet {bound_wallet:#x}",
+                entry.transaction_hash
+            );
+        }
+    }
+    Ok(())
 }
 
 fn zero_wei_string() -> String {
@@ -1206,7 +1246,7 @@ impl TransactionJournal {
             store,
             config,
             wallet,
-            history_telemetry,
+            Arc::clone(&history_telemetry),
             authorize_new_session,
             force_new_session,
             None,
@@ -1253,6 +1293,42 @@ impl TransactionJournal {
         )
     }
 
+    pub(crate) fn open_for_read_only_recovery(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        history_telemetry: Arc<HistoryTelemetry>,
+    ) -> Result<Self> {
+        if config.network != Network::Testnet {
+            bail!("transaction recovery is restricted to Injective Testnet");
+        }
+        if let Some(configured_wallet) = config
+            .wallet_address
+            .as_deref()
+            .map(Address::from_str)
+            .transpose()
+            .context("configured recovery wallet address is invalid")?
+            && configured_wallet != wallet
+        {
+            bail!(
+                "configured wallet {configured_wallet:#x} does not match the original journal recovery wallet {wallet:#x}"
+            );
+        }
+        let lock = store.lock_transaction_journal()?;
+        let (mut journal, migrated) = Self::open_authenticated_with_lock(
+            store,
+            config,
+            wallet,
+            history_telemetry,
+            lock,
+            Some(wallet),
+        )?;
+        if migrated {
+            journal.persist()?;
+        }
+        Ok(journal)
+    }
+
     fn open_internal(
         store: &ConfigStore,
         config: &AppConfig,
@@ -1277,38 +1353,15 @@ impl TransactionJournal {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn open_internal_with_lock(
+    fn open_authenticated_with_lock(
         store: &ConfigStore,
         config: &AppConfig,
         wallet: Address,
         history_telemetry: Arc<HistoryTelemetry>,
-        authorize_new_session: bool,
-        force_new_session: bool,
-        transition_previous_config: Option<(String, Option<String>)>,
         lock: File,
-        run_budget: Option<RunSessionBudget>,
-        require_per_run_policy: bool,
-    ) -> Result<Self> {
+        recovery_wallet: Option<Address>,
+    ) -> Result<(Self, bool)> {
         let _open_timer = history_telemetry.timer(HistoryDuration::JournalOpen);
-        if config.network != Network::Testnet {
-            bail!("transaction signing is disabled outside Injective Testnet");
-        }
-        let configured_limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
-        let limit = run_budget.map_or(configured_limit, |budget| budget.approved_limit_wei);
-        if let Some(budget) = run_budget
-            && (!config.per_run_sessions_enabled()
-                || !authorize_new_session
-                || !force_new_session
-                || budget.ceiling_wei != configured_limit
-                || budget.minimum_reserve_wei != parse_inj_wei(&config.minimum_reserve_inj)?
-                || budget.approved_limit_wei.is_zero()
-                || budget.approved_limit_wei > budget.ceiling_wei)
-        {
-            bail!(
-                "per-run authorization budget does not match the configured policy or new-session request"
-            );
-        }
         let (state, mut authenticator, source_version) = match store.read_transaction_journal()? {
             Some(contents) => {
                 let state = serde_json::from_slice::<JournalState>(&contents)
@@ -1317,18 +1370,25 @@ impl TransactionJournal {
                 let authenticator = JournalAuthenticator::for_existing_journal(store, &state)?;
                 (state, authenticator, source_version)
             }
+            None if recovery_wallet.is_some() => {
+                bail!("read-only transaction recovery requires an existing authenticated journal")
+            }
             None => (
                 JournalState::default(),
                 JournalAuthenticator::for_empty_journal(store)?,
                 JOURNAL_VERSION,
             ),
         };
+        if let Some(wallet) = recovery_wallet {
+            validate_recovery_wallet_identity(&state, wallet)?;
+        }
         let (mut state, mut migrated) =
             migrate_journal(state, wallet, config.transaction_confirmations)?;
-        if state.pending_session_transition.is_some() {
-            bail!(
-                "an interrupted spending-session change must be resolved by `astatine init` before mining"
-            );
+        if let Some(wallet) = recovery_wallet {
+            validate_recovery_wallet_identity(&state, wallet)?;
+        }
+        if state.pending_session_transition.is_some() && recovery_wallet.is_some() {
+            bail!("a spending-session change is interrupted; run `astatine init` before recovery");
         }
         let archive_validation = {
             let _archive_validation_timer =
@@ -1352,21 +1412,71 @@ impl TransactionJournal {
         validate_journal(&state)?;
         authenticator.sync_checkpoint(store)?;
         if state.pending_authorization.take().is_some() {
-            // The raw signature is never broadcast until its hash and full intent
-            // are persisted. An orphan reservation can therefore be retired on
-            // restart without refunding its cumulative maximum exposure.
+            // Signatures are never broadcast before their signed intent is durable.
+            // Retire only the orphan marker; the already-charged session counter stays.
             migrated = true;
         }
 
-        let mut journal = Self {
-            store: store.clone(),
-            state,
-            authenticator,
-            _lock: lock,
-            history_telemetry: Arc::clone(&history_telemetry),
-            allow_unresolved_transactions: config.per_run_sessions_enabled() && force_new_session,
-            confirmed_finalization_retries: HashSet::new(),
-        };
+        Ok((
+            Self {
+                store: store.clone(),
+                state,
+                authenticator,
+                _lock: lock,
+                history_telemetry,
+                allow_unresolved_transactions: false,
+                confirmed_finalization_retries: HashSet::new(),
+            },
+            migrated,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_internal_with_lock(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        history_telemetry: Arc<HistoryTelemetry>,
+        authorize_new_session: bool,
+        force_new_session: bool,
+        transition_previous_config: Option<(String, Option<String>)>,
+        lock: File,
+        run_budget: Option<RunSessionBudget>,
+        require_per_run_policy: bool,
+    ) -> Result<Self> {
+        if config.network != Network::Testnet {
+            bail!("transaction signing is disabled outside Injective Testnet");
+        }
+        let configured_limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
+        let limit = run_budget.map_or(configured_limit, |budget| budget.approved_limit_wei);
+        if let Some(budget) = run_budget
+            && (!config.per_run_sessions_enabled()
+                || !authorize_new_session
+                || !force_new_session
+                || budget.ceiling_wei != configured_limit
+                || budget.minimum_reserve_wei != parse_inj_wei(&config.minimum_reserve_inj)?
+                || budget.approved_limit_wei.is_zero()
+                || budget.approved_limit_wei > budget.ceiling_wei)
+        {
+            bail!(
+                "per-run authorization budget does not match the configured policy or new-session request"
+            );
+        }
+        let (mut journal, migrated) = Self::open_authenticated_with_lock(
+            store,
+            config,
+            wallet,
+            history_telemetry,
+            lock,
+            None,
+        )?;
+        if journal.state.pending_session_transition.is_some() {
+            bail!(
+                "an interrupted spending-session change must be resolved by `astatine init` before mining"
+            );
+        }
+        journal.allow_unresolved_transactions =
+            config.per_run_sessions_enabled() && force_new_session;
         let previous_session = journal.state.active_session.clone();
         let has_unresolved = journal.has_unresolved();
         if require_per_run_policy {
@@ -3273,26 +3383,21 @@ impl TransactionManager {
         ast_token: Address,
         history_telemetry: Arc<HistoryTelemetry>,
     ) -> Result<Self> {
-        let summary = TransactionJournal::inspect_session(store, config)?;
-        if summary.pending_transition.is_some() {
-            bail!("a spending-session change is interrupted; run `astatine init` before recovery");
-        }
-        let mut recovery_config = config.clone();
-        if let Some(limit_wei) = summary.limit_wei {
-            recovery_config.per_session_spending_limit_inj =
-                wei_as_inj(parse_decimal_wei(&limit_wei)?);
-        }
-        let mut manager = Self::open_with_session_policy(
+        let journal = TransactionJournal::open_for_read_only_recovery(
             store,
-            &recovery_config,
+            config,
+            wallet,
+            Arc::clone(&history_telemetry),
+        )?;
+        Self::from_journal(
+            journal,
+            config,
             wallet,
             ast_token,
             history_telemetry,
-            false,
-            false,
-        )?;
-        manager.read_only_recovery = true;
-        Ok(manager)
+            U256::ZERO,
+            true,
+        )
     }
 
     pub(crate) fn open_with_session_policy(
@@ -3319,6 +3424,7 @@ impl TransactionManager {
             ast_token,
             history_telemetry,
             parse_inj_wei(&config.per_session_spending_limit_inj)?,
+            false,
         )
     }
 
@@ -3346,6 +3452,7 @@ impl TransactionManager {
             ast_token,
             history_telemetry,
             budget.approved_limit_wei,
+            false,
         )
     }
 
@@ -3356,10 +3463,14 @@ impl TransactionManager {
         ast_token: Address,
         history_telemetry: Arc<HistoryTelemetry>,
         session_limit: U256,
+        read_only_recovery: bool,
     ) -> Result<Self> {
+        if read_only_recovery && !session_limit.is_zero() {
+            bail!("read-only recovery manager cannot have spending authority");
+        }
         Ok(Self {
             journal,
-            read_only_recovery: false,
+            read_only_recovery,
             wallet,
             ast_token,
             chain_id: 1439,
@@ -4648,6 +4759,9 @@ impl TransactionManager {
     }
 
     pub fn close_session(&mut self) -> Result<()> {
+        if self.read_only_recovery {
+            bail!("read-only transaction recovery cannot modify a spending session");
+        }
         self.journal.close_session_for_run(
             self.journal.allow_unresolved_transactions && !self.read_only_recovery,
         )
@@ -6972,18 +7086,6 @@ fn parse_decimal_wei(value: &str) -> Result<U256> {
     U256::from_str_radix(value, 10).context("transaction journal amount is not decimal wei")
 }
 
-fn wei_as_inj(value: U256) -> String {
-    let scale = U256::from(10_u8).pow(U256::from(18_u8));
-    let whole = value / scale;
-    let fractional = format!("{:0>18}", (value % scale));
-    let fractional = fractional.trim_end_matches('0');
-    if fractional.is_empty() {
-        whole.to_string()
-    } else {
-        format!("{whole}.{fractional}")
-    }
-}
-
 fn new_session_id() -> String {
     let mut bytes = [0_u8; 16];
     thread_rng().fill_bytes(&mut bytes);
@@ -7089,6 +7191,10 @@ mod tests {
                 return signer;
             }
         }
+    }
+
+    fn recovery_signer() -> SigningKey {
+        SigningKey::from_slice(&[0x11; 32]).unwrap()
     }
 
     fn test_request() -> Eip1559Request {
@@ -9961,19 +10067,559 @@ mod tests {
         assert_eq!(committed.state.session_history[0].id, old_session_id);
     }
 
-    #[test]
-    fn read_only_recovery_manager_cannot_sign_or_broadcast() {
+    #[tokio::test]
+    async fn read_only_recovery_opens_closed_session_without_reopening_or_signing() {
+        let empty_root = tempdir().unwrap();
+        let empty_store = ConfigStore::at_root(PathBuf::from(empty_root.path()));
+        let empty_wallet = signer_address(&recovery_signer());
+        let empty_config = AppConfig {
+            wallet_address: Some(format!("{empty_wallet:#x}")),
+            ..AppConfig::default()
+        };
+        assert!(
+            TransactionManager::open_for_read_only_recovery(
+                &empty_store,
+                &empty_config,
+                empty_wallet,
+                Address::with_last_byte(0x74),
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .is_err()
+        );
+        assert!(empty_store.read_transaction_journal().unwrap().is_none());
+
         let root = tempdir().unwrap();
         let store = ConfigStore::at_root(PathBuf::from(root.path()));
-        let wallet = Address::with_last_byte(0x73);
+        let signer = recovery_signer();
+        let wallet = signer_address(&signer);
         let token = Address::with_last_byte(0x74);
+        let contract = Address::with_last_byte(0x75);
         let config = AppConfig {
             per_session_spending_limit_inj: "1".to_owned(),
             wallet_address: Some(format!("{wallet:#x}")),
             ..AppConfig::default()
         };
-        let journal = TransactionJournal::open(&store, &config, wallet).unwrap();
-        drop(journal);
+        store.save(&config).unwrap();
+        TransactionJournal::set_per_run_policy_approval(&store, &config, Some(wallet)).unwrap();
+        let mut paid_run = TransactionManager::open_with_session_authorization(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+            true,
+        )
+        .unwrap();
+        let session_id = paid_run
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        paid_run.close_session().unwrap();
+        drop(paid_run);
+        let closed_snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert_eq!(
+            closed_snapshot.session_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        assert!(closed_snapshot.closed);
+        assert!(closed_snapshot.unresolved.is_empty());
+        let journal_before = store.read_transaction_journal().unwrap().unwrap();
+
+        let mut manager = TransactionManager::open_for_read_only_recovery(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+        )
+        .unwrap();
+        assert!(manager.read_only_recovery);
+        assert!(manager.session_limit.is_zero());
+        assert_eq!(
+            manager.journal.state.active_session.as_ref().unwrap().id,
+            session_id
+        );
+        assert!(
+            manager
+                .journal
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .closed
+        );
+        assert!(manager.require_signing_enabled().is_err());
+        let client = NetworkClient::local_test_client(
+            "http://127.0.0.1:1",
+            contract,
+            B256::with_last_byte(0x76),
+            token,
+            B256::with_last_byte(0x77),
+            9,
+        )
+        .unwrap();
+        assert!(
+            manager
+                .finalize_window(&client, &signer, contract, 1, 7)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("read-only transaction recovery")
+        );
+        assert!(
+            manager
+                .submit_proof(
+                    &client,
+                    &signer,
+                    ProofSubmission {
+                        contract,
+                        node_id: 1,
+                        window_id: 7,
+                        nonce: 1,
+                        header: vec![1],
+                        work_hash: B256::with_last_byte(1),
+                    },
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("read-only transaction recovery")
+        );
+        assert!(manager.close_session().is_err());
+        drop(manager);
+        assert_eq!(
+            store.read_transaction_journal().unwrap().unwrap(),
+            journal_before,
+            "opening or invoking transaction admission through read-only recovery must not touch the closed session"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_recovery_migrates_closed_v9_sessions_without_resetting_liabilities() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let signer = recovery_signer();
+        let wallet = signer_address(&signer);
+        let contract = Address::with_last_byte(0x81);
+        let token = Address::with_last_byte(0x82);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        TransactionJournal::set_per_run_policy_approval(&store, &config, Some(wallet)).unwrap();
+
+        let (first_session, first_request, first_hash, first_exposure) =
+            create_closed_broadcast_run(&store, &config, wallet, token, &signer, contract, 5, 7);
+        let (second_session, second_request, second_hash, second_exposure) =
+            create_closed_broadcast_run_at_version(
+                &store,
+                &config,
+                wallet,
+                token,
+                &signer,
+                contract,
+                6,
+                8,
+                PRE_PER_RUN_JOURNAL_VERSION,
+            );
+        assert_ne!(first_session, second_session);
+
+        let before: super::JournalState =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        assert_eq!(before.version, PRE_PER_RUN_JOURNAL_VERSION);
+        assert!(before.per_run_policy_approval.is_none());
+        assert!(before.active_session.as_ref().unwrap().closed);
+        assert_eq!(before.active_session.as_ref().unwrap().id, second_session);
+        assert_eq!(before.session_history.len(), 1);
+        assert_eq!(before.session_history[0].id, first_session);
+        assert!(before.session_history[0].closed);
+        let total_exposure = first_exposure + second_exposure;
+        assert_eq!(
+            TransactionJournal::inspect_session(&store, &config)
+                .unwrap()
+                .pending_exposure_wei
+                .as_deref(),
+            Some(total_exposure.to_string().as_str())
+        );
+        let authorizations_before = before
+            .session_history
+            .iter()
+            .chain(before.active_session.iter())
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    session.authorized_exposure_wei.clone().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let receipt_block = 20_u64;
+        let receipt_hash = B256::with_last_byte(0x20);
+        let latest_hash = B256::with_last_byte(0x21);
+        let first_transaction = recovery_transaction_json(&first_request, first_hash, wallet);
+        let second_transaction = recovery_transaction_json(&second_request, second_hash, wallet);
+        let first_receipt = recovery_finalization_receipt_json(
+            &first_request,
+            first_hash,
+            wallet,
+            7,
+            receipt_block,
+            receipt_hash,
+            0,
+            true,
+        );
+        let second_receipt = recovery_finalization_receipt_json(
+            &second_request,
+            second_hash,
+            wallet,
+            8,
+            receipt_block,
+            receipt_hash,
+            1,
+            true,
+        );
+        let (url, rpc_counts, stop_server, server) =
+            read_only_recovery_rpc_server(ReadOnlyRecoveryRpcFixture {
+                latest_block: 21,
+                canonical_blocks: HashMap::from([(receipt_block, receipt_hash), (21, latest_hash)]),
+                transactions: HashMap::from([
+                    (first_hash, first_transaction),
+                    (second_hash, second_transaction),
+                ]),
+                receipts: HashMap::from([
+                    (first_hash, first_receipt),
+                    (second_hash, second_receipt),
+                ]),
+                unavailable: false,
+            });
+        let client = NetworkClient::local_test_client(
+            &url,
+            contract,
+            B256::with_last_byte(0x83),
+            token,
+            B256::with_last_byte(0x84),
+            18,
+        )
+        .unwrap();
+
+        let mut recovery = TransactionManager::open_for_read_only_recovery(
+            &store,
+            &config,
+            wallet,
+            token,
+            client.history_telemetry(),
+        )
+        .unwrap();
+        assert!(recovery.read_only_recovery);
+        assert!(recovery.session_limit.is_zero());
+        assert_eq!(recovery.journal.state.version, JOURNAL_VERSION);
+        assert!(recovery.journal.state.per_run_policy_approval.is_none());
+        assert!(recovery.journal.has_unresolved());
+        assert_eq!(recovery.journal.pending_exposure().unwrap(), total_exposure);
+        assert_eq!(
+            recovery.journal.state.active_session.as_ref().unwrap().id,
+            second_session
+        );
+        assert!(
+            recovery
+                .journal
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .closed
+        );
+        assert!(recovery.journal.state.session_history[0].closed);
+        assert!(recovery.close_session().is_err());
+
+        let finalization_error = recovery
+            .finalize_window(&client, &signer, contract, 1, 7)
+            .await
+            .unwrap_err();
+        assert!(
+            finalization_error
+                .to_string()
+                .contains("read-only transaction recovery")
+        );
+        let proof_error = recovery
+            .submit_proof(
+                &client,
+                &signer,
+                ProofSubmission {
+                    contract,
+                    node_id: 1,
+                    window_id: 9,
+                    nonce: 1,
+                    header: vec![1],
+                    work_hash: B256::with_last_byte(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            proof_error
+                .to_string()
+                .contains("read-only transaction recovery")
+        );
+
+        recovery.reconcile(&client).await.unwrap();
+        assert!(!recovery.journal.has_unresolved());
+        assert_eq!(recovery.journal.pending_exposure().unwrap(), U256::ZERO);
+        for (hash, request) in [
+            (&first_hash, &first_request),
+            (&second_hash, &second_request),
+        ] {
+            let entry = recovery.journal.entry(*hash).unwrap();
+            assert_eq!(entry.status, TransactionStatus::MinedSuccess);
+            assert_eq!(entry.nonce, request.nonce);
+            assert_eq!(entry_hash(&entry).unwrap(), *hash);
+            assert_eq!(entry.receipt_status, Some(true));
+            assert_eq!(
+                entry.receipt_verification,
+                super::ReceiptVerification::TrustedRpcChecked
+            );
+            assert_eq!(
+                entry.outcome.as_deref(),
+                Some("window-finalized-winner:0x0000000000000000000000000000000000000000:payout:0")
+            );
+            assert_eq!(entry.actual_cost_wei.as_deref(), Some("100000"));
+        }
+        let authorizations_after = recovery
+            .journal
+            .state
+            .session_history
+            .iter()
+            .chain(recovery.journal.state.active_session.iter())
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    session.authorized_exposure_wei.clone().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(authorizations_after, authorizations_before);
+        assert!(
+            recovery
+                .journal
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .closed
+        );
+        assert_eq!(
+            recovery.journal.state.active_session.as_ref().unwrap().id,
+            second_session
+        );
+        assert_eq!(recovery.journal.state.session_history.len(), 1);
+        assert_eq!(recovery.journal.state.session_history[0].id, first_session);
+        assert!(recovery.journal.state.session_history[0].closed);
+        drop(recovery);
+
+        let verified = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(verified.closed);
+        assert!(verified.unresolved.is_empty());
+        assert_eq!(
+            verified.session_id.as_deref(),
+            Some(second_session.as_str())
+        );
+        let counts = rpc_counts.lock().unwrap();
+        assert!(!counts.contains_key("eth_sendRawTransaction"));
+        assert_eq!(counts.get("eth_getTransactionReceipt"), Some(&2));
+        assert_eq!(counts.get("eth_getTransactionByHash"), Some(&2));
+        drop(counts);
+        stop_server.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn read_only_recovery_rejects_wallet_auth_checkpoint_and_concurrent_access_failures() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let signer = recovery_signer();
+        let wallet = signer_address(&signer);
+        let other_wallet = Address::with_last_byte(0x9a);
+        let contract = Address::with_last_byte(0x9b);
+        let token = Address::with_last_byte(0x9c);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        TransactionJournal::set_per_run_policy_approval(&store, &config, Some(wallet)).unwrap();
+        create_closed_broadcast_run(&store, &config, wallet, token, &signer, contract, 3, 4);
+        let original_journal = store.read_transaction_journal().unwrap().unwrap();
+        let original_checkpoint = store.read_journal_anchor().unwrap().unwrap().to_vec();
+
+        let wrong_config = AppConfig {
+            wallet_address: Some(format!("{other_wallet:#x}")),
+            ..config.clone()
+        };
+        assert!(
+            TransactionManager::open_for_read_only_recovery(
+                &store,
+                &wrong_config,
+                wallet,
+                token,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .is_err()
+        );
+        let unselected_config = AppConfig {
+            wallet_address: None,
+            ..config.clone()
+        };
+        assert!(
+            TransactionManager::open_for_read_only_recovery(
+                &store,
+                &unselected_config,
+                other_wallet,
+                token,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .is_err()
+        );
+
+        let recovery = TransactionManager::open_for_read_only_recovery(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+        )
+        .unwrap();
+        let concurrent_error = match TransactionManager::open_for_read_only_recovery(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the existing journal lock must exclude another recovery process"),
+        };
+        assert!(format!("{concurrent_error:#}").contains("already holds the transaction journal"));
+        drop(recovery);
+        assert_eq!(
+            store.read_transaction_journal().unwrap().unwrap(),
+            original_journal
+        );
+        let lock_released = TransactionManager::open_for_read_only_recovery(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+        )
+        .unwrap();
+        drop(lock_released);
+
+        let mut mismatched_checkpoint = original_checkpoint.clone();
+        *mismatched_checkpoint.last_mut().unwrap() ^= 1;
+        store.write_journal_anchor(&mismatched_checkpoint).unwrap();
+        assert!(
+            TransactionManager::open_for_read_only_recovery(
+                &store,
+                &config,
+                wallet,
+                token,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .is_err(),
+            "read-only recovery must authenticate the matching OS checkpoint"
+        );
+        store.write_journal_anchor(&original_checkpoint).unwrap();
+
+        let mut corrupted_journal: serde_json::Value =
+            serde_json::from_slice(&original_journal).unwrap();
+        corrupted_journal["entries"][0]["maximum_exposure_wei"] =
+            serde_json::Value::String("0".to_owned());
+        store
+            .write_transaction_journal(&serde_json::to_vec(&corrupted_journal).unwrap())
+            .unwrap();
+        assert!(
+            TransactionManager::open_for_read_only_recovery(
+                &store,
+                &config,
+                wallet,
+                token,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .is_err(),
+            "read-only recovery must authenticate the full journal before inspection"
+        );
+        store.write_transaction_journal(&original_journal).unwrap();
+
+        store.clear_journal_anchor_for_test().unwrap();
+        assert!(
+            TransactionManager::open_for_read_only_recovery(
+                &store,
+                &config,
+                wallet,
+                token,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .is_err(),
+            "missing credential checkpoint must never create a replacement key"
+        );
+        assert_eq!(
+            store.read_transaction_journal().unwrap().unwrap(),
+            original_journal
+        );
+    }
+
+    #[test]
+    fn read_only_recovery_inspects_an_open_legacy_session_without_resuming_or_closing_it() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let signer = recovery_signer();
+        let wallet = signer_address(&signer);
+        let contract = Address::with_last_byte(0xa1);
+        let token = Address::with_last_byte(0xa2);
+        let config = AppConfig {
+            schema_version: 1,
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        let mut legacy = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let request = recovery_finalization_request(contract, 11);
+        let hash = sign_eip1559(&signer, &request).unwrap().hash;
+        let exposure = maximum_transaction_exposure(&request).unwrap();
+        legacy
+            .prepare(PreparedTransaction {
+                request,
+                tx_hash: hash,
+                intent: TransactionIntent {
+                    contract,
+                    node_id: 1,
+                    window_id: 12,
+                    action: TransactionAction::FinalizeWindow,
+                    proof: None,
+                    reward_destination: None,
+                    forwarding: None,
+                },
+                session_limit: parse_inj_wei("1").unwrap(),
+                minimum_reserve: parse_inj_wei("0.1").unwrap(),
+                confirmed_balance: U256::MAX,
+                confirmations_required: config.transaction_confirmations,
+            })
+            .unwrap();
+        legacy
+            .set_broadcast_state(hash, TransactionStatus::Broadcast)
+            .unwrap();
+        let session_id = legacy.state.active_session.as_ref().unwrap().id.clone();
+        let authorization = legacy.session_authorized_total().unwrap();
+        assert_eq!(legacy.pending_exposure().unwrap(), exposure);
+        drop(legacy);
 
         let manager = TransactionManager::open_for_read_only_recovery(
             &store,
@@ -9983,7 +10629,517 @@ mod tests {
             Arc::new(HistoryTelemetry::default()),
         )
         .unwrap();
-        assert!(manager.require_signing_enabled().is_err());
+        assert!(manager.read_only_recovery);
+        assert!(manager.journal.has_unresolved());
+        assert_eq!(manager.journal.pending_exposure().unwrap(), exposure);
+        let active = manager.journal.state.active_session.as_ref().unwrap();
+        assert_eq!(active.id, session_id);
+        assert!(
+            !active.closed,
+            "legacy recovery inspects the open session but does not resume it"
+        );
+        assert_eq!(
+            manager.journal.session_authorized_total().unwrap(),
+            authorization
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_recovery_settles_closed_per_run_liabilities_without_signing() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let signer = recovery_signer();
+        let wallet = signer_address(&signer);
+        let contract = Address::with_last_byte(0x81);
+        let token = Address::with_last_byte(0x82);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        TransactionJournal::set_per_run_policy_approval(&store, &config, Some(wallet)).unwrap();
+
+        let (first_session, first_request, first_hash, first_exposure) =
+            create_closed_broadcast_run(&store, &config, wallet, token, &signer, contract, 5, 7);
+        let (second_session, second_request, second_hash, second_exposure) =
+            create_closed_broadcast_run(&store, &config, wallet, token, &signer, contract, 6, 8);
+        assert_ne!(first_session, second_session);
+        let mut no_transaction_run = TransactionManager::open_with_session_authorization(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+            true,
+        )
+        .unwrap();
+        let third_session = no_transaction_run
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        no_transaction_run.close_session().unwrap();
+        drop(no_transaction_run);
+
+        let before: super::JournalState =
+            serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap()).unwrap();
+        assert!(before.active_session.as_ref().unwrap().closed);
+        assert_eq!(before.active_session.as_ref().unwrap().id, third_session);
+        assert_eq!(before.session_history.len(), 2);
+        assert_eq!(before.session_history[0].id, first_session);
+        assert!(before.session_history[0].closed);
+        assert_eq!(before.session_history[1].id, second_session);
+        assert!(before.session_history[1].closed);
+        assert_eq!(
+            TransactionJournal::inspect_session(&store, &config)
+                .unwrap()
+                .pending_exposure_wei
+                .as_deref(),
+            Some((first_exposure + second_exposure).to_string().as_str())
+        );
+        let authorizations_before = before
+            .session_history
+            .iter()
+            .chain(before.active_session.iter())
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    session.authorized_exposure_wei.clone().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let receipt_block = 20_u64;
+        let receipt_hash = B256::with_last_byte(0x20);
+        let latest_hash = B256::with_last_byte(0x21);
+        let first_transaction = recovery_transaction_json(&first_request, first_hash, wallet);
+        let second_transaction = recovery_transaction_json(&second_request, second_hash, wallet);
+        let first_receipt = recovery_finalization_receipt_json(
+            &first_request,
+            first_hash,
+            wallet,
+            7,
+            receipt_block,
+            receipt_hash,
+            0,
+            true,
+        );
+        let second_receipt = recovery_finalization_receipt_json(
+            &second_request,
+            second_hash,
+            wallet,
+            8,
+            receipt_block,
+            receipt_hash,
+            1,
+            true,
+        );
+        let (url, rpc_counts, stop_server, server) =
+            read_only_recovery_rpc_server(ReadOnlyRecoveryRpcFixture {
+                latest_block: 21,
+                canonical_blocks: HashMap::from([(receipt_block, receipt_hash), (21, latest_hash)]),
+                transactions: HashMap::from([
+                    (first_hash, first_transaction),
+                    (second_hash, second_transaction),
+                ]),
+                receipts: HashMap::from([
+                    (first_hash, first_receipt),
+                    (second_hash, second_receipt),
+                ]),
+                unavailable: false,
+            });
+        let client = NetworkClient::local_test_client(
+            &url,
+            contract,
+            B256::with_last_byte(0x83),
+            token,
+            B256::with_last_byte(0x84),
+            18,
+        )
+        .unwrap();
+
+        let mut recovery = TransactionManager::open_for_read_only_recovery(
+            &store,
+            &config,
+            wallet,
+            token,
+            client.history_telemetry(),
+        )
+        .unwrap();
+        assert!(recovery.read_only_recovery);
+        assert!(recovery.session_limit.is_zero());
+        assert!(recovery.journal.has_unresolved());
+        assert_eq!(
+            recovery.journal.pending_exposure().unwrap(),
+            first_exposure + second_exposure
+        );
+        assert_eq!(
+            recovery.journal.state.active_session.as_ref().unwrap().id,
+            third_session
+        );
+        assert!(
+            recovery
+                .journal
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .closed
+        );
+        assert!(recovery.journal.state.session_history[0].closed);
+        assert!(recovery.close_session().is_err());
+
+        let finalization_error = recovery
+            .finalize_window(&client, &signer, contract, 1, 7)
+            .await
+            .unwrap_err();
+        assert!(
+            finalization_error
+                .to_string()
+                .contains("read-only transaction recovery")
+        );
+        let proof_error = recovery
+            .submit_proof(
+                &client,
+                &signer,
+                ProofSubmission {
+                    contract,
+                    node_id: 1,
+                    window_id: 9,
+                    nonce: 1,
+                    header: vec![1],
+                    work_hash: B256::with_last_byte(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            proof_error
+                .to_string()
+                .contains("read-only transaction recovery")
+        );
+
+        recovery.reconcile(&client).await.unwrap();
+        assert!(!recovery.journal.has_unresolved());
+        assert_eq!(recovery.journal.pending_exposure().unwrap(), U256::ZERO);
+        for hash in [first_hash, second_hash] {
+            let entry = recovery.journal.entry(hash).unwrap();
+            assert_eq!(entry.status, TransactionStatus::MinedSuccess);
+            assert_eq!(entry.receipt_status, Some(true));
+            assert_eq!(
+                entry.receipt_verification,
+                super::ReceiptVerification::TrustedRpcChecked
+            );
+            assert_eq!(
+                entry.outcome.as_deref(),
+                Some("window-finalized-winner:0x0000000000000000000000000000000000000000:payout:0")
+            );
+            assert_eq!(entry.actual_cost_wei.as_deref(), Some("100000"));
+        }
+        let authorizations_after = recovery
+            .journal
+            .state
+            .session_history
+            .iter()
+            .chain(recovery.journal.state.active_session.iter())
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    session.authorized_exposure_wei.clone().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(authorizations_after, authorizations_before);
+        assert!(
+            recovery
+                .journal
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .closed
+        );
+        assert_eq!(recovery.journal.state.session_history.len(), 2);
+        assert_eq!(
+            recovery.journal.state.active_session.as_ref().unwrap().id,
+            third_session
+        );
+        assert_eq!(recovery.journal.state.session_history[0].id, first_session);
+        assert!(recovery.journal.state.session_history[0].closed);
+        assert_eq!(recovery.journal.state.session_history[1].id, second_session);
+        assert!(recovery.journal.state.session_history[1].closed);
+        drop(recovery);
+
+        let verified = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(verified.closed);
+        assert!(verified.unresolved.is_empty());
+        assert_eq!(verified.session_id.as_deref(), Some(third_session.as_str()));
+        let counts = rpc_counts.lock().unwrap();
+        assert!(!counts.contains_key("eth_sendRawTransaction"));
+        assert_eq!(counts.get("eth_getTransactionReceipt"), Some(&2));
+        assert_eq!(counts.get("eth_getTransactionByHash"), Some(&2));
+        drop(counts);
+        stop_server.store(true, Ordering::Release);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_recovery_preserves_pending_reorged_and_unavailable_exposure() {
+        #[derive(Clone, Copy, Debug)]
+        enum RecoveryCase {
+            Pending,
+            ReorgedReceipt,
+            RevertedReceipt,
+            RpcUnavailable,
+        }
+
+        for (case, expected_status, expect_unresolved) in [
+            (RecoveryCase::Pending, TransactionStatus::Broadcast, true),
+            (
+                RecoveryCase::ReorgedReceipt,
+                TransactionStatus::Unknown,
+                true,
+            ),
+            (
+                RecoveryCase::RevertedReceipt,
+                TransactionStatus::MinedReverted,
+                false,
+            ),
+            (
+                RecoveryCase::RpcUnavailable,
+                TransactionStatus::Broadcast,
+                true,
+            ),
+        ] {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(PathBuf::from(root.path()));
+            let signer = recovery_signer();
+            let wallet = signer_address(&signer);
+            let contract = Address::with_last_byte(0x91);
+            let token = Address::with_last_byte(0x92);
+            let config = AppConfig {
+                wallet_address: Some(format!("{wallet:#x}")),
+                per_session_spending_limit_inj: "1".to_owned(),
+                ..AppConfig::default()
+            };
+            store.save(&config).unwrap();
+            TransactionJournal::set_per_run_policy_approval(&store, &config, Some(wallet)).unwrap();
+            let (session_id, request, hash, exposure) = create_closed_broadcast_run(
+                &store, &config, wallet, token, &signer, contract, 9, 12,
+            );
+            let session_before = TransactionJournal::inspect_session(&store, &config).unwrap();
+            assert_eq!(
+                session_before.session_id.as_deref(),
+                Some(session_id.as_str())
+            );
+            assert!(session_before.closed);
+            assert_eq!(
+                session_before.pending_exposure_wei.as_deref(),
+                Some(exposure.to_string().as_str())
+            );
+            let authorization_before = {
+                let bytes = store.read_transaction_journal().unwrap().unwrap();
+                let state: super::JournalState = serde_json::from_slice(&bytes).unwrap();
+                state
+                    .active_session
+                    .as_ref()
+                    .unwrap()
+                    .authorized_exposure_wei
+                    .clone()
+                    .unwrap()
+            };
+
+            let receipt_hash = B256::with_last_byte(0x20);
+            let canonical_receipt_hash = match case {
+                RecoveryCase::ReorgedReceipt => B256::with_last_byte(0x22),
+                _ => receipt_hash,
+            };
+            let latest_hash = B256::with_last_byte(0x21);
+            let transactions =
+                HashMap::from([(hash, recovery_transaction_json(&request, hash, wallet))]);
+            let receipts = match case {
+                RecoveryCase::Pending | RecoveryCase::RpcUnavailable => HashMap::new(),
+                RecoveryCase::ReorgedReceipt => HashMap::from([(
+                    hash,
+                    recovery_finalization_receipt_json(
+                        &request,
+                        hash,
+                        wallet,
+                        12,
+                        20,
+                        receipt_hash,
+                        0,
+                        true,
+                    ),
+                )]),
+                RecoveryCase::RevertedReceipt => HashMap::from([(
+                    hash,
+                    recovery_finalization_receipt_json(
+                        &request,
+                        hash,
+                        wallet,
+                        12,
+                        20,
+                        receipt_hash,
+                        0,
+                        false,
+                    ),
+                )]),
+            };
+            let (url, rpc_counts, stop_server, server) =
+                read_only_recovery_rpc_server(ReadOnlyRecoveryRpcFixture {
+                    latest_block: 21,
+                    canonical_blocks: HashMap::from([
+                        (20, canonical_receipt_hash),
+                        (21, latest_hash),
+                    ]),
+                    transactions,
+                    receipts,
+                    unavailable: matches!(case, RecoveryCase::RpcUnavailable),
+                });
+            let client = NetworkClient::local_test_client(
+                &url,
+                contract,
+                B256::with_last_byte(0x93),
+                token,
+                B256::with_last_byte(0x94),
+                18,
+            )
+            .unwrap();
+            let mut recovery = TransactionManager::open_for_read_only_recovery(
+                &store,
+                &config,
+                wallet,
+                token,
+                client.history_telemetry(),
+            )
+            .unwrap();
+            assert!(recovery.read_only_recovery);
+            assert!(
+                recovery
+                    .journal
+                    .state
+                    .active_session
+                    .as_ref()
+                    .unwrap()
+                    .closed
+            );
+            recovery.reconcile(&client).await.unwrap();
+
+            let recovered = recovery.journal.entry(hash).unwrap();
+            assert_eq!(recovered.status, expected_status);
+            assert_eq!(
+                recovery.journal.has_unresolved(),
+                expect_unresolved,
+                "case {case:?} must not discard or invent unresolved exposure"
+            );
+            assert_eq!(
+                recovery
+                    .journal
+                    .state
+                    .active_session
+                    .as_ref()
+                    .unwrap()
+                    .authorized_exposure_wei
+                    .as_deref(),
+                Some(authorization_before.as_str()),
+                "receipt handling must never refund or change authorized exposure"
+            );
+            if expect_unresolved {
+                assert_eq!(recovery.journal.pending_exposure().unwrap(), exposure);
+                assert!(recovered.actual_cost_wei.is_none());
+            } else {
+                assert_eq!(recovery.journal.pending_exposure().unwrap(), U256::ZERO);
+                assert_eq!(recovered.receipt_status, Some(false));
+                assert_eq!(recovered.actual_cost_wei.as_deref(), Some("100000"));
+            }
+            assert!(recovery.close_session().is_err());
+            drop(recovery);
+
+            let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+            assert!(snapshot.closed);
+            assert_eq!(snapshot.session_id.as_deref(), Some(session_id.as_str()));
+            assert_eq!(
+                snapshot.unresolved.len(),
+                if expect_unresolved { 1 } else { 0 }
+            );
+            let counts = rpc_counts.lock().unwrap();
+            assert!(!counts.contains_key("eth_sendRawTransaction"));
+            drop(counts);
+            stop_server.store(true, Ordering::Release);
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_during_read_only_recovery_releases_lock_without_changing_session_or_liability()
+    {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let signer = recovery_signer();
+        let wallet = signer_address(&signer);
+        let contract = Address::with_last_byte(0xb1);
+        let token = Address::with_last_byte(0xb2);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        TransactionJournal::set_per_run_policy_approval(&store, &config, Some(wallet)).unwrap();
+        let (session_id, _request, hash, exposure) =
+            create_closed_broadcast_run(&store, &config, wallet, token, &signer, contract, 2, 3);
+        let client = NetworkClient::local_test_client(
+            "http://127.0.0.1:1",
+            contract,
+            B256::with_last_byte(0xb3),
+            token,
+            B256::with_last_byte(0xb4),
+            18,
+        )
+        .unwrap();
+        let mut recovery = TransactionManager::open_for_read_only_recovery(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+        )
+        .unwrap();
+        let mut ctrl_c: crate::startup::CtrlCSignal = Box::pin(async { Ok(()) });
+        assert!(
+            !crate::commands::reconcile_recovery_or_interrupt(&mut recovery, &client, &mut ctrl_c,)
+                .await
+                .unwrap()
+        );
+        drop(recovery);
+
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert_eq!(snapshot.session_id.as_deref(), Some(session_id.as_str()));
+        assert!(snapshot.closed);
+        assert_eq!(snapshot.unresolved.len(), 1);
+        assert_eq!(snapshot.unresolved[0].hash, format!("{hash:#x}"));
+        assert_eq!(
+            snapshot.pending_exposure_wei.as_deref(),
+            Some(exposure.to_string().as_str())
+        );
+        let resumed_recovery = TransactionManager::open_for_read_only_recovery(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+        )
+        .unwrap();
+        assert!(resumed_recovery.read_only_recovery);
+        assert_eq!(
+            resumed_recovery.journal.pending_exposure().unwrap(),
+            exposure
+        );
     }
 
     #[test]
@@ -10151,6 +11307,282 @@ mod tests {
             }
         });
         (format!("http://{address}"), counts, stop_server, thread)
+    }
+
+    struct ReadOnlyRecoveryRpcFixture {
+        latest_block: u64,
+        canonical_blocks: HashMap<u64, B256>,
+        transactions: HashMap<B256, serde_json::Value>,
+        receipts: HashMap<B256, serde_json::Value>,
+        unavailable: bool,
+    }
+
+    fn read_only_recovery_rpc_server(fixture: ReadOnlyRecoveryRpcFixture) -> HistoryRpcServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+        let server_counts = Arc::clone(&counts);
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop_server);
+        let thread = std::thread::spawn(move || {
+            loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if server_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("accept read-only recovery RPC request: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let request = read_history_http_request(&mut stream);
+                let method = request["method"].as_str().unwrap().to_owned();
+                *server_counts
+                    .lock()
+                    .unwrap()
+                    .entry(method.clone())
+                    .or_insert(0) += 1;
+                let result = match method.as_str() {
+                    "eth_blockNumber" => {
+                        serde_json::Value::String(format!("0x{:x}", fixture.latest_block))
+                    }
+                    "eth_getBlockByNumber" => {
+                        let tag = request["params"][0].as_str().unwrap();
+                        let number = if tag == "latest" {
+                            fixture.latest_block
+                        } else {
+                            u64::from_str_radix(tag.trim_start_matches("0x"), 16).unwrap()
+                        };
+                        let hash = fixture
+                            .canonical_blocks
+                            .get(&number)
+                            .copied()
+                            .unwrap_or(B256::with_last_byte(0xee));
+                        serde_json::json!({
+                            "number": format!("0x{number:x}"),
+                            "timestamp": "0x1",
+                            "hash": format!("{hash:#x}"),
+                        })
+                    }
+                    "eth_getTransactionByHash" | "eth_getTransactionReceipt" => {
+                        let hash = B256::from_str(request["params"][0].as_str().unwrap()).unwrap();
+                        let items = if method == "eth_getTransactionByHash" {
+                            &fixture.transactions
+                        } else {
+                            &fixture.receipts
+                        };
+                        items.get(&hash).cloned().unwrap_or(serde_json::Value::Null)
+                    }
+                    "eth_getTransactionCount" => {
+                        let tag = request["params"][1].as_str().unwrap();
+                        serde_json::Value::String(if tag == "pending" {
+                            "0x8".to_owned()
+                        } else {
+                            "0x7".to_owned()
+                        })
+                    }
+                    "eth_getLogs" => serde_json::Value::Array(Vec::new()),
+                    "eth_sendRawTransaction" => {
+                        serde_json::Value::String(format!("{:#x}", B256::with_last_byte(0xdd)))
+                    }
+                    other => panic!("unexpected read-only recovery RPC method {other}"),
+                };
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result,
+                })
+                .to_string();
+                let status = if fixture.unavailable { 503 } else { 200 };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .unwrap();
+            }
+        });
+        (format!("http://{address}"), counts, stop_server, thread)
+    }
+
+    fn recovery_transaction_json(
+        request: &Eip1559Request,
+        hash: B256,
+        wallet: Address,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "hash": format!("{hash:#x}"),
+            "chainId": "0x59f",
+            "from": format!("{wallet:#x}"),
+            "to": format!("{:#x}", request.to),
+            "nonce": format!("0x{:x}", request.nonce),
+            "value": format!("{:#x}", request.value),
+            "gas": format!("0x{:x}", request.gas_limit),
+            "input": format!("0x{}", hex::encode(&request.data)),
+            "maxFeePerGas": format!("{:#x}", request.max_fee_per_gas),
+            "maxPriorityFeePerGas": format!("{:#x}", request.max_priority_fee_per_gas),
+            "type": "0x2",
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recovery_finalization_receipt_json(
+        request: &Eip1559Request,
+        hash: B256,
+        wallet: Address,
+        window_id: u64,
+        block_number: u64,
+        block_hash: B256,
+        transaction_index: u64,
+        successful: bool,
+    ) -> serde_json::Value {
+        let finalized = AstatineMinerRead::WindowFinalized {
+            completedWindowId: window_id,
+            nextWindowId: window_id.saturating_add(1),
+            winner: Address::ZERO,
+            virtualBlockHash: B256::with_last_byte(window_id as u8),
+            payout: U256::ZERO,
+            targetAfter: U256::MAX,
+            seedAfter: B256::with_last_byte(window_id.saturating_add(1) as u8),
+            emaAfter: 60,
+            ended: false,
+        };
+        let topics = finalized
+            .encode_topics()
+            .into_iter()
+            .map(|topic| {
+                let topic: B256 = topic.into();
+                format!("{topic:#x}")
+            })
+            .collect::<Vec<_>>();
+        let event_log = serde_json::json!({
+            "address": format!("{:#x}", request.to),
+            "topics": topics,
+            "data": format!("0x{}", hex::encode(finalized.encode_data())),
+            "blockNumber": format!("0x{block_number:x}"),
+            "transactionHash": format!("{hash:#x}"),
+            "transactionIndex": format!("0x{transaction_index:x}"),
+            "blockHash": format!("{block_hash:#x}"),
+            "logIndex": "0x0",
+            "removed": false,
+        });
+        serde_json::json!({
+            "transactionHash": format!("{hash:#x}"),
+            "transactionIndex": format!("0x{transaction_index:x}"),
+            "from": format!("{wallet:#x}"),
+            "to": format!("{:#x}", request.to),
+            "status": if successful { "0x1" } else { "0x0" },
+            "gasUsed": "0xc350",
+            "cumulativeGasUsed": format!("0x{:x}", 50_000_u64.saturating_mul(transaction_index + 1)),
+            "effectiveGasPrice": "0x2",
+            "type": "0x2",
+            "blockNumber": format!("0x{block_number:x}"),
+            "blockHash": format!("{block_hash:#x}"),
+            "logs": if successful { vec![event_log] } else { Vec::new() },
+        })
+    }
+
+    fn recovery_finalization_request(contract: Address, nonce: u64) -> Eip1559Request {
+        let mut request = test_request();
+        request.to = contract;
+        request.nonce = nonce;
+        request.value = U256::ZERO;
+        request.data = AstatineMinerRead::finalizeWindowCall {}.abi_encode();
+        request
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_closed_broadcast_run(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        ast_token: Address,
+        signer: &SigningKey,
+        contract: Address,
+        nonce: u64,
+        window_id: u64,
+    ) -> (String, Eip1559Request, B256, U256) {
+        create_closed_broadcast_run_at_version(
+            store,
+            config,
+            wallet,
+            ast_token,
+            signer,
+            contract,
+            nonce,
+            window_id,
+            JOURNAL_VERSION,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_closed_broadcast_run_at_version(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        ast_token: Address,
+        signer: &SigningKey,
+        contract: Address,
+        nonce: u64,
+        window_id: u64,
+        journal_version: u32,
+    ) -> (String, Eip1559Request, B256, U256) {
+        let mut manager = TransactionManager::open_with_session_authorization(
+            store,
+            config,
+            wallet,
+            ast_token,
+            Arc::new(HistoryTelemetry::default()),
+            true,
+        )
+        .unwrap();
+        let request = recovery_finalization_request(contract, nonce);
+        let hash = sign_eip1559(signer, &request).unwrap().hash;
+        let exposure = maximum_transaction_exposure(&request).unwrap();
+        manager
+            .journal
+            .prepare(PreparedTransaction {
+                request: request.clone(),
+                tx_hash: hash,
+                intent: TransactionIntent {
+                    contract,
+                    node_id: 1,
+                    window_id,
+                    action: TransactionAction::FinalizeWindow,
+                    proof: None,
+                    reward_destination: None,
+                    forwarding: None,
+                },
+                session_limit: parse_inj_wei(&config.per_session_spending_limit_inj).unwrap(),
+                minimum_reserve: parse_inj_wei(&config.minimum_reserve_inj).unwrap(),
+                confirmed_balance: U256::MAX,
+                confirmations_required: config.transaction_confirmations,
+            })
+            .unwrap();
+        manager
+            .journal
+            .set_broadcast_state(hash, TransactionStatus::Broadcast)
+            .unwrap();
+        if journal_version != JOURNAL_VERSION {
+            manager.journal.state.version = journal_version;
+            manager.journal.state.per_run_policy_approval = None;
+            manager.journal.persist().unwrap();
+        }
+        let session_id = manager
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        manager.close_session().unwrap();
+        drop(manager);
+        (session_id, request, hash, exposure)
     }
 
     fn read_history_http_request(stream: &mut TcpStream) -> serde_json::Value {

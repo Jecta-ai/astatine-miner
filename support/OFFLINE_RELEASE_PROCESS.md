@@ -54,15 +54,18 @@ The workflow supports an explicit `workflow_dispatch` rehearsal input. It runs
 the unsigned package assembly, raw-binary and package attestations, branch-ref
 provenance verification, and native Windows package/archive smoke test. It has no
 signing key or publishing job, and it does not create or move a Git tag.
+Always pass `release_tag` explicitly because the workflow-dispatch default may
+name an earlier Testnet candidate. The value must equal `v` plus the package
+version in `Cargo.toml`.
 
 From a clean checkout at the commit to rehearse:
 
 ```sh
 REPOSITORY="$(tr -d '\n' < support/release-repository.txt)"
 BRANCH="main"
-TAG="v0.1.0-testnet.15"
+RELEASE_TAG="v0.1.0-testnet.15"
 gh workflow run ci.yml --repo "$REPOSITORY" --ref "$BRANCH" \
-  -f release_rehearsal=true -f release_tag="$TAG"
+  -f release_rehearsal=true -f release_tag="$RELEASE_TAG"
 ```
 
 Wait for the run to complete, then use that run's ID and head SHA to download
@@ -73,10 +76,10 @@ RUN_ID="<completed-workflow-dispatch-run-id>"
 SOURCE_COMMIT="<40-character-head-SHA-from-that-run>"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/astatine-rehearsal.XXXXXX")"
 gh run download "$RUN_ID" --repo "$REPOSITORY" \
-  --name "astatine-${TAG}-unsigned-release-packages" \
+  --name "astatine-${RELEASE_TAG}-unsigned-release-packages" \
   --dir "$WORK/unsigned"
 python3 support/verify_release_provenance.py --rehearsal \
-  --artifact-dir "$WORK/unsigned" --tag "$TAG" --branch "$BRANCH" \
+  --artifact-dir "$WORK/unsigned" --tag "$RELEASE_TAG" --branch "$BRANCH" \
   --run-id "$RUN_ID" --source-commit "$SOURCE_COMMIT" \
   --report "$WORK/rehearsal-preflight.json"
 ```
