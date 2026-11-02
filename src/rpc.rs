@@ -153,6 +153,16 @@ pub struct TransactionReceipt {
     pub logs: Vec<RpcLog>,
 }
 
+impl TransactionReceipt {
+    pub(crate) fn evm_logs(&self) -> Vec<RpcLog> {
+        self.logs
+            .iter()
+            .filter(|log| !log.removed && !log.virtual_log)
+            .cloned()
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionDetails {
     pub hash: B256,
@@ -3271,47 +3281,30 @@ mod tests {
 
     #[test]
     fn injective_virtual_logs_do_not_invalidate_signed_transaction_inclusion() {
-        let hash = B256::with_last_byte(0xa1);
-        let block_hash = B256::with_last_byte(0xa2);
-        let receipt_json: ReceiptJson = serde_json::from_value(serde_json::json!({
-            "transactionHash": format!("{hash:#x}"),
-            "transactionIndex": "0x2",
-            "from": format!("{:#x}", Address::with_last_byte(0xa3)),
-            "to": format!("{:#x}", Address::with_last_byte(0xa4)),
-            "status": "0x1",
-            "gasUsed": "0x5208",
-            "cumulativeGasUsed": "0x10410",
-            "effectiveGasPrice": "0x2",
-            "type": "0x2",
-            "blockNumber": "0x10",
-            "blockHash": format!("{block_hash:#x}"),
-            "logs": [
-                {
-                    "address": format!("{:#x}", Address::with_last_byte(0xa5)),
-                    "topics": [],
-                    "data": "0x",
-                    "blockNumber": "0x10",
-                    "blockHash": format!("{block_hash:#x}"),
-                    "transactionHash": format!("{hash:#x}"),
-                    "transactionIndex": "0x2",
-                    "logIndex": "0x14",
-                    "removed": false,
-                    "virtual": false
-                },
-                {
-                    "address": "0x0000000000000000000000000000000000000800",
-                    "topics": [],
-                    "data": "0x",
-                    "removed": false,
-                    "virtual": true
-                }
-            ]
-        }))
+        let receipt_json: ReceiptJson = serde_json::from_str(include_str!(
+            "../tests/fixtures/injective-testnet-virtual-receipt.json"
+        ))
         .unwrap();
         let receipt = TransactionReceipt::try_from(receipt_json).unwrap();
 
-        assert_eq!(receipt.logs.len(), 2);
-        assert!(receipt.logs[1].virtual_log);
+        assert_eq!(
+            format!("{:#x}", receipt.transaction_hash),
+            "0x0bb5c1a62950464c0e27a7e6ba525ad9305be3064f6977ac67b80206f2211dfe"
+        );
+        assert_eq!(receipt.block_number, 0x8ba197e);
+        assert_eq!(
+            format!("{:#x}", receipt.block_hash),
+            "0xf23693cb504671f46be1f0e4b4e975fcbabce37460e9f84f29ef8a666a6c4989"
+        );
+        assert!(receipt.status);
+        assert_eq!(receipt.logs.len(), 8);
+        assert_eq!(receipt.logs.iter().filter(|log| log.virtual_log).count(), 5);
+        assert_eq!(
+            receipt.logs.iter().filter(|log| !log.virtual_log).count(),
+            3
+        );
+        assert!(receipt.logs.iter().all(|log| !log.removed));
+        assert_eq!(receipt.evm_logs().len(), 3);
         assert!(validate_trusted_rpc_receipt(&receipt).is_ok());
     }
 

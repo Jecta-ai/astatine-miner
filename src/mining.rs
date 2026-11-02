@@ -16,10 +16,11 @@ use crate::{
     rpc::{BlockSnapshot, NetworkClient, NodeState, ReadSnapshot, is_transient_rpc_error},
     startup::{CtrlCSignal, StartupProgress, race_with_ctrl_c},
     transaction::{
-        AUTOMATIC_REWARD_FORWARDING_DISABLED, ConfirmedAction, ProofSubmission,
-        SessionJournalSnapshot, TransactionAction, TransactionActivityState,
-        TransactionDashboardState, TransactionManager, TransactionPolicyRefusalKind,
-        is_stale_transaction_preflight, mined_transaction_reverted, transaction_policy_refusal,
+        AUTOMATIC_REWARD_FORWARDING_DISABLED, ConfirmedAction, ProofSubmission, RunSessionBudget,
+        RunSessionLimitChanged, SessionJournalSnapshot, TransactionAction,
+        TransactionActivityState, TransactionDashboardState, TransactionManager,
+        TransactionPolicyRefusalKind, is_stale_transaction_preflight, mined_transaction_reverted,
+        transaction_policy_refusal,
     },
     wallet::{selected_address, unlock_selected_interactive},
 };
@@ -27,6 +28,7 @@ use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
     collections::{HashMap, HashSet},
+    io::{self, Write},
     num::NonZeroUsize,
     sync::{
         Arc, Mutex, RwLock,
@@ -975,6 +977,31 @@ pub(crate) async fn run_with_session_confirmation(
             "an init spending-session change is interrupted; run `astatine init` to resolve it before mining"
         );
     }
+    if !args.compute_only && config.network != crate::cli::Network::Testnet {
+        progress.fail("Autonomous transaction signing is disabled outside Injective Testnet");
+        bail!("autonomous transaction signing is disabled outside Injective Testnet");
+    }
+    let configured_limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
+    if !args.compute_only && !configured_limit.is_zero() {
+        if config.per_run_sessions_enabled() {
+            let wallet = selected_address(&config)?;
+            if !session
+                .per_run_policy_approval
+                .as_ref()
+                .map(|approval| approval.matches_config(&config, wallet))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                bail!(
+                    "authenticated per-run spending approval does not match the selected wallet, network, ceiling, or reserve; run `astatine init` to approve the current policy"
+                );
+            }
+        } else if session.per_run_policy_approval.is_some() {
+            bail!(
+                "journal has an authenticated per-run policy; run `astatine init` to explicitly change authorization modes"
+            );
+        }
+    }
     if unresolved_session_blocks_mining(
         args.compute_only,
         !session.unresolved.is_empty(),
@@ -1044,6 +1071,172 @@ pub(crate) async fn run_with_session_confirmation(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn open_paid_per_run_session(
+    store: &ConfigStore,
+    config: &crate::config::AppConfig,
+    wallet: Address,
+    ast_token: Address,
+    client: &NetworkClient,
+    configured_ceiling: U256,
+    mut approved_limit: U256,
+    history_telemetry: Arc<crate::history_telemetry::HistoryTelemetry>,
+    startup: Option<&StartupProgress>,
+) -> Result<Option<(TransactionManager, U256)>> {
+    let minimum_reserve = parse_inj_wei(&config.minimum_reserve_inj)?;
+    loop {
+        let (session, journal_lock) =
+            crate::transaction::TransactionJournal::inspect_session_and_lock(store, config)?;
+        if session.pending_transition.is_some() {
+            bail!(
+                "an interrupted spending-session change must be resolved by `astatine init` before mining"
+            );
+        }
+        let pending_exposure = session
+            .pending_exposure_wei
+            .as_deref()
+            .map(|value| {
+                U256::from_str_radix(value, 10).context("journal pending exposure is invalid")
+            })
+            .transpose()?
+            .unwrap_or(U256::ZERO);
+        let confirmed_balance = match client.confirmed_balance(wallet).await {
+            Ok(balance) => balance,
+            Err(error) => {
+                drop(journal_lock);
+                eprintln!(
+                    "ASTATINE — CONFIRMED BALANCE UNAVAILABLE\nUnable to revalidate wallet balance and unresolved liabilities; no paid session was created.\n{error:#}"
+                );
+                if let Some(startup) = startup {
+                    startup.cancel();
+                }
+                return Ok(None);
+            }
+        };
+        let available = confirmed_balance
+            .checked_sub(minimum_reserve)
+            .and_then(|remaining| remaining.checked_sub(pending_exposure))
+            .unwrap_or(U256::ZERO);
+        let safe_ceiling = configured_ceiling.min(available);
+        if safe_ceiling < approved_limit {
+            drop(journal_lock);
+            let Some(suggested) = suggested_session_limit(configured_ceiling, safe_ceiling) else {
+                print_wallet_needs_funding(
+                    wallet,
+                    confirmed_balance,
+                    minimum_reserve,
+                    pending_exposure,
+                );
+                if let Some(startup) = startup {
+                    startup.cancel();
+                }
+                return Ok(None);
+            };
+            let accepted = if startup.is_some() {
+                prompt_reduced_run_limit(
+                    wallet,
+                    configured_ceiling,
+                    confirmed_balance,
+                    minimum_reserve,
+                    pending_exposure,
+                    available,
+                    suggested,
+                    startup,
+                )?
+            } else {
+                false
+            };
+            let Some(approved) = approved_session_limit(configured_ceiling, safe_ceiling, accepted)
+            else {
+                eprintln!(
+                    "Locked journal/balance recheck requires a lower session limit; no session was created without approval."
+                );
+                if let Some(startup) = startup {
+                    startup.cancel();
+                }
+                return Ok(None);
+            };
+            debug_assert_eq!(approved, suggested);
+            approved_limit = approved;
+            continue;
+        }
+
+        let budget = RunSessionBudget {
+            ceiling_wei: configured_ceiling,
+            approved_limit_wei: approved_limit,
+            confirmed_balance_wei: confirmed_balance,
+            minimum_reserve_wei: minimum_reserve,
+        };
+        match TransactionManager::open_for_per_run_session_with_lock(
+            store,
+            config,
+            wallet,
+            ast_token,
+            Arc::clone(&history_telemetry),
+            journal_lock,
+            budget,
+        ) {
+            Ok(manager) => {
+                eprintln!(
+                    "Session limit: {} INJ (configured ceiling {} INJ; confirmed balance and unresolved liabilities revalidated under the journal lock).",
+                    format_token_units(Some(approved_limit), 18),
+                    format_token_units(Some(configured_ceiling), 18),
+                );
+                return Ok(Some((manager, approved_limit)));
+            }
+            Err(error) => {
+                let Some(changed) = error.downcast_ref::<RunSessionLimitChanged>() else {
+                    return Err(error);
+                };
+                let safe = changed.safe_limit_wei.min(approved_limit);
+                let Some(suggested) = suggested_session_limit(configured_ceiling, safe) else {
+                    print_wallet_needs_funding(
+                        wallet,
+                        changed.confirmed_balance_wei,
+                        minimum_reserve,
+                        changed.pending_exposure_wei,
+                    );
+                    if let Some(startup) = startup {
+                        startup.cancel();
+                    }
+                    return Ok(None);
+                };
+                let available = changed
+                    .confirmed_balance_wei
+                    .checked_sub(minimum_reserve)
+                    .and_then(|remaining| remaining.checked_sub(changed.pending_exposure_wei))
+                    .unwrap_or(U256::ZERO);
+                let accepted = if startup.is_some() {
+                    prompt_reduced_run_limit(
+                        wallet,
+                        configured_ceiling,
+                        changed.confirmed_balance_wei,
+                        minimum_reserve,
+                        changed.pending_exposure_wei,
+                        available,
+                        suggested,
+                        startup,
+                    )?
+                } else {
+                    false
+                };
+                let Some(approved) = approved_session_limit(configured_ceiling, safe, accepted)
+                else {
+                    eprintln!(
+                        "Final locked-journal recheck requires a different session limit; no session was created without approval."
+                    );
+                    if let Some(startup) = startup {
+                        startup.cancel();
+                    }
+                    return Ok(None);
+                };
+                debug_assert_eq!(approved, suggested);
+                approved_limit = approved;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) async fn run_with_client(
     store: &ConfigStore,
@@ -1054,6 +1247,25 @@ pub(crate) async fn run_with_client(
     probe_sender: Option<tokio::sync::oneshot::Sender<MiningProbe>>,
     new_session_authorized: bool,
 ) -> Result<()> {
+    if new_session_authorized && !args.compute_only && config.per_run_sessions_enabled() {
+        let wallet = selected_address(&config)?;
+        let snapshot = crate::transaction::TransactionJournal::inspect_session(store, &config)?;
+        if !snapshot
+            .per_run_policy_approval
+            .as_ref()
+            .map(|approval| approval.matches_config(&config, wallet))
+            .transpose()?
+            .unwrap_or(false)
+        {
+            // Local-runtime tests pass `new_session_authorized` as their explicit
+            // owner approval and persist the corresponding policy before startup.
+            crate::transaction::TransactionJournal::set_per_run_policy_approval(
+                store,
+                &config,
+                Some(wallet),
+            )?;
+        }
+    }
     let mut ctrl_c: CtrlCSignal = Box::pin(tokio::signal::ctrl_c());
     run_runtime(
         store,
@@ -1073,7 +1285,7 @@ pub(crate) async fn run_with_client(
 
 async fn run_runtime(
     store: &ConfigStore,
-    mut config: crate::config::AppConfig,
+    config: crate::config::AppConfig,
     args: MineArgs,
     mut client: NetworkClient,
     supplied_signer: Option<bip32::secp256k1::ecdsa::SigningKey>,
@@ -1106,52 +1318,7 @@ async fn run_runtime(
     }
     let address = selected_address(&config)?;
     let configured_limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
-    let mut run_confirmed_balance = None;
-    let mut spending_limit = if config.per_run_sessions_enabled()
-        && !args.compute_only
-        && !configured_limit.is_zero()
-    {
-        let session = crate::transaction::TransactionJournal::inspect_session(store, &config)?;
-        let pending_exposure = session
-            .pending_exposure_wei
-            .as_deref()
-            .map(|value| {
-                U256::from_str_radix(value, 10).context("journal pending exposure is invalid")
-            })
-            .transpose()?
-            .unwrap_or(U256::ZERO);
-        let minimum_reserve = parse_inj_wei(&config.minimum_reserve_inj)?;
-        match client.confirmed_balance(address).await {
-            Ok(confirmed_balance) => {
-                run_confirmed_balance = Some(confirmed_balance);
-                let effective_limit = per_run_authorization_cap(
-                    configured_limit,
-                    minimum_reserve,
-                    pending_exposure,
-                    confirmed_balance,
-                );
-                eprintln!(
-                    "Per-run authorization: ceiling={} INJ · confirmed={} INJ · reserve={} INJ · unresolved maximum exposure={} INJ · effective cap={} INJ",
-                    format_inj(Some(configured_limit)),
-                    format_inj(Some(confirmed_balance)),
-                    format_inj(Some(minimum_reserve)),
-                    format_inj(Some(pending_exposure)),
-                    format_inj(Some(effective_limit)),
-                );
-                config.per_session_spending_limit_inj = wei_as_inj(effective_limit);
-                effective_limit
-            }
-            Err(error) => {
-                eprintln!(
-                    "Per-run authorization disabled because a consistent confirmed INJ balance could not be established; mining will continue without signing: {error:#}"
-                );
-                config.per_session_spending_limit_inj = "0".to_owned();
-                U256::ZERO
-            }
-        }
-    } else {
-        configured_limit
-    };
+    let mut spending_limit = configured_limit;
     if args.new_session
         && !config.per_run_sessions_enabled()
         && (args.compute_only || spending_limit.is_zero())
@@ -1184,6 +1351,78 @@ async fn run_runtime(
     if transaction_mode && !client.verification.token_verified {
         bail!("AST token runtime is not verified; refusing autonomous transaction signing");
     }
+    if transaction_mode && per_run_sessions_enabled {
+        let initial_journal =
+            crate::transaction::TransactionJournal::inspect_session(store, &config)?;
+        let pending_exposure = initial_journal
+            .pending_exposure_wei
+            .as_deref()
+            .map(|value| {
+                U256::from_str_radix(value, 10).context("journal pending exposure is invalid")
+            })
+            .transpose()?
+            .unwrap_or(U256::ZERO);
+        let minimum_reserve = parse_inj_wei(&config.minimum_reserve_inj)?;
+        let confirmed_balance = match client.confirmed_balance(address).await {
+            Ok(balance) => balance,
+            Err(error) => {
+                eprintln!(
+                    "ASTATINE — CONFIRMED BALANCE UNAVAILABLE\nUnable to verify wallet balance and unresolved liabilities; no paid session was created and no transaction can be signed.\n{error:#}"
+                );
+                if let Some(startup) = startup {
+                    startup.cancel();
+                }
+                return Ok(());
+            }
+        };
+        let available = confirmed_balance
+            .checked_sub(minimum_reserve)
+            .and_then(|remaining| remaining.checked_sub(pending_exposure))
+            .unwrap_or(U256::ZERO);
+        if available < configured_limit {
+            let Some(suggested) = suggested_session_limit(configured_limit, available) else {
+                print_wallet_needs_funding(
+                    address,
+                    confirmed_balance,
+                    minimum_reserve,
+                    pending_exposure,
+                );
+                if let Some(startup) = startup {
+                    startup.cancel();
+                }
+                return Ok(());
+            };
+            let accepted = if startup.is_some() {
+                prompt_reduced_run_limit(
+                    address,
+                    configured_limit,
+                    confirmed_balance,
+                    minimum_reserve,
+                    pending_exposure,
+                    available,
+                    suggested,
+                    startup,
+                )?
+            } else {
+                eprintln!(
+                    "A reduced session limit requires interactive approval; no paid session was created."
+                );
+                false
+            };
+            let Some(approved_limit) =
+                approved_session_limit(configured_limit, available, accepted)
+            else {
+                println!("Cancelled. No paid session or signing authority was created.");
+                if let Some(startup) = startup {
+                    startup.cancel();
+                }
+                return Ok(());
+            };
+            debug_assert_eq!(approved_limit, suggested);
+            spending_limit = approved_limit;
+        }
+    }
+    transaction_mode = !args.compute_only && !spending_limit.is_zero();
     if let Some(startup) = startup {
         startup.begin("Recovering previous transactions");
     }
@@ -1208,19 +1447,35 @@ async fn run_runtime(
             .as_ref()
             .context("AST token pin is missing from the Testnet manifest")?;
         let ast_token = crate::deployment::parse_address(&token.address)?;
-        let mut manager = match TransactionManager::open_with_session_policy(
-            store,
-            &config,
-            address,
-            ast_token,
-            client.history_telemetry(),
-            new_session_authorized,
-            args.new_session
-                || (config.per_run_sessions_enabled()
-                    && transaction_mode
-                    && new_session_authorized),
-        ) {
-            Ok(manager) => manager,
+        let manager_result =
+            if transaction_mode && config.per_run_sessions_enabled() && new_session_authorized {
+                open_paid_per_run_session(
+                    store,
+                    &config,
+                    address,
+                    ast_token,
+                    &client,
+                    spending_limit,
+                    configured_limit,
+                    client.history_telemetry(),
+                    startup,
+                )
+                .await
+            } else {
+                TransactionManager::open_with_session_policy(
+                    store,
+                    &config,
+                    address,
+                    ast_token,
+                    client.history_telemetry(),
+                    new_session_authorized,
+                    args.new_session,
+                )
+                .map(|manager| Some((manager, spending_limit)))
+            };
+        let (mut manager, approved_limit) = match manager_result {
+            Ok(Some((manager, approved_limit))) => (manager, approved_limit),
+            Ok(None) => return Ok(()),
             Err(error) => {
                 if let Some(startup) = startup {
                     startup.fail(format!(
@@ -1230,6 +1485,9 @@ async fn run_runtime(
                 return Err(error).context("open transaction journal for startup recovery");
             }
         };
+        if config.per_run_sessions_enabled() && transaction_mode && new_session_authorized {
+            spending_limit = approved_limit;
+        }
         // The test probe is only supplied by local-runtime tests. Production CLI
         // entry points refuse unresolved startup sessions and route them to the
         // dedicated read-only `astatine recover` command.
@@ -1255,22 +1513,6 @@ async fn run_runtime(
             bail!(
                 "run `astatine recover`; after it completes, start a fresh `astatine mine` process to unlock the wallet"
             );
-        }
-        if transaction_mode
-            && config.per_run_sessions_enabled()
-            && new_session_authorized
-            && let Some(confirmed_balance) = run_confirmed_balance
-        {
-            let reduced_limit = manager.constrain_per_run_cap_to_balance(confirmed_balance)?;
-            if reduced_limit < spending_limit {
-                eprintln!(
-                    "Per-run authorization ceiling reduced under the locked transaction journal to {} INJ after rechecking unresolved maximum liabilities.",
-                    format_inj(Some(reduced_limit))
-                );
-                spending_limit = reduced_limit;
-                config.per_session_spending_limit_inj = wei_as_inj(reduced_limit);
-                transaction_mode = !args.compute_only && !spending_limit.is_zero();
-            }
         }
         manager.configure_reward_forwarding(args.send_rewards_to)?;
         manager.set_proof_telemetry(Arc::clone(&proof_telemetry));
@@ -2365,20 +2607,33 @@ async fn run_runtime(
     }
 
     let mut stopped_message = None;
-    if fatal_error.is_none() {
-        if let Some(manager) = transactions.as_mut() {
-            if manager.journal.has_unresolved() {
+    if let Some(manager) = transactions.as_mut() {
+        let has_unresolved = manager.journal.has_unresolved();
+        if has_unresolved && !per_run_sessions_enabled {
+            if fatal_error.is_none() {
                 stopped_message = Some(
                     "Stopped with transaction exposure reserved for read-only recovery. The session remains open in the private journal.",
                 );
-            } else if let Err(error) = manager.close_session() {
-                fatal_error = Some(error.context("close transaction spending session"));
-            } else {
-                stopped_message = Some(
-                    "Stopped autonomous Testnet mining. Transaction journal retained without private key material.",
-                );
             }
-        } else if args.compute_only {
+        } else if let Err(error) = manager.close_session() {
+            let error = error.context("close transaction spending session");
+            fatal_error = Some(match fatal_error.take() {
+                Some(existing) => {
+                    existing.context(format!("also failed to close session: {error:#}"))
+                }
+                None => error,
+            });
+        } else if fatal_error.is_none() && has_unresolved {
+            stopped_message = Some(
+                "Stopped paid mining. This invocation's session is closed; unresolved transaction exposure remains reserved in the private journal.",
+            );
+        } else if fatal_error.is_none() {
+            stopped_message = Some(
+                "Stopped autonomous Testnet mining. Transaction journal retained without private key material.",
+            );
+        }
+    } else if fatal_error.is_none() {
+        if args.compute_only {
             stopped_message =
                 Some("Stopped compute-only mining. No transactions were signed or sent.");
         } else {
@@ -2611,6 +2866,37 @@ async fn maybe_finalize_expired(
         else {
             continue;
         };
+        if manager.journal.has_unresolved_finalization(
+            node.address,
+            node.id,
+            state.work.window_id,
+        )? {
+            mark_dashboard_nodes(
+                options.dashboard,
+                [node.id],
+                NodeStatus::Recovering,
+                Some(format!(
+                    "Node {:02} window #{} • reconciling the existing finalization transaction...",
+                    node.id, state.work.window_id
+                )),
+            );
+            continue;
+        }
+        if manager.journal.has_successful_finalization(
+            node.address,
+            node.id,
+            state.work.window_id,
+        )? {
+            record_finalization_state(
+                &options,
+                node.id,
+                FinalizationState::Blocked {
+                    window_id: state.work.window_id,
+                    reason: "journal already records a successful canonical finalization; waiting for the node state to advance".to_owned(),
+                },
+            );
+            continue;
+        }
         let previous = options
             .finalization_state
             .read()
@@ -2760,6 +3046,9 @@ async fn maybe_finalize_expired(
                             );
                             continue;
                         }
+                        TransactionPolicyRefusalKind::DuplicateFinalization => {
+                            format!("duplicate finalization refused: {error:#}")
+                        }
                     };
                     record_finalization_state(
                         &options,
@@ -2783,13 +3072,16 @@ async fn maybe_finalize_expired(
                                     })
                             });
                             if still_finalizable {
+                                let attempts = retry_attempts(previous.as_ref()).saturating_add(1);
                                 record_finalization_state(
                                     &options,
                                     node.id,
-                                    FinalizationState::Blocked {
+                                    FinalizationState::Retrying {
                                         window_id: state.work.window_id,
+                                        attempts,
+                                        retry_at: Instant::now() + STALE_PREFLIGHT_RETRY,
                                         reason: format!(
-                                            "a confirmed finalization transaction reverted while fresh canonical state still reports this window finalizable; inspect contract/RPC state before restarting: {error:#}"
+                                            "confirmed finalization revert revalidated against the canonical window; considering the one safe retry: {error:#}"
                                         ),
                                     },
                                 );
@@ -2808,16 +3100,21 @@ async fn maybe_finalize_expired(
                                 );
                             }
                         }
-                        Err(state_error) => record_finalization_state(
-                            &options,
-                            node.id,
-                            FinalizationState::Blocked {
-                                window_id: state.work.window_id,
-                                reason: format!(
-                                    "a confirmed finalization transaction reverted and fresh state could not be verified; inspect canonical state before restarting: {state_error:#}"
-                                ),
-                            },
-                        ),
+                        Err(state_error) => {
+                            let attempts = retry_attempts(previous.as_ref()).saturating_add(1);
+                            record_finalization_state(
+                                &options,
+                                node.id,
+                                FinalizationState::Retrying {
+                                    window_id: state.work.window_id,
+                                    attempts,
+                                    retry_at: Instant::now() + finalization_retry_delay(attempts),
+                                    reason: format!(
+                                        "fresh canonical state is unavailable after a confirmed revert; another attempt remains deferred: {state_error:#}"
+                                    ),
+                                },
+                            );
+                        }
                     }
                 } else if is_stale_transaction_preflight(&error) {
                     let attempts = retry_attempts(previous.as_ref()).saturating_add(1);
@@ -4854,6 +5151,7 @@ pub(crate) fn unresolved_session_blocks_mining(
     !compute_only && has_unresolved_transaction && !per_run_sessions_enabled
 }
 
+#[cfg(test)]
 fn per_run_authorization_cap(
     configured_ceiling: U256,
     minimum_reserve: U256,
@@ -4867,8 +5165,130 @@ fn per_run_authorization_cap(
     configured_ceiling.min(available)
 }
 
-fn wei_as_inj(value: U256) -> String {
-    format_token_units(Some(value), 18)
+fn floor_inj_to_cents(value: U256) -> U256 {
+    let wei_per_cent = U256::from(10_000_000_000_000_000_u128);
+    (value / wei_per_cent) * wei_per_cent
+}
+
+fn suggested_session_limit(configured_ceiling: U256, available: U256) -> Option<U256> {
+    if configured_ceiling.is_zero() {
+        return None;
+    }
+    let suggested = if available >= configured_ceiling {
+        configured_ceiling
+    } else {
+        floor_inj_to_cents(available.min(configured_ceiling))
+    };
+    (!suggested.is_zero()).then_some(suggested)
+}
+
+fn approved_session_limit(
+    configured_ceiling: U256,
+    available: U256,
+    accepted_reduction: bool,
+) -> Option<U256> {
+    let suggested = suggested_session_limit(configured_ceiling, available)?;
+    if available < configured_ceiling && !accepted_reduction {
+        return None;
+    }
+    Some(suggested)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prompt_reduced_run_limit(
+    wallet: Address,
+    configured_ceiling: U256,
+    confirmed_balance: U256,
+    minimum_reserve: U256,
+    pending_exposure: U256,
+    available: U256,
+    suggested: U256,
+    startup: Option<&StartupProgress>,
+) -> Result<bool> {
+    if let Some(startup) = startup {
+        startup.pause_for_prompt("Approve reduced session limit");
+    }
+    println!("\nASTATINE — INSUFFICIENT SESSION BALANCE");
+    println!("Wallet: {wallet:#x}");
+    println!(
+        "Wallet balance: {} INJ",
+        format_inj_min_decimals(confirmed_balance, 2)
+    );
+    println!(
+        "Minimum reserve: {} INJ",
+        format_inj_min_decimals(minimum_reserve, 2)
+    );
+    println!(
+        "Outstanding maximum liabilities: {} INJ",
+        format_inj_min_decimals(pending_exposure, 2)
+    );
+    println!(
+        "Available for mining: {} INJ",
+        format_inj_min_decimals(available, 2)
+    );
+    println!(
+        "\nYour configured session limit is {} INJ.",
+        format_inj_min_decimals(configured_ceiling, 2)
+    );
+    println!(
+        "Would you like to use {} INJ\nfor this session instead? [y/N]",
+        format_inj_two_decimals(suggested)
+    );
+    print!("> ");
+    io::stdout()
+        .flush()
+        .context("flush reduced session limit prompt")?;
+    let mut answer = String::new();
+    let read_result = io::stdin().read_line(&mut answer);
+    if let Some(startup) = startup {
+        startup.resume_after_prompt("Rechecking balance and pending liabilities");
+    }
+    read_result.context("read reduced session limit confirmation")?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn format_inj_two_decimals(value: U256) -> String {
+    let cents = value / U256::from(10_000_000_000_000_000_u128);
+    let whole = cents / U256::from(100_u8);
+    let fractional = (cents % U256::from(100_u8)).to_string();
+    format!("{whole}.{:0>2}", fractional)
+}
+
+fn print_wallet_needs_funding(
+    wallet: Address,
+    confirmed_balance: U256,
+    minimum_reserve: U256,
+    pending_exposure: U256,
+) {
+    println!("\nASTATINE — WALLET NEEDS FUNDING");
+    println!("Wallet: {wallet:#x}");
+    println!(
+        "Balance: {} INJ",
+        format_inj_min_decimals(confirmed_balance, 4)
+    );
+    println!(
+        "Minimum reserve: {} INJ",
+        format_inj_min_decimals(minimum_reserve, 4)
+    );
+    println!(
+        "Outstanding maximum liabilities: {} INJ",
+        format_inj_min_decimals(pending_exposure, 4)
+    );
+    let available = confirmed_balance
+        .checked_sub(minimum_reserve)
+        .and_then(|remaining| remaining.checked_sub(pending_exposure))
+        .unwrap_or(U256::ZERO);
+    println!(
+        "Available for mining: {} INJ",
+        format_inj_min_decimals(available, 4)
+    );
+    println!("\nYour wallet does not have enough INJ to start a paid mining session.");
+    println!(
+        "Fund your wallet or allow unresolved transaction liabilities to settle, then try again."
+    );
 }
 
 fn should_open_transaction_manager(
@@ -4906,6 +5326,21 @@ fn format_token_units(value: Option<U256>, decimals: u8) -> String {
     }
 }
 
+fn format_inj_min_decimals(value: U256, minimum_fractional_digits: usize) -> String {
+    let exact = format_token_units(Some(value), 18);
+    let Some((whole, fractional)) = exact.split_once('.') else {
+        return format!("{exact}.{}", "0".repeat(minimum_fractional_digits));
+    };
+    if fractional.len() >= minimum_fractional_digits {
+        exact
+    } else {
+        format!(
+            "{whole}.{fractional}{}",
+            "0".repeat(minimum_fractional_digits - fractional.len())
+        )
+    }
+}
+
 fn network_label(network: crate::cli::Network) -> &'static str {
     match network {
         crate::cli::Network::Testnet => "Testnet",
@@ -4920,13 +5355,14 @@ mod tests {
         MiningWorkerContext, NodeSlot, NonceAllocator, ObserverUpdate,
         PENDING_PROOF_CANDIDATE_CAPACITY, PendingDashboardSync, ProofFound, SnapshotFreshness,
         activate_cpu_fallback, apply_genesis_poll_error, apply_transaction_state_to_model,
-        clear_genesis_poll_error, compare_snapshot_freshness, dashboard_model,
-        dashboard_node_status, finalization_retry_delay, gpu_is_meaningfully_faster,
-        history_profile_enabled, inactive_genesis_nodes, next_poll_delay, next_scheduled_slot,
-        per_run_authorization_cap, process_hashed_candidate, proof_inbox, reconcile_head_progress,
-        revalidate_queued_proof, revalidate_queued_proof_at, selected_nodes,
-        should_open_transaction_manager, take_observer_update, traced_node_status,
-        unresolved_session_blocks_mining, update_slots, worker_loop,
+        approved_session_limit, clear_genesis_poll_error, compare_snapshot_freshness,
+        dashboard_model, dashboard_node_status, finalization_retry_delay,
+        gpu_is_meaningfully_faster, history_profile_enabled, inactive_genesis_nodes,
+        next_poll_delay, next_scheduled_slot, per_run_authorization_cap, process_hashed_candidate,
+        proof_inbox, reconcile_head_progress, revalidate_queued_proof, revalidate_queued_proof_at,
+        selected_nodes, should_open_transaction_manager, suggested_session_limit,
+        take_observer_update, traced_node_status, unresolved_session_blocks_mining, update_slots,
+        worker_loop,
     };
     use crate::{
         cli::{DeviceChoice, MineArgs, Network},
@@ -5047,6 +5483,25 @@ mod tests {
         assert_eq!(
             per_run_authorization_cap(inj, U256::ZERO, inj, inj / U256::from(2)),
             U256::ZERO
+        );
+    }
+
+    #[test]
+    fn reduced_per_run_limit_rounds_down_and_requires_one_explicit_yes() {
+        let inj = U256::from(1_000_000_000_000_000_000_u128);
+        let available = U256::from(873_727_000_000_000_000_u128);
+        let suggested = U256::from(870_000_000_000_000_000_u128);
+        assert_eq!(suggested_session_limit(inj, available), Some(suggested));
+        assert_eq!(approved_session_limit(inj, available, false), None);
+        assert_eq!(
+            approved_session_limit(inj, available, true),
+            Some(suggested)
+        );
+        assert_eq!(suggested_session_limit(inj, U256::ZERO), None);
+        assert_eq!(
+            approved_session_limit(inj, inj + U256::from(400_000_000_000_000_000_u128), false),
+            Some(inj),
+            "sufficient balance uses the configured cap without another confirmation"
         );
     }
 
