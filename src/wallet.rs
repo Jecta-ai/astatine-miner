@@ -14,13 +14,14 @@ use bip32::{DerivationPath, XPrv};
 use bip39::{Language, Mnemonic, WordCount};
 use ctr::Ctr128BE;
 use pbkdf2::pbkdf2_hmac;
+use qrcodegen::{QrCode, QrCodeEcc};
 use rand::{RngCore, thread_rng};
 use scrypt::{Params as ScryptParams, scrypt};
 use serde_json::Value;
 use sha2::Sha256;
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::Path,
     str::FromStr,
 };
@@ -180,7 +181,58 @@ pub fn print_address(store: &ConfigStore, config: &AppConfig) -> Result<()> {
         bail!("selected wallet keyfile address does not match configuration");
     }
     println!("Wallet: {address:#x}");
+    print_address_qr(address)?;
     Ok(())
+}
+
+fn qr_modules(address: Address) -> Result<Vec<Vec<bool>>> {
+    const QUIET_ZONE: usize = 4;
+    let payload = format!("{address:#x}");
+    let qr = QrCode::encode_text(&payload, QrCodeEcc::Medium)
+        .map_err(|_| anyhow::anyhow!("wallet address is too long to encode as a QR code"))?;
+    let qr_size = usize::try_from(qr.size()).context("QR code size is invalid")?;
+    let size = qr_size + QUIET_ZONE * 2;
+    let mut modules = vec![vec![false; size]; size];
+    for (y, row) in modules.iter_mut().enumerate() {
+        for (x, module) in row.iter_mut().enumerate() {
+            let qr_x = i32::try_from(x).context("QR code coordinate is out of range")?
+                - i32::try_from(QUIET_ZONE).expect("quiet zone fits in i32");
+            let qr_y = i32::try_from(y).context("QR code coordinate is out of range")?
+                - i32::try_from(QUIET_ZONE).expect("quiet zone fits in i32");
+            *module = qr.get_module(qr_x, qr_y);
+        }
+    }
+    Ok(modules)
+}
+
+fn print_address_qr(address: Address) -> Result<()> {
+    let stdout = io::stdout();
+    if !stdout.is_terminal() || std::env::var("TERM").is_ok_and(|term| term == "dumb") {
+        return Ok(());
+    }
+
+    let modules = qr_modules(address)?;
+    let mut output = stdout.lock();
+    writeln!(output, "Scan this QR code to copy the wallet address:")?;
+    for y in (0..modules.len()).step_by(2) {
+        for x in 0..modules[y].len() {
+            let upper = modules[y][x];
+            let lower = modules.get(y + 1).is_some_and(|row| row[x]);
+            let (style, glyph) = terminal_qr_cell(upper, lower);
+            write!(output, "{style}{glyph}")?;
+        }
+        writeln!(output, "\x1b[0m")?;
+    }
+    output.flush().context("flush wallet address QR code")
+}
+
+fn terminal_qr_cell(upper: bool, lower: bool) -> (&'static str, char) {
+    match (upper, lower) {
+        (true, true) => ("\x1b[30;40m", '█'),
+        (false, false) => ("\x1b[37;47m", ' '),
+        (true, false) => ("\x1b[30;47m", '▀'),
+        (false, true) => ("\x1b[37;40m", '▄'),
+    }
 }
 
 fn derive_signer(phrase: &str, passphrase: &str, path: &str) -> Result<SigningKey> {
@@ -592,8 +644,9 @@ fn confirm_backup() -> Result<()> {
 mod tests {
     use super::{
         Aes128Ctr, DEFAULT_DERIVATION_PATH, MAX_PASSWORD_BYTES, decrypt_v3_keystore, derive_signer,
-        should_warn_short_password, signer_address, store_signer, validate_import_password,
-        validate_new_password, validate_password_confirmation, validate_v3_keystore,
+        qr_modules, should_warn_short_password, signer_address, store_signer, terminal_qr_cell,
+        validate_import_password, validate_new_password, validate_password_confirmation,
+        validate_v3_keystore,
     };
     use crate::config::{AppConfig, ConfigStore};
     use aes::cipher::{KeyIvInit, StreamCipher};
@@ -614,6 +667,66 @@ mod tests {
             signer_address(&signer),
             Address::from_str("0x9858EfFD232B4033E47d90003D41EC34EcaEda94").unwrap()
         );
+    }
+
+    #[test]
+    fn wallet_address_qr_has_a_quiet_zone_and_decodes_to_the_exact_address() {
+        let address = Address::from_str("0x9858EfFD232B4033E47d90003D41EC34EcaEda94").unwrap();
+        let payload = format!("{address:#x}");
+        let modules = qr_modules(address).unwrap();
+        let size = modules.len();
+
+        assert!(modules.iter().all(|row| row.len() == size));
+        assert!(modules[..4].iter().flatten().all(|module| !module));
+        assert!(modules[size - 4..].iter().flatten().all(|module| !module));
+        assert!(modules.iter().all(|row| {
+            row[..4].iter().all(|module| !module) && row[size - 4..].iter().all(|module| !module)
+        }));
+
+        let rendered_height = size.div_ceil(2) * 2;
+        let mut rendered_modules = vec![vec![false; size]; rendered_height];
+        for y in (0..size).step_by(2) {
+            for x in 0..size {
+                let (_, glyph) =
+                    terminal_qr_cell(modules[y][x], modules.get(y + 1).is_some_and(|row| row[x]));
+                let (upper, lower) = match glyph {
+                    '█' => (true, true),
+                    ' ' => (false, false),
+                    '▀' => (true, false),
+                    '▄' => (false, true),
+                    _ => unreachable!("QR renderer emitted an unsupported glyph"),
+                };
+                rendered_modules[y][x] = upper;
+                rendered_modules[y + 1][x] = lower;
+            }
+        }
+
+        const SCALE: usize = 8;
+        let image_width = size * SCALE;
+        let image_height = rendered_height * SCALE;
+        let mut grayscale = vec![255_u8; image_width * image_height];
+        for (y, row) in rendered_modules.iter().enumerate() {
+            for (x, dark) in row.iter().copied().enumerate() {
+                if dark {
+                    for dy in 0..SCALE {
+                        for dx in 0..SCALE {
+                            grayscale[(y * SCALE + dy) * image_width + x * SCALE + dx] = 0;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut scanner = quircs::Quirc::new();
+        let decoded = scanner
+            .identify(image_width, image_height, &grayscale)
+            .find_map(|candidate| {
+                candidate
+                    .ok()
+                    .and_then(|code| code.decode().ok())
+                    .and_then(|data| String::from_utf8(data.payload).ok())
+            });
+        assert_eq!(decoded.as_deref(), Some(payload.as_str()));
     }
 
     #[test]

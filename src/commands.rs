@@ -4,7 +4,9 @@ use crate::{
     deployment::{DeploymentManifest, parse_address},
     mining,
     rpc::{NetworkClient, NodeView},
-    transaction::{SessionJournalSnapshot, TransactionJournal, TransactionManager},
+    transaction::{
+        PerRunPolicyApproval, SessionJournalSnapshot, TransactionJournal, TransactionManager,
+    },
     wallet,
 };
 use alloy_primitives::{Address, U256};
@@ -44,6 +46,23 @@ pub async fn dispatch(command: Command) -> Result<()> {
         Command::NetworkUse(network) => {
             let store = ConfigStore::system_default()?;
             let mut config = store.load()?;
+            let approval_revoked = config.network != network && config.per_run_sessions_enabled();
+            if approval_revoked {
+                let session = TransactionJournal::inspect_session(&store, &config)?;
+                if !session.unresolved.is_empty() {
+                    bail!(
+                        "network changes are blocked while transactions are unresolved; recover them on their original network first"
+                    );
+                }
+                if !prompt_yes_no(
+                    "Changing networks revokes the saved per-run spending approval. Continue?",
+                    false,
+                )? {
+                    println!("Network unchanged; the per-run policy approval remains active.");
+                    return Ok(());
+                }
+                TransactionJournal::set_per_run_policy_approval(&store, &config, None)?;
+            }
             config.network = network;
             store.save(&config)?;
             println!(
@@ -51,6 +70,11 @@ pub async fn dispatch(command: Command) -> Result<()> {
                 network_label(network),
                 chain_id(network)
             );
+            if approval_revoked {
+                println!(
+                    "Per-run spending approval was revoked; run `astatine init` to explicitly approve a policy for the selected network."
+                );
+            }
             if network == Network::Mainnet {
                 println!(
                     "Mainnet has no configured Astatine mining deployment; transaction signing is unavailable."
@@ -107,6 +131,23 @@ async fn run_init(args: InitArgs) -> Result<()> {
         config = store.load()?;
     }
     let persisted_config = config.clone();
+    if initial_snapshot.per_run_policy_approval.is_some() && !config.per_run_sessions_enabled() {
+        config.schema_version = 2;
+        println!(
+            "Restored the authenticated per-run policy mode recorded in the transaction journal; paid mining cannot silently downgrade its authorization policy."
+        );
+    }
+    if args.per_run_sessions {
+        config.schema_version = 2;
+    } else if !config.per_run_sessions_enabled() {
+        println!(
+            "This existing schema-v1 account keeps its legacy spending-session policy unless you explicitly migrate. Per-run mode starts a fresh allowance for each paid `astatine mine` invocation; the effective cap is reduced by confirmed balance, the reserve, and unresolved maximum exposure."
+        );
+        if prompt_yes_no("Migrate this account to per-run spending sessions?", false)? {
+            config.schema_version = 2;
+        }
+    }
+    let per_run_sessions = config.per_run_sessions_enabled();
     let mut session_snapshot = TransactionJournal::inspect_session(&store, &config)?;
     let effective_limit = session_effective_limit(&session_snapshot, &config)?;
     let stored_limit_wei = parse_inj_wei(&config.per_session_spending_limit_inj)?;
@@ -115,9 +156,13 @@ async fn run_init(args: InitArgs) -> Result<()> {
         .as_deref()
         .map(|value| U256::from_str_radix(value, 10).context("journal session limit is invalid"))
         .transpose()?;
-    let safe_config_limit = journal_limit_wei
-        .map(|limit| format_token_units(stored_limit_wei.min(limit), 18))
-        .unwrap_or_else(|| config.per_session_spending_limit_inj.clone());
+    let safe_config_limit = if per_run_sessions {
+        config.per_session_spending_limit_inj.clone()
+    } else {
+        journal_limit_wei
+            .map(|limit| format_token_units(stored_limit_wei.min(limit), 18))
+            .unwrap_or_else(|| config.per_session_spending_limit_inj.clone())
+    };
     if safe_config_limit != config.per_session_spending_limit_inj {
         println!(
             "Saved cap {} INJ is above the active journal session limit {} INJ. The old session remains the effective authorization until a new session is explicitly approved.",
@@ -144,14 +189,25 @@ async fn run_init(args: InitArgs) -> Result<()> {
     }
     let previous_config = config.clone();
     println!("ASTATINE · INITIAL SETUP");
-    println!(
-        "Every signed transaction permanently consumes its maximum possible INJ authorization for this session; RPC receipts do not refund it. Finalization can spend gas on empty windows or windows won by another miner. The default cap of zero authorizes no transaction spending."
-    );
+    if per_run_sessions {
+        println!(
+            "Approve one per-run spending policy here. Every later paid mine invocation starts one fresh session under that persisted policy without a full-cap prompt. A reduced balance-derived cap requires separate approval for that invocation."
+        );
+    } else {
+        println!(
+            "Every signed transaction permanently consumes its maximum possible INJ authorization for this session; RPC receipts do not refund it. Finalization can spend gas on empty windows or windows won by another miner. The default cap of zero authorizes no transaction spending."
+        );
+    }
 
     config.network = match args.network {
         Some(network) => network,
         None => prompt_network(config.network)?,
     };
+    if !session_snapshot.unresolved.is_empty() && config.network != previous_config.network {
+        bail!(
+            "network changes are blocked while transactions are unresolved; recover them on their original network first"
+        );
+    }
     configure_init_rpc(&mut config, args.rpc.as_deref()).await?;
     config.cpu_threads = match args.threads {
         Some(threads) => threads.get(),
@@ -163,12 +219,12 @@ async fn run_init(args: InitArgs) -> Result<()> {
     };
     let proposed_limit = match args.spending_limit_inj {
         Some(amount) => amount,
-        None => prompt_spending_limit(&config.per_session_spending_limit_inj)?,
+        None => prompt_spending_limit(&config.per_session_spending_limit_inj, per_run_sessions)?,
     };
     parse_inj_wei(&proposed_limit)
         .context("spending limit must be a decimal INJ amount with at most 18 decimals")?;
-    // Keep the previously configured safe limit in every config write made by wallet
-    // creation/import. The proposed limit is committed only with its session.
+    // Wallet creation/import during setup must never commit the proposed ceiling
+    // before the final config save below.
     config.per_session_spending_limit_inj = safe_config_limit.clone();
     config.transaction_confirmations = match args.transaction_confirmations {
         Some(confirmations) => confirmations,
@@ -181,7 +237,8 @@ async fn run_init(args: InitArgs) -> Result<()> {
     };
     config.validate()?;
 
-    if !session_snapshot.unresolved.is_empty()
+    if !per_run_sessions
+        && !session_snapshot.unresolved.is_empty()
         && parse_inj_wei(&proposed_limit)? != parse_inj_wei(&effective_limit)?
     {
         print_unresolved_session_blocker(&session_snapshot, &effective_limit, &proposed_limit);
@@ -258,6 +315,70 @@ async fn run_init(args: InitArgs) -> Result<()> {
     }
 
     config.validate()?;
+    if per_run_sessions {
+        if !parse_inj_wei(&proposed_limit)?.is_zero() && config.wallet_address.is_none() {
+            bail!("select a wallet before configuring a positive per-run spending ceiling");
+        }
+        let previous_wallet = session_snapshot
+            .wallet
+            .as_deref()
+            .or(previous_config.wallet_address.as_deref())
+            .map(Address::from_str)
+            .transpose()
+            .context("previous wallet address is invalid")?;
+        let selected_wallet = config
+            .wallet_address
+            .as_deref()
+            .map(Address::from_str)
+            .transpose()
+            .context("selected wallet address is invalid")?;
+        if previous_wallet != selected_wallet
+            && !prompt_yes_no(
+                "Use the selected wallet for future per-run spending sessions?",
+                false,
+            )?
+        {
+            config.wallet_address = previous_wallet.map(|wallet| format!("{wallet:#x}"));
+        }
+        config.per_session_spending_limit_inj = proposed_limit;
+        let approved_wallet = config
+            .wallet_address
+            .as_deref()
+            .map(Address::from_str)
+            .transpose()
+            .context("selected wallet address is invalid")?;
+        let proposed_policy = approved_wallet
+            .map(|wallet| PerRunPolicyApproval::for_config(&config, wallet))
+            .transpose()?;
+        if proposed_policy != session_snapshot.per_run_policy_approval
+            && let Some(wallet) = approved_wallet
+            && !prompt_per_run_policy_approval(&config, wallet)?
+        {
+            println!(
+                "Per-run policy was not approved. No session or signing authority was created; run `astatine init` again to review and approve the policy."
+            );
+            return Ok(());
+        }
+        TransactionJournal::set_per_run_policy_approval(&store, &config, approved_wallet)?;
+        store.save(&config)?;
+        println!(
+            "Configured {} | {} CPU worker(s) | reserve {} INJ | per-run authorization ceiling {} INJ | confirmations {} block(s)",
+            network_label(config.network),
+            config.cpu_threads,
+            config.minimum_reserve_inj,
+            config.per_session_spending_limit_inj,
+            config.transaction_confirmations
+        );
+        println!(
+            "Wallet address: {}",
+            config.wallet_address.as_deref().unwrap_or("not selected")
+        );
+        println!(
+            "Each explicit paid `astatine mine` invocation starts one fresh session under the saved approval. No session or transaction is created by `astatine init`."
+        );
+        return Ok(());
+    }
+
     let new_wallet = config
         .wallet_address
         .as_deref()
@@ -419,6 +540,39 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
             "a spending-session change was interrupted; run `astatine init` to resolve it before mining"
         );
     }
+    if config.per_run_sessions_enabled() {
+        if !args.compute_only {
+            let configured_limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
+            if !configured_limit.is_zero() {
+                if config.network != Network::Testnet {
+                    bail!("autonomous transaction signing is disabled outside Injective Testnet");
+                }
+                let selected_wallet = config
+                    .wallet_address
+                    .as_deref()
+                    .and_then(|address| Address::from_str(address).ok());
+                if selected_wallet.is_none() {
+                    bail!("select a wallet with `astatine init` before authorizing paid mining");
+                }
+                let wallet = selected_wallet.expect("checked above");
+                if !per_run_policy_matches(&session, &config, wallet)? {
+                    bail!(
+                        "per-run spending approval does not match the selected wallet, network, ceiling, or reserve; run `astatine init` to review and explicitly approve the policy"
+                    );
+                }
+                return mining::run_with_session_confirmation(&store, args, true).await;
+            }
+        }
+        return mining::run_with_session_confirmation(&store, args, false).await;
+    }
+    if !args.compute_only
+        && !parse_inj_wei(&config.per_session_spending_limit_inj)?.is_zero()
+        && session.per_run_policy_approval.is_some()
+    {
+        bail!(
+            "an authenticated per-run policy exists for this wallet; run `astatine init` to explicitly switch authorization policies"
+        );
+    }
     if args.new_session {
         if args.compute_only || parse_inj_wei(&config.per_session_spending_limit_inj)?.is_zero() {
             bail!(
@@ -455,7 +609,11 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
         }
         return mining::run_with_session_confirmation(&store, args, true).await;
     }
-    if mining::unresolved_session_blocks_mining(args.compute_only, !session.unresolved.is_empty()) {
+    if mining::unresolved_session_blocks_mining(
+        args.compute_only,
+        !session.unresolved.is_empty(),
+        config.per_run_sessions_enabled(),
+    ) {
         println!("RECOVERY REQUIRED • WALLET LOCKED • mining paused");
         print_unresolved_session_blocker(
             &session,
@@ -561,9 +719,15 @@ async fn run_recover() -> Result<()> {
         client.history_telemetry(),
     )?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut ctrl_c: crate::startup::CtrlCSignal = Box::pin(tokio::signal::ctrl_c());
     let mut last_status = Vec::new();
     loop {
-        manager.reconcile(&client).await?;
+        if !reconcile_recovery_or_interrupt(&mut manager, &client, &mut ctrl_c).await? {
+            println!(
+                "RECOVERY PAUSED • WALLET LOCKED\nNo spending session was changed. Rerun `astatine recover` to continue read-only verification."
+            );
+            return Ok(());
+        }
         let unresolved = manager.journal.unresolved_transactions();
         if unresolved.is_empty() {
             println!("RECOVERY COMPLETE • WALLET LOCKED");
@@ -591,14 +755,77 @@ async fn run_recover() -> Result<()> {
     }
 }
 
-fn prompt_spending_limit(current: &str) -> Result<String> {
-    println!("\nMaximum INJ allowed for mining transactions in one spending session.");
+pub(crate) async fn reconcile_recovery_or_interrupt(
+    manager: &mut TransactionManager,
+    client: &NetworkClient,
+    ctrl_c: &mut crate::startup::CtrlCSignal,
+) -> Result<bool> {
+    tokio::select! {
+        biased;
+        signal = ctrl_c.as_mut() => {
+            signal.context("listen for Ctrl+C during transaction recovery")?;
+            Ok(false)
+        }
+        result = manager.reconcile(client) => {
+            result?;
+            Ok(true)
+        }
+    }
+}
+
+fn prompt_spending_limit(current: &str, per_run_sessions: bool) -> Result<String> {
+    if per_run_sessions {
+        println!("\nMaximum INJ authorization ceiling for each paid mining run.");
+    } else {
+        println!("\nMaximum INJ allowed for mining transactions in one spending session.");
+    }
     println!("This covers proof submission fees and maximum gas costs.");
     println!("It is a safety limit, not an amount charged upfront.");
-    println!("A suggested starting allowance is 0.5 INJ; choose your own amount.");
+    if per_run_sessions {
+        println!(
+            "The configured default ceiling is 1 INJ; choose a lower or higher amount if desired."
+        );
+    } else {
+        println!("Choose a session cap; prior authorization is never refunded.");
+    }
     println!("Enter 0 to disable paid transactions.");
-    println!("Your allowance does not reset when you restart the miner.");
-    prompt_value("Maximum INJ per session (recommended 0.5 INJ)", current)
+    if per_run_sessions {
+        println!(
+            "After you approve the policy, each explicit paid `astatine mine` invocation starts one fresh allowance without a full-cap Y/N prompt."
+        );
+        println!(
+            "The actual cap may be lower after accounting for confirmed balance, reserve, and unresolved transaction liabilities."
+        );
+        prompt_value("Maximum INJ per run", current)
+    } else {
+        println!("Your allowance does not reset when you restart the miner.");
+        prompt_value("Maximum INJ per session", current)
+    }
+}
+
+fn prompt_per_run_policy_approval(config: &AppConfig, wallet: Address) -> Result<bool> {
+    println!("\nASTATINE PER-RUN SPENDING POLICY");
+    println!(
+        "Network: {} (chain {})",
+        network_label(config.network),
+        chain_id(config.network)
+    );
+    println!("Wallet: {wallet:#x}");
+    println!(
+        "Each explicit paid `astatine mine` invocation may authorize up to {} INJ.",
+        config.per_session_spending_limit_inj
+    );
+    println!(
+        "The cap resets for the next explicit run; aggregate spending across multiple runs can exceed one run's cap."
+    );
+    println!(
+        "Each run automatically uses the full cap when confirmed balance, the {} INJ reserve, and unresolved liabilities allow it. A reduced cap requires a separate one-time approval for that run.",
+        config.minimum_reserve_inj
+    );
+    prompt_yes_no(
+        "Persist and approve this per-run policy for the selected wallet and network?",
+        false,
+    )
 }
 
 fn requires_new_paid_session(
@@ -666,6 +893,11 @@ pub(crate) fn ensure_standalone_wallet_change_allowed(
             "wallet changes are blocked during transaction recovery; run `astatine recover` first"
         );
     }
+    if config.per_run_sessions_enabled() && session.per_run_policy_approval.is_some() {
+        bail!(
+            "a wallet bound to an approved per-run spending policy can only be changed with `astatine init` so the new wallet can be explicitly reauthorized"
+        );
+    }
     if session.session_id.is_some()
         && !session.closed
         && session
@@ -694,6 +926,19 @@ fn session_effective_limit(session: &SessionJournalSnapshot, config: &AppConfig)
         })
         .transpose()
         .map(|value| value.unwrap_or_else(|| config.per_session_spending_limit_inj.clone()))
+}
+
+fn per_run_policy_matches(
+    session: &SessionJournalSnapshot,
+    config: &AppConfig,
+    wallet: Address,
+) -> Result<bool> {
+    session
+        .per_run_policy_approval
+        .as_ref()
+        .map(|approval| approval.matches_config(config, wallet))
+        .transpose()
+        .map(|approved| approved.unwrap_or(false))
 }
 
 fn prompt_new_session_confirmation(
@@ -1351,6 +1596,26 @@ mod tests {
 
         let error = ensure_standalone_wallet_change_allowed(&store, &config).unwrap_err();
         assert!(format!("{error:#}").contains("astatine init"));
+    }
+
+    #[test]
+    fn standalone_wallet_selection_requires_per_run_policy_reauthorization() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(root.path().to_path_buf());
+        let wallet = Address::with_last_byte(0xa1);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        TransactionJournal::set_per_run_policy_approval(&store, &config, Some(wallet)).unwrap();
+
+        let error = ensure_standalone_wallet_change_allowed(&store, &config).unwrap_err();
+        assert!(format!("{error:#}").contains("per-run spending policy"));
+        assert_eq!(
+            store.load().unwrap().wallet_address.as_deref(),
+            Some(format!("{wallet:#x}").as_str())
+        );
     }
 
     #[test]

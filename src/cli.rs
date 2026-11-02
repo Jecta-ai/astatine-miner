@@ -90,6 +90,7 @@ pub struct InitArgs {
     pub spending_limit_inj: Option<String>,
     pub transaction_confirmations: Option<u8>,
     pub rpc: Option<String>,
+    pub per_run_sessions: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -153,13 +154,13 @@ fn command() -> ClapCommand {
         .version(env!("CARGO_PKG_VERSION"))
         .about("A native command-line miner for Astatine")
         .long_about(
-            "Astatine is a non-custodial CPU/GPU miner. CPU is the default backend. GPU candidates are checked again by the canonical CPU WorkHasher before entering the bounded proof pipeline. Testnet transaction authorizations count their maximum possible INJ exposure cumulatively for the session; RPC receipts never refund signing authority. Permissionless finalization can spend gas for empty windows or windows won by another miner. Automatic AST reward forwarding is disabled because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually. --compute-only never signs or submits transactions. Mainnet transaction signing is disabled.",
+            "Astatine is a non-custodial CPU/GPU miner. CPU is the default backend. GPU candidates are checked again by the canonical CPU WorkHasher before entering the bounded proof pipeline. Per-run Testnet authorizations count maximum possible INJ exposure and are capped by confirmed balance after reserve and unresolved liabilities; RPC receipts never refund signing authority. Existing schema-v1 accounts retain legacy session behavior until explicitly migrated with `astatine init --per-run-sessions`. Permissionless finalization can spend gas for empty windows or windows won by another miner. Automatic AST reward forwarding is disabled because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually. --compute-only never signs or submits transactions. Mainnet transaction signing is disabled.",
         )
         .subcommand_required(true)
         .arg_required_else_help(true)
         .subcommand(
             ClapCommand::new("init")
-                .about("Configure the local wallet, network, CPU, spending cap, and confirmation depth")
+                .about("Configure the local wallet, network, CPU, per-run spending ceiling, and confirmation depth")
                 .arg(
                     Arg::new("network")
                         .long("network")
@@ -181,6 +182,12 @@ fn command() -> ClapCommand {
                     Arg::new("spending-limit-inj")
                         .long("spending-limit-inj")
                         .value_name("INJ"),
+                )
+                .arg(
+                    Arg::new("per-run-sessions")
+                        .long("per-run-sessions")
+                        .action(clap::ArgAction::SetTrue)
+                        .help("Explicitly migrate a legacy account to a fresh allowance for every paid mine invocation"),
                 )
                 .arg(
                     Arg::new("confirmation-blocks")
@@ -217,7 +224,7 @@ fn command() -> ClapCommand {
                         .long("new-session")
                         .action(clap::ArgAction::SetTrue)
                         .conflicts_with("compute-only")
-                        .help("Explicitly authorize a separate spending session after prior spending"),
+                        .help("Legacy mode: explicitly authorize a separate spending session after prior spending"),
                 )
                 .arg(
                     Arg::new("threads")
@@ -240,7 +247,7 @@ fn command() -> ClapCommand {
                         .long("send-rewards-to")
                         .value_name("ADDRESS")
                         .value_parser(parse_reward_destination)
-                        .help("Disabled in Testnet.14: RPC reward evidence cannot authorize AST transfers"),
+                        .help("Disabled in Testnet.15: RPC reward evidence cannot authorize AST transfers"),
                 ),
         )
         .subcommand(
@@ -389,7 +396,8 @@ fn wallet_command() -> ClapCommand {
                 ),
         )
         .subcommand(
-            ClapCommand::new("address").about("Display the selected wallet's public address"),
+            ClapCommand::new("address")
+                .about("Display the selected wallet's public address and terminal QR code"),
         )
 }
 
@@ -425,6 +433,7 @@ fn parse_matches(matches: &ArgMatches) -> Command {
             spending_limit_inj: args.get_one::<String>("spending-limit-inj").cloned(),
             transaction_confirmations: args.get_one::<u8>("confirmation-blocks").copied(),
             rpc: args.get_one::<String>("rpc").cloned(),
+            per_run_sessions: args.get_flag("per-run-sessions"),
         }),
         Some(("mine", args)) => Command::Mine(MineArgs {
             device: args
@@ -829,9 +838,15 @@ mod tests {
             }
         );
         assert_eq!(
-            try_parse_from(["astatine", "init", "--rpc", "https://rpc.example.org"])
-                .unwrap()
-                .command,
+            try_parse_from([
+                "astatine",
+                "init",
+                "--rpc",
+                "https://rpc.example.org",
+                "--per-run-sessions",
+            ])
+            .unwrap()
+            .command,
             Command::Init(InitArgs {
                 network: None,
                 threads: None,
@@ -839,6 +854,7 @@ mod tests {
                 spending_limit_inj: None,
                 transaction_confirmations: None,
                 rpc: Some("https://rpc.example.org".to_owned()),
+                per_run_sessions: true,
             })
         );
 

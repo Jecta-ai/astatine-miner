@@ -153,6 +153,16 @@ pub struct TransactionReceipt {
     pub logs: Vec<RpcLog>,
 }
 
+impl TransactionReceipt {
+    pub(crate) fn evm_logs(&self) -> Vec<RpcLog> {
+        self.logs
+            .iter()
+            .filter(|log| !log.removed && !log.virtual_log)
+            .cloned()
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionDetails {
     pub hash: B256,
@@ -713,6 +723,28 @@ impl NetworkClient {
             .context("pending balance endpoint is unavailable")?;
         if balances.iter().any(|other| *other != balance) {
             bail!("selected RPC returned inconsistent pending INJ balance data");
+        }
+        Ok(balance)
+    }
+
+    pub async fn confirmed_balance(&self, address: Address) -> Result<U256> {
+        let endpoints = self.trusted_rpc_endpoints()?;
+        let mut balances = Vec::with_capacity(endpoints.len());
+        for endpoint in &endpoints {
+            let result = rpc_request::<String>(
+                endpoint,
+                "eth_getBalance",
+                serde_json::json!([format!("{address:#x}"), "latest"]),
+            )
+            .await
+            .with_context(|| format!("read confirmed balance from {}", endpoint.name))?;
+            balances.push(parse_hex_u256(&result)?);
+        }
+        let balance = *balances
+            .first()
+            .context("confirmed balance endpoint is unavailable")?;
+        if balances.iter().any(|other| *other != balance) {
+            bail!("selected RPC returned inconsistent confirmed INJ balance data");
         }
         Ok(balance)
     }
@@ -2148,12 +2180,22 @@ fn validate_trusted_rpc_receipt(receipt: &TransactionReceipt) -> Result<()> {
     {
         bail!("receipt reports a zero effective gas price");
     }
-    if !receipt.status && !receipt.logs.is_empty() {
+    if !receipt.status
+        && receipt
+            .logs
+            .iter()
+            .any(|log| !log.virtual_log && !log.removed)
+    {
         bail!("reverted EVM receipt unexpectedly contains logs");
     }
     for log in &receipt.logs {
-        if log.removed || log.virtual_log {
-            bail!("transaction receipt contains a removed or virtual log");
+        if log.removed {
+            bail!("transaction receipt contains a removed log");
+        }
+        if log.virtual_log {
+            // Injective includes virtual Cosmos logs in EVM receipts. They are
+            // not EVM event evidence and are ignored by event verification.
+            continue;
         }
         if log.block_number != Some(receipt.block_number)
             || log.block_hash != Some(receipt.block_hash)
@@ -2913,10 +2955,11 @@ fn parse_hex_u256(value: &str) -> Result<U256> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MiningInfo, NetworkClient, RpcEndpoint, RpcResponse, RpcResult, SUBMISSION_FEE_WEI,
-        WorkInfo, decode_candidate, decode_mining, decode_work, is_transient_receipt_error,
-        is_transient_rpc_error, is_window_expired_revert, is_window_not_expired_revert,
-        rpc_request, validate_coherent_state, validate_trusted_rpc_receipt,
+        MiningInfo, NetworkClient, ReceiptJson, RpcEndpoint, RpcResponse, RpcResult,
+        SUBMISSION_FEE_WEI, TransactionReceipt, WorkInfo, decode_candidate, decode_mining,
+        decode_work, is_transient_receipt_error, is_transient_rpc_error, is_window_expired_revert,
+        is_window_not_expired_revert, rpc_request, validate_coherent_state,
+        validate_trusted_rpc_receipt,
     };
     use crate::deployment::NodePin;
     use alloy_primitives::{Address, B256, Bytes, U256, hex};
@@ -3031,6 +3074,33 @@ mod tests {
 
     fn rpc_result(result: serde_json::Value) -> String {
         serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string()
+    }
+
+    #[tokio::test]
+    async fn confirmed_balance_reads_latest_native_balance() {
+        let (endpoint, server) = mock_endpoint(
+            "primary",
+            vec![(200, rpc_result(serde_json::json!("0x16345785d8a0000")))],
+        );
+        let mut client = NetworkClient::local_test_client(
+            endpoint.url.as_str(),
+            Address::with_last_byte(0x11),
+            B256::with_last_byte(0x12),
+            Address::with_last_byte(0x13),
+            B256::with_last_byte(0x14),
+            18,
+        )
+        .unwrap();
+        client.endpoints = vec![endpoint];
+
+        assert_eq!(
+            client
+                .confirmed_balance(Address::with_last_byte(0x11))
+                .await
+                .unwrap(),
+            U256::from(100_000_000_000_000_000_u128)
+        );
+        server.join().unwrap();
     }
 
     fn receipt_result(hash: B256, block_hash: B256) -> String {
@@ -3196,9 +3266,46 @@ mod tests {
         forged.logs[0].transaction_hash = Some(B256::with_last_byte(0x96));
         assert!(validate_trusted_rpc_receipt(&forged).is_err());
 
-        let mut virtual_event = receipt;
+        let mut virtual_event = receipt.clone();
         virtual_event.logs[0].virtual_log = true;
-        assert!(validate_trusted_rpc_receipt(&virtual_event).is_err());
+        virtual_event.logs[0].block_hash = None;
+        assert!(
+            validate_trusted_rpc_receipt(&virtual_event).is_ok(),
+            "virtual Injective logs must not invalidate EVM transaction inclusion"
+        );
+
+        let mut removed = receipt;
+        removed.logs[0].removed = true;
+        assert!(validate_trusted_rpc_receipt(&removed).is_err());
+    }
+
+    #[test]
+    fn injective_virtual_logs_do_not_invalidate_signed_transaction_inclusion() {
+        let receipt_json: ReceiptJson = serde_json::from_str(include_str!(
+            "../tests/fixtures/injective-testnet-virtual-receipt.json"
+        ))
+        .unwrap();
+        let receipt = TransactionReceipt::try_from(receipt_json).unwrap();
+
+        assert_eq!(
+            format!("{:#x}", receipt.transaction_hash),
+            "0x0bb5c1a62950464c0e27a7e6ba525ad9305be3064f6977ac67b80206f2211dfe"
+        );
+        assert_eq!(receipt.block_number, 0x8ba197e);
+        assert_eq!(
+            format!("{:#x}", receipt.block_hash),
+            "0xf23693cb504671f46be1f0e4b4e975fcbabce37460e9f84f29ef8a666a6c4989"
+        );
+        assert!(receipt.status);
+        assert_eq!(receipt.logs.len(), 8);
+        assert_eq!(receipt.logs.iter().filter(|log| log.virtual_log).count(), 5);
+        assert_eq!(
+            receipt.logs.iter().filter(|log| !log.virtual_log).count(),
+            3
+        );
+        assert!(receipt.logs.iter().all(|log| !log.removed));
+        assert_eq!(receipt.evm_logs().len(), 3);
+        assert!(validate_trusted_rpc_receipt(&receipt).is_ok());
     }
 
     fn block_result(number: u64, timestamp: u64, hash: B256) -> String {

@@ -438,7 +438,7 @@ def self_test(repo_root: pathlib.Path) -> None:
     import release_artifacts
     import release_public_key
 
-    tag = "v0.1.0-testnet.14"
+    tag = "v0.1.0-testnet.15"
     source_commit = "b" * 40
     with tempfile.TemporaryDirectory(prefix="astatine-publish-test-") as temporary:
         temp = pathlib.Path(temporary)
@@ -511,7 +511,7 @@ def self_test(repo_root: pathlib.Path) -> None:
             passphrase="",
             repo_root=test_repo,
         )
-        notes = repo_root / "support/release-notes-v0.1.0-testnet.14.md"
+        notes = repo_root / "support/release-notes-v0.1.0-testnet.15.md"
         confirmation = f"PUBLISH {tag} {source_commit} PREFLIGHT {preflight_sha256}"
 
         rehearsal_preflight_path = temp / "rehearsal-preflight.json"
@@ -760,7 +760,7 @@ def main() -> None:
         for name in ("release_dir", "preflight_report", "tag", "source_commit", "verified_preflight_sha256"):
             require(getattr(args, name) is not None, f"--{name.replace('_', '-')} is required")
         validate_local_source_checkout(repo_root, args.source_commit)
-        notes_file = args.notes_file or repo_root / "support/release-notes-v0.1.0-testnet.14.md"
+        notes_file = args.notes_file or repo_root / "support/release-notes-v0.1.0-testnet.15.md"
         report = prepare_publication(
             args.release_dir,
             args.preflight_report,
