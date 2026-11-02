@@ -975,7 +975,11 @@ pub(crate) async fn run_with_session_confirmation(
             "an init spending-session change is interrupted; run `astatine init` to resolve it before mining"
         );
     }
-    if unresolved_session_blocks_mining(args.compute_only, !session.unresolved.is_empty()) {
+    if unresolved_session_blocks_mining(
+        args.compute_only,
+        !session.unresolved.is_empty(),
+        config.per_run_sessions_enabled(),
+    ) {
         progress
             .fail("An unresolved transaction requires read-only recovery; wallet remains locked");
         eprintln!("RECOVERY REQUIRED • WALLET LOCKED • mining paused");
@@ -1069,7 +1073,7 @@ pub(crate) async fn run_with_client(
 
 async fn run_runtime(
     store: &ConfigStore,
-    config: crate::config::AppConfig,
+    mut config: crate::config::AppConfig,
     args: MineArgs,
     mut client: NetworkClient,
     supplied_signer: Option<bip32::secp256k1::ecdsa::SigningKey>,
@@ -1081,6 +1085,7 @@ async fn run_runtime(
         progress: startup,
         new_session_authorized,
     } = startup_control;
+    let per_run_sessions_enabled = config.per_run_sessions_enabled();
     if args.send_rewards_to.is_some() {
         bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
     }
@@ -1100,13 +1105,62 @@ async fn run_runtime(
         bail!("autonomous transaction signing is disabled outside Injective Testnet");
     }
     let address = selected_address(&config)?;
-    let spending_limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
-    if args.new_session && (args.compute_only || spending_limit.is_zero()) {
+    let configured_limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
+    let mut run_confirmed_balance = None;
+    let mut spending_limit = if config.per_run_sessions_enabled()
+        && !args.compute_only
+        && !configured_limit.is_zero()
+    {
+        let session = crate::transaction::TransactionJournal::inspect_session(store, &config)?;
+        let pending_exposure = session
+            .pending_exposure_wei
+            .as_deref()
+            .map(|value| {
+                U256::from_str_radix(value, 10).context("journal pending exposure is invalid")
+            })
+            .transpose()?
+            .unwrap_or(U256::ZERO);
+        let minimum_reserve = parse_inj_wei(&config.minimum_reserve_inj)?;
+        match client.confirmed_balance(address).await {
+            Ok(confirmed_balance) => {
+                run_confirmed_balance = Some(confirmed_balance);
+                let effective_limit = per_run_authorization_cap(
+                    configured_limit,
+                    minimum_reserve,
+                    pending_exposure,
+                    confirmed_balance,
+                );
+                eprintln!(
+                    "Per-run authorization: ceiling={} INJ · confirmed={} INJ · reserve={} INJ · unresolved maximum exposure={} INJ · effective cap={} INJ",
+                    format_inj(Some(configured_limit)),
+                    format_inj(Some(confirmed_balance)),
+                    format_inj(Some(minimum_reserve)),
+                    format_inj(Some(pending_exposure)),
+                    format_inj(Some(effective_limit)),
+                );
+                config.per_session_spending_limit_inj = wei_as_inj(effective_limit);
+                effective_limit
+            }
+            Err(error) => {
+                eprintln!(
+                    "Per-run authorization disabled because a consistent confirmed INJ balance could not be established; mining will continue without signing: {error:#}"
+                );
+                config.per_session_spending_limit_inj = "0".to_owned();
+                U256::ZERO
+            }
+        }
+    } else {
+        configured_limit
+    };
+    if args.new_session
+        && !config.per_run_sessions_enabled()
+        && (args.compute_only || spending_limit.is_zero())
+    {
         bail!(
             "--new-session requires transaction mode and a positive per-session authorization cap"
         );
     }
-    let transaction_mode = !args.compute_only && !spending_limit.is_zero();
+    let mut transaction_mode = !args.compute_only && !spending_limit.is_zero();
     let threads = args
         .threads
         .map(NonZeroUsize::get)
@@ -1161,7 +1215,10 @@ async fn run_runtime(
             ast_token,
             client.history_telemetry(),
             new_session_authorized,
-            args.new_session,
+            args.new_session
+                || (config.per_run_sessions_enabled()
+                    && transaction_mode
+                    && new_session_authorized),
         ) {
             Ok(manager) => manager,
             Err(error) => {
@@ -1176,8 +1233,11 @@ async fn run_runtime(
         // The test probe is only supplied by local-runtime tests. Production CLI
         // entry points refuse unresolved startup sessions and route them to the
         // dedicated read-only `astatine recover` command.
-        if unresolved_session_blocks_mining(args.compute_only, manager.journal.has_unresolved())
-            && probe_sender.is_none()
+        if unresolved_session_blocks_mining(
+            args.compute_only,
+            manager.journal.has_unresolved(),
+            config.per_run_sessions_enabled(),
+        ) && probe_sender.is_none()
         {
             let unresolved = manager.journal.unresolved_transactions();
             if let Some(startup) = startup {
@@ -1195,6 +1255,22 @@ async fn run_runtime(
             bail!(
                 "run `astatine recover`; after it completes, start a fresh `astatine mine` process to unlock the wallet"
             );
+        }
+        if transaction_mode
+            && config.per_run_sessions_enabled()
+            && new_session_authorized
+            && let Some(confirmed_balance) = run_confirmed_balance
+        {
+            let reduced_limit = manager.constrain_per_run_cap_to_balance(confirmed_balance)?;
+            if reduced_limit < spending_limit {
+                eprintln!(
+                    "Per-run authorization ceiling reduced under the locked transaction journal to {} INJ after rechecking unresolved maximum liabilities.",
+                    format_inj(Some(reduced_limit))
+                );
+                spending_limit = reduced_limit;
+                config.per_session_spending_limit_inj = wei_as_inj(reduced_limit);
+                transaction_mode = !args.compute_only && !spending_limit.is_zero();
+            }
         }
         manager.configure_reward_forwarding(args.send_rewards_to)?;
         manager.set_proof_telemetry(Arc::clone(&proof_telemetry));
@@ -1251,14 +1327,20 @@ async fn run_runtime(
     }
     let signing_ready = transactions
         .as_ref()
-        .is_some_and(|manager| !manager.journal.has_unresolved());
+        .is_some_and(|manager| !manager.signing_blocked_by_unresolved());
     if transactions
         .as_ref()
         .is_some_and(|manager| manager.journal.has_unresolved())
     {
-        eprintln!(
-            "An unresolved or underconfirmed transaction is being recovered. No further transactions will be signed until it settles; maximum exposure remains reserved."
-        );
+        if per_run_sessions_enabled {
+            eprintln!(
+                "An unresolved or underconfirmed transaction is being recovered read-only. Its maximum exposure remains reserved; this run may sign only with a distinct pending nonce and sufficient balance and cap."
+            );
+        } else {
+            eprintln!(
+                "An unresolved or underconfirmed transaction is being recovered. No further transactions will be signed until it settles; maximum exposure remains reserved."
+            );
+        }
     }
     let mut supplied_signer = supplied_signer;
     let signer = if transaction_mode {
@@ -1426,7 +1508,7 @@ async fn run_runtime(
         && (signer.is_none()
             || transactions
                 .as_ref()
-                .is_some_and(|manager| manager.journal.has_unresolved()));
+                .is_some_and(|manager| manager.signing_blocked_by_unresolved()));
     let (proof_sender, mut proof_receiver) =
         proof_inbox(Arc::clone(&proof_attempt_guard), proof_delivery_paused);
     let worker_context = MiningWorkerContext {
@@ -1727,7 +1809,8 @@ async fn run_runtime(
                             }
                             proof_receiver.set_paused(
                                 transaction_mode
-                                    && (signer.is_none() || manager.journal.has_unresolved()),
+                                    && (signer.is_none()
+                                        || manager.signing_blocked_by_unresolved()),
                             );
                         }
                         if proof_receiver.has_pending() {
@@ -1762,7 +1845,7 @@ async fn run_runtime(
                                 && (signer.is_none()
                                     || transactions
                                         .as_ref()
-                                        .is_some_and(|manager| manager.journal.has_unresolved())),
+                                        .is_some_and(|manager| manager.signing_blocked_by_unresolved())),
                         );
                         snapshot = observer.latest_snapshot().unwrap_or(snapshot);
                         if proof_receiver.has_pending() {
@@ -1819,7 +1902,7 @@ async fn run_runtime(
                                 && (signer.is_none()
                                     || transactions
                                         .as_ref()
-                                        .is_some_and(|manager| manager.journal.has_unresolved())
+                                        .is_some_and(|manager| manager.signing_blocked_by_unresolved())
                                     || budget_exhausted),
                         );
                         snapshot = observer.latest_snapshot().unwrap_or(snapshot);
@@ -1843,7 +1926,7 @@ async fn run_runtime(
                                 && (signer.is_none()
                                     || transactions
                                         .as_ref()
-                                        .is_some_and(|manager| manager.journal.has_unresolved())
+                                        .is_some_and(|manager| manager.signing_blocked_by_unresolved())
                                     || budget_exhausted),
                         );
                         last_snapshot = observer.latest_snapshot().unwrap_or(snapshot);
@@ -1901,7 +1984,7 @@ async fn run_runtime(
                         && (signer.is_none()
                             || transactions
                                 .as_ref()
-                                .is_some_and(|manager| manager.journal.has_unresolved())
+                                .is_some_and(|manager| manager.signing_blocked_by_unresolved())
                             || budget_exhausted),
                 );
             }
@@ -1987,11 +2070,17 @@ async fn run_runtime(
                     proof_telemetry.record(proof.node_id, ProofMetric::RefusedSigningDisabled);
                     continue;
                 };
+                let unresolved_before = manager
+                    .journal
+                    .unresolved_transactions()
+                    .into_iter()
+                    .map(|entry| entry.hash)
+                    .collect::<HashSet<_>>();
                 if manager.proof_attempted(contract, window_id) {
                     proof_telemetry.record(proof.node_id, ProofMetric::SuppressedPriorAttempt);
                     continue;
                 }
-                if manager.journal.has_unresolved() {
+                if manager.signing_blocked_by_unresolved() {
                     proof_receiver.set_paused(true);
                     let _ = proof_receiver.requeue(proof.clone(), &proof_telemetry);
                     proof_telemetry.record(
@@ -2053,7 +2142,7 @@ async fn run_runtime(
                     match result {
                         Err(error)
                             if is_transient_rpc_error(&error)
-                                && !manager.journal.has_unresolved()
+                                && !manager.signing_blocked_by_unresolved()
                                 && !manager.journal.has_unverified_receipt() =>
                         {
                             proof_telemetry.record(
@@ -2156,26 +2245,60 @@ async fn run_runtime(
                         observer.force_refresh();
                         proof_receiver.set_paused(
                             transaction_mode
-                                && manager.journal.has_unresolved(),
+                                && manager.signing_blocked_by_unresolved(),
                         );
                     }
                     Err(error)
-                        if manager.journal.has_unresolved()
-                            || manager.journal.has_unverified_receipt() =>
+                        if manager
+                            .journal
+                            .unresolved_transactions()
+                            .iter()
+                            .any(|entry| !unresolved_before.contains(&entry.hash))
+                            || (!per_run_sessions_enabled && manager.journal.has_unresolved()) =>
                     {
                         report_mining_warning(
                             &dashboard,
-                            format!(
-                                "proof outcome remains journaled as unresolved; no further transaction will be signed, but read-only recovery and mining observation will continue: {error:#}"
-                            ),
+                            if per_run_sessions_enabled {
+                                format!(
+                                    "proof outcome remains journaled as unresolved; its maximum exposure and nonce remain reserved while receipt recovery continues read-only. Later transactions require a distinct pending nonce and sufficient balance/cap: {error:#}"
+                                )
+                            } else {
+                                format!(
+                                    "proof outcome remains journaled as unresolved; no further transaction will be signed, but read-only recovery and mining observation will continue: {error:#}"
+                                )
+                            },
                         );
-                        proof_receiver.set_paused(true);
+                        proof_receiver.set_paused(manager.signing_blocked_by_unresolved());
                         mark_dashboard_nodes(
                             &dashboard,
                             [proof.node_id],
                             NodeStatus::Recovering,
                             Some(format!(
                                 "Node {:02} • recovering journaled proof outcome...",
+                                proof.node_id
+                            )),
+                        );
+                        observer.force_refresh();
+                    }
+                    Err(error) if is_unresolved_nonce_refusal(&error) => {
+                        proof_telemetry.record(
+                            proof.node_id,
+                            ProofMetric::DeferredUnresolvedTransaction,
+                        );
+                        let _ = proof_receiver.requeue(proof.clone(), &proof_telemetry);
+                        proof_receiver.set_paused(true);
+                        report_mining_warning(
+                            &dashboard,
+                            format!(
+                                "proof retained while an unresolved transaction owns the wallet's current pending nonce; receipt recovery remains read-only and hashing continues: {error:#}"
+                            ),
+                        );
+                        mark_dashboard_nodes(
+                            &dashboard,
+                            [proof.node_id],
+                            NodeStatus::Recovering,
+                            Some(format!(
+                                "Node {:02} • waiting for an unresolved wallet nonce...",
                                 proof.node_id
                             )),
                         );
@@ -2420,7 +2543,7 @@ async fn maybe_finalize_expired(
     last_verified_snapshot: &ReadSnapshot,
     options: FinalizationOptions<'_>,
 ) -> Result<bool> {
-    if manager.journal.has_unresolved() {
+    if manager.signing_blocked_by_unresolved() {
         return Ok(false);
     }
     let snapshot = match client.snapshot(Some(wallet)).await {
@@ -2549,6 +2672,12 @@ async fn maybe_finalize_expired(
             NodeStatus::Finalizing,
             Some(format!("Node {:02} • Finalizing window...", node.id)),
         );
+        let unresolved_before = manager
+            .journal
+            .unresolved_transactions()
+            .into_iter()
+            .map(|entry| entry.hash)
+            .collect::<HashSet<_>>();
         match manager
             .finalize_window(client, signer, node.address, node.id, state.work.window_id)
             .await
@@ -2583,16 +2712,23 @@ async fn maybe_finalize_expired(
                 finalized_any = true;
             }
             Err(error)
-                if manager.journal.has_unresolved() || manager.journal.has_unverified_receipt() =>
+                if manager
+                    .journal
+                    .unresolved_transactions()
+                    .iter()
+                    .any(|entry| !unresolved_before.contains(&entry.hash))
+                    || manager.signing_blocked_by_unresolved() =>
             {
                 report_mining_warning(
                     options.dashboard,
                     format!(
-                        "node {} window {} finalization outcome is journaled and requires recovery; no rebroadcast will occur: {error:#}",
+                        "node {} window {} finalization outcome remains journaled with maximum exposure reserved; no transaction will be resent: {error:#}",
                         node.id, state.work.window_id
                     ),
                 );
-                break;
+                if manager.signing_blocked_by_unresolved() {
+                    break;
+                }
             }
             Err(error) => {
                 if let Some(kind) = transaction_policy_refusal(&error) {
@@ -2607,6 +2743,22 @@ async fn maybe_finalize_expired(
                         }
                         TransactionPolicyRefusalKind::SigningDisabled => {
                             format!("transaction signing is disabled: {error:#}")
+                        }
+                        TransactionPolicyRefusalKind::UnresolvedNonce => {
+                            let attempts = retry_attempts(previous.as_ref()).saturating_add(1);
+                            record_finalization_state(
+                                &options,
+                                node.id,
+                                FinalizationState::Retrying {
+                                    window_id: state.work.window_id,
+                                    attempts,
+                                    retry_at: Instant::now() + STALE_PREFLIGHT_RETRY,
+                                    reason: format!(
+                                        "waiting for an unresolved wallet nonce: {error:#}"
+                                    ),
+                                },
+                            );
+                            continue;
                         }
                     };
                     record_finalization_state(
@@ -2704,7 +2856,7 @@ async fn maybe_finalize_expired(
                 }
             }
         }
-        if manager.journal.has_unresolved() || manager.budget_remaining()?.is_zero() {
+        if manager.signing_blocked_by_unresolved() || manager.budget_remaining()?.is_zero() {
             break;
         }
     }
@@ -2793,6 +2945,13 @@ fn confirmed_action_message(label: &str, action: &ConfirmedAction) -> String {
 
 fn is_policy_refusal(error: &anyhow::Error) -> bool {
     transaction_policy_refusal(error).is_some()
+}
+
+fn is_unresolved_nonce_refusal(error: &anyhow::Error) -> bool {
+    matches!(
+        transaction_policy_refusal(error),
+        Some(TransactionPolicyRefusalKind::UnresolvedNonce)
+    )
 }
 
 fn is_session_limit_refusal(error: &anyhow::Error) -> bool {
@@ -4690,8 +4849,26 @@ fn next_poll_delay(current: Duration) -> Duration {
 pub(crate) fn unresolved_session_blocks_mining(
     compute_only: bool,
     has_unresolved_transaction: bool,
+    per_run_sessions_enabled: bool,
 ) -> bool {
-    !compute_only && has_unresolved_transaction
+    !compute_only && has_unresolved_transaction && !per_run_sessions_enabled
+}
+
+fn per_run_authorization_cap(
+    configured_ceiling: U256,
+    minimum_reserve: U256,
+    pending_exposure: U256,
+    confirmed_balance: U256,
+) -> U256 {
+    let available = confirmed_balance
+        .checked_sub(minimum_reserve)
+        .and_then(|remaining| remaining.checked_sub(pending_exposure))
+        .unwrap_or(U256::ZERO);
+    configured_ceiling.min(available)
+}
+
+fn wei_as_inj(value: U256) -> String {
+    format_token_units(Some(value), 18)
 }
 
 fn should_open_transaction_manager(
@@ -4746,10 +4923,10 @@ mod tests {
         clear_genesis_poll_error, compare_snapshot_freshness, dashboard_model,
         dashboard_node_status, finalization_retry_delay, gpu_is_meaningfully_faster,
         history_profile_enabled, inactive_genesis_nodes, next_poll_delay, next_scheduled_slot,
-        process_hashed_candidate, proof_inbox, reconcile_head_progress, revalidate_queued_proof,
-        revalidate_queued_proof_at, selected_nodes, should_open_transaction_manager,
-        take_observer_update, traced_node_status, unresolved_session_blocks_mining, update_slots,
-        worker_loop,
+        per_run_authorization_cap, process_hashed_candidate, proof_inbox, reconcile_head_progress,
+        revalidate_queued_proof, revalidate_queued_proof_at, selected_nodes,
+        should_open_transaction_manager, take_observer_update, traced_node_status,
+        unresolved_session_blocks_mining, update_slots, worker_loop,
     };
     use crate::{
         cli::{DeviceChoice, MineArgs, Network},
@@ -4835,10 +5012,42 @@ mod tests {
 
     #[test]
     fn compute_only_can_continue_with_unresolved_transactions_without_opening_a_manager() {
-        assert!(!unresolved_session_blocks_mining(true, true));
-        assert!(unresolved_session_blocks_mining(false, true));
+        assert!(!unresolved_session_blocks_mining(true, true, false));
+        assert!(unresolved_session_blocks_mining(false, true, false));
+        assert!(!unresolved_session_blocks_mining(false, true, true));
         assert!(!should_open_transaction_manager(true, false, true));
         assert!(!should_open_transaction_manager(true, false, false));
+    }
+
+    #[test]
+    fn per_run_cap_is_bounded_by_balance_after_reserve_and_unresolved_liabilities() {
+        let inj = U256::from(1_000_000_000_000_000_000_u128);
+        assert_eq!(
+            per_run_authorization_cap(
+                inj,
+                inj / U256::from(10),
+                inj / U256::from(5),
+                inj * U256::from(2),
+            ),
+            inj
+        );
+        assert_eq!(
+            per_run_authorization_cap(
+                inj * U256::from(3),
+                inj / U256::from(10),
+                inj / U256::from(5),
+                inj * U256::from(2),
+            ),
+            inj * U256::from(17) / U256::from(10)
+        );
+        assert_eq!(
+            per_run_authorization_cap(inj, inj, U256::ZERO, inj / U256::from(2)),
+            U256::ZERO
+        );
+        assert_eq!(
+            per_run_authorization_cap(inj, U256::ZERO, inj, inj / U256::from(2)),
+            U256::ZERO
+        );
     }
 
     #[test]

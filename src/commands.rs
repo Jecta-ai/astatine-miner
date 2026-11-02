@@ -107,6 +107,17 @@ async fn run_init(args: InitArgs) -> Result<()> {
         config = store.load()?;
     }
     let persisted_config = config.clone();
+    if args.per_run_sessions {
+        config.schema_version = 2;
+    } else if !config.per_run_sessions_enabled() {
+        println!(
+            "This existing schema-v1 account keeps its legacy spending-session policy unless you explicitly migrate. Per-run mode starts a fresh allowance for each paid `astatine mine` invocation; the effective cap is reduced by confirmed balance, the reserve, and unresolved maximum exposure."
+        );
+        if prompt_yes_no("Migrate this account to per-run spending sessions?", false)? {
+            config.schema_version = 2;
+        }
+    }
+    let per_run_sessions = config.per_run_sessions_enabled();
     let mut session_snapshot = TransactionJournal::inspect_session(&store, &config)?;
     let effective_limit = session_effective_limit(&session_snapshot, &config)?;
     let stored_limit_wei = parse_inj_wei(&config.per_session_spending_limit_inj)?;
@@ -115,9 +126,13 @@ async fn run_init(args: InitArgs) -> Result<()> {
         .as_deref()
         .map(|value| U256::from_str_radix(value, 10).context("journal session limit is invalid"))
         .transpose()?;
-    let safe_config_limit = journal_limit_wei
-        .map(|limit| format_token_units(stored_limit_wei.min(limit), 18))
-        .unwrap_or_else(|| config.per_session_spending_limit_inj.clone());
+    let safe_config_limit = if per_run_sessions {
+        config.per_session_spending_limit_inj.clone()
+    } else {
+        journal_limit_wei
+            .map(|limit| format_token_units(stored_limit_wei.min(limit), 18))
+            .unwrap_or_else(|| config.per_session_spending_limit_inj.clone())
+    };
     if safe_config_limit != config.per_session_spending_limit_inj {
         println!(
             "Saved cap {} INJ is above the active journal session limit {} INJ. The old session remains the effective authorization until a new session is explicitly approved.",
@@ -144,9 +159,15 @@ async fn run_init(args: InitArgs) -> Result<()> {
     }
     let previous_config = config.clone();
     println!("ASTATINE · INITIAL SETUP");
-    println!(
-        "Every signed transaction permanently consumes its maximum possible INJ authorization for this session; RPC receipts do not refund it. Finalization can spend gas on empty windows or windows won by another miner. The default cap of zero authorizes no transaction spending."
-    );
+    if per_run_sessions {
+        println!(
+            "Every paid mine invocation requires fresh approval. Its one-run cap is at most the configured ceiling and is reduced by confirmed balance, the minimum reserve, and all unresolved maximum liabilities. Signed maximum exposure is never refunded by RPC receipts."
+        );
+    } else {
+        println!(
+            "Every signed transaction permanently consumes its maximum possible INJ authorization for this session; RPC receipts do not refund it. Finalization can spend gas on empty windows or windows won by another miner. The default cap of zero authorizes no transaction spending."
+        );
+    }
 
     config.network = match args.network {
         Some(network) => network,
@@ -163,12 +184,12 @@ async fn run_init(args: InitArgs) -> Result<()> {
     };
     let proposed_limit = match args.spending_limit_inj {
         Some(amount) => amount,
-        None => prompt_spending_limit(&config.per_session_spending_limit_inj)?,
+        None => prompt_spending_limit(&config.per_session_spending_limit_inj, per_run_sessions)?,
     };
     parse_inj_wei(&proposed_limit)
         .context("spending limit must be a decimal INJ amount with at most 18 decimals")?;
-    // Keep the previously configured safe limit in every config write made by wallet
-    // creation/import. The proposed limit is committed only with its session.
+    // Wallet creation/import during setup must never commit the proposed ceiling
+    // before the final config save below.
     config.per_session_spending_limit_inj = safe_config_limit.clone();
     config.transaction_confirmations = match args.transaction_confirmations {
         Some(confirmations) => confirmations,
@@ -181,7 +202,8 @@ async fn run_init(args: InitArgs) -> Result<()> {
     };
     config.validate()?;
 
-    if !session_snapshot.unresolved.is_empty()
+    if !per_run_sessions
+        && !session_snapshot.unresolved.is_empty()
         && parse_inj_wei(&proposed_limit)? != parse_inj_wei(&effective_limit)?
     {
         print_unresolved_session_blocker(&session_snapshot, &effective_limit, &proposed_limit);
@@ -258,6 +280,51 @@ async fn run_init(args: InitArgs) -> Result<()> {
     }
 
     config.validate()?;
+    if per_run_sessions {
+        if !parse_inj_wei(&proposed_limit)?.is_zero() && config.wallet_address.is_none() {
+            bail!("select a wallet before configuring a positive per-run spending ceiling");
+        }
+        let previous_wallet = session_snapshot
+            .wallet
+            .as_deref()
+            .or(previous_config.wallet_address.as_deref())
+            .map(Address::from_str)
+            .transpose()
+            .context("previous wallet address is invalid")?;
+        let selected_wallet = config
+            .wallet_address
+            .as_deref()
+            .map(Address::from_str)
+            .transpose()
+            .context("selected wallet address is invalid")?;
+        if previous_wallet != selected_wallet
+            && !prompt_yes_no(
+                "Use the selected wallet for future per-run spending sessions?",
+                false,
+            )?
+        {
+            config.wallet_address = previous_wallet.map(|wallet| format!("{wallet:#x}"));
+        }
+        config.per_session_spending_limit_inj = proposed_limit;
+        store.save(&config)?;
+        println!(
+            "Configured {} | {} CPU worker(s) | reserve {} INJ | per-run authorization ceiling {} INJ | confirmations {} block(s)",
+            network_label(config.network),
+            config.cpu_threads,
+            config.minimum_reserve_inj,
+            config.per_session_spending_limit_inj,
+            config.transaction_confirmations
+        );
+        println!(
+            "Wallet address: {}",
+            config.wallet_address.as_deref().unwrap_or("not selected")
+        );
+        println!(
+            "Each paid `astatine mine` invocation asks for fresh approval; no allowance is created by `astatine init`."
+        );
+        return Ok(());
+    }
+
     let new_wallet = config
         .wallet_address
         .as_deref()
@@ -419,6 +486,41 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
             "a spending-session change was interrupted; run `astatine init` to resolve it before mining"
         );
     }
+    if config.per_run_sessions_enabled() {
+        if args.new_session
+            && (args.compute_only
+                || parse_inj_wei(&config.per_session_spending_limit_inj)?.is_zero())
+        {
+            bail!(
+                "`astatine mine --new-session` requires transaction mode and a positive per-run authorization ceiling"
+            );
+        }
+        if !args.compute_only {
+            let configured_limit = parse_inj_wei(&config.per_session_spending_limit_inj)?;
+            if !configured_limit.is_zero() {
+                let selected_wallet = config
+                    .wallet_address
+                    .as_deref()
+                    .and_then(|address| Address::from_str(address).ok());
+                if selected_wallet.is_none() {
+                    bail!("select a wallet with `astatine init` before authorizing paid mining");
+                }
+                let previous_limit = session_effective_limit(&session, &config)?;
+                if !prompt_per_run_session_confirmation(
+                    &previous_limit,
+                    &config.per_session_spending_limit_inj,
+                    session.authorized_exposure_wei.as_deref(),
+                    session.session_id.is_some(),
+                    session.unresolved.len(),
+                )? {
+                    println!("Cancelled. No per-run spending allowance was created.");
+                    return Ok(());
+                }
+                return mining::run_with_session_confirmation(&store, args, true).await;
+            }
+        }
+        return mining::run_with_session_confirmation(&store, args, false).await;
+    }
     if args.new_session {
         if args.compute_only || parse_inj_wei(&config.per_session_spending_limit_inj)?.is_zero() {
             bail!(
@@ -455,7 +557,11 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
         }
         return mining::run_with_session_confirmation(&store, args, true).await;
     }
-    if mining::unresolved_session_blocks_mining(args.compute_only, !session.unresolved.is_empty()) {
+    if mining::unresolved_session_blocks_mining(
+        args.compute_only,
+        !session.unresolved.is_empty(),
+        config.per_run_sessions_enabled(),
+    ) {
         println!("RECOVERY REQUIRED • WALLET LOCKED • mining paused");
         print_unresolved_session_blocker(
             &session,
@@ -591,14 +697,34 @@ async fn run_recover() -> Result<()> {
     }
 }
 
-fn prompt_spending_limit(current: &str) -> Result<String> {
-    println!("\nMaximum INJ allowed for mining transactions in one spending session.");
+fn prompt_spending_limit(current: &str, per_run_sessions: bool) -> Result<String> {
+    if per_run_sessions {
+        println!("\nMaximum INJ authorization ceiling for each paid mining run.");
+    } else {
+        println!("\nMaximum INJ allowed for mining transactions in one spending session.");
+    }
     println!("This covers proof submission fees and maximum gas costs.");
     println!("It is a safety limit, not an amount charged upfront.");
-    println!("A suggested starting allowance is 0.5 INJ; choose your own amount.");
+    if per_run_sessions {
+        println!(
+            "The configured default ceiling is 1 INJ; choose a lower or higher amount if desired."
+        );
+    } else {
+        println!("Choose a session cap; prior authorization is never refunded.");
+    }
     println!("Enter 0 to disable paid transactions.");
-    println!("Your allowance does not reset when you restart the miner.");
-    prompt_value("Maximum INJ per session (recommended 0.5 INJ)", current)
+    if per_run_sessions {
+        println!(
+            "Each paid `astatine mine` invocation requires separate approval and gets at most one allowance."
+        );
+        println!(
+            "The actual cap may be lower after accounting for confirmed balance, reserve, and unresolved transaction liabilities."
+        );
+        prompt_value("Maximum INJ per run", current)
+    } else {
+        println!("Your allowance does not reset when you restart the miner.");
+        prompt_value("Maximum INJ per session", current)
+    }
 }
 
 fn requires_new_paid_session(
@@ -736,6 +862,48 @@ fn prompt_new_session_confirmation(
     }
     prompt_yes_no(
         &format!("Start a new spending session with {proposed_limit} INJ?"),
+        false,
+    )
+}
+
+fn prompt_per_run_session_confirmation(
+    previous_limit: &str,
+    requested_ceiling: &str,
+    previous_authorization_wei: Option<&str>,
+    has_previous_session: bool,
+    unresolved_count: usize,
+) -> Result<bool> {
+    let previous_used = previous_authorization_wei
+        .map(|value| {
+            U256::from_str_radix(value, 10)
+                .context("previous session authorization counter is invalid")
+        })
+        .transpose()?
+        .unwrap_or(U256::ZERO);
+    if has_previous_session {
+        println!(
+            "The prior run had a ceiling of {previous_limit} INJ and permanently authorized up to {} INJ.",
+            format_token_units(previous_used, 18)
+        );
+    } else {
+        println!("No prior per-run session is open. Configured ceiling: {previous_limit} INJ.");
+    }
+    println!(
+        "This `astatine mine` invocation requests a fresh allowance up to {requested_ceiling} INJ."
+    );
+    println!(
+        "The startup cap is reduced by confirmed balance, the minimum reserve, and unresolved maximum exposure."
+    );
+    println!(
+        "Prior authorization is never refunded; old unresolved transactions are only reconciled and never resent."
+    );
+    if unresolved_count > 0 {
+        println!(
+            "{unresolved_count} unresolved transaction(s) will keep their liability reserved while mining observes and recovers them."
+        );
+    }
+    prompt_yes_no(
+        &format!("Create one fresh allowance for this run, up to {requested_ceiling} INJ?"),
         false,
     )
 }

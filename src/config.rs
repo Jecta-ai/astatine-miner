@@ -26,6 +26,8 @@ const MAX_TRANSACTION_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024;
 const WEI_PER_INJ: u128 = 1_000_000_000_000_000_000;
 const DEFAULT_TRANSACTION_CONFIRMATIONS: u8 = 2;
 const MAX_TRANSACTION_CONFIRMATIONS: u8 = 12;
+const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
+const PER_RUN_CONFIG_SCHEMA_VERSION: u32 = 2;
 
 #[cfg(test)]
 static TEST_JOURNAL_ANCHORS: std::sync::OnceLock<
@@ -80,12 +82,12 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: PER_RUN_CONFIG_SCHEMA_VERSION,
             network: Network::Testnet,
             wallet_address: None,
             cpu_threads: conservative_thread_budget(),
             minimum_reserve_inj: "0.1".to_owned(),
-            per_session_spending_limit_inj: "0".to_owned(),
+            per_session_spending_limit_inj: "1".to_owned(),
             testnet_rpc: None,
             mainnet_rpc: None,
             transaction_confirmations: DEFAULT_TRANSACTION_CONFIRMATIONS,
@@ -95,7 +97,10 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 1 {
+        if !matches!(
+            self.schema_version,
+            LEGACY_CONFIG_SCHEMA_VERSION | PER_RUN_CONFIG_SCHEMA_VERSION
+        ) {
             bail!(
                 "unsupported configuration schema version {}",
                 self.schema_version
@@ -137,6 +142,10 @@ impl AppConfig {
             Network::Testnet => self.testnet_rpc = rpc,
             Network::Mainnet => self.mainnet_rpc = rpc,
         }
+    }
+
+    pub fn per_run_sessions_enabled(&self) -> bool {
+        self.schema_version >= PER_RUN_CONFIG_SCHEMA_VERSION
     }
 }
 
@@ -1027,6 +1036,9 @@ mod tests {
     fn confirmation_threshold_defaults_and_is_bounded() {
         let config = AppConfig::default();
         assert_eq!(config.transaction_confirmations, 2);
+        assert_eq!(config.schema_version, 2);
+        assert_eq!(config.per_session_spending_limit_inj, "1");
+        assert!(config.per_run_sessions_enabled());
         assert!(config.validate().is_ok());
         let invalid = AppConfig {
             transaction_confirmations: 13,
@@ -1049,6 +1061,7 @@ transaction_confirmations = 2
 "#,
         )
         .unwrap();
+        assert!(!legacy.per_run_sessions_enabled());
         assert_eq!(legacy.rpc_override(Network::Testnet), None);
         assert_eq!(legacy.rpc_override(Network::Mainnet), None);
 

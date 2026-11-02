@@ -52,7 +52,7 @@ const REWARD_SCAN_RETRY_MAX: Duration = Duration::from_secs(30);
 const REWARD_EMPTY_SCAN_RETRY_BASE_SECS: u64 = 60;
 const REWARD_EMPTY_SCAN_RETRY_MAX_SECS: u64 = 3_600;
 const SUBMISSION_FEE_WEI: u128 = 10_000_000_000_000_000;
-pub(crate) const AUTOMATIC_REWARD_FORWARDING_DISABLED: &str = "automatic AST reward forwarding is disabled in Testnet.14 because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually from your wallet";
+pub(crate) const AUTOMATIC_REWARD_FORWARDING_DISABLED: &str = "automatic AST reward forwarding is disabled in Testnet.15 because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually from your wallet";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Eip1559Request {
@@ -85,6 +85,7 @@ pub enum TransactionPolicyRefusalKind {
     SessionLimitExceeded,
     InsufficientConfirmedBalance,
     SigningDisabled,
+    UnresolvedNonce,
 }
 
 #[derive(Debug)]
@@ -244,6 +245,7 @@ pub(crate) struct SessionJournalSnapshot {
     pub authorized_exposure_wei: Option<String>,
     pub closed: bool,
     pub has_prior_session_history: bool,
+    pub pending_exposure_wei: Option<String>,
     pub unresolved: Vec<UnresolvedTransactionSummary>,
     pub pending_transition: Option<PendingSessionTransitionSummary>,
 }
@@ -784,6 +786,7 @@ pub struct TransactionJournal {
     authenticator: JournalAuthenticator,
     _lock: File,
     history_telemetry: Arc<HistoryTelemetry>,
+    allow_unresolved_transactions: bool,
 }
 
 impl TransactionJournal {
@@ -904,6 +907,15 @@ impl TransactionJournal {
                 status: format!("{:?}", entry.status),
             })
             .collect();
+        let pending_exposure = state
+            .entries
+            .iter()
+            .filter(|entry| entry.status.is_unresolved())
+            .try_fold(U256::ZERO, |total, entry| {
+                total
+                    .checked_add(parse_decimal_wei(&entry.maximum_exposure_wei)?)
+                    .context("pending transaction exposure overflow")
+            })?;
         Ok(SessionJournalSnapshot {
             session_id: active_session.map(|session| session.id.clone()),
             wallet: Some(session_wallet),
@@ -912,6 +924,7 @@ impl TransactionJournal {
                 .and_then(|session| session.authorized_exposure_wei.clone()),
             closed: active_session.is_none_or(|session| session.closed),
             has_prior_session_history,
+            pending_exposure_wei: Some(pending_exposure.to_string()),
             unresolved,
             pending_transition: state.pending_session_transition.as_ref().map(|pending| {
                 PendingSessionTransitionSummary {
@@ -1123,11 +1136,34 @@ impl TransactionJournal {
             authenticator,
             _lock: lock,
             history_telemetry: Arc::clone(&history_telemetry),
+            allow_unresolved_transactions: config.per_run_sessions_enabled() && force_new_session,
         };
         let previous_session = journal.state.active_session.clone();
         let has_unresolved = journal.has_unresolved();
-        if force_new_session && has_unresolved {
+        if force_new_session && has_unresolved && !config.per_run_sessions_enabled() {
             bail!("cannot start a new spending session while a transaction is unresolved");
+        }
+        if force_new_session
+            && has_unresolved
+            && (journal
+                .state
+                .active_session
+                .as_ref()
+                .is_some_and(|session| {
+                    !session.wallet.is_empty()
+                        && Address::from_str(&session.wallet)
+                            .is_ok_and(|session_wallet| session_wallet != wallet)
+                })
+                || journal.state.entries.iter().any(|entry| {
+                    entry.status.is_unresolved()
+                        && !entry.wallet.is_empty()
+                        && Address::from_str(&entry.wallet)
+                            .is_ok_and(|entry_wallet| entry_wallet != wallet)
+                }))
+        {
+            bail!(
+                "cannot start a per-run session for a different wallet while an earlier wallet transaction is unresolved"
+            );
         }
         if !authorize_new_session
             && journal
@@ -1178,7 +1214,7 @@ impl TransactionJournal {
             .filter(|session| !session.closed)
         {
             let session_limit = parse_decimal_wei(&session.limit_wei)?;
-            if has_unresolved && session_limit != limit {
+            if has_unresolved && session_limit != limit && !force_new_session {
                 bail!("spending limit cannot change while transaction exposure is unresolved");
             }
             let wallet_matches = !session.wallet.is_empty()
@@ -1366,6 +1402,16 @@ impl TransactionJournal {
             })
     }
 
+    fn unresolved_nonce_conflict(&self, wallet: Address, nonce: u64) -> bool {
+        self.state.entries.iter().any(|entry| {
+            entry.status.is_unresolved()
+                && entry.nonce == nonce
+                && (entry.wallet.is_empty()
+                    || Address::from_str(&entry.wallet)
+                        .is_ok_and(|entry_wallet| entry_wallet == wallet))
+        })
+    }
+
     fn session_authorized_total(&self) -> Result<U256> {
         let session = self
             .state
@@ -1447,7 +1493,7 @@ impl TransactionJournal {
             bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
         }
         self.archive_settled()?;
-        if self.has_unresolved() || self.state.pending_authorization.is_some() {
+        if self.state.pending_authorization.is_some() {
             bail!("an earlier transaction has unresolved broadcast status; refusing a second send");
         }
         let journal_wallet = self
@@ -1456,6 +1502,17 @@ impl TransactionJournal {
             .as_ref()
             .and_then(|session| Address::from_str(&session.wallet).ok())
             .context("active spending session has no recoverable wallet")?;
+        if self.has_unresolved() && !self.allow_unresolved_transactions {
+            bail!("an earlier transaction has unresolved broadcast status; refusing a second send");
+        }
+        if self.unresolved_nonce_conflict(journal_wallet, request.nonce) {
+            return Err(TransactionPolicyRefusal {
+                kind: TransactionPolicyRefusalKind::UnresolvedNonce,
+                details: "an unresolved transaction already owns this wallet nonce; refusing to sign a conflicting transaction"
+                    .to_owned(),
+            }
+            .into());
+        }
         if request.to != intent.contract || request.chain_id != 1439 {
             bail!("transaction request does not match the approved Testnet intent");
         }
@@ -2539,8 +2596,19 @@ impl TransactionJournal {
         Ok(entries.len())
     }
 
+    #[cfg(test)]
     fn close_session(&mut self) -> Result<()> {
         if self.has_unresolved() {
+            bail!("cannot close the spending session while a transaction is unresolved");
+        }
+        if let Some(session) = &mut self.state.active_session {
+            session.closed = true;
+        }
+        self.persist()
+    }
+
+    fn close_session_for_run(&mut self, allow_unresolved: bool) -> Result<()> {
+        if self.has_unresolved() && !allow_unresolved {
             bail!("cannot close the spending session while a transaction is unresolved");
         }
         if let Some(session) = &mut self.state.active_session {
@@ -3095,7 +3163,7 @@ impl TransactionManager {
                 )
         }) {
             self.report_warning(
-                "a legacy automatic AST forwarding intent remains in the journal; Testnet.14 will only monitor existing transfers and will not sign or broadcast new ones",
+                "a legacy automatic AST forwarding intent remains in the journal; Testnet.15 will only monitor existing transfers and will not sign or broadcast new ones",
             );
         }
         Ok(())
@@ -3199,7 +3267,15 @@ impl TransactionManager {
             .timer(HistoryDuration::ReceiptRecovery);
         for entry in self.journal.unresolved_entries() {
             let hash = entry_hash(&entry)?;
-            let known = client.transaction_known(hash).await?;
+            let known = match client.transaction_known(hash).await {
+                Ok(known) => known,
+                Err(error) => {
+                    self.report_warning(format!(
+                        "transaction {hash:#x} recovery lookup is temporarily unavailable; preserving its exposure and continuing mining observation: {error:#}"
+                    ));
+                    continue;
+                }
+            };
             let wallet = Address::from_str(&entry.wallet).unwrap_or(self.wallet);
             match (
                 client.primary_nonce(wallet, "latest").await,
@@ -4124,7 +4200,14 @@ impl TransactionManager {
     }
 
     pub fn close_session(&mut self) -> Result<()> {
-        self.journal.close_session()
+        self.journal.close_session_for_run(
+            self.journal.allow_unresolved_transactions && !self.read_only_recovery,
+        )
+    }
+
+    pub fn signing_blocked_by_unresolved(&self) -> bool {
+        self.journal.has_unresolved()
+            && (!self.journal.allow_unresolved_transactions || self.read_only_recovery)
     }
 
     pub fn budget_remaining(&self) -> Result<U256> {
@@ -4134,6 +4217,53 @@ impl TransactionManager {
         self.session_limit
             .checked_sub(self.journal.session_authorized_total()?)
             .context("cumulative session authorization exceeds the configured cap")
+    }
+
+    pub fn constrain_per_run_cap_to_balance(&mut self, confirmed_balance: U256) -> Result<U256> {
+        if !self.journal.allow_unresolved_transactions {
+            bail!(
+                "balance-based per-run cap adjustment requires a newly authorized per-run session"
+            );
+        }
+        let pending_exposure = self.journal.pending_exposure()?;
+        let available = confirmed_balance
+            .checked_sub(self.minimum_reserve)
+            .and_then(|remaining| remaining.checked_sub(pending_exposure))
+            .unwrap_or(U256::ZERO);
+        let reduced_limit = self.session_limit.min(available);
+        if reduced_limit < self.session_limit {
+            let active = self
+                .journal
+                .state
+                .active_session
+                .as_ref()
+                .context("new per-run session disappeared before its cap was finalized")?;
+            if !parse_decimal_wei(
+                active
+                    .authorized_exposure_wei
+                    .as_deref()
+                    .context("new per-run session has no authorization counter")?,
+            )?
+            .is_zero()
+                || self
+                    .journal
+                    .state
+                    .entries
+                    .iter()
+                    .any(|entry| entry.session_id == active.id)
+            {
+                bail!("cannot reduce a per-run cap after transaction authorization activity");
+            }
+            self.journal
+                .state
+                .active_session
+                .as_mut()
+                .context("new per-run session disappeared before its cap was finalized")?
+                .limit_wei = reduced_limit.to_string();
+            self.session_limit = reduced_limit;
+            self.journal.persist()?;
+        }
+        Ok(reduced_limit)
     }
 
     pub fn proof_attempted(&self, contract: Address, window_id: u64) -> bool {
@@ -4184,7 +4314,7 @@ impl TransactionManager {
             }
             .into());
         }
-        if self.journal.has_unresolved() {
+        if self.signing_blocked_by_unresolved() {
             bail!(
                 "an earlier transaction is unresolved; refusing to broadcast another transaction"
             );
@@ -4584,6 +4714,7 @@ impl TransactionManager {
         if !receipt.status {
             return Ok("transaction-reverted".to_owned());
         }
+        let evm_logs = evm_receipt_logs(receipt);
         let contract =
             Address::from_str(&entry.contract).context("journal contract address is invalid")?;
         match entry.action {
@@ -4598,7 +4729,7 @@ impl TransactionManager {
                     .proof_nonce
                     .context("proof nonce is missing from journal")?;
                 match verify_submission_events(
-                    &receipt.logs,
+                    &evm_logs,
                     contract,
                     entry_wallet,
                     entry.window_id,
@@ -4613,7 +4744,7 @@ impl TransactionManager {
             }
             TransactionAction::FinalizeWindow => {
                 let (winner, payout) = verify_finalization_events(
-                    &receipt.logs,
+                    &evm_logs,
                     contract,
                     self.ast_token,
                     entry.window_id,
@@ -4689,7 +4820,7 @@ impl TransactionManager {
                     );
                 }
                 verify_forwarding_transfer_events(
-                    &receipt.logs,
+                    &evm_logs,
                     self.ast_token,
                     self.wallet,
                     destination,
@@ -4703,6 +4834,15 @@ impl TransactionManager {
             }
         }
     }
+}
+
+fn evm_receipt_logs(receipt: &TransactionReceipt) -> Vec<RpcLog> {
+    receipt
+        .logs
+        .iter()
+        .filter(|log| !log.removed && !log.virtual_log)
+        .cloned()
+        .collect()
 }
 
 impl Drop for TransactionManager {
@@ -6397,10 +6537,10 @@ mod tests {
         SUBMISSION_FEE_WEI, TransactionAction, TransactionActivity, TransactionActivityState,
         TransactionDashboardState, TransactionEntry, TransactionIntent, TransactionJournal,
         TransactionManager, TransactionPolicyRefusalKind, TransactionStatus, encode_rlp_list,
-        entry_hash, maximum_transaction_exposure, parse_decimal_wei, reward_scan_key, rlp_bytes,
-        rlp_u64, rlp_u256, run_reward_scan_batch, sign_eip1559, transaction_policy_refusal,
-        unix_time_secs, validate_archive_ledger, validate_journal, validate_transaction_binding,
-        verify_finalization_events, verify_submission_events,
+        entry_hash, evm_receipt_logs, maximum_transaction_exposure, parse_decimal_wei,
+        reward_scan_key, rlp_bytes, rlp_u64, rlp_u256, run_reward_scan_batch, sign_eip1559,
+        transaction_policy_refusal, unix_time_secs, validate_archive_ledger, validate_journal,
+        validate_transaction_binding, verify_finalization_events, verify_submission_events,
     };
     use crate::{
         cli::{DeviceChoice, MineArgs, Network},
@@ -6490,6 +6630,40 @@ mod tests {
             value: U256::from(10_000_000_000_000_000_u128),
             data: vec![1, 2, 3, 4],
         }
+    }
+
+    #[test]
+    fn virtual_receipt_logs_are_not_available_as_evm_event_evidence() {
+        let real_log = RpcLog {
+            address: Address::with_last_byte(0x51),
+            topics: vec![B256::with_last_byte(0x52)],
+            data: Bytes::from(vec![1, 2, 3]),
+            block_number: Some(10),
+            block_hash: Some(B256::with_last_byte(0x53)),
+            transaction_hash: Some(B256::with_last_byte(0x54)),
+            transaction_index: Some(1),
+            log_index: Some(2),
+            removed: false,
+            virtual_log: false,
+        };
+        let mut virtual_log = real_log.clone();
+        virtual_log.virtual_log = true;
+        let receipt = TransactionReceipt {
+            transaction_hash: B256::with_last_byte(0x54),
+            transaction_index: 1,
+            from: Address::with_last_byte(0x55),
+            to: Some(Address::with_last_byte(0x56)),
+            status: true,
+            gas_used: U256::from(21_000),
+            cumulative_gas_used: U256::from(21_000),
+            effective_gas_price: Some(U256::from(1)),
+            transaction_type: Some(2),
+            block_number: 10,
+            block_hash: B256::with_last_byte(0x53),
+            logs: vec![real_log.clone(), virtual_log],
+        };
+
+        assert_eq!(evm_receipt_logs(&receipt), vec![real_log]);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10881,6 +11055,163 @@ mod tests {
     }
 
     #[test]
+    fn per_run_session_preserves_old_liability_and_rejects_nonce_collisions() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let wallet = Address::with_last_byte(0x99);
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let old_request = test_request();
+        let old_hash = sign_eip1559(&test_signer(), &old_request).unwrap().hash;
+        let old_exposure = maximum_transaction_exposure(&old_request).unwrap();
+        let old_session_id;
+        {
+            let mut old_run = TransactionJournal::open(&store, &config, wallet).unwrap();
+            old_run
+                .prepare(prepared_test_transaction(
+                    &old_request,
+                    old_hash,
+                    parse_inj_wei("1").unwrap(),
+                    parse_inj_wei("0.1").unwrap(),
+                    U256::MAX,
+                    Some(ProofData {
+                        nonce: 7,
+                        work_hash: B256::with_last_byte(7),
+                        header: b"old-run".to_vec(),
+                    }),
+                ))
+                .unwrap();
+            old_session_id = old_run.state.active_session.as_ref().unwrap().id.clone();
+            assert_eq!(old_run.pending_exposure().unwrap(), old_exposure);
+        }
+
+        let session_snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert_eq!(
+            session_snapshot.pending_exposure_wei.as_deref(),
+            Some(old_exposure.to_string().as_str())
+        );
+
+        let mut new_run = TransactionJournal::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            Arc::new(crate::history_telemetry::HistoryTelemetry::default()),
+            true,
+            true,
+        )
+        .unwrap();
+        let new_session = new_run.state.active_session.as_ref().unwrap();
+        assert_ne!(new_session.id, old_session_id);
+        assert!(new_run.allow_unresolved_transactions);
+        assert!(new_run.has_unresolved());
+        assert!(
+            new_run
+                .state
+                .session_history
+                .iter()
+                .any(|session| session.id == old_session_id && session.closed)
+        );
+        assert_eq!(new_run.pending_exposure().unwrap(), old_exposure);
+
+        let proof = ProofData {
+            nonce: 8,
+            work_hash: B256::with_last_byte(8),
+            header: b"new-run".to_vec(),
+        };
+        let intent = TransactionIntent {
+            contract: old_request.to,
+            node_id: 1,
+            window_id: 5,
+            action: TransactionAction::SubmitProof,
+            proof: Some(proof.clone()),
+            reward_destination: None,
+            forwarding: None,
+        };
+        let mut new_request = old_request.clone();
+        new_request.nonce = old_request.nonce + 1;
+        new_request.data = AstatineMinerRead::submitSolutionCall {
+            header: Bytes::copy_from_slice(&proof.header),
+            nonce: proof.nonce,
+        }
+        .abi_encode();
+        let new_exposure = maximum_transaction_exposure(&new_request).unwrap();
+        let reserve = parse_inj_wei("0.1").unwrap();
+        let near_balance = reserve + old_exposure + new_exposure - U256::from(1);
+        assert!(
+            new_run
+                .validate_exposure(
+                    &new_request,
+                    &intent,
+                    parse_inj_wei("1").unwrap(),
+                    reserve,
+                    near_balance,
+                )
+                .is_err(),
+            "the new run must reserve all older unresolved maximum exposure"
+        );
+        assert_eq!(
+            new_run
+                .validate_exposure(
+                    &new_request,
+                    &intent,
+                    parse_inj_wei("1").unwrap(),
+                    reserve,
+                    reserve + old_exposure + new_exposure,
+                )
+                .unwrap(),
+            new_exposure
+        );
+
+        new_request.nonce = old_request.nonce;
+        let nonce_error = new_run
+            .validate_exposure(
+                &new_request,
+                &intent,
+                parse_inj_wei("1").unwrap(),
+                reserve,
+                U256::MAX,
+            )
+            .unwrap_err();
+        assert_eq!(
+            transaction_policy_refusal(&nonce_error),
+            Some(TransactionPolicyRefusalKind::UnresolvedNonce),
+            "an unresolved prior transaction retains exclusive ownership of its nonce"
+        );
+        drop(new_run);
+
+        let mut manager = TransactionManager::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            Address::with_last_byte(0x51),
+            Arc::new(HistoryTelemetry::default()),
+            true,
+            true,
+        )
+        .unwrap();
+        let spendable = parse_inj_wei("0.05").unwrap();
+        let confirmed_balance = reserve + old_exposure + spendable;
+        assert_eq!(
+            manager
+                .constrain_per_run_cap_to_balance(confirmed_balance)
+                .unwrap(),
+            spendable
+        );
+        assert_eq!(
+            manager
+                .journal
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .limit_wei,
+            spendable.to_string()
+        );
+    }
+
+    #[test]
     fn settled_proof_attempt_guard_survives_restart() {
         let root = tempdir().unwrap();
         let store = ConfigStore::at_root(PathBuf::from(root.path()));
@@ -11416,7 +11747,11 @@ mod tests {
         let root = tempdir().unwrap();
         let store = ConfigStore::at_root(PathBuf::from(root.path()));
         let wallet = Address::with_last_byte(0x99);
-        let readonly = TransactionJournal::open(&store, &AppConfig::default(), wallet).unwrap();
+        let readonly_config = AppConfig {
+            per_session_spending_limit_inj: "0".to_owned(),
+            ..AppConfig::default()
+        };
+        let readonly = TransactionJournal::open(&store, &readonly_config, wallet).unwrap();
         assert!(readonly.state.active_session.is_none());
         assert!(!readonly.has_unresolved());
         drop(readonly);

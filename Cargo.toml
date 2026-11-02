@@ -1,6 +1,6 @@
 [package]
 name = "astatine-cli-rust"
-version = "0.1.0-testnet.14"
+version = "0.1.0-testnet.15"
 edition = "2024"
 rust-version = "1.94.1"
 description = "A native Rust CPU and GPU command-line miner for Astatine"
@@ -24,6 +24,7 @@ crossterm = "=0.28.1"
 ctr = "=0.10.1"
 pbkdf2 = "=0.13.0"
 pollster = "=0.4.0"
+qrcodegen = "=1.8.0"
 rand = "=0.8.6"
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm", "crossterm_0_28"] }
 rpassword = "=7.5.4"
@@ -40,6 +41,9 @@ tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "signal"
 toml = "=1.1.8"
 wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
 zeroize = { version = "=1.9.1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+quircs = "=0.10.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"

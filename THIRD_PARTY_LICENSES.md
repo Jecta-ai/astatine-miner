@@ -4,8 +4,8 @@ This file is generated from the dependency graph in `Cargo.lock` with cargo-abou
 
 ## License summary
 
-- Apache License 2.0: 255 crate(s)
-- MIT License: 58 crate(s)
+- Apache License 2.0: 256 crate(s)
+- MIT License: 60 crate(s)
 - ISC License: 21 crate(s)
 - Unicode License v3: 20 crate(s)
 - Creative Commons Zero v1.0 Universal: 3 crate(s)
@@ -4998,6 +4998,7 @@ Used by:
 - [log 0.4.34](https://github.com/rust-lang/log)
 - [num-bigint 0.4.8](https://github.com/rust-num/num-bigint)
 - [num-complex 0.4.6](https://github.com/rust-num/num-complex)
+- [num-derive 0.4.2](https://github.com/rust-num/num-derive)
 - [num-integer 0.1.47](https://github.com/rust-num/num-integer)
 - [num-iter 0.1.46](https://github.com/rust-num/num-iter)
 - [num-rational 0.4.2](https://github.com/rust-num/num-rational)
@@ -8871,7 +8872,7 @@ SOFTWARE.
 ### MIT License
 
 Used by:
-- [astatine-cli-rust 0.1.0-testnet.14](https://crates.io/crates/astatine-cli-rust)
+- [astatine-cli-rust 0.1.0-testnet.15](https://crates.io/crates/astatine-cli-rust)
 <pre>
 MIT License
 
@@ -8905,6 +8906,8 @@ Used by:
 - [objc2-encode 4.1.0](https://github.com/madsmtm/objc2)
 - [objc2-foundation 0.3.2](https://github.com/madsmtm/objc2)
 - [objc2 0.6.5](https://github.com/madsmtm/objc2)
+- [qrcodegen 1.8.0](https://github.com/nayuki/QR-Code-generator)
+- [quircs 0.10.3](https://github.com/dignifiedquire/quircs)
 - [ruint-macro 1.2.1](https://github.com/recmo/uint)
 - [ruint 1.21.1](https://github.com/alloy-rs/ruint)
 <pre>
