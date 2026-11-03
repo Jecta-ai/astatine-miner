@@ -226,6 +226,7 @@ pub struct DashboardModel {
     pub recovering: bool,
     pub stopping: bool,
     pub session_limit_reached: bool,
+    pub monitoring_error: Option<String>,
     pub hashrate: f64,
     pub current_action: Option<String>,
     pub connection_error: Option<String>,
@@ -1385,16 +1386,70 @@ fn render_footer(
     let (text, tint) = if model.stopping {
         ("Stopping • Ctrl+C received".to_owned(), AMBER)
     } else if model.session_limit_reached {
-        let text = if area.width >= 68 {
-            "Session limit reached • Press Ctrl+C to exit and run astatine mine again"
+        let text = if let Some(error) = model.monitoring_error.as_deref() {
+            let genesis_poll_degraded = error.contains("genesis polling");
+            let no_verified_snapshot = error.contains("no verified snapshot");
+            let snapshot_may_be_stale = error.contains("may be stale");
+            let snapshot_is_stale = error.contains("stale");
+            if genesis_poll_degraded {
+                if area.width >= 100 {
+                    "SESSION LIMIT • Genesis polling degraded; mining remains stopped • Ctrl+C • run astatine mine again".to_owned()
+                } else if area.width >= 60 {
+                    "LIMIT • Genesis polling degraded • Ctrl+C".to_owned()
+                } else if area.width >= 44 {
+                    "LIMIT • GENESIS POLL • Ctrl+C".to_owned()
+                } else if area.width >= 24 {
+                    "LIMIT • GENESIS • Ctrl+C".to_owned()
+                } else {
+                    "LIMIT • Ctrl+C".to_owned()
+                }
+            } else if no_verified_snapshot {
+                if area.width >= 100 {
+                    "SESSION LIMIT • No verified snapshot; mining remains stopped • Ctrl+C • run astatine mine again".to_owned()
+                } else if area.width >= 60 {
+                    "LIMIT • No verified snapshot • Ctrl+C".to_owned()
+                } else if area.width >= 44 {
+                    "LIMIT • NO SNAPSHOT • Ctrl+C".to_owned()
+                } else if area.width >= 24 {
+                    "LIMIT • NO SNAP • Ctrl+C".to_owned()
+                } else {
+                    "LIMIT • Ctrl+C".to_owned()
+                }
+            } else if snapshot_may_be_stale && area.width >= 100 {
+                "SESSION LIMIT • Observer RPC error; last verified block may be stale • Ctrl+C • run astatine mine again".to_owned()
+            } else if snapshot_is_stale && area.width >= 100 {
+                format!(
+                    "SESSION LIMIT • Observer unavailable; block {} stale • Ctrl+C • run astatine mine again",
+                    format_block(model.block_number)
+                )
+            } else if snapshot_may_be_stale && area.width >= 60 {
+                "LIMIT • Observer RPC error; last block may be stale • Ctrl+C".to_owned()
+            } else if snapshot_is_stale && area.width >= 60 {
+                "LIMIT • Observer unavailable; last block stale • Ctrl+C".to_owned()
+            } else if area.width >= 100 {
+                format!(
+                    "SESSION LIMIT • Read-only monitoring degraded; block {} retained • Ctrl+C • run astatine mine again",
+                    format_block(model.block_number)
+                )
+            } else if area.width >= 60 {
+                "LIMIT • Read-only monitor degraded • Ctrl+C".to_owned()
+            } else if area.width >= 44 {
+                "LIMIT • STALE MONITOR • Ctrl+C".to_owned()
+            } else if area.width >= 24 {
+                "LIMIT • MONITOR OFF • Ctrl+C".to_owned()
+            } else {
+                "LIMIT • Ctrl+C".to_owned()
+            }
+        } else if area.width >= 68 {
+            "Session limit reached • Press Ctrl+C to exit and run astatine mine again".to_owned()
         } else if area.width >= 44 {
-            "SESSION LIMIT • Ctrl+C • run astatine mine again"
+            "SESSION LIMIT • Ctrl+C • run astatine mine again".to_owned()
         } else if area.width >= 24 {
-            "LIMIT REACHED • Ctrl+C"
+            "LIMIT REACHED • Ctrl+C".to_owned()
         } else {
-            "LIMIT • Ctrl+C"
+            "LIMIT • Ctrl+C".to_owned()
         };
-        (text.to_owned(), AMBER)
+        (text, AMBER)
     } else if let Some(error) = model.critical_error.as_deref() {
         (format!("ERROR • {error}"), ERROR_RED)
     } else if let Some(error) = model.connection_error.as_deref() {
@@ -1731,6 +1786,7 @@ mod tests {
             recovering: false,
             stopping: false,
             session_limit_reached: false,
+            monitoring_error: None,
             hashrate: 184_200.0,
             current_action: None,
             connection_error: None,
@@ -1806,6 +1862,10 @@ mod tests {
             refreshed.authorization_used = Some(U256::from(10_500_000_000_000_001_u128));
             refreshed.block_number += 1;
             refreshed.connection_error = Some("transient observer refresh".to_owned());
+            refreshed.monitoring_error = Some(
+                "Read-only observer unavailable — mining remains stopped; last verified block is stale"
+                    .to_owned(),
+            );
             refreshed.hashrate = 987_654.0;
             *view = refreshed;
         });
@@ -1817,6 +1877,7 @@ mod tests {
 
         let view = shared.read().unwrap().clone();
         assert!(view.session_limit_reached);
+        assert!(view.monitoring_error.is_some());
         assert_eq!(view.mode(Instant::now()), "SESSION LIMIT REACHED");
         assert_eq!(view.hashrate, 0.0);
         assert_eq!(view.selected_nodes[0].status, NodeStatus::Confirming);
@@ -1850,7 +1911,57 @@ mod tests {
             assert!(text.contains("AST"), "width={width}: {text}");
             assert!(text.contains("AUTH"), "width={width}: {text}");
             assert!(text.contains("Ctrl+C"), "width={width}: {text}");
+            if width >= 60 {
+                assert!(
+                    text.to_lowercase().contains("observer unavailable")
+                        && text.to_lowercase().contains("stale"),
+                    "width={width}: {text}"
+                );
+            } else {
+                assert!(text.contains("MONITOR OFF"), "width={width}: {text}");
+            }
         }
+
+        let mut genesis_degraded = view.clone();
+        genesis_degraded.monitoring_error =
+            Some("Read-only genesis polling unavailable — mining remains stopped".to_owned());
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &genesis_degraded, None, true))
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Genesis polling degraded"), "{text}");
+        assert!(!text.contains("block 144,123,457 stale"), "{text}");
+
+        let mut snapshot_unavailable = view.clone();
+        snapshot_unavailable.monitoring_error = Some(
+            "Initial read-only snapshot unavailable; no verified snapshot is available; mining remains stopped"
+                .to_owned(),
+        );
+        for (width, expected) in [
+            (100, "No verified snapshot"),
+            (60, "No verified snapshot"),
+            (44, "NO SNAPSHOT"),
+            (32, "NO SNAP"),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| render_dashboard(frame, &snapshot_unavailable, None, true))
+                .unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains(expected), "width={width}: {text}");
+            assert!(text.contains("Ctrl+C"), "width={width}: {text}");
+        }
+
+        updater.update(|view| {
+            let refreshed = model(vec![node(1, NodeStatus::Mining, Some(wallet(1)))]);
+            *view = refreshed;
+        });
+        let recovered = shared.read().unwrap();
+        assert!(recovered.session_limit_reached);
+        assert!(recovered.monitoring_error.is_none());
+        assert_eq!(recovered.mode(Instant::now()), "SESSION LIMIT REACHED");
+        assert_eq!(recovered.hashrate, 0.0);
     }
 
     #[test]

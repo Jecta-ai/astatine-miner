@@ -16,7 +16,7 @@ on:
       release_tag:
         description: Testnet package version used by the nonpublishing rehearsal
         required: true
-        default: v0.1.0-testnet.14
+        default: v0.1.0-testnet.16
         type: string
 
 permissions:
@@ -277,7 +277,9 @@ jobs:
       - name: Verify local EVM tools
         run: forge --version && anvil --version
       - name: Run all local Anvil lifecycle tests
-        run: cargo test --release --locked -- --ignored --test-threads=1
+        # This Linux runner is headless; the ignored GPU worker-loop test is
+        # exercised separately on physical hardware when an adapter is available.
+        run: cargo test --release --locked -- --ignored --test-threads=1 --skip mining::tests::initialized_gpu_worker_loop_observes_terminal_stop_flag
 
   build-release-package:
     name: Build unsigned Testnet release packages

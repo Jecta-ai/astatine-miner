@@ -5472,6 +5472,10 @@ async fn run_reward_scan_batch(
 ) -> Result<RewardScanBatchOutput> {
     let telemetry = client.history_telemetry();
     let _reconciliation_timer = telemetry.timer(HistoryDuration::RewardReconciliation);
+    #[cfg(test)]
+    if telemetry.take_reward_scan_failure_for_test() {
+        bail!("test-injected transient historical reward scan failure");
+    }
     if let Some(anchor) = previous_anchor {
         let previous_hash = B256::from_str(&anchor.block_hash)
             .context("persisted reward scan anchor hash is invalid")?;
@@ -7252,6 +7256,59 @@ mod tests {
             value: U256::from(10_000_000_000_000_000_u128),
             data: vec![1, 2, 3, 4],
         }
+    }
+
+    fn seed_unknown_finalization_liability(
+        store: &ConfigStore,
+        config: &AppConfig,
+        signer: &SigningKey,
+        contract: Address,
+    ) -> (B256, U256) {
+        let wallet = signer_address(signer);
+        let limit = parse_inj_wei(&config.per_session_spending_limit_inj).unwrap();
+        let minimum_reserve = parse_inj_wei(&config.minimum_reserve_inj).unwrap();
+        let confirmed_balance = parse_inj_wei("0.02").unwrap();
+        let request = Eip1559Request {
+            chain_id: 1439,
+            nonce: 1,
+            max_priority_fee_per_gas: U256::from(1_000_000_000_u64),
+            max_fee_per_gas: U256::from(100_000_000_000_u64),
+            gas_limit: 50_000,
+            to: contract,
+            value: U256::ZERO,
+            data: AstatineMinerRead::finalizeWindowCall {}.abi_encode(),
+        };
+        let intent = TransactionIntent {
+            contract,
+            node_id: 1,
+            window_id: 99,
+            action: TransactionAction::FinalizeWindow,
+            proof: None,
+            reward_destination: None,
+            forwarding: None,
+        };
+        let mut journal = TransactionJournal::open(store, config, wallet).unwrap();
+        let maximum_exposure = journal
+            .authorize_exposure(&request, &intent, limit, minimum_reserve, confirmed_balance)
+            .unwrap();
+        let signed = sign_eip1559(signer, &request).unwrap();
+        let hash = signed.hash;
+        journal
+            .prepare(PreparedTransaction {
+                request,
+                tx_hash: hash,
+                intent,
+                session_limit: limit,
+                minimum_reserve,
+                confirmed_balance,
+                confirmations_required: config.transaction_confirmations,
+            })
+            .unwrap();
+        journal
+            .set_broadcast_state(hash, TransactionStatus::Unknown)
+            .unwrap();
+        journal.close_session_for_run(true).unwrap();
+        (hash, maximum_exposure)
     }
 
     #[test]
@@ -15402,6 +15459,8 @@ mod tests {
         AtomicNineNodes,
         TransientPollRecovery,
         StopWhileWaiting,
+        PaidObserverStallBeforeLimit,
+        PaidObserverFatalBeforeLimit,
         AlreadyActiveAtStartup,
         ExpiredAfterActivation,
     }
@@ -15444,6 +15503,20 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
+    async fn paid_observer_stall_before_session_limit_still_stops_fail_closed() {
+        run_genesis_activation_scenario(GenesisActivationScenario::PaidObserverStallBeforeLimit)
+            .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
+    async fn paid_observer_fatal_before_session_limit_still_stops_fail_closed() {
+        run_genesis_activation_scenario(GenesisActivationScenario::PaidObserverFatalBeforeLimit)
+            .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Anvil; uses the pinned Foundry bytecode fixtures"]
     async fn autonomous_runtime_resumes_mining_when_genesis_is_active_at_startup() {
         run_genesis_activation_scenario(GenesisActivationScenario::AlreadyActiveAtStartup).await;
     }
@@ -15469,6 +15542,8 @@ mod tests {
                 | GenesisActivationScenario::SingleNodeSigning
                 | GenesisActivationScenario::TransientPollRecovery
                 | GenesisActivationScenario::StopWhileWaiting
+                | GenesisActivationScenario::PaidObserverStallBeforeLimit
+                | GenesisActivationScenario::PaidObserverFatalBeforeLimit
                 | GenesisActivationScenario::AlreadyActiveAtStartup
                 | GenesisActivationScenario::ExpiredAfterActivation => vec![1],
                 GenesisActivationScenario::ThreeNodes => vec![1, 3, 5],
@@ -15477,6 +15552,8 @@ mod tests {
             let transaction_mode = matches!(
                 scenario,
                 GenesisActivationScenario::SingleNodeSigning
+                    | GenesisActivationScenario::PaidObserverStallBeforeLimit
+                    | GenesisActivationScenario::PaidObserverFatalBeforeLimit
                     | GenesisActivationScenario::ExpiredAfterActivation
             );
             let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -15817,6 +15894,81 @@ mod tests {
             );
             assert!(probe.slots.iter().all(|slot| slot.completed_hashes() == 0));
             assert_no_journaled_transactions(&store);
+
+            if scenario == GenesisActivationScenario::PaidObserverStallBeforeLimit {
+                assert!(transaction_mode);
+                assert!(!probe.session_limit_reached.load(Ordering::Acquire));
+                let controls = &probe.observer_test_controls;
+                controls.pause_publications();
+                tokio::time::timeout(Duration::from_secs(8), async {
+                    while !controls.pause_acknowledged() {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("pre-limit test observer pauses after its last publication");
+                controls.backdate_last_publication(Duration::from_secs(46));
+                let result = tokio::time::timeout(Duration::from_secs(12), &mut runtime)
+                    .await
+                    .expect("pre-limit observer stall preserves fail-closed shutdown")
+                    .expect("pre-limit stalled runtime joins");
+                let error = result.expect_err("observer stall before terminal must stop mining");
+                assert!(format!("{error:#}").contains("read-only chain observer has not published"));
+                assert!(!probe.session_limit_reached.load(Ordering::Acquire));
+                assert!(!probe.observer_monitoring_degraded.load(Ordering::Acquire));
+                assert_no_journaled_transactions(&store);
+                assert!(
+                    TransactionJournal::inspect_session(&store, &config)
+                        .unwrap()
+                        .closed
+                );
+                return;
+            }
+
+            if scenario == GenesisActivationScenario::PaidObserverFatalBeforeLimit {
+                assert!(transaction_mode);
+                assert!(!probe.session_limit_reached.load(Ordering::Acquire));
+                let controls = &probe.observer_test_controls;
+                controls.pause_publications();
+                tokio::time::timeout(Duration::from_secs(8), async {
+                    while !controls.pause_acknowledged() {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("pre-limit observer is paused before fatal injection");
+                let mut injected_updates = probe.observer_updates.clone();
+                let _ = injected_updates.borrow_and_update();
+                controls.inject_fatal_and_stop("test-injected pre-limit observer failure".to_owned());
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        injected_updates.changed().await.unwrap();
+                        if matches!(
+                            injected_updates.borrow_and_update().clone(),
+                            ObserverUpdate::Fatal(_)
+                        ) {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("pre-limit fatal observer update is delivered");
+                let result = tokio::time::timeout(Duration::from_secs(5), &mut runtime)
+                    .await
+                    .expect("pre-limit fatal observer update still stops mining")
+                    .expect("pre-limit fatal runtime joins");
+                let error = result.expect_err("observer fatal error before terminal must stop mining");
+                assert!(format!("{error:#}").contains("read-only observer failed"));
+                assert!(!probe.session_limit_reached.load(Ordering::Acquire));
+                assert!(!probe.observer_monitoring_degraded.load(Ordering::Acquire));
+                assert_no_journaled_transactions(&store);
+                assert!(
+                    TransactionJournal::inspect_session(&store, &config)
+                        .unwrap()
+                        .closed
+                );
+                return;
+            }
 
             let mut activated_nodes = HashSet::new();
             if scenario == GenesisActivationScenario::ExpiredAfterActivation {
@@ -16758,26 +16910,12 @@ mod tests {
                 "expiry snapshots cannot increase or refund the current allowance"
             );
 
-            probe.stop_signal.request_stop();
-            let first_stop = tokio::time::timeout(Duration::from_secs(15), &mut runtime)
-                .await
-                .expect("Ctrl+C stops terminal paid mining normally")
-                .expect("terminal mining task joins");
-            assert!(first_stop.is_ok());
-            let stopped_journal: super::JournalState =
-                serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
-                    .unwrap();
-            let stopped_session = stopped_journal.active_session.as_ref().unwrap();
-            assert!(stopped_session.closed);
-            assert_eq!(stopped_session.id, old_session_id);
-            assert!(stopped_journal.entries.iter().any(|entry| {
-                entry.action == TransactionAction::SubmitProof
-                    && entry.status == TransactionStatus::MinedSuccess
-                    && entry.outcome.as_deref() == Some("candidate-updated")
-            }));
-
-            // Explicitly finalize locally so the next paid invocation can start on
-            // an active window; this is a local Anvil setup transaction only.
+            let reward_scan_errors_before = probe
+                .history_telemetry
+                .count(HistoryCounter::RewardScanErrors);
+            probe.history_telemetry.fail_next_reward_scan_for_test();
+            // Finalize only the local Anvil fixture after verifying that the
+            // terminal mining runtime did not authorize a finalization.
             send_unlocked(
                 &rpc,
                 &endpoint,
@@ -16794,6 +16932,228 @@ mod tests {
                         .state
                         .as_ref()
                         .is_some_and(|state| state.work.window_id > initial_work.window_id)
+            }));
+            let mut observer_updates = probe.observer_updates.clone();
+            let _ = observer_updates.borrow_and_update();
+            probe.observer_refresh.force_refresh();
+            let refreshed =
+                wait_for_observer_snapshot(&mut observer_updates, next_window.block.number).await;
+            assert!(refreshed.block.number >= next_window.block.number);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while probe
+                    .history_telemetry
+                    .count(HistoryCounter::RewardScanErrors)
+                    == reward_scan_errors_before
+                {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect(
+                "recoverable reward scan failure is deferred while terminal mining remains alive",
+            );
+            assert!(!runtime.is_finished());
+            let reward_failure_state: super::JournalState =
+                serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                    .unwrap();
+            let confirmed_proof = reward_failure_state
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.action == TransactionAction::SubmitProof
+                        && entry.status == TransactionStatus::MinedSuccess
+                })
+                .expect("the authorized proof remains journaled");
+            assert!(!confirmed_proof.reward_confirmed);
+            assert_eq!(confirmed_proof.reward_outcome, None);
+            assert!(
+                reward_failure_state
+                    .entries
+                    .iter()
+                    .all(|entry| entry.action != TransactionAction::ForwardReward)
+            );
+
+            let observer_controls = &probe.observer_test_controls;
+            observer_controls.pause_publications();
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while !observer_controls.pause_acknowledged() {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("test observer pauses after the last publication");
+            observer_controls.backdate_last_publication(Duration::from_secs(46));
+            tokio::time::timeout(Duration::from_secs(7), async {
+                while !probe.observer_monitoring_degraded.load(Ordering::Acquire) {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("terminal observer stall is surfaced after the 45-second timeout");
+            assert!(probe.session_limit_reached.load(Ordering::Acquire));
+            assert!(probe.worker_stop.load(Ordering::Acquire));
+            assert!(probe.proof_delivery_paused.load(Ordering::Acquire));
+            assert!(
+                !runtime.is_finished(),
+                "observer stall must not exit terminal mining"
+            );
+
+            observer_controls.resume_publications();
+            probe.observer_refresh.force_refresh();
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while probe.observer_monitoring_degraded.load(Ordering::Acquire) {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("a fresh verified snapshot clears the observer-stall diagnostic");
+
+            observer_controls.pause_publications();
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while !observer_controls.pause_acknowledged() {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("test observer pauses before injected RPC failures");
+            let mut observer_error_updates = probe.observer_updates.clone();
+            let _ = observer_error_updates.borrow_and_update();
+            observer_controls.publish_update(ObserverUpdate::RpcError {
+                message: "test-injected read-only RPC failure".to_owned(),
+                report: true,
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    observer_error_updates.changed().await.unwrap();
+                    let update = observer_error_updates.borrow_and_update().clone();
+                    if matches!(update, ObserverUpdate::RpcError { .. }) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("terminal read-only RPC failure update is observed");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !probe.observer_monitoring_degraded.load(Ordering::Acquire) {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("terminal RPC failure is handled by the mining event loop");
+            assert!(probe.observer_monitoring_degraded.load(Ordering::Acquire));
+            assert!(!runtime.is_finished());
+
+            // This probe flag is test observability only; resetting it lets the
+            // next injected observer event prove it reached the same handler.
+            probe
+                .observer_monitoring_degraded
+                .store(false, Ordering::Release);
+            observer_controls.publish_update(ObserverUpdate::GenesisPollError {
+                message: "test-injected read-only genesis poll failure".to_owned(),
+                report: true,
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    observer_error_updates.changed().await.unwrap();
+                    let update = observer_error_updates.borrow_and_update().clone();
+                    if matches!(update, ObserverUpdate::GenesisPollError { .. }) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("terminal genesis-poll failure update is observed");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !probe.observer_monitoring_degraded.load(Ordering::Acquire) {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("terminal genesis-poll error is handled by the mining event loop");
+            assert!(probe.observer_monitoring_degraded.load(Ordering::Acquire));
+            assert!(!runtime.is_finished());
+
+            observer_controls.resume_publications();
+            probe.observer_refresh.force_refresh();
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while probe.observer_monitoring_degraded.load(Ordering::Acquire) {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("a verified snapshot clears terminal RPC and genesis polling diagnostics");
+
+            let mut fatal_updates = probe.observer_updates.clone();
+            let _ = fatal_updates.borrow_and_update();
+            observer_controls.inject_fatal_and_stop("test-injected observer failure".to_owned());
+            tokio::time::timeout(Duration::from_secs(2), fatal_updates.changed())
+                .await
+                .expect("observer fatal update reaches its receiver")
+                .expect("fatal observer update channel remains observable");
+            assert!(matches!(
+                fatal_updates.borrow_and_update().clone(),
+                ObserverUpdate::Fatal(_)
+            ));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !probe.observer_monitoring_degraded.load(Ordering::Acquire) {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("fatal observer update is surfaced without ending the terminal run");
+            assert!(
+                !runtime.is_finished(),
+                "observer fatal update must not exit terminal mining"
+            );
+            let state_after_observer_failure: super::JournalState =
+                serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(
+                parse_decimal_wei(
+                    state_after_observer_failure
+                        .active_session
+                        .as_ref()
+                        .unwrap()
+                        .authorized_exposure_wei
+                        .as_deref()
+                        .unwrap()
+                )
+                .unwrap(),
+                authorization_at_latch,
+                "observer failure cannot refund or increase authorization"
+            );
+            assert_eq!(
+                state_after_observer_failure
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.action == TransactionAction::SubmitProof)
+                    .count(),
+                1,
+                "observer failure cannot sign another proof"
+            );
+            assert!(
+                state_after_observer_failure
+                    .entries
+                    .iter()
+                    .all(|entry| entry.action != TransactionAction::FinalizeWindow)
+            );
+
+            probe.stop_signal.request_stop();
+            let first_stop = tokio::time::timeout(Duration::from_secs(15), &mut runtime)
+                .await
+                .expect("Ctrl+C stops terminal paid mining normally")
+                .expect("terminal mining task joins");
+            assert!(first_stop.is_ok());
+            let stopped_journal: super::JournalState =
+                serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                    .unwrap();
+            let stopped_session = stopped_journal.active_session.as_ref().unwrap();
+            assert!(stopped_session.closed);
+            assert_eq!(stopped_session.id, old_session_id);
+            assert!(stopped_journal.entries.iter().any(|entry| {
+                entry.action == TransactionAction::SubmitProof
+                    && entry.status == TransactionStatus::MinedSuccess
+                    && entry.outcome.as_deref() == Some("candidate-updated")
             }));
 
             let second_store = store.clone();
@@ -17045,6 +17405,12 @@ mod tests {
                 ..AppConfig::default()
             };
             store.save(&config).unwrap();
+            let (unresolved_finalization_hash, unresolved_finalization_exposure) =
+                seed_unknown_finalization_liability(&store, &config, &signer, miner);
+            assert_eq!(
+                unresolved_finalization_exposure,
+                parse_inj_wei("0.005").unwrap()
+            );
             let args = MineArgs {
                 device: test_device,
                 compute_only: false,
@@ -17141,11 +17507,37 @@ mod tests {
                     .count(),
                 1
             );
-            assert!(
+            let unresolved_finalization = state
+                .entries
+                .iter()
+                .find(|entry| entry_hash(entry).ok() == Some(unresolved_finalization_hash))
+                .expect("prior unresolved finalization remains journaled");
+            assert_eq!(unresolved_finalization.status, TransactionStatus::Unknown);
+            assert_eq!(
+                unresolved_finalization.maximum_exposure_wei,
+                unresolved_finalization_exposure.to_string()
+            );
+            assert_ne!(unresolved_finalization.session_id, session.id);
+            let submitted_proof = state
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.action == TransactionAction::SubmitProof
+                        && entry.status == TransactionStatus::MinedSuccess
+                })
+                .expect("the accepted proof uses the fresh session nonce");
+            assert_ne!(
+                unresolved_finalization.nonce, submitted_proof.nonce,
+                "a new run must not reuse the nonce reserved by the older unresolved transaction"
+            );
+            assert_eq!(
                 state
                     .entries
                     .iter()
-                    .all(|entry| entry.action != TransactionAction::FinalizeWindow)
+                    .filter(|entry| entry.action == TransactionAction::FinalizeWindow)
+                    .count(),
+                1,
+                "terminal run does not add another finalization authorization"
             );
 
             let mut stable_hashes = probe.slots[0].completed_hashes();
@@ -17193,12 +17585,19 @@ mod tests {
                 1,
                 "terminal state prevents another proof transaction"
             );
-            assert!(
+            assert_eq!(
                 state_after_expiry
                     .entries
                     .iter()
-                    .all(|entry| entry.action != TransactionAction::FinalizeWindow)
+                    .filter(|entry| entry.action == TransactionAction::FinalizeWindow)
+                    .count(),
+                1,
+                "expiry observation does not create a finalization authorization"
             );
+            assert!(state_after_expiry.entries.iter().any(|entry| {
+                entry_hash(entry).ok() == Some(unresolved_finalization_hash)
+                    && entry.status == TransactionStatus::Unknown
+            }));
             assert_eq!(
                 parse_decimal_wei(
                     state_after_expiry
@@ -17326,6 +17725,7 @@ mod tests {
             let mut below_fee_config = config.clone();
             below_fee_config.per_session_spending_limit_inj = "0.005".to_owned();
             store.save(&below_fee_config).unwrap();
+            let recovery_config = below_fee_config.clone();
             let below_fee_args = MineArgs {
                 device: DeviceChoice::Gpu,
                 compute_only: false,
@@ -17337,6 +17737,7 @@ mod tests {
             let below_fee_store = store.clone();
             let below_fee_network = network.clone();
             let below_fee_signer = clone_signer(&signer);
+            network.fail_next_snapshots_for_test(1);
             let (below_fee_probe_tx, below_fee_probe_rx) = tokio::sync::oneshot::channel();
             let mut below_fee_runtime = tokio::spawn(async move {
                 crate::mining::run_with_client(
@@ -17355,6 +17756,10 @@ mod tests {
                 .expect("below-fee paid invocation reaches its terminal monitor")
                 .expect("below-fee terminal probe remains connected");
             assert!(
+                below_fee_probe.initial_snapshot_unavailable,
+                "initial read-only snapshot failure does not prevent the terminal monitor from starting"
+            );
+            assert!(
                 below_fee_probe
                     .session_limit_reached
                     .load(Ordering::Acquire)
@@ -17372,10 +17777,21 @@ mod tests {
             );
             assert_eq!(below_fee_probe.slots[0].completed_hashes(), 0);
             assert!(!below_fee_runtime.is_finished());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while below_fee_probe
+                    .observer_monitoring_degraded
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("read-only observer clears initial snapshot degradation after a verified refresh");
             let below_fee_state: super::JournalState =
                 serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
                     .unwrap();
             let below_fee_session = below_fee_state.active_session.as_ref().unwrap();
+            let below_fee_session_id = below_fee_session.id.clone();
             assert_eq!(
                 parse_decimal_wei(&below_fee_session.limit_wei).unwrap(),
                 parse_inj_wei("0.005").unwrap()
@@ -17393,12 +17809,97 @@ mod tests {
                 1,
                 "below-fee startup performs no additional proof signing"
             );
-            assert!(
+            assert_eq!(
                 below_fee_state
                     .entries
                     .iter()
-                    .all(|entry| entry.action != TransactionAction::FinalizeWindow)
+                    .filter(|entry| entry.action == TransactionAction::FinalizeWindow)
+                    .count(),
+                1,
+                "below-fee startup preserves the prior unresolved finalization without authorizing another"
             );
+            assert!(below_fee_state.entries.iter().any(|entry| {
+                entry_hash(entry).ok() == Some(unresolved_finalization_hash)
+                    && entry.status == TransactionStatus::Unknown
+                    && parse_decimal_wei(&entry.maximum_exposure_wei).ok()
+                        == Some(unresolved_finalization_exposure)
+            }));
+
+            below_fee_probe
+                .observer_test_controls
+                .pause_publications();
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while !below_fee_probe
+                    .observer_test_controls
+                    .pause_acknowledged()
+                {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("below-fee observer is paused before closing its update channel");
+            let mut closed_observer_updates = below_fee_probe.observer_updates.clone();
+            let _ = closed_observer_updates.borrow_and_update();
+            below_fee_probe.observer_test_controls.close_and_stop();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if closed_observer_updates.changed().await.is_err() {
+                        break;
+                    }
+                    let _ = closed_observer_updates.borrow_and_update();
+                }
+            })
+            .await
+            .expect("closed observer channel is noticed promptly without spinning");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !below_fee_probe
+                    .observer_monitoring_degraded
+                    .load(Ordering::Acquire)
+                {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("closed observer channel is reported without leaving the terminal state");
+            let service_calls_before = below_fee_probe
+                .history_telemetry
+                .count(HistoryCounter::RewardServiceCalls);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while below_fee_probe
+                    .history_telemetry
+                    .count(HistoryCounter::RewardServiceCalls)
+                    == service_calls_before
+                {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("safe read-only reward service continues after observer closure");
+            assert!(!below_fee_runtime.is_finished());
+            let journal_after_channel_close: super::JournalState =
+                serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(
+                journal_after_channel_close
+                    .active_session
+                    .as_ref()
+                    .unwrap()
+                    .id,
+                below_fee_session_id,
+                "observer failure cannot create or rotate a spending session"
+            );
+            assert_eq!(
+                journal_after_channel_close
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.action == TransactionAction::FinalizeWindow)
+                    .count(),
+                1
+            );
+            assert!(journal_after_channel_close.entries.iter().any(|entry| {
+                entry_hash(entry).ok() == Some(unresolved_finalization_hash)
+                    && entry.status == TransactionStatus::Unknown
+            }));
             below_fee_probe.stop_signal.request_stop();
             let below_fee_stop =
                 tokio::time::timeout(Duration::from_secs(15), &mut below_fee_runtime)
@@ -17411,6 +17912,7 @@ mod tests {
                     .unwrap();
             let closed_below_fee_session = closed_below_fee_state.active_session.as_ref().unwrap();
             assert!(closed_below_fee_session.closed);
+            assert_eq!(closed_below_fee_session.id, below_fee_session_id);
             assert_eq!(
                 closed_below_fee_session.authorized_exposure_wei.as_deref(),
                 Some("0")
@@ -17423,6 +17925,35 @@ mod tests {
                     .count(),
                 1,
                 "below-fee startup performs no new proof signing"
+            );
+            let recovery_snapshot = network.snapshot(Some(wallet)).await.unwrap();
+            let mut read_only_recovery = TransactionManager::open_for_read_only_recovery(
+                &store,
+                &recovery_config,
+                wallet,
+                token,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .unwrap();
+            assert!(read_only_recovery.require_signing_enabled().is_err());
+            assert!(read_only_recovery.journal.has_unresolved());
+            read_only_recovery
+                .monitor_at_snapshot(&network, &recovery_snapshot.block)
+                .await
+                .unwrap();
+            assert!(read_only_recovery.journal.has_unresolved());
+            assert!(read_only_recovery.require_signing_enabled().is_err());
+            let recoverable_entry = read_only_recovery
+                .journal
+                .state
+                .entries
+                .iter()
+                .find(|entry| entry_hash(entry).ok() == Some(unresolved_finalization_hash))
+                .expect("the old maximum liability remains available for explicit recovery");
+            assert!(recoverable_entry.status.is_unresolved());
+            assert_eq!(
+                parse_decimal_wei(&recoverable_entry.maximum_exposure_wei).unwrap(),
+                unresolved_finalization_exposure
             );
         })
         .await

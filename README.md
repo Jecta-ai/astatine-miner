@@ -54,7 +54,7 @@ Add `$HOME\bin` to your user `Path`, then open a new PowerShell window and verif
 
 Paid mining checks the durable remaining session authorization against the canonical 0.01 INJ proof fee. When less than one proof fee remains, the run latches `SESSION LIMIT REACHED`: CPU/GPU workers stop, queued proofs are discarded, and no new proof or finalization transaction is signed. The comparison is strict, so exactly 0.01 INJ remaining is not treated as exhausted. The authorization counter is not reduced by a later receipt or observer snapshot.
 
-The dashboard remains open until Ctrl+C, displays the terminal state, and continues read-only chain observation and recovery of transactions that were already in flight. Starting below the proof-fee threshold skips worker initialization and signer unlocking. In per-run policy mode, a later explicit `astatine mine` invocation starts its own fresh session under the existing approved policy; the current run is never automatically refilled.
+The dashboard remains open until Ctrl+C, displays the terminal state, and continues read-only chain observation and recovery of transactions that were already in flight. If the observer stalls or fails, the miner reports monitoring degradation and marks its last verified block stale; it does not exit or start a new session automatically. Starting below the proof-fee threshold skips worker initialization and signer unlocking. In per-run policy mode, a later explicit `astatine mine` invocation starts its own fresh session under the existing approved policy; the current run is never automatically refilled.
 
 ### GPU mining
 

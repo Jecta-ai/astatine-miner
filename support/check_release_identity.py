@@ -93,6 +93,14 @@ def main() -> None:
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     require("$GITHUB_REPOSITORY" in workflow, "workflow provenance checks must bind the GitHub repository context")
     require("--repo " + LEGACY_REPOSITORY not in workflow, "workflow must not retain a stale hardcoded GitHub owner/repository")
+    package_version_match = re.search(
+        r'(?m)^version = "([^"]+)"$', (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    require(package_version_match is not None, "Cargo.toml must declare a package version")
+    require(
+        f"        default: v{package_version_match.group(1)}" in workflow,
+        "workflow-dispatch release_tag default must match the current package version",
+    )
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     require(f"raw.githubusercontent.com/{repository}/" in readme, "README installer URLs differ from the canonical release identity")
     require("support/release-repository.txt" in readme, "README provenance command must use the canonical release identity")
