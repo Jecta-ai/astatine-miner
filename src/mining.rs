@@ -527,6 +527,7 @@ struct ProofInboxReceiver {
     pending: Arc<Mutex<[Option<ProofFound>; PENDING_PROOF_CANDIDATE_CAPACITY]>>,
     wake: mpsc::Receiver<()>,
     paused: Arc<AtomicBool>,
+    pause_latched: Arc<AtomicBool>,
     sender: ProofInboxSender,
 }
 
@@ -536,6 +537,7 @@ fn proof_inbox(
 ) -> (ProofInboxSender, ProofInboxReceiver) {
     let pending = Arc::new(Mutex::new(std::array::from_fn(|_| None)));
     let paused = Arc::new(AtomicBool::new(initially_paused));
+    let pause_latched = Arc::new(AtomicBool::new(false));
     let (wake, wake_receiver) = mpsc::channel(PROOF_WAKE_CAPACITY);
     let sender = ProofInboxSender {
         pending: Arc::clone(&pending),
@@ -548,6 +550,7 @@ fn proof_inbox(
             pending,
             wake: wake_receiver,
             paused,
+            pause_latched,
             sender,
         },
     )
@@ -658,10 +661,16 @@ impl ProofInboxReceiver {
     }
 
     fn set_paused(&self, paused: bool) {
+        let paused = paused || self.pause_latched.load(Ordering::Acquire);
         let was_paused = self.paused.swap(paused, Ordering::AcqRel);
         if was_paused && !paused {
             let _ = self.sender.wake.try_send(());
         }
+    }
+
+    fn latch_paused(&self) {
+        self.pause_latched.store(true, Ordering::Release);
+        self.set_paused(true);
     }
 
     fn requeue(&self, proof: ProofFound, telemetry: &ProofPipelineTelemetry) -> bool {
@@ -858,6 +867,12 @@ pub(crate) struct MiningProbe {
     pub(crate) transaction_state: Arc<RwLock<TransactionDashboardState>>,
     #[cfg(test)]
     pub(crate) history_telemetry: Arc<crate::history_telemetry::HistoryTelemetry>,
+    #[cfg(test)]
+    pub(crate) session_limit_reached: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) worker_stop: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) proof_delivery_paused: Arc<AtomicBool>,
     #[cfg(test)]
     pub(crate) proof_processing_gate: watch::Sender<bool>,
 }
@@ -1567,6 +1582,16 @@ async fn run_runtime(
             startup.note(profile);
         }
     }
+    let initial_session_limit_reached = if transaction_mode {
+        transactions
+            .as_ref()
+            .map(TransactionManager::remaining_authorization_below_submission_fee)
+            .transpose()?
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let session_limit_reached = Arc::new(AtomicBool::new(initial_session_limit_reached));
     let signing_ready = transactions
         .as_ref()
         .is_some_and(|manager| !manager.signing_blocked_by_unresolved());
@@ -1585,7 +1610,14 @@ async fn run_runtime(
         }
     }
     let mut supplied_signer = supplied_signer;
-    let signer = if transaction_mode {
+    let signer = if initial_session_limit_reached {
+        if let Some(startup) = startup {
+            startup.note(
+                "Session limit is below the 0.01 INJ proof fee; compute workers will not start",
+            );
+        }
+        None
+    } else if transaction_mode {
         if let Some(signer) = supplied_signer.take() {
             Some(signer)
         } else if signing_ready {
@@ -1633,7 +1665,7 @@ async fn run_runtime(
     }
     let slots = Arc::new((1..=9).map(NodeSlot::new).collect::<Vec<_>>());
     let schedule = Arc::new(RwLock::new(Vec::new()));
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(initial_session_limit_reached));
     let cursor = Arc::new(AtomicUsize::new(0));
     let total_hashes = Arc::new(AtomicU64::new(0));
     let active_backend = Arc::new(RwLock::new(ActiveBackend::Cpu { threads }));
@@ -1747,12 +1779,16 @@ async fn run_runtime(
         }
     }
     let proof_delivery_paused = transaction_mode
-        && (signer.is_none()
+        && (session_limit_reached.load(Ordering::Acquire)
+            || signer.is_none()
             || transactions
                 .as_ref()
                 .is_some_and(|manager| manager.signing_blocked_by_unresolved()));
     let (proof_sender, mut proof_receiver) =
         proof_inbox(Arc::clone(&proof_attempt_guard), proof_delivery_paused);
+    if session_limit_reached.load(Ordering::Acquire) {
+        proof_receiver.latch_paused();
+    }
     let worker_context = MiningWorkerContext {
         slots: Arc::clone(&slots),
         schedule: Arc::clone(&schedule),
@@ -1763,10 +1799,14 @@ async fn run_runtime(
         telemetry: Arc::clone(&proof_telemetry),
     };
     if let Some(startup) = startup {
-        startup.begin(match args.device {
-            DeviceChoice::Cpu => "Preparing CPU mining workers",
-            DeviceChoice::Gpu => "Initializing and self-testing physical GPU",
-            DeviceChoice::Auto => "Detecting and self-testing physical GPU",
+        startup.begin(if initial_session_limit_reached {
+            "Checking terminal session authorization"
+        } else {
+            match args.device {
+                DeviceChoice::Cpu => "Preparing CPU mining workers",
+                DeviceChoice::Gpu => "Initializing and self-testing physical GPU",
+                DeviceChoice::Auto => "Detecting and self-testing physical GPU",
+            }
         });
     }
     let mut worker_guard = MiningWorkers {
@@ -1775,53 +1815,59 @@ async fn run_runtime(
         has_gpu_controller: false,
     };
     let mut backend_event_receiver = None;
-    match args.device {
-        DeviceChoice::Cpu => {
-            worker_guard.workers = start_cpu_worker_threads(threads, worker_context.clone())
-                .inspect_err(|error| {
-                    if let Some(startup) = startup {
-                        startup.fail(format!("Could not start CPU mining workers: {error:#}"));
-                    }
-                })?;
-            if let Some(startup) = startup {
-                startup.complete(format!("CPU workers ready · {threads} thread(s)"));
-            }
+    if initial_session_limit_reached {
+        stop.store(true, Ordering::Release);
+        if let Some(startup) = startup {
+            startup.complete("Session limit reached; compute workers were not started");
         }
-        DeviceChoice::Gpu | DeviceChoice::Auto => {
-            if let Some(startup) = startup {
-                startup.update("GPU initialization includes a real WGSL SHA-256d self-test");
-            }
-            let (events, receiver) = mpsc::unbounded_channel();
-            backend_event_receiver = Some(receiver);
-            let controller_context = worker_context.clone();
-            worker_guard.has_gpu_controller = true;
-            let controller = thread::Builder::new()
-                .name("astatine-gpu-controller".to_owned())
-                .spawn(move || {
-                    gpu_worker_controller(args.device, threads, controller_context, events);
-                })
-                .context("start GPU backend controller")?;
-            worker_guard.workers.push(controller);
-
-            let initial_event = tokio::select! {
-                event = receive_backend_event(&mut backend_event_receiver) => event,
-                signal = ctrl_c.as_mut() => {
-                    if let Err(error) = signal {
-                        report_mining_warning(&None, format!("Ctrl+C signal handler failed: {error}"));
-                    }
-                    stop.store(true, Ordering::Release);
-                    if let Some(startup) = startup { startup.cancel(); }
-                    let _ = worker_guard.stop_and_join();
-                    return Ok(());
+    } else {
+        match args.device {
+            DeviceChoice::Cpu => {
+                worker_guard.workers = start_cpu_worker_threads(threads, worker_context.clone())
+                    .inspect_err(|error| {
+                        if let Some(startup) = startup {
+                            startup.fail(format!("Could not start CPU mining workers: {error:#}"));
+                        }
+                    })?;
+                if let Some(startup) = startup {
+                    startup.complete(format!("CPU workers ready · {threads} thread(s)"));
                 }
-            };
-            match initial_event {
-                Some(BackendEvent::Activated(backend)) => {
-                    *active_backend
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = backend.clone();
-                    if let Some(startup) = startup {
-                        startup.complete(match &backend {
+            }
+            DeviceChoice::Gpu | DeviceChoice::Auto => {
+                if let Some(startup) = startup {
+                    startup.update("GPU initialization includes a real WGSL SHA-256d self-test");
+                }
+                let (events, receiver) = mpsc::unbounded_channel();
+                backend_event_receiver = Some(receiver);
+                let controller_context = worker_context.clone();
+                worker_guard.has_gpu_controller = true;
+                let controller = thread::Builder::new()
+                    .name("astatine-gpu-controller".to_owned())
+                    .spawn(move || {
+                        gpu_worker_controller(args.device, threads, controller_context, events);
+                    })
+                    .context("start GPU backend controller")?;
+                worker_guard.workers.push(controller);
+
+                let initial_event = tokio::select! {
+                    event = receive_backend_event(&mut backend_event_receiver) => event,
+                    signal = ctrl_c.as_mut() => {
+                        if let Err(error) = signal {
+                            report_mining_warning(&None, format!("Ctrl+C signal handler failed: {error}"));
+                        }
+                        stop.store(true, Ordering::Release);
+                        if let Some(startup) = startup { startup.cancel(); }
+                        let _ = worker_guard.stop_and_join();
+                        return Ok(());
+                    }
+                };
+                match initial_event {
+                    Some(BackendEvent::Activated(backend)) => {
+                        *active_backend
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = backend.clone();
+                        if let Some(startup) = startup {
+                            startup.complete(match &backend {
                             ActiveBackend::Cpu { threads } if args.device == DeviceChoice::Auto => {
                                 format!(
                                     "Auto selected CPU by measured throughput · {threads} thread(s)"
@@ -1837,34 +1883,35 @@ async fn run_runtime(
                                 )
                             }
                         });
+                        }
                     }
-                }
-                Some(BackendEvent::FallbackNotice(reason)) => {
-                    diagnostics.push(format!("{reason}; using CPU fallback."));
-                    *active_backend
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        ActiveBackend::Cpu { threads };
-                    if let Some(startup) = startup {
-                        startup.complete(format!("CPU fallback ready · {threads} thread(s)"));
+                    Some(BackendEvent::FallbackNotice(reason)) => {
+                        diagnostics.push(format!("{reason}; using CPU fallback."));
+                        *active_backend
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            ActiveBackend::Cpu { threads };
+                        if let Some(startup) = startup {
+                            startup.complete(format!("CPU fallback ready · {threads} thread(s)"));
+                        }
                     }
-                }
-                Some(BackendEvent::Failed(message)) => {
-                    stop.store(true, Ordering::Release);
-                    let _ = worker_guard.stop_and_join();
-                    if let Some(startup) = startup {
-                        startup.fail(message.clone());
+                    Some(BackendEvent::Failed(message)) => {
+                        stop.store(true, Ordering::Release);
+                        let _ = worker_guard.stop_and_join();
+                        if let Some(startup) = startup {
+                            startup.fail(message.clone());
+                        }
+                        bail!("{message}");
                     }
-                    bail!("{message}");
-                }
-                None => {
-                    stop.store(true, Ordering::Release);
-                    let _ = worker_guard.stop_and_join();
-                    let error = anyhow!("GPU backend stopped before initialization completed");
-                    if let Some(startup) = startup {
-                        startup.fail(format!("{error:#}"));
+                    None => {
+                        stop.store(true, Ordering::Release);
+                        let _ = worker_guard.stop_and_join();
+                        let error = anyhow!("GPU backend stopped before initialization completed");
+                        if let Some(startup) = startup {
+                            startup.fail(format!("{error:#}"));
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
                 }
             }
         }
@@ -1872,11 +1919,16 @@ async fn run_runtime(
     drop(proof_sender);
     dashboard_context
         .workers_started
-        .store(true, Ordering::Release);
-    if let Some(startup) = startup {
+        .store(!initial_session_limit_reached, Ordering::Release);
+    if let Some(startup) = startup
+        && !initial_session_limit_reached
+    {
         startup.miner_ready();
     }
-    let model = dashboard_model(&dashboard_context, &snapshot, Instant::now());
+    let mut model = dashboard_model(&dashboard_context, &snapshot, Instant::now());
+    if initial_session_limit_reached {
+        model.latch_session_limit();
+    }
     let mut dashboard =
         match Dashboard::start(model, Arc::clone(&total_hashes), diagnostics.clone()) {
             Ok(dashboard) => dashboard,
@@ -1894,11 +1946,19 @@ async fn run_runtime(
             manager.set_diagnostics(diagnostics);
         }
     }
+    let session_limit_control = transaction_mode.then(|| SessionLimitRuntimeControl {
+        session_limit_reached: Arc::clone(&session_limit_reached),
+        worker_stop: Arc::clone(&stop),
+        total_hashes: Arc::clone(&total_hashes),
+        proof_paused: Arc::clone(&proof_receiver.paused),
+        proof_pause_latched: Arc::clone(&proof_receiver.pause_latched),
+    });
     connect_transaction_dashboard(
         &mut transactions,
         &dashboard,
         Arc::clone(&transaction_state),
-    );
+        session_limit_control,
+    )?;
     let dashboard_updater = dashboard.as_ref().map(Dashboard::updater);
     refresh_dashboard(dashboard_updater.as_ref(), &dashboard_context, &snapshot);
     if !client.verification.token_verified {
@@ -1921,20 +1981,23 @@ async fn run_runtime(
         for message in diagnostics.drain() {
             eprintln!("astatine: {message}");
         }
-        if !args.compute_only && spending_limit.is_zero() {
+        if session_limit_reached.load(Ordering::Acquire) {
+            println!("SESSION LIMIT REACHED • Press Ctrl+C to exit and run astatine mine again");
+        } else if !args.compute_only && spending_limit.is_zero() {
             println!(
                 "Per-session spending limit is zero; autonomous signing is disabled. Hashing continues without submissions or finalizations."
             );
+        } else {
+            print_startup(
+                &client,
+                address,
+                &active_backend,
+                &snapshot,
+                &slots,
+                &selected,
+                changed,
+            );
         }
-        print_startup(
-            &client,
-            address,
-            &active_backend,
-            &snapshot,
-            &slots,
-            &selected,
-            changed,
-        );
     }
     let mut observer = start_read_only_observer(
         client.clone(),
@@ -1973,6 +2036,12 @@ async fn run_runtime(
             transaction_state: Arc::clone(&transaction_state),
             #[cfg(test)]
             history_telemetry: client.history_telemetry(),
+            #[cfg(test)]
+            session_limit_reached: Arc::clone(&session_limit_reached),
+            #[cfg(test)]
+            worker_stop: Arc::clone(&stop),
+            #[cfg(test)]
+            proof_delivery_paused: Arc::clone(&proof_receiver.paused),
             #[cfg(test)]
             proof_processing_gate: proof_processing_gate
                 .clone()
@@ -2090,6 +2159,15 @@ async fn run_runtime(
                                         .is_some_and(|manager| manager.signing_blocked_by_unresolved())),
                         );
                         snapshot = observer.latest_snapshot().unwrap_or(snapshot);
+                        if session_limit_reached.load(Ordering::Acquire) {
+                            proof_receiver.latch_paused();
+                            proof_receiver.discard_pending(
+                                &proof_telemetry,
+                                ProofMetric::RefusedSpendingLimit,
+                            );
+                            last_snapshot = snapshot;
+                            continue 'mining_loop;
+                        }
                         if proof_receiver.has_pending() {
                             last_snapshot = snapshot;
                             continue 'mining_loop;
@@ -2138,6 +2216,15 @@ async fn run_runtime(
                                     break;
                                 }
                             }
+                        }
+                        if session_limit_reached.load(Ordering::Acquire) {
+                            proof_receiver.latch_paused();
+                            proof_receiver.discard_pending(
+                                &proof_telemetry,
+                                ProofMetric::RefusedSpendingLimit,
+                            );
+                            last_snapshot = observer.latest_snapshot().unwrap_or(snapshot);
+                            continue 'mining_loop;
                         }
                         proof_receiver.set_paused(
                             transaction_mode
@@ -2202,7 +2289,10 @@ async fn run_runtime(
                     break;
                 }
                 let elapsed = last_progress.elapsed();
-                if dashboard.is_none() && elapsed >= PROGRESS_INTERVAL {
+                if dashboard.is_none()
+                    && !session_limit_reached.load(Ordering::Acquire)
+                    && elapsed >= PROGRESS_INTERVAL
+                {
                     print_progress(
                         &last_snapshot,
                         &slots,
@@ -2227,8 +2317,16 @@ async fn run_runtime(
                             || transactions
                                 .as_ref()
                                 .is_some_and(|manager| manager.signing_blocked_by_unresolved())
+                            || session_limit_reached.load(Ordering::Acquire)
                             || budget_exhausted),
                 );
+                if session_limit_reached.load(Ordering::Acquire) {
+                    proof_receiver.latch_paused();
+                    proof_receiver.discard_pending(
+                        &proof_telemetry,
+                        ProofMetric::RefusedSpendingLimit,
+                    );
+                }
             }
             event = receive_backend_event(&mut backend_event_receiver) => {
                 match event {
@@ -2272,11 +2370,58 @@ async fn run_runtime(
                     break;
                 };
                 proof_telemetry.record(proof.node_id, ProofMetric::MainLoopReceived);
+                if session_limit_reached.load(Ordering::Acquire) {
+                    proof_telemetry.record(proof.node_id, ProofMetric::RefusedSpendingLimit);
+                    proof_receiver.latch_paused();
+                    proof_receiver.discard_pending(
+                        &proof_telemetry,
+                        ProofMetric::RefusedSpendingLimit,
+                    );
+                    continue;
+                }
                 #[cfg(test)]
                 if let Some(gate) = proof_processing_gate_receiver.as_mut() {
                     while *gate.borrow() {
-                        if gate.changed().await.is_err() {
-                            break;
+                        tokio::select! {
+                            changed = gate.changed() => {
+                                if changed.is_err() {
+                                    break;
+                                }
+                            }
+                            _ = reward_scan_ticker.tick() => {
+                                let gate_snapshot = observer
+                                    .latest_snapshot()
+                                    .unwrap_or_else(|| last_snapshot.clone());
+                                last_snapshot = gate_snapshot.clone();
+                                if let Some(manager) = transactions.as_mut()
+                                    && let Err(error) = manager
+                                        .service_reward_reconciliation(&client, &gate_snapshot)
+                                        .await
+                                {
+                                    fatal_error = Some(error.context(
+                                        "service reward reconciliation while test proof processing is gated",
+                                    ));
+                                    break 'mining_loop;
+                                }
+                            }
+                            signal = ctrl_c.as_mut() => {
+                                if let Err(error) = signal {
+                                    report_mining_warning(
+                                        &dashboard,
+                                        format!("Ctrl+C signal handler failed: {error}"),
+                                    );
+                                }
+                                break 'mining_loop;
+                            }
+                            event = wait_for_dashboard_event(dashboard_signal.clone()) => {
+                                match event {
+                                    DashboardEventKind::StopRequested => break 'mining_loop,
+                                    DashboardEventKind::Failure(error) => {
+                                        fatal_error = Some(anyhow!("dashboard failed: {error}"));
+                                        break 'mining_loop;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2458,6 +2603,13 @@ async fn run_runtime(
                         result => break result,
                     }
                 };
+                if session_limit_reached.load(Ordering::Acquire) {
+                    proof_receiver.latch_paused();
+                    proof_receiver.discard_pending(
+                        &proof_telemetry,
+                        ProofMetric::RefusedSpendingLimit,
+                    );
+                }
                 match submission_result {
                     Ok(action) => {
                         report_mining_info(
@@ -2798,6 +2950,9 @@ async fn maybe_finalize_expired(
     last_verified_snapshot: &ReadSnapshot,
     options: FinalizationOptions<'_>,
 ) -> Result<bool> {
+    if manager.refresh_session_limit_state()? {
+        return Ok(false);
+    }
     if manager.signing_blocked_by_unresolved() {
         return Ok(false);
     }
@@ -2856,6 +3011,9 @@ async fn maybe_finalize_expired(
     }
     let mut finalized_any = false;
     for node in &snapshot.nodes {
+        if manager.refresh_session_limit_state()? {
+            return Ok(finalized_any);
+        }
         if !selected.contains(&node.id) {
             continue;
         }
@@ -4193,6 +4351,7 @@ fn dashboard_model(
             .iter()
             .any(|activity| activity.state == TransactionActivityState::Recovering),
         stopping: false,
+        session_limit_reached: false,
         hashrate: 0.0,
         current_action,
         connection_error: first_error,
@@ -4360,13 +4519,22 @@ fn mark_dashboard_nodes(
     });
 }
 
+struct SessionLimitRuntimeControl {
+    session_limit_reached: Arc<AtomicBool>,
+    worker_stop: Arc<AtomicBool>,
+    total_hashes: Arc<AtomicU64>,
+    proof_paused: Arc<AtomicBool>,
+    proof_pause_latched: Arc<AtomicBool>,
+}
+
 fn connect_transaction_dashboard(
     transactions: &mut Option<TransactionManager>,
     dashboard: &Option<Dashboard>,
     transaction_state: Arc<RwLock<TransactionDashboardState>>,
-) {
+    session_limit_control: Option<SessionLimitRuntimeControl>,
+) -> Result<()> {
     let Some(manager) = transactions.as_mut() else {
-        return;
+        return Ok(());
     };
     let updater = dashboard.as_ref().map(Dashboard::updater);
     manager.set_dashboard_sink(Arc::new(move |state| {
@@ -4377,6 +4545,35 @@ fn connect_transaction_dashboard(
             updater.update(|model| apply_transaction_state_to_model(model, &state));
         }
     }));
+    if let Some(session_limit_control) = session_limit_control {
+        let updater = dashboard.as_ref().map(Dashboard::updater);
+        manager.set_session_limit_reached_sink(Arc::new(move || {
+            let first_latch = session_limit_control
+                .session_limit_reached
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+            session_limit_control
+                .worker_stop
+                .store(true, Ordering::Release);
+            session_limit_control
+                .proof_pause_latched
+                .store(true, Ordering::Release);
+            session_limit_control
+                .proof_paused
+                .store(true, Ordering::Release);
+            session_limit_control
+                .total_hashes
+                .store(0, Ordering::Relaxed);
+            if let Some(updater) = &updater {
+                updater.update(DashboardModel::latch_session_limit);
+            } else if first_latch {
+                eprintln!(
+                    "SESSION LIMIT REACHED • Press Ctrl+C to exit and run astatine mine again"
+                );
+            }
+        }))?;
+    }
+    Ok(())
 }
 
 fn apply_transaction_state_to_model(model: &mut DashboardModel, state: &TransactionDashboardState) {
@@ -4661,10 +4858,19 @@ fn gpu_worker_controller(
     context: MiningWorkerContext,
     events: mpsc::UnboundedSender<BackendEvent>,
 ) {
+    if context.stop.load(Ordering::Acquire) {
+        return;
+    }
     let gpu_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
         let mut engine = GpuEngine::initialize()?;
+        if context.stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if selection == DeviceChoice::Auto {
             let cpu_rate = benchmark_cpu_reference(cpu_threads)?;
+            if context.stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
             let gpu_rate = engine.info().tuned_hashes_per_second;
             engine.record_cpu_comparison(cpu_rate, cpu_threads);
             if !gpu_is_meaningfully_faster(gpu_rate, cpu_rate) {
@@ -4676,6 +4882,9 @@ fn gpu_worker_controller(
                 activate_cpu_fallback(cpu_threads, context.clone(), events.clone(), reason);
                 return Ok(());
             }
+        }
+        if context.stop.load(Ordering::Acquire) {
+            return Ok(());
         }
         events
             .send(BackendEvent::Activated(ActiveBackend::Gpu(
@@ -5357,10 +5566,11 @@ mod tests {
         activate_cpu_fallback, apply_genesis_poll_error, apply_transaction_state_to_model,
         approved_session_limit, clear_genesis_poll_error, compare_snapshot_freshness,
         dashboard_model, dashboard_node_status, finalization_retry_delay,
-        gpu_is_meaningfully_faster, history_profile_enabled, inactive_genesis_nodes,
-        next_poll_delay, next_scheduled_slot, per_run_authorization_cap, process_hashed_candidate,
-        proof_inbox, reconcile_head_progress, revalidate_queued_proof, revalidate_queued_proof_at,
-        selected_nodes, should_open_transaction_manager, suggested_session_limit,
+        gpu_is_meaningfully_faster, gpu_worker_controller, gpu_worker_loop,
+        history_profile_enabled, inactive_genesis_nodes, next_poll_delay, next_scheduled_slot,
+        per_run_authorization_cap, process_hashed_candidate, proof_inbox, reconcile_head_progress,
+        revalidate_queued_proof, revalidate_queued_proof_at, selected_nodes,
+        should_open_transaction_manager, start_cpu_worker_threads, suggested_session_limit,
         take_observer_update, traced_node_status, unresolved_session_blocks_mining, update_slots,
         worker_loop,
     };
@@ -5369,7 +5579,7 @@ mod tests {
         config::ConfigStore,
         dashboard::{NodeStatus, hashes_per_second},
         deployment::DeploymentManifest,
-        gpu::GpuBatchIdentity,
+        gpu::{GpuBatchIdentity, GpuEngine},
         proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
         protocol::{WorkContext, WorkHasher, meets_target},
         rpc::{
@@ -7361,6 +7571,144 @@ mod tests {
             .unwrap();
         assert_eq!(deferred.hash, proof.hash);
         assert_eq!(telemetry.count(1, ProofMetric::QueuedCandidates), 2);
+    }
+
+    #[test]
+    fn terminal_pause_latches_and_discards_queued_proofs() {
+        let telemetry = ProofPipelineTelemetry::default();
+        let (sender, receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let proof = ProofFound {
+            node_id: 1,
+            generation: 1,
+            context: HashingContext {
+                chain_id: 1439,
+                contract: Address::with_last_byte(9),
+                window_id: 3,
+                seed: B256::with_last_byte(1),
+                miner: Address::with_last_byte(8),
+                header: Vec::new(),
+            },
+            nonce: 7,
+            hash: B256::with_last_byte(1),
+            target: U256::MAX,
+            incumbent: None,
+            batch_identity: None,
+            queued_at: Instant::now(),
+        };
+        assert!(sender.deliver(proof, &telemetry));
+        assert!(receiver.has_pending());
+
+        receiver.latch_paused();
+        assert!(receiver.paused.load(Ordering::Acquire));
+        receiver.set_paused(false);
+        assert!(
+            receiver.paused.load(Ordering::Acquire),
+            "ordinary pause updates cannot clear the terminal proof-delivery latch"
+        );
+        receiver.discard_pending(&telemetry, ProofMetric::RefusedSpendingLimit);
+        assert!(
+            receiver
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .all(Option::is_none)
+        );
+        assert_eq!(telemetry.count(1, ProofMetric::RefusedSpendingLimit), 1);
+    }
+
+    #[test]
+    fn cpu_workers_stop_when_the_paid_session_stop_flag_is_set() {
+        let manifest = DeploymentManifest::load(Network::Testnet).unwrap();
+        let slot = NodeSlot::new(1);
+        let miner = Address::with_last_byte(8);
+        let contract = Address::with_last_byte(9);
+        let mut state = eligible_state();
+        state.work.target = U256::MAX;
+        slot.set_work(
+            &manifest,
+            miner,
+            contract,
+            Some(&state),
+            &test_block(1, 100),
+        )
+        .unwrap();
+
+        let slots = Arc::new(vec![slot]);
+        let schedule = Arc::new(RwLock::new(vec![0]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let total_hashes = Arc::new(AtomicU64::new(0));
+        let telemetry = Arc::new(ProofPipelineTelemetry::default());
+        let (proofs, _receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let workers = start_cpu_worker_threads(
+            2,
+            MiningWorkerContext {
+                slots: Arc::clone(&slots),
+                schedule,
+                stop: Arc::clone(&stop),
+                cursor,
+                total_hashes: Arc::clone(&total_hashes),
+                proofs,
+                telemetry,
+            },
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while slots[0].completed_hashes() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(slots[0].completed_hashes() > 0, "CPU worker began hashing");
+        stop.store(true, Ordering::Release);
+        for worker in workers {
+            worker.join().expect("CPU worker exits after the stop flag");
+        }
+        let stopped_hashes = slots[0].completed_hashes();
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(slots[0].completed_hashes(), stopped_hashes);
+        assert_eq!(total_hashes.load(Ordering::Relaxed), stopped_hashes);
+    }
+
+    #[test]
+    fn gpu_controller_does_not_initialize_or_fallback_after_terminal_stop() {
+        let stop = Arc::new(AtomicBool::new(true));
+        let telemetry = Arc::new(ProofPipelineTelemetry::default());
+        let (proofs, _receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), true);
+        let context = MiningWorkerContext {
+            slots: Arc::new(vec![NodeSlot::new(1)]),
+            schedule: Arc::new(RwLock::new(Vec::new())),
+            stop: Arc::clone(&stop),
+            cursor: Arc::new(AtomicUsize::new(0)),
+            total_hashes: Arc::new(AtomicU64::new(0)),
+            proofs,
+            telemetry,
+        };
+        let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        gpu_worker_controller(DeviceChoice::Gpu, 1, context, events);
+        assert!(stop.load(Ordering::Acquire));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a physical GPU adapter"]
+    fn initialized_gpu_worker_loop_observes_terminal_stop_flag() {
+        let mut engine = GpuEngine::initialize().expect("physical GPU adapter is available");
+        let stop = Arc::new(AtomicBool::new(true));
+        let (proofs, _receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), true);
+        let context = MiningWorkerContext {
+            slots: Arc::new(vec![NodeSlot::new(1)]),
+            schedule: Arc::new(RwLock::new(Vec::new())),
+            stop: Arc::clone(&stop),
+            cursor: Arc::new(AtomicUsize::new(0)),
+            total_hashes: Arc::new(AtomicU64::new(0)),
+            proofs,
+            telemetry: Arc::new(ProofPipelineTelemetry::default()),
+        };
+        gpu_worker_loop(&mut engine, &context).unwrap();
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(context.total_hashes.load(Ordering::Relaxed), 0);
+        assert_eq!(context.slots[0].completed_hashes(), 0);
     }
 
     #[test]

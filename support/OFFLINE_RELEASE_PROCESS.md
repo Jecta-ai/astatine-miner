@@ -63,7 +63,7 @@ From a clean checkout at the commit to rehearse:
 ```sh
 REPOSITORY="$(tr -d '\n' < support/release-repository.txt)"
 BRANCH="main"
-RELEASE_TAG="v0.1.0-testnet.15"
+RELEASE_TAG="v0.1.0-testnet.16"
 gh workflow run ci.yml --repo "$REPOSITORY" --ref "$BRANCH" \
   -f release_rehearsal=true -f release_tag="$RELEASE_TAG"
 ```
@@ -98,7 +98,7 @@ shown by GitHub. Keep the working directory outside the repository:
 
 ```sh
 REPOSITORY="$(tr -d '\n' < support/release-repository.txt)"
-TAG="v0.1.0-testnet.15"
+TAG="v0.1.0-testnet.16"
 RUN_ID="<successful-tag-workflow-run-id>"
 SOURCE_COMMIT="<40-character-source-commit-from-that-run>"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/astatine-release.XXXXXX")"
@@ -185,7 +185,7 @@ python3 support/publish_signed_release.py \
   --source-commit "$SOURCE_COMMIT" \
   --verified-preflight-sha256 "<same SHA-256 recorded during online verification>" \
   --public-key support/release-signing-public.pem \
-  --notes-file support/release-notes-v0.1.0-testnet.15.md
+  --notes-file support/release-notes-v0.1.0-testnet.16.md
 ```
 
 The script prompts for `PUBLISH <tag> <source-commit> PREFLIGHT <report-sha256>`.
