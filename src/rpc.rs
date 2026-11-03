@@ -399,6 +399,8 @@ pub struct NetworkClient {
     genesis_poll_delay_ms: Arc<AtomicU64>,
     #[cfg(test)]
     fail_next_genesis_polls: Arc<AtomicUsize>,
+    #[cfg(test)]
+    fail_next_snapshots: Arc<AtomicUsize>,
 }
 
 #[cfg(test)]
@@ -563,6 +565,8 @@ impl NetworkClient {
             genesis_poll_delay_ms: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             fail_next_genesis_polls: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_next_snapshots: Arc::new(AtomicUsize::new(0)),
             verification: DeploymentVerification {
                 token_verified: false,
                 reference_snapshot_verified: false,
@@ -1468,6 +1472,8 @@ impl NetworkClient {
             genesis_poll_delay_ms: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             fail_next_genesis_polls: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_next_snapshots: Arc::new(AtomicUsize::new(0)),
             verification: DeploymentVerification {
                 token_verified: true,
                 reference_snapshot_verified: false,
@@ -1519,6 +1525,11 @@ impl NetworkClient {
     #[cfg(test)]
     pub(crate) fn fee_quote_delays_started(&self) -> u64 {
         self.fee_quote_delays_started.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_snapshots_for_test(&self, count: usize) {
+        self.fail_next_snapshots.fetch_add(count, Ordering::AcqRel);
     }
 
     #[cfg(test)]
@@ -1884,6 +1895,10 @@ impl NetworkClient {
     }
 
     pub async fn snapshot(&self, wallet: Option<Address>) -> Result<ReadSnapshot> {
+        #[cfg(test)]
+        if consume_counter(&self.fail_next_snapshots) {
+            bail!("test-injected read-only snapshot RPC failure");
+        }
         let (endpoints, block) = self.best_block().await?;
         let primary = endpoints
             .first()

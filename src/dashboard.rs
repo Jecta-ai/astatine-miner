@@ -57,6 +57,7 @@ pub enum NodeStatus {
     Paused,
     Ended,
     RpcError,
+    SessionLimitReached,
 }
 
 impl NodeStatus {
@@ -78,6 +79,7 @@ impl NodeStatus {
             Self::Paused => "PAUSED",
             Self::Ended => "ENDED",
             Self::RpcError => "RPC ERROR",
+            Self::SessionLimitReached => "LIMIT",
         }
     }
 
@@ -93,7 +95,8 @@ impl NodeStatus {
             | Self::FinalizationRequired
             | Self::FinalizationRetrying
             | Self::FinalizationBlocked
-            | Self::Recovering => AMBER,
+            | Self::Recovering
+            | Self::SessionLimitReached => AMBER,
             Self::RpcError => ERROR_RED,
             Self::WaitingForGenesis => GENESIS_AMBER,
             Self::Waiting | Self::Paused | Self::Ended => MUTED,
@@ -222,6 +225,8 @@ pub struct DashboardModel {
     pub signing_enabled: bool,
     pub recovering: bool,
     pub stopping: bool,
+    pub session_limit_reached: bool,
+    pub monitoring_error: Option<String>,
     pub hashrate: f64,
     pub current_action: Option<String>,
     pub connection_error: Option<String>,
@@ -232,6 +237,8 @@ impl DashboardModel {
     pub fn mode(&self, now: Instant) -> &'static str {
         if self.stopping {
             "STOPPING"
+        } else if self.session_limit_reached {
+            "SESSION LIMIT REACHED"
         } else if self.recovering {
             "RECOVERING"
         } else if self.connection_error.is_some() {
@@ -293,6 +300,35 @@ impl DashboardModel {
             "COMPUTE ONLY"
         } else {
             "LIVE MINING"
+        }
+    }
+
+    pub fn latch_session_limit(&mut self) {
+        self.session_limit_reached = true;
+        self.enforce_session_limit_state();
+    }
+
+    fn enforce_session_limit_state(&mut self) {
+        if !self.session_limit_reached {
+            return;
+        }
+        self.hashrate = 0.0;
+        self.current_action = Some(
+            "Session limit reached • Press Ctrl+C to exit and run astatine mine again".to_owned(),
+        );
+        for node in &mut self.selected_nodes {
+            if !matches!(
+                node.status,
+                NodeStatus::Signed
+                    | NodeStatus::Finalizing
+                    | NodeStatus::Confirming
+                    | NodeStatus::Syncing
+                    | NodeStatus::Recovering
+            ) {
+                node.status = NodeStatus::SessionLimitReached;
+            }
+            node.mining_deadline = None;
+            node.countdown = None;
         }
     }
 }
@@ -503,7 +539,12 @@ impl DashboardUpdater {
             .model
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let latched = model.session_limit_reached;
         update(&mut model);
+        if latched {
+            model.session_limit_reached = true;
+        }
+        model.enforce_session_limit_state();
     }
 }
 
@@ -757,7 +798,9 @@ fn draw_frame(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     snapshot.stopping |= stop_requested.load(Ordering::Acquire);
-    if let Some(hashrate) = hashrate {
+    if snapshot.session_limit_reached {
+        snapshot.hashrate = 0.0;
+    } else if let Some(hashrate) = hashrate {
         snapshot.hashrate = hashrate;
     }
     let latest_diagnostic = diagnostics.latest();
@@ -934,7 +977,7 @@ fn render_compact(
     latest_diagnostic: Option<&str>,
     colors: bool,
 ) {
-    let header_height = 7.min(area.height.saturating_sub(5));
+    let header_height = 8.min(area.height.saturating_sub(5));
     let mut lines = vec![
         Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
         version_mode_line(model, colors),
@@ -954,11 +997,14 @@ fn render_compact(
             format_mined(model.mined_rewards)
         ))),
         Line::from(Span::raw(format!(
-            "DEVICE {} {} • {} • Auth {} • RPC cost {}",
+            "AUTH / LIMIT {}",
+            format_authorization_compact(model)
+        ))),
+        Line::from(Span::raw(format!(
+            "DEVICE {} {} • {} • RPC cost {}",
             model.device_label,
             model.device_detail,
             format_hashrate(model.hashrate),
-            format_authorization(model),
             format_rpc_cost(model)
         ))),
     ];
@@ -1032,7 +1078,7 @@ fn render_narrow(
     latest_diagnostic: Option<&str>,
     colors: bool,
 ) {
-    let header_height = 4.min(area.height.saturating_sub(2));
+    let header_height = 5.min(area.height.saturating_sub(2));
     let ast_balance = model
         .ast_balance
         .map(|balance| format_units(balance, 9))
@@ -1046,29 +1092,68 @@ fn render_narrow(
     let versioned_mode = format!("v{} • {mode} • {network_code}", env!("CARGO_PKG_VERSION"));
     let mode_line = if versioned_mode.chars().count() <= usize::from(area.width) {
         versioned_mode
+    } else if mode == "SESSION LIMIT REACHED" && area.width < 27 {
+        format!("LIMIT • {network_code}")
     } else {
         format!("{mode} • {network_code}")
     };
-    let mode_span = if mode == "WAITING FOR GENESIS" {
+    let mode_span = if mode == "SESSION LIMIT REACHED" {
+        Span::styled(mode_line, style(colors, AMBER, true))
+    } else if mode == "WAITING FOR GENESIS" {
         Span::styled(mode_line, style(colors, GENESIS_AMBER, false))
     } else {
         Span::raw(mode_line)
     };
-    let balance_line = if area.width < 45 {
-        format!("AST BAL {ast_balance} AST • RPC MINED +{mined} AST")
+    let wallet_line = if area.width < 40 {
+        format!(
+            "{} · INJ {}",
+            short_address(model.wallet),
+            format_optional_inj_value(model.inj_balance)
+        )
     } else {
-        format!("AST BALANCE {ast_balance} AST • RPC MINED +{mined} AST")
-    };
-    let lines = vec![
-        Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
-        Line::from(mode_span),
-        Line::from(Span::raw(format!(
+        format!(
             "{} · {} · {}",
             model.device_label,
             short_address(model.wallet),
             format_optional_inj_value(model.inj_balance),
-        ))),
+        )
+    };
+    let balance_line = if area.width < 40 {
+        format!("AST {ast_balance} • +{mined} AST")
+    } else if area.width < 45 {
+        format!("AST BAL {ast_balance} AST • RPC MINED +{mined} AST")
+    } else {
+        format!("AST BALANCE {ast_balance} AST • RPC MINED +{mined} AST")
+    };
+    let authorization_line = if area.width < 24 {
+        if model.session_limit_reached {
+            "AUTH <0.01".to_owned()
+        } else {
+            "AUTH".to_owned()
+        }
+    } else if model.session_limit_reached && area.width < 44 {
+        "AUTH LEFT <0.01 INJ".to_owned()
+    } else if area.width < 44 {
+        match (model.authorization_used, model.session_limit) {
+            (Some(used), Some(limit)) => format!(
+                "AUTH {} / {} INJ",
+                format_units(used, 18),
+                format_units(limit, 18)
+            ),
+            _ => "AUTH --".to_owned(),
+        }
+    } else {
+        format!("AUTH / LIMIT {}", format_authorization(model))
+    };
+    let lines = vec![
+        Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
+        Line::from(mode_span),
+        Line::from(Span::raw(wallet_line)),
         Line::from(Span::raw(balance_line)),
+        Line::from(Span::styled(
+            authorization_line,
+            style(colors, AMBER, false),
+        )),
     ];
     frame.render_widget(
         Paragraph::new(lines),
@@ -1298,7 +1383,74 @@ fn render_footer(
     latest_diagnostic: Option<&str>,
     colors: bool,
 ) {
-    let (text, tint) = if let Some(error) = model.critical_error.as_deref() {
+    let (text, tint) = if model.stopping {
+        ("Stopping • Ctrl+C received".to_owned(), AMBER)
+    } else if model.session_limit_reached {
+        let text = if let Some(error) = model.monitoring_error.as_deref() {
+            let genesis_poll_degraded = error.contains("genesis polling");
+            let no_verified_snapshot = error.contains("no verified snapshot");
+            let snapshot_may_be_stale = error.contains("may be stale");
+            let snapshot_is_stale = error.contains("stale");
+            if genesis_poll_degraded {
+                if area.width >= 100 {
+                    "SESSION LIMIT • Genesis polling degraded; mining remains stopped • Ctrl+C • run astatine mine again".to_owned()
+                } else if area.width >= 60 {
+                    "LIMIT • Genesis polling degraded • Ctrl+C".to_owned()
+                } else if area.width >= 44 {
+                    "LIMIT • GENESIS POLL • Ctrl+C".to_owned()
+                } else if area.width >= 24 {
+                    "LIMIT • GENESIS • Ctrl+C".to_owned()
+                } else {
+                    "LIMIT • Ctrl+C".to_owned()
+                }
+            } else if no_verified_snapshot {
+                if area.width >= 100 {
+                    "SESSION LIMIT • No verified snapshot; mining remains stopped • Ctrl+C • run astatine mine again".to_owned()
+                } else if area.width >= 60 {
+                    "LIMIT • No verified snapshot • Ctrl+C".to_owned()
+                } else if area.width >= 44 {
+                    "LIMIT • NO SNAPSHOT • Ctrl+C".to_owned()
+                } else if area.width >= 24 {
+                    "LIMIT • NO SNAP • Ctrl+C".to_owned()
+                } else {
+                    "LIMIT • Ctrl+C".to_owned()
+                }
+            } else if snapshot_may_be_stale && area.width >= 100 {
+                "SESSION LIMIT • Observer RPC error; last verified block may be stale • Ctrl+C • run astatine mine again".to_owned()
+            } else if snapshot_is_stale && area.width >= 100 {
+                format!(
+                    "SESSION LIMIT • Observer unavailable; block {} stale • Ctrl+C • run astatine mine again",
+                    format_block(model.block_number)
+                )
+            } else if snapshot_may_be_stale && area.width >= 60 {
+                "LIMIT • Observer RPC error; last block may be stale • Ctrl+C".to_owned()
+            } else if snapshot_is_stale && area.width >= 60 {
+                "LIMIT • Observer unavailable; last block stale • Ctrl+C".to_owned()
+            } else if area.width >= 100 {
+                format!(
+                    "SESSION LIMIT • Read-only monitoring degraded; block {} retained • Ctrl+C • run astatine mine again",
+                    format_block(model.block_number)
+                )
+            } else if area.width >= 60 {
+                "LIMIT • Read-only monitor degraded • Ctrl+C".to_owned()
+            } else if area.width >= 44 {
+                "LIMIT • STALE MONITOR • Ctrl+C".to_owned()
+            } else if area.width >= 24 {
+                "LIMIT • MONITOR OFF • Ctrl+C".to_owned()
+            } else {
+                "LIMIT • Ctrl+C".to_owned()
+            }
+        } else if area.width >= 68 {
+            "Session limit reached • Press Ctrl+C to exit and run astatine mine again".to_owned()
+        } else if area.width >= 44 {
+            "SESSION LIMIT • Ctrl+C • run astatine mine again".to_owned()
+        } else if area.width >= 24 {
+            "LIMIT REACHED • Ctrl+C".to_owned()
+        } else {
+            "LIMIT • Ctrl+C".to_owned()
+        };
+        (text, AMBER)
+    } else if let Some(error) = model.critical_error.as_deref() {
         (format!("ERROR • {error}"), ERROR_RED)
     } else if let Some(error) = model.connection_error.as_deref() {
         (format!("RPC ERROR • {error}"), ERROR_RED)
@@ -1375,6 +1527,7 @@ fn version_mode_line(model: &DashboardModel, colors: bool) -> Line<'static> {
         "CONFIRMING" | "FINALIZING" => AMBER,
         "RECOVERING"
         | "STOPPING"
+        | "SESSION LIMIT REACHED"
         | "WAITING FOR CHAIN"
         | "FINALIZATION REQUIRED"
         | "RETRYING FINALIZATION" => AMBER,
@@ -1465,6 +1618,17 @@ fn format_authorization(model: &DashboardModel) -> String {
                 format_units(remaining, 18)
             )
         }
+        _ => "--".to_owned(),
+    }
+}
+
+fn format_authorization_compact(model: &DashboardModel) -> String {
+    match (model.authorization_used, model.session_limit) {
+        (Some(used), Some(limit)) => format!(
+            "{} / {} INJ",
+            format_units(used, 18),
+            format_units(limit, 18)
+        ),
         _ => "--".to_owned(),
     }
 }
@@ -1582,14 +1746,17 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        DashboardModel, DashboardNode, GENESIS_AMBER, NodeStatus, WindowCountdown, format_hashrate,
-        format_mined_value, format_optional_ast_value, format_reward, format_time_left,
-        format_units, hashes_per_second, render_dashboard,
+        DashboardModel, DashboardNode, DashboardUpdater, GENESIS_AMBER, NodeStatus,
+        WindowCountdown, format_hashrate, format_mined_value, format_optional_ast_value,
+        format_reward, format_time_left, format_units, hashes_per_second, render_dashboard,
     };
     use crate::cli::Network;
     use alloy_primitives::{Address, B256, U256};
     use ratatui::{Terminal, backend::TestBackend};
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::{Arc, RwLock},
+        time::{Duration, Instant},
+    };
 
     fn wallet(last: u8) -> Address {
         Address::with_last_byte(last)
@@ -1618,6 +1785,8 @@ mod tests {
             signing_enabled: true,
             recovering: false,
             stopping: false,
+            session_limit_reached: false,
+            monitoring_error: None,
             hashrate: 184_200.0,
             current_action: None,
             connection_error: None,
@@ -1656,6 +1825,143 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn session_limit_dashboard_latches_across_snapshot_and_transaction_updates() {
+        let initial = model(vec![
+            node(1, NodeStatus::Mining, Some(wallet(1))),
+            node(3, NodeStatus::Waiting, None),
+        ]);
+        let shared = Arc::new(RwLock::new(initial));
+        let updater = DashboardUpdater {
+            model: Arc::clone(&shared),
+        };
+        updater.update(|view| {
+            view.session_limit = Some(U256::from(20_000_000_000_000_000_u128));
+            view.authorization_used = Some(U256::from(10_500_000_000_000_001_u128));
+            view.latch_session_limit();
+        });
+        {
+            let view = shared.read().unwrap();
+            assert_eq!(view.mode(Instant::now()), "SESSION LIMIT REACHED");
+            assert_eq!(view.hashrate, 0.0);
+            assert!(
+                view.selected_nodes
+                    .iter()
+                    .all(|node| node.status == NodeStatus::SessionLimitReached)
+            );
+        }
+
+        updater.update(|view| {
+            let mut refreshed = model(vec![
+                node(1, NodeStatus::Mining, Some(wallet(2))),
+                node(3, NodeStatus::Mining, Some(wallet(1))),
+            ]);
+            refreshed.session_limit = Some(U256::from(20_000_000_000_000_000_u128));
+            refreshed.authorization_used = Some(U256::from(10_500_000_000_000_001_u128));
+            refreshed.block_number += 1;
+            refreshed.connection_error = Some("transient observer refresh".to_owned());
+            refreshed.monitoring_error = Some(
+                "Read-only observer unavailable — mining remains stopped; last verified block is stale"
+                    .to_owned(),
+            );
+            refreshed.hashrate = 987_654.0;
+            *view = refreshed;
+        });
+        updater.update(|view| {
+            view.selected_nodes[0].status = NodeStatus::Confirming;
+            view.selected_nodes[1].status = NodeStatus::Mining;
+            view.current_action = Some("Confirming transaction".to_owned());
+        });
+
+        let view = shared.read().unwrap().clone();
+        assert!(view.session_limit_reached);
+        assert!(view.monitoring_error.is_some());
+        assert_eq!(view.mode(Instant::now()), "SESSION LIMIT REACHED");
+        assert_eq!(view.hashrate, 0.0);
+        assert_eq!(view.selected_nodes[0].status, NodeStatus::Confirming);
+        assert_eq!(
+            view.selected_nodes[1].status,
+            NodeStatus::SessionLimitReached
+        );
+        assert_eq!(
+            view.inj_balance,
+            Some(U256::from(2_948_000_000_000_000_000_u128))
+        );
+        assert_eq!(view.ast_balance, Some(U256::from(39_000_000_000_000_u128)));
+        assert_eq!(
+            view.authorization_used,
+            Some(U256::from(10_500_000_000_000_001_u128)),
+            "normal snapshot replacement retains the last trustworthy authorization display"
+        );
+        assert_eq!(
+            view.session_limit,
+            Some(U256::from(20_000_000_000_000_000_u128))
+        );
+
+        for width in [100, 60, 32] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| render_dashboard(frame, &view, None, true))
+                .unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("LIMIT"), "width={width}: {text}");
+            assert!(!text.contains("● MINING"), "width={width}: {text}");
+            assert!(text.contains("AST"), "width={width}: {text}");
+            assert!(text.contains("AUTH"), "width={width}: {text}");
+            assert!(text.contains("Ctrl+C"), "width={width}: {text}");
+            if width >= 60 {
+                assert!(
+                    text.to_lowercase().contains("observer unavailable")
+                        && text.to_lowercase().contains("stale"),
+                    "width={width}: {text}"
+                );
+            } else {
+                assert!(text.contains("MONITOR OFF"), "width={width}: {text}");
+            }
+        }
+
+        let mut genesis_degraded = view.clone();
+        genesis_degraded.monitoring_error =
+            Some("Read-only genesis polling unavailable — mining remains stopped".to_owned());
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &genesis_degraded, None, true))
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Genesis polling degraded"), "{text}");
+        assert!(!text.contains("block 144,123,457 stale"), "{text}");
+
+        let mut snapshot_unavailable = view.clone();
+        snapshot_unavailable.monitoring_error = Some(
+            "Initial read-only snapshot unavailable; no verified snapshot is available; mining remains stopped"
+                .to_owned(),
+        );
+        for (width, expected) in [
+            (100, "No verified snapshot"),
+            (60, "No verified snapshot"),
+            (44, "NO SNAPSHOT"),
+            (32, "NO SNAP"),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| render_dashboard(frame, &snapshot_unavailable, None, true))
+                .unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains(expected), "width={width}: {text}");
+            assert!(text.contains("Ctrl+C"), "width={width}: {text}");
+        }
+
+        updater.update(|view| {
+            let refreshed = model(vec![node(1, NodeStatus::Mining, Some(wallet(1)))]);
+            *view = refreshed;
+        });
+        let recovered = shared.read().unwrap();
+        assert!(recovered.session_limit_reached);
+        assert!(recovered.monitoring_error.is_none());
+        assert_eq!(recovered.mode(Instant::now()), "SESSION LIMIT REACHED");
+        assert_eq!(recovered.hashrate, 0.0);
     }
 
     #[test]

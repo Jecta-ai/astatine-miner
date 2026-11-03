@@ -55,6 +55,7 @@ def main() -> None:
         "support/release-notes-v0.1.0-testnet.13.md",
         "support/release-notes-v0.1.0-testnet.14.md",
         "support/release-notes-v0.1.0-testnet.15.md",
+        "support/release-notes-v0.1.0-testnet.16.md",
         "support/release-notes-v0.1.0-testnet.9.md",
         "support/release-notes-v0.1.0-testnet.10.md",
         "support/release-notes-v0.1.0-testnet.11.md",
@@ -87,11 +88,19 @@ def main() -> None:
         and 'assert!(parse_manifest(legacy_repository.as_bytes()).is_err())' in updater,
         "updater tests must reject manifests from the old repository",
     )
-    release_notes = (ROOT / "support/release-notes-v0.1.0-testnet.15.md").read_text(encoding="utf-8")
-    require("__RELEASE_REPOSITORY__" in release_notes, "Testnet.15 release notes must receive the canonical repository during publication")
+    release_notes = (ROOT / "support/release-notes-v0.1.0-testnet.16.md").read_text(encoding="utf-8")
+    require("__RELEASE_REPOSITORY__" in release_notes, "Testnet.16 release notes must receive the canonical repository during publication")
     workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     require("$GITHUB_REPOSITORY" in workflow, "workflow provenance checks must bind the GitHub repository context")
     require("--repo " + LEGACY_REPOSITORY not in workflow, "workflow must not retain a stale hardcoded GitHub owner/repository")
+    package_version_match = re.search(
+        r'(?m)^version = "([^"]+)"$', (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    require(package_version_match is not None, "Cargo.toml must declare a package version")
+    require(
+        f"        default: v{package_version_match.group(1)}" in workflow,
+        "workflow-dispatch release_tag default must match the current package version",
+    )
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     require(f"raw.githubusercontent.com/{repository}/" in readme, "README installer URLs differ from the canonical release identity")
     require("support/release-repository.txt" in readme, "README provenance command must use the canonical release identity")

@@ -247,7 +247,7 @@ fn command() -> ClapCommand {
                         .long("send-rewards-to")
                         .value_name("ADDRESS")
                         .value_parser(parse_reward_destination)
-                        .help("Disabled in Testnet.15: RPC reward evidence cannot authorize AST transfers"),
+                        .help("Disabled since Testnet.15: RPC reward evidence cannot authorize AST transfers"),
                 ),
         )
         .subcommand(

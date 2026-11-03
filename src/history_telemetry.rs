@@ -56,6 +56,8 @@ pub(crate) enum HistoryDuration {
 pub(crate) struct HistoryTelemetry {
     counters: [AtomicU64; COUNTER_COUNT],
     durations_micros: [AtomicU64; DURATION_COUNT],
+    #[cfg(test)]
+    reward_scan_failures_for_test: AtomicU64,
 }
 
 pub(crate) struct HistoryTimer {
@@ -69,6 +71,8 @@ impl Default for HistoryTelemetry {
         Self {
             counters: std::array::from_fn(|_| AtomicU64::new(0)),
             durations_micros: std::array::from_fn(|_| AtomicU64::new(0)),
+            #[cfg(test)]
+            reward_scan_failures_for_test: AtomicU64::new(0),
         }
     }
 }
@@ -95,6 +99,25 @@ impl HistoryTelemetry {
 
     pub(crate) fn count(&self, counter: HistoryCounter) -> u64 {
         self.counters[counter as usize].load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_reward_scan_for_test(&self) {
+        self.reward_scan_failures_for_test
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_reward_scan_failure_for_test(&self) -> bool {
+        self.reward_scan_failures_for_test
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                if remaining == 0 {
+                    None
+                } else {
+                    Some(remaining - 1)
+                }
+            })
+            .is_ok()
     }
 
     fn elapsed_ms(&self, duration: HistoryDuration) -> f64 {
