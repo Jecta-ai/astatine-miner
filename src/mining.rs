@@ -7691,9 +7691,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a physical GPU adapter"]
     fn initialized_gpu_worker_loop_observes_terminal_stop_flag() {
-        let mut engine = GpuEngine::initialize().expect("physical GPU adapter is available");
+        let mut engine = match GpuEngine::initialize() {
+            Ok(engine) => engine,
+            Err(error) => {
+                eprintln!("Skipping physical GPU worker-loop regression: {error:#}");
+                return;
+            }
+        };
         let stop = Arc::new(AtomicBool::new(true));
         let (proofs, _receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), true);
         let context = MiningWorkerContext {
