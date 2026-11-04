@@ -838,9 +838,14 @@ fn render_wide(
     latest_diagnostic: Option<&str>,
     colors: bool,
 ) {
-    let top_height = 9.min(area.height.saturating_sub(7));
+    let left_width = wide_header_left_width(area.width, model);
+    let metadata_lines =
+        wide_header_metadata_lines(model, area.width.saturating_sub(left_width), colors);
+    let top_height = metadata_lines
+        .len()
+        .min(usize::from(area.height.saturating_sub(7))) as u16;
     let header_area = Rect::new(area.x, area.y, area.width, top_height);
-    render_wide_header(frame, header_area, model, colors);
+    render_wide_header(frame, header_area, model, colors, metadata_lines);
 
     let remaining_y = area.y.saturating_add(top_height);
     let footer_y = area.y.saturating_add(area.height).saturating_sub(1);
@@ -909,21 +914,17 @@ fn render_wide(
     );
 }
 
-fn render_wide_header(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel, colors: bool) {
+fn render_wide_header(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &DashboardModel,
+    colors: bool,
+    mut lines: Vec<Line<'static>>,
+) {
     if area.height == 0 {
         return;
     }
-    let title_width = format!(
-        "v{} • {}",
-        env!("CARGO_PKG_VERSION"),
-        model.mode(Instant::now())
-    )
-    .chars()
-    .count()
-    .saturating_add(1);
-    let left_width = title_width
-        .max(31)
-        .min(usize::from(area.width.saturating_sub(32))) as u16;
+    let left_width = wide_header_left_width(area.width, model);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(left_width), Constraint::Min(0)])
@@ -938,9 +939,39 @@ fn render_wide_header(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel,
         )),
     ];
     frame.render_widget(Paragraph::new(left), chunks[0]);
+    lines.truncate(usize::from(area.height));
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+}
+
+fn wide_header_left_width(area_width: u16, model: &DashboardModel) -> u16 {
+    let title_width = format!(
+        "v{} • {}",
+        env!("CARGO_PKG_VERSION"),
+        model.mode(Instant::now())
+    )
+    .chars()
+    .count()
+    .saturating_add(1);
+    title_width
+        .max(31)
+        .min(usize::from(area_width.saturating_sub(32))) as u16
+}
+
+fn wide_header_metadata_lines(
+    model: &DashboardModel,
+    width: u16,
+    colors: bool,
+) -> Vec<Line<'static>> {
     let mut lines = vec![
-        metadata_line("NETWORK", network_name(model.network), colors),
-        metadata_line("CHAIN ID", &model.chain_id.to_string(), colors),
+        metadata_line(
+            "NETWORK",
+            &format!(
+                "{} • CHAIN ID {}",
+                network_name(model.network),
+                model.chain_id
+            ),
+            colors,
+        ),
         metadata_line("WALLET", &short_address(model.wallet), colors),
         metadata_line(
             "INJ BALANCE",
@@ -953,21 +984,43 @@ fn render_wide_header(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel,
             colors,
         ),
         metadata_line("RPC MINED", &format_mined(model.mined_rewards), colors),
-        metadata_line(
-            "DEVICE",
-            &format!(
-                "{} · {} • {}",
-                model.device_label,
-                model.device_detail,
-                format_hashrate(model.hashrate)
-            ),
-            colors,
-        ),
-        metadata_line("AUTH / LIMIT", &format_authorization(model), colors),
-        metadata_line("RPC-REPORTED COST", &format_rpc_cost(model), colors),
     ];
-    lines.truncate(usize::from(area.height));
-    frame.render_widget(Paragraph::new(lines), chunks[1]);
+    let device = format!(
+        "{} · {} • {}",
+        model.device_label,
+        model.device_detail,
+        format_hashrate(model.hashrate)
+    );
+    lines.extend(wrapped_prefixed_lines(
+        &metadata_label("DEVICE"),
+        &device,
+        width,
+        colors,
+    ));
+
+    let authorization = format_authorization(model);
+    if let Some((amounts, remaining)) = authorization.split_once(" · ") {
+        lines.extend(wrapped_prefixed_lines(
+            &metadata_label("AUTH / LIMIT"),
+            amounts,
+            width,
+            colors,
+        ));
+        lines.extend(wrapped_prefixed_lines(
+            &metadata_label(""),
+            remaining,
+            width,
+            colors,
+        ));
+    } else {
+        lines.push(metadata_line("AUTH / LIMIT", &authorization, colors));
+    }
+    lines.push(metadata_line(
+        "RPC-REPORTED COST",
+        &format_rpc_cost(model),
+        colors,
+    ));
+    lines
 }
 
 fn render_compact(
@@ -977,7 +1030,6 @@ fn render_compact(
     latest_diagnostic: Option<&str>,
     colors: bool,
 ) {
-    let header_height = 8.min(area.height.saturating_sub(5));
     let mut lines = vec![
         Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
         version_mode_line(model, colors),
@@ -1000,14 +1052,18 @@ fn render_compact(
             "AUTH / LIMIT {}",
             format_authorization_compact(model)
         ))),
-        Line::from(Span::raw(format!(
-            "DEVICE {} {} • {} • RPC cost {}",
-            model.device_label,
-            model.device_detail,
-            format_hashrate(model.hashrate),
-            format_rpc_cost(model)
-        ))),
     ];
+    let device = format!(
+        "{} {} • {} • RPC cost {}",
+        model.device_label,
+        model.device_detail,
+        format_hashrate(model.hashrate),
+        format_rpc_cost(model)
+    );
+    lines.extend(wrapped_prefixed_lines(
+        "DEVICE ", &device, area.width, colors,
+    ));
+    let header_height = lines.len().min(usize::from(area.height.saturating_sub(5))) as u16;
     lines.truncate(usize::from(header_height));
     frame.render_widget(
         Paragraph::new(lines),
@@ -1078,7 +1134,6 @@ fn render_narrow(
     latest_diagnostic: Option<&str>,
     colors: bool,
 ) {
-    let header_height = 5.min(area.height.saturating_sub(2));
     let ast_balance = model
         .ast_balance
         .map(|balance| format_units(balance, 9))
@@ -1125,36 +1180,55 @@ fn render_narrow(
     } else {
         format!("AST BALANCE {ast_balance} AST • RPC MINED +{mined} AST")
     };
-    let authorization_line = if area.width < 24 {
-        if model.session_limit_reached {
-            "AUTH <0.01".to_owned()
-        } else {
-            "AUTH".to_owned()
-        }
-    } else if model.session_limit_reached && area.width < 44 {
-        "AUTH LEFT <0.01 INJ".to_owned()
-    } else if area.width < 44 {
-        match (model.authorization_used, model.session_limit) {
-            (Some(used), Some(limit)) => format!(
-                "AUTH {} / {} INJ",
-                format_units(used, 18),
-                format_units(limit, 18)
-            ),
-            _ => "AUTH --".to_owned(),
-        }
-    } else {
-        format!("AUTH / LIMIT {}", format_authorization(model))
-    };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
         Line::from(mode_span),
         Line::from(Span::raw(wallet_line)),
         Line::from(Span::raw(balance_line)),
-        Line::from(Span::styled(
-            authorization_line,
-            style(colors, AMBER, false),
-        )),
     ];
+    if area.width >= 44 {
+        let authorization = format_authorization(model);
+        if let Some((amounts, remaining)) = authorization.split_once(" · ") {
+            lines.push(Line::from(Span::styled(
+                format!("AUTH / LIMIT {amounts}"),
+                style(colors, AMBER, false),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  {remaining}"),
+                style(colors, AMBER, false),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("AUTH / LIMIT {authorization}"),
+                style(colors, AMBER, false),
+            )));
+        }
+    } else {
+        let authorization = if area.width < 24 {
+            if model.session_limit_reached {
+                "AUTH <0.01".to_owned()
+            } else {
+                "AUTH".to_owned()
+            }
+        } else if model.session_limit_reached {
+            "AUTH LEFT <0.01 INJ".to_owned()
+        } else {
+            match (model.authorization_used, model.session_limit) {
+                (Some(used), Some(limit)) => format!(
+                    "AUTH {} / {} INJ",
+                    format_units(used, 18),
+                    format_units(limit, 18)
+                ),
+                _ => "AUTH --".to_owned(),
+            }
+        };
+        lines.push(Line::from(Span::styled(
+            authorization,
+            style(colors, AMBER, false),
+        )));
+    }
+    let header_height = lines.len().min(usize::from(area.height.saturating_sub(2))) as u16;
+    lines.truncate(usize::from(header_height));
     frame.render_widget(
         Paragraph::new(lines),
         Rect::new(area.x, area.y, area.width, header_height),
@@ -1515,9 +1589,83 @@ fn render_rule(frame: &mut Frame<'_>, area: Rect, colors: bool) {
 
 fn metadata_line(label: &str, value: &str, colors: bool) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<12}"), style(colors, MUTED, false)),
+        Span::styled(metadata_label(label), style(colors, MUTED, false)),
         Span::styled(value.to_owned(), style(colors, LIGHT, false)),
     ])
+}
+
+fn metadata_label(label: &str) -> String {
+    if Span::raw(label).width() < 12 {
+        format!("{label:<12}")
+    } else {
+        format!("{label} ")
+    }
+}
+
+fn wrapped_prefixed_lines(
+    prefix: &str,
+    value: &str,
+    width: u16,
+    colors: bool,
+) -> Vec<Line<'static>> {
+    let prefix_width = Span::raw(prefix).width();
+    let value_width = usize::from(width).saturating_sub(prefix_width).max(1);
+    wrap_text(value, value_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            Line::from(vec![
+                Span::styled(
+                    if index == 0 {
+                        prefix.to_owned()
+                    } else {
+                        " ".repeat(prefix_width)
+                    },
+                    style(colors, MUTED, false),
+                ),
+                Span::styled(value, style(colors, LIGHT, false)),
+            ])
+        })
+        .collect()
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let word_width = Span::raw(word).width();
+        if word_width > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let mut chunk = String::new();
+            for character in word.chars() {
+                let mut candidate = chunk.clone();
+                candidate.push(character);
+                if !chunk.is_empty() && Span::raw(&candidate).width() > width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(character);
+            }
+            current = chunk;
+        } else if current.is_empty() {
+            current.push_str(word);
+        } else if Span::raw(&current).width() + 1 + word_width <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn version_mode_line(model: &DashboardModel, colors: bool) -> Line<'static> {
@@ -1752,7 +1900,7 @@ mod tests {
     };
     use crate::cli::Network;
     use alloy_primitives::{Address, B256, U256};
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, text::Span};
     use std::{
         sync::{Arc, RwLock},
         time::{Duration, Instant},
@@ -2011,6 +2159,54 @@ mod tests {
                     text.contains("Apple M4"),
                     "GPU model was not rendered at {width} columns: {text}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn long_cuda_device_and_authorization_details_use_clean_wrapped_rows() {
+        let mut view = model(vec![node(1, NodeStatus::Mining, None)]);
+        view.device_label = "GPU".to_owned();
+        view.device_detail = "NVIDIA GeForce RTX 3070 · CUDA Driver API 12.8 · compute capability 8.6 · 8.0 GiB · batch 262144 · WG32 · CPU verify".to_owned();
+
+        for width in [50, 70, 80, 100, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| render_dashboard(frame, &view, None, false))
+                .unwrap();
+            let rendered = buffer_text(&terminal);
+            let rows = rendered.lines().map(str::trim_end).collect::<Vec<_>>();
+            let text = rows
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if width >= 52 {
+                assert!(
+                    text.contains("NVIDIA GeForce RTX 3070"),
+                    "device name was clipped at {width} columns: {text}"
+                );
+                assert!(
+                    text.contains("CUDA Driver API 12.8")
+                        && text.contains("compute capability 8.6")
+                        && text.contains("batch 262144"),
+                    "CUDA details were clipped at {width} columns: {text}"
+                );
+            }
+            assert!(
+                rows.iter()
+                    .all(|row| Span::raw(*row).width() <= usize::from(width)),
+                "a rendered row exceeded {width} columns: {rows:?}"
+            );
+
+            if width == 50 || width >= 78 {
+                let authorization_index = rows
+                    .iter()
+                    .position(|row| row.contains("AUTH / LIMIT"))
+                    .expect("wide dashboard displays the authorization label");
+                assert!(rows[authorization_index].contains("0.052 / 0.5 INJ"));
+                assert!(!rows[authorization_index].contains("left"));
+                assert!(rows[authorization_index + 1].contains("0.448 left"));
             }
         }
     }
