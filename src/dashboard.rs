@@ -841,11 +841,35 @@ fn render_wide(
     let left_width = wide_header_left_width(area.width, model);
     let metadata_lines =
         wide_header_metadata_lines(model, area.width.saturating_sub(left_width), colors);
+    let device = format!(
+        "{} · {} • {}",
+        model.device_label,
+        model.device_detail,
+        format_hashrate(model.hashrate)
+    );
+    let device_line_budget = usize::from(area.height)
+        .saturating_sub(6 + model.selected_nodes.len() + metadata_lines.len())
+        .max(1);
+    let device_lines = wrapped_prefixed_lines(
+        &metadata_label("DEVICE"),
+        &device,
+        area.width,
+        colors,
+        Some(device_line_budget),
+    );
     let top_height = metadata_lines
         .len()
+        .saturating_add(device_lines.len())
         .min(usize::from(area.height.saturating_sub(7))) as u16;
     let header_area = Rect::new(area.x, area.y, area.width, top_height);
-    render_wide_header(frame, header_area, model, colors, metadata_lines);
+    render_wide_header(
+        frame,
+        header_area,
+        model,
+        colors,
+        metadata_lines,
+        device_lines,
+    );
 
     let remaining_y = area.y.saturating_add(top_height);
     let footer_y = area.y.saturating_add(area.height).saturating_sub(1);
@@ -921,16 +945,19 @@ fn render_wide_header(
     area: Rect,
     model: &DashboardModel,
     colors: bool,
-    mut lines: Vec<Line<'static>>,
+    mut metadata_lines: Vec<Line<'static>>,
+    mut device_lines: Vec<Line<'static>>,
 ) {
     if area.height == 0 {
         return;
     }
-    let left_width = wide_header_left_width(area.width, model);
+    let metadata_height = metadata_lines.len().min(usize::from(area.height)) as u16;
+    let metadata_area = Rect::new(area.x, area.y, area.width, metadata_height);
+    let left_width = wide_header_left_width(metadata_area.width, model);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(left_width), Constraint::Min(0)])
-        .split(area);
+        .split(metadata_area);
     let left = vec![
         Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
         version_mode_line(model, colors),
@@ -941,8 +968,18 @@ fn render_wide_header(
         )),
     ];
     frame.render_widget(Paragraph::new(left), chunks[0]);
-    lines.truncate(usize::from(area.height));
-    frame.render_widget(Paragraph::new(lines), chunks[1]);
+    metadata_lines.truncate(usize::from(metadata_height));
+    frame.render_widget(Paragraph::new(metadata_lines), chunks[1]);
+
+    let device_y = area.y.saturating_add(metadata_height);
+    let device_height = area.height.saturating_sub(metadata_height);
+    device_lines.truncate(usize::from(device_height));
+    if device_height > 0 {
+        frame.render_widget(
+            Paragraph::new(device_lines),
+            Rect::new(area.x, device_y, area.width, device_height),
+        );
+    }
 }
 
 fn wide_header_left_width(area_width: u16, model: &DashboardModel) -> u16 {
@@ -982,25 +1019,14 @@ fn wide_header_metadata_lines(
         ),
         metadata_line(
             "AST BALANCE",
-            &format_optional_ast(model.ast_balance),
+            &format!(
+                "{} · RPC MINED {}",
+                format_optional_ast(model.ast_balance),
+                format_mined(model.mined_rewards)
+            ),
             colors,
         ),
-        metadata_line("RPC MINED", &format_mined(model.mined_rewards), colors),
     ];
-    let device = format!(
-        "{} · {} • {}",
-        model.device_label,
-        model.device_detail,
-        format_hashrate(model.hashrate)
-    );
-    lines.extend(wrapped_prefixed_lines(
-        &metadata_label("DEVICE"),
-        &device,
-        width,
-        colors,
-        Some(2),
-    ));
-
     let authorization = format_authorization(model);
     if let Some((amounts, remaining)) = authorization.split_once(" · ") {
         lines.extend(wrapped_prefixed_lines(
@@ -1039,22 +1065,34 @@ fn render_compact(
     let mut lines = vec![
         Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
         version_mode_line(model, colors),
-        Line::from(Span::raw(format!(
+    ];
+    if area.width >= 56 {
+        lines.push(Line::from(Span::raw(format!(
+            "{} • Chain {} • Wallet {}",
+            network_name(model.network),
+            model.chain_id,
+            short_address(model.wallet)
+        ))));
+    } else {
+        lines.push(Line::from(Span::raw(format!(
             "{} • Chain {}",
             network_name(model.network),
             model.chain_id
-        ))),
-        Line::from(Span::raw(format!("Wallet {}", short_address(model.wallet)))),
-        Line::from(Span::raw(format!(
-            "INJ BALANCE {} • AST BALANCE {}",
-            format_optional_inj_value(model.inj_balance),
-            format_optional_ast(model.ast_balance)
-        ))),
-        Line::from(Span::raw(format!(
-            "RPC MINED {}",
-            format_mined(model.mined_rewards)
-        ))),
-    ];
+        ))));
+        lines.push(Line::from(Span::raw(format!(
+            "Wallet {}",
+            short_address(model.wallet)
+        ))));
+    }
+    lines.push(Line::from(Span::raw(format!(
+        "INJ BALANCE {} • AST BALANCE {}",
+        format_optional_inj_value(model.inj_balance),
+        format_optional_ast(model.ast_balance)
+    ))));
+    lines.push(Line::from(Span::raw(format!(
+        "RPC MINED {}",
+        format_mined(model.mined_rewards)
+    ))));
     let authorization = format_authorization(model);
     if let Some((amounts, remaining)) = authorization.split_once(" · ") {
         lines.push(Line::from(Span::raw(format!("AUTH / LIMIT {amounts}"))));
@@ -1071,12 +1109,15 @@ fn render_compact(
         format_hashrate(model.hashrate),
         format_rpc_cost(model)
     );
+    let device_line_budget = usize::from(area.height)
+        .saturating_sub(5 + model.selected_nodes.len() + lines.len())
+        .max(1);
     lines.extend(wrapped_prefixed_lines(
         "DEVICE ",
         &device,
         area.width,
         colors,
-        Some(2),
+        Some(device_line_budget),
     ));
     let header_height = lines.len().min(usize::from(area.height.saturating_sub(5))) as u16;
     lines.truncate(usize::from(header_height));
@@ -1214,12 +1255,15 @@ fn render_narrow(
             model.device_detail,
             format_hashrate(model.hashrate)
         );
+        let device_line_budget = usize::from(area.height)
+            .saturating_sub(model.selected_nodes.len() + 8)
+            .max(1);
         lines.extend(wrapped_prefixed_lines(
             "DEVICE ",
             &device,
             area.width,
             colors,
-            Some(2),
+            Some(device_line_budget),
         ));
     }
     lines.extend([
@@ -1680,10 +1724,12 @@ fn wrapped_prefixed_lines(
     {
         lines.truncate(max_lines);
         if let Some(last) = lines.last_mut() {
-            while Span::raw(last.as_str()).width() + 1 > value_width {
+            const CONTINUATION: &str = " (more; resize)";
+            let available_width = value_width.saturating_sub(Span::raw(CONTINUATION).width());
+            while Span::raw(last.as_str()).width() > available_width {
                 last.pop();
             }
-            last.push('…');
+            last.push_str(CONTINUATION);
         }
     }
     lines
@@ -2255,9 +2301,19 @@ mod tests {
                 "critical device identity was clipped at {width} columns: {text}"
             );
             assert!(
-                text.contains("CPU verification") || text.contains('…'),
-                "secondary device details must be visible or explicitly collapsed at {width} columns: {text}"
+                [
+                    "Synthetic CUDA Driver",
+                    "Capability sample",
+                    "Memory sample",
+                    "Batch sample",
+                    "Workgroup sample",
+                    "CPU verification",
+                ]
+                .into_iter()
+                .all(|detail| text.contains(detail)),
+                "complete device details were not rendered at {width} columns: {text}"
             );
+            assert!(!text.contains('…'), "device metadata was truncated: {text}");
             assert!(
                 rows.iter()
                     .all(|row| Span::raw(*row).width() <= usize::from(width)),
@@ -2290,6 +2346,8 @@ mod tests {
             .unwrap();
         let rendered = buffer_text(&terminal);
         let rows = rendered.lines().map(str::trim_end).collect::<Vec<_>>();
+        assert!(rendered.contains("more; resize"));
+        assert!(!rendered.contains('…'));
         let visible = rows
             .iter()
             .find(|row| row.contains("visible; resize"))
@@ -2303,8 +2361,8 @@ mod tests {
                 })
             })
             .count();
-        assert_eq!(visible_node_count, 4);
-        assert!(visible.contains("4/9 visible; resize"));
+        assert_eq!(visible_node_count, 5);
+        assert!(visible.contains("5/9 visible; resize"));
     }
 
     #[test]
