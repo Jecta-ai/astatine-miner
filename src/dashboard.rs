@@ -1165,10 +1165,16 @@ fn render_narrow(
             short_address(model.wallet),
             format_optional_inj_value(model.inj_balance)
         )
-    } else {
+    } else if area.width < 45 {
         format!(
             "{} · {} · {}",
             model.device_label,
+            short_address(model.wallet),
+            format_optional_inj_value(model.inj_balance),
+        )
+    } else {
+        format!(
+            "{} · {}",
             short_address(model.wallet),
             format_optional_inj_value(model.inj_balance),
         )
@@ -1183,9 +1189,22 @@ fn render_narrow(
     let mut lines = vec![
         Line::from(Span::styled("ASTATINE", style(colors, EMERALD, true))),
         Line::from(mode_span),
+    ];
+    if area.width >= 45 {
+        let device = format!(
+            "{} · {} • {}",
+            model.device_label,
+            model.device_detail,
+            format_hashrate(model.hashrate)
+        );
+        lines.extend(wrapped_prefixed_lines(
+            "DEVICE ", &device, area.width, colors,
+        ));
+    }
+    lines.extend([
         Line::from(Span::raw(wallet_line)),
         Line::from(Span::raw(balance_line)),
-    ];
+    ]);
     if area.width >= 44 {
         let authorization = format_authorization(model);
         if let Some((amounts, remaining)) = authorization.split_once(" · ") {
@@ -2154,7 +2173,7 @@ mod tests {
                 text.contains("GPU"),
                 "backend label was clipped at {width} columns: {text}"
             );
-            if width >= 52 {
+            if width >= 45 {
                 assert!(
                     text.contains("Apple M4"),
                     "GPU model was not rendered at {width} columns: {text}"
