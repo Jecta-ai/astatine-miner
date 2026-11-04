@@ -9,6 +9,7 @@ Testnet.17 adds a native NVIDIA CUDA Driver API compute backend for supported Li
 - The CUDA kernel uses precompiled PTX embedded in the executable. Mining hosts need a compatible NVIDIA driver but do not need the CUDA Toolkit, `nvcc`, NVRTC, Vulkan graphics libraries, a display server, or administrator access.
 - Every CUDA candidate is independently rehashed by the canonical Rust `WorkHasher` before it can enter the existing bounded proof pipeline. CUDA does not own transaction authorization, signing, journal, or nonce policy.
 - Existing Apple Metal, Linux Vulkan, Windows DirectX 12/Vulkan, and CPU paths are preserved.
+- Mining continues after a proof submission and permits a strictly better same-window proof after fresh canonical validation. Each additional on-chain submission costs `0.01 INJ` plus gas; a competing proof can overtake between preflight and inclusion while the fee is still spent. A temporary lead does not guarantee the final window reward.
 
 The CUDA source and pinned-container PTX reproduction instructions are included in the source tree at `src/gpu/cuda/` and `support/cuda/`. CUDA availability remains conditional on the installed driver, device compute capability, and runtime self-test. Record any Linux and Windows physical-hardware validation separately from the code; compilation and PTX assembly alone are not runtime evidence.
 

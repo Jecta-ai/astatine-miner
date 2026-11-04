@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const NODE_COUNT: usize = 9;
 
@@ -33,7 +33,7 @@ pub(crate) enum ProofMetric {
     DroppedHashMismatch,
     DroppedCurrentTarget,
     DroppedCurrentIncumbent,
-    SuppressedPriorAttempt,
+    DuplicateProofRejected,
     DeferredUnresolvedTransaction,
     RefusedSpendingLimit,
     RefusedSigningDisabled,
@@ -60,69 +60,6 @@ const METRIC_COUNT: usize = ProofMetric::GpuBatchIdentityRejected as usize + 1;
 
 struct NodeCounters {
     values: [AtomicU64; METRIC_COUNT],
-}
-
-struct NodeAttemptGuard {
-    attempted: AtomicBool,
-    through_window: AtomicU64,
-}
-
-impl NodeAttemptGuard {
-    fn new() -> Self {
-        Self {
-            attempted: AtomicBool::new(false),
-            through_window: AtomicU64::new(0),
-        }
-    }
-}
-
-pub(crate) struct ProofAttemptGuard {
-    nodes: [NodeAttemptGuard; NODE_COUNT],
-}
-
-impl Default for ProofAttemptGuard {
-    fn default() -> Self {
-        Self {
-            nodes: std::array::from_fn(|_| NodeAttemptGuard::new()),
-        }
-    }
-}
-
-impl ProofAttemptGuard {
-    pub(crate) fn record_attempt(&self, node_id: u8, window_id: u64) {
-        let Some(node) = node_id
-            .checked_sub(1)
-            .map(usize::from)
-            .filter(|node| *node < NODE_COUNT)
-        else {
-            return;
-        };
-        self.nodes[node]
-            .through_window
-            .fetch_max(window_id, Ordering::Relaxed);
-        self.nodes[node].attempted.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn suppresses(&self, node_id: u8, window_id: u64) -> bool {
-        let Some(node) = node_id
-            .checked_sub(1)
-            .map(usize::from)
-            .filter(|node| *node < NODE_COUNT)
-        else {
-            return false;
-        };
-        self.nodes[node].attempted.load(Ordering::Acquire)
-            && window_id <= self.nodes[node].through_window.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn last_attempted_window(&self, node_id: u8) -> Option<u64> {
-        let node = node_id.checked_sub(1).map(usize::from)?;
-        let node = self.nodes.get(node)?;
-        node.attempted
-            .load(Ordering::Acquire)
-            .then(|| node.through_window.load(Ordering::Relaxed))
-    }
 }
 
 impl NodeCounters {
@@ -185,7 +122,7 @@ impl ProofPipelineTelemetry {
                     counters.values[metric as usize].load(Ordering::Relaxed)
                 };
                 format!(
-                    "proof-pipeline node={:02} target_valid={} target_valid_not_new_local_best={} incumbent_rejected={} incumbent_passed={} new_local_best={} stale_worker_hash={} worker_deadline_hash_dropped={} worker_stopped_generation={} worker_stopped_deadline={} worker_hash_failures={} nonce_space_exhausted={} queued={} queue_full_coalesced={} queue_candidate_superseded={} queue_replaced_better={} queue_replaced_new_context={} queue_wake_coalesced={} receiver_closed={} received={} generation_revalidated={} generation_dropped={} no_eligible_work={} deadline_expired={} window_mismatch={} context_mismatch={} hash_mismatch={} current_target_rejected={} current_incumbent_rejected={} prior_attempt_suppressed={} unresolved_deferred={} spending_refused={} signing_disabled={} signer_identity_mismatch={} preflight_started={} preflight_rpc_failed={} preflight_stale={} preflight_policy_refused={} preflight_other_failed={} signed={} broadcast={} broadcast_unknown={} receipt_confirmed={} candidate_updated={} candidate_rejected={} dropped_on_shutdown={} gpu_batches={} gpu_candidates_cpu_verified={} gpu_hash_mismatch={} gpu_batch_identity_rejected={}",
+                    "proof-pipeline node={:02} target_valid={} target_valid_not_new_local_best={} incumbent_rejected={} incumbent_passed={} new_local_best={} stale_worker_hash={} worker_deadline_hash_dropped={} worker_stopped_generation={} worker_stopped_deadline={} worker_hash_failures={} nonce_space_exhausted={} queued={} queue_full_coalesced={} queue_candidate_superseded={} queue_replaced_better={} queue_replaced_new_context={} queue_wake_coalesced={} receiver_closed={} received={} generation_revalidated={} generation_dropped={} no_eligible_work={} deadline_expired={} window_mismatch={} context_mismatch={} hash_mismatch={} current_target_rejected={} current_incumbent_rejected={} duplicate_proof_rejected={} unresolved_deferred={} spending_refused={} signing_disabled={} signer_identity_mismatch={} preflight_started={} preflight_rpc_failed={} preflight_stale={} preflight_policy_refused={} preflight_other_failed={} signed={} broadcast={} broadcast_unknown={} receipt_confirmed={} candidate_updated={} candidate_rejected={} dropped_on_shutdown={} gpu_batches={} gpu_candidates_cpu_verified={} gpu_hash_mismatch={} gpu_batch_identity_rejected={}",
                     index + 1,
                     count(ProofMetric::TargetValidHashes),
                     count(ProofMetric::TargetValidNotNewLocalBest),
@@ -215,7 +152,7 @@ impl ProofPipelineTelemetry {
                     count(ProofMetric::DroppedHashMismatch),
                     count(ProofMetric::DroppedCurrentTarget),
                     count(ProofMetric::DroppedCurrentIncumbent),
-                    count(ProofMetric::SuppressedPriorAttempt),
+                    count(ProofMetric::DuplicateProofRejected),
                     count(ProofMetric::DeferredUnresolvedTransaction),
                     count(ProofMetric::RefusedSpendingLimit),
                     count(ProofMetric::RefusedSigningDisabled),
@@ -244,7 +181,7 @@ impl ProofPipelineTelemetry {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry};
+    use super::{ProofMetric, ProofPipelineTelemetry};
 
     #[test]
     fn proof_report_is_bounded_per_node_and_names_each_stage() {
@@ -262,20 +199,5 @@ mod tests {
         assert!(report[0].contains("generation_revalidated=1"));
         assert!(report[1].contains("node=09"));
         assert!(report[1].contains("broadcast=1"));
-    }
-
-    #[test]
-    fn proof_attempt_guard_suppresses_old_windows_but_allows_newer_work() {
-        let guard = ProofAttemptGuard::default();
-        assert!(!guard.suppresses(1, 4));
-        guard.record_attempt(1, 4);
-        assert!(guard.suppresses(1, 3));
-        assert!(guard.suppresses(1, 4));
-        assert!(!guard.suppresses(1, 5));
-        assert!(!guard.suppresses(2, 4));
-        guard.record_attempt(1, 7);
-        assert!(guard.suppresses(1, 7));
-        assert!(!guard.suppresses(1, 8));
-        assert_eq!(guard.last_attempted_window(1), Some(7));
     }
 }
