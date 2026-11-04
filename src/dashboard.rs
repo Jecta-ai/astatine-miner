@@ -2086,6 +2086,17 @@ mod tests {
             .join("\n")
     }
 
+    fn long_cuda_device_model() -> DashboardModel {
+        let mut view = model(
+            (1..=9)
+                .map(|id| node(id, NodeStatus::Mining, None))
+                .collect(),
+        );
+        view.device_label = "GPU".to_owned();
+        view.device_detail = "Example Adapter Alpha · Synthetic CUDA Driver · Capability sample · Memory sample · Batch sample · Workgroup sample · CPU verification".to_owned();
+        view
+    }
+
     #[test]
     fn session_limit_dashboard_latches_across_snapshot_and_transaction_updates() {
         let initial = model(vec![
@@ -2276,13 +2287,7 @@ mod tests {
 
     #[test]
     fn long_cuda_device_metadata_is_bounded_and_all_selected_nodes_remain_visible() {
-        let mut view = model(
-            (1..=9)
-                .map(|id| node(id, NodeStatus::Mining, None))
-                .collect(),
-        );
-        view.device_label = "GPU".to_owned();
-        view.device_detail = "Example Adapter Alpha · Synthetic CUDA Driver · Capability sample · Memory sample · Batch sample · Workgroup sample · CPU verification".to_owned();
+        let view = long_cuda_device_model();
 
         for width in [50, 70, 80, 100, 120] {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
@@ -2363,6 +2368,75 @@ mod tests {
             .count();
         assert_eq!(visible_node_count, 5);
         assert!(visible.contains("5/9 visible; resize"));
+    }
+
+    #[test]
+    fn long_cuda_device_metadata_reflows_after_terminal_resize() {
+        let view = long_cuda_device_model();
+        let mut terminal = Terminal::new(TestBackend::new(50, 24)).unwrap();
+
+        for (width, height) in [(50, 24), (120, 24)] {
+            terminal.backend_mut().resize(width, height);
+            terminal
+                .draw(|frame| render_dashboard(frame, &view, None, false))
+                .unwrap();
+            let rendered = buffer_text(&terminal);
+            let rows = rendered.lines().collect::<Vec<_>>();
+            assert!(
+                rendered.contains("CPU verification"),
+                "{width}x{height}: {rendered}"
+            );
+            assert!(
+                !rendered.contains("more; resize"),
+                "{width}x{height}: {rendered}"
+            );
+            assert!(
+                rows.iter()
+                    .all(|row| Span::raw(*row).width() <= usize::from(width)),
+                "a resized row exceeded {width} columns: {rows:?}"
+            );
+            for node_id in 1..=9 {
+                assert!(
+                    rows.iter().any(|row| {
+                        row.trim_start().starts_with(&format!("{node_id:02}"))
+                            && row.contains("MINING")
+                    }),
+                    "node {node_id:02} is not visible at {width}x{height}: {rows:?}"
+                );
+            }
+        }
+
+        terminal.backend_mut().resize(50, 14);
+        terminal
+            .draw(|frame| render_dashboard(frame, &view, None, false))
+            .unwrap();
+        let short = buffer_text(&terminal);
+        let short_rows = short.lines().collect::<Vec<_>>();
+        assert!(short.contains("more; resize"));
+        assert!(short.contains("5/9 visible; resize"));
+        assert!(
+            short_rows.iter().all(|row| Span::raw(*row).width() <= 50),
+            "a short resized row exceeded 50 columns: {short_rows:?}"
+        );
+        let visible_nodes = short_rows
+            .iter()
+            .filter(|row| {
+                let row = row.trim_start();
+                (1..=9).any(|node_id| {
+                    row.starts_with(&format!("{node_id:02}")) && row.contains("MINING")
+                })
+            })
+            .count();
+        assert_eq!(visible_nodes, 5);
+
+        terminal.backend_mut().resize(120, 24);
+        terminal
+            .draw(|frame| render_dashboard(frame, &view, None, false))
+            .unwrap();
+        let restored = buffer_text(&terminal);
+        assert!(restored.contains("CPU verification"));
+        assert!(!restored.contains("more; resize"));
+        assert!(!restored.contains("visible; resize"));
     }
 
     #[test]
