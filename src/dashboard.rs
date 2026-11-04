@@ -871,6 +871,8 @@ fn render_wide(
         ),
         model,
         colors,
+        usize::from(area.height.saturating_sub(top_height).saturating_sub(6))
+            .min(model.selected_nodes.len()),
     );
     let labels_y = title_y.saturating_add(1);
     render_column_labels(
@@ -996,6 +998,7 @@ fn wide_header_metadata_lines(
         &device,
         width,
         colors,
+        Some(2),
     ));
 
     let authorization = format_authorization(model);
@@ -1005,21 +1008,24 @@ fn wide_header_metadata_lines(
             amounts,
             width,
             colors,
+            None,
         ));
+        let cost_and_remaining = format!("{} · {remaining}", format_rpc_cost(model));
         lines.extend(wrapped_prefixed_lines(
-            &metadata_label(""),
-            remaining,
+            &metadata_label("RPC-REPORTED COST"),
+            &cost_and_remaining,
             width,
             colors,
+            None,
         ));
     } else {
         lines.push(metadata_line("AUTH / LIMIT", &authorization, colors));
+        lines.push(metadata_line(
+            "RPC-REPORTED COST",
+            &format_rpc_cost(model),
+            colors,
+        ));
     }
-    lines.push(metadata_line(
-        "RPC-REPORTED COST",
-        &format_rpc_cost(model),
-        colors,
-    ));
     lines
 }
 
@@ -1048,11 +1054,16 @@ fn render_compact(
             "RPC MINED {}",
             format_mined(model.mined_rewards)
         ))),
-        Line::from(Span::raw(format!(
-            "AUTH / LIMIT {}",
-            format_authorization_compact(model)
-        ))),
     ];
+    let authorization = format_authorization(model);
+    if let Some((amounts, remaining)) = authorization.split_once(" · ") {
+        lines.push(Line::from(Span::raw(format!("AUTH / LIMIT {amounts}"))));
+        lines.push(Line::from(Span::raw(format!("  {remaining}"))));
+    } else {
+        lines.push(Line::from(Span::raw(format!(
+            "AUTH / LIMIT {authorization}"
+        ))));
+    }
     let device = format!(
         "{} {} • {} • RPC cost {}",
         model.device_label,
@@ -1061,7 +1072,11 @@ fn render_compact(
         format_rpc_cost(model)
     );
     lines.extend(wrapped_prefixed_lines(
-        "DEVICE ", &device, area.width, colors,
+        "DEVICE ",
+        &device,
+        area.width,
+        colors,
+        Some(2),
     ));
     let header_height = lines.len().min(usize::from(area.height.saturating_sub(5))) as u16;
     lines.truncate(usize::from(header_height));
@@ -1086,6 +1101,8 @@ fn render_compact(
             ),
             model,
             colors,
+            usize::from(area.height.saturating_sub(header_height).saturating_sub(5))
+                .min(model.selected_nodes.len()),
         );
         cursor = cursor.saturating_add(1);
     }
@@ -1198,7 +1215,11 @@ fn render_narrow(
             format_hashrate(model.hashrate)
         );
         lines.extend(wrapped_prefixed_lines(
-            "DEVICE ", &device, area.width, colors,
+            "DEVICE ",
+            &device,
+            area.width,
+            colors,
+            Some(2),
         ));
     }
     lines.extend([
@@ -1252,6 +1273,7 @@ fn render_narrow(
         Paragraph::new(lines),
         Rect::new(area.x, area.y, area.width, header_height),
     );
+    let footer_y = area.y.saturating_add(area.height).saturating_sub(1);
     let title_y = area.y.saturating_add(header_height);
     if title_y < area.y.saturating_add(area.height).saturating_sub(1) {
         render_heading(
@@ -1259,10 +1281,14 @@ fn render_narrow(
             Rect::new(area.x, title_y, area.width, 1),
             model,
             colors,
+            usize::from(
+                footer_y.saturating_sub(title_y.saturating_add(1))
+                    / if area.width >= 45 { 1 } else { 2 },
+            )
+            .min(model.selected_nodes.len()),
         );
     }
     let rows_y = title_y.saturating_add(1);
-    let footer_y = area.y.saturating_add(area.height).saturating_sub(1);
     render_narrow_rows(
         frame,
         Rect::new(area.x, rows_y, area.width, footer_y.saturating_sub(rows_y)),
@@ -1278,15 +1304,25 @@ fn render_narrow(
     );
 }
 
-fn render_heading(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel, colors: bool) {
-    let heading = format!(
-        "MINING NODES  {}",
-        if area.width >= 28 {
-            format!("{} selected / 9 total", model.selected_nodes.len())
+fn render_heading(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &DashboardModel,
+    colors: bool,
+    visible_nodes: usize,
+) {
+    let selected_nodes = model.selected_nodes.len();
+    let heading = if visible_nodes < selected_nodes {
+        if area.width >= 52 {
+            format!("MINING NODES {visible_nodes}/{selected_nodes} visible; resize")
         } else {
-            format!(" {} / 9", model.selected_nodes.len())
+            format!("{visible_nodes}/{selected_nodes} visible; resize")
         }
-    );
+    } else if area.width >= 28 {
+        format!("MINING NODES  {selected_nodes} selected / 9 total")
+    } else {
+        format!("MINING NODES  {selected_nodes} / 9")
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             heading,
@@ -1340,6 +1376,10 @@ fn render_compact_rows(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel
 }
 
 fn render_narrow_rows(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel, colors: bool) {
+    if area.width >= 45 {
+        render_compact_rows(frame, area, model, colors);
+        return;
+    }
     let now = Instant::now();
     let mut lines = Vec::with_capacity(model.selected_nodes.len() * 2);
     for node in &model.selected_nodes {
@@ -1361,7 +1401,11 @@ fn render_narrow_rows(frame: &mut Frame<'_>, area: Rect, model: &DashboardModel,
         ]));
         lines.push(narrow_candidate_reward_line(node, model, colors));
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    let visible_height = area.height - area.height % 2;
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(area.x, area.y, area.width, visible_height),
+    );
 }
 
 fn wide_node_line(
@@ -1626,10 +1670,23 @@ fn wrapped_prefixed_lines(
     value: &str,
     width: u16,
     colors: bool,
+    max_lines: Option<usize>,
 ) -> Vec<Line<'static>> {
     let prefix_width = Span::raw(prefix).width();
     let value_width = usize::from(width).saturating_sub(prefix_width).max(1);
-    wrap_text(value, value_width)
+    let mut lines = wrap_text(value, value_width);
+    if let Some(max_lines) = max_lines.filter(|max_lines| *max_lines > 0)
+        && lines.len() > max_lines
+    {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            while Span::raw(last.as_str()).width() + 1 > value_width {
+                last.pop();
+            }
+            last.push('…');
+        }
+    }
+    lines
         .into_iter()
         .enumerate()
         .map(|(index, value)| {
@@ -1785,17 +1842,6 @@ fn format_authorization(model: &DashboardModel) -> String {
                 format_units(remaining, 18)
             )
         }
-        _ => "--".to_owned(),
-    }
-}
-
-fn format_authorization_compact(model: &DashboardModel) -> String {
-    match (model.authorization_used, model.session_limit) {
-        (Some(used), Some(limit)) => format!(
-            "{} / {} INJ",
-            format_units(used, 18),
-            format_units(limit, 18)
-        ),
         _ => "--".to_owned(),
     }
 }
@@ -2183,10 +2229,14 @@ mod tests {
     }
 
     #[test]
-    fn long_cuda_device_and_authorization_details_use_clean_wrapped_rows() {
-        let mut view = model(vec![node(1, NodeStatus::Mining, None)]);
+    fn long_cuda_device_metadata_is_bounded_and_all_selected_nodes_remain_visible() {
+        let mut view = model(
+            (1..=9)
+                .map(|id| node(id, NodeStatus::Mining, None))
+                .collect(),
+        );
         view.device_label = "GPU".to_owned();
-        view.device_detail = "NVIDIA GeForce RTX 3070 · CUDA Driver API 12.8 · compute capability 8.6 · 8.0 GiB · batch 262144 · WG32 · CPU verify".to_owned();
+        view.device_detail = "Example Adapter Alpha · Synthetic CUDA Driver · Capability sample · Memory sample · Batch sample · Workgroup sample · CPU verification".to_owned();
 
         for width in [50, 70, 80, 100, 120] {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
@@ -2200,25 +2250,30 @@ mod tests {
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
-            if width >= 52 {
-                assert!(
-                    text.contains("NVIDIA GeForce RTX 3070"),
-                    "device name was clipped at {width} columns: {text}"
-                );
-                assert!(
-                    text.contains("CUDA Driver API 12.8")
-                        && text.contains("compute capability 8.6")
-                        && text.contains("batch 262144"),
-                    "CUDA details were clipped at {width} columns: {text}"
-                );
-            }
+            assert!(
+                text.contains("Example Adapter Alpha"),
+                "critical device identity was clipped at {width} columns: {text}"
+            );
+            assert!(
+                text.contains("CPU verification") || text.contains('…'),
+                "secondary device details must be visible or explicitly collapsed at {width} columns: {text}"
+            );
             assert!(
                 rows.iter()
                     .all(|row| Span::raw(*row).width() <= usize::from(width)),
                 "a rendered row exceeded {width} columns: {rows:?}"
             );
+            for node_id in 1..=9 {
+                assert!(
+                    rows.iter().any(|row| {
+                        row.trim_start().starts_with(&format!("{node_id:02}"))
+                            && row.contains("MINING")
+                    }),
+                    "node {node_id:02} is not visible at {width} columns: {rows:?}"
+                );
+            }
 
-            if width == 50 || width >= 78 {
+            if width >= 50 {
                 let authorization_index = rows
                     .iter()
                     .position(|row| row.contains("AUTH / LIMIT"))
@@ -2228,6 +2283,28 @@ mod tests {
                 assert!(rows[authorization_index + 1].contains("0.448 left"));
             }
         }
+
+        let mut terminal = Terminal::new(TestBackend::new(50, 14)).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &view, None, false))
+            .unwrap();
+        let rendered = buffer_text(&terminal);
+        let rows = rendered.lines().map(str::trim_end).collect::<Vec<_>>();
+        let visible = rows
+            .iter()
+            .find(|row| row.contains("visible; resize"))
+            .expect("short terminals disclose that some selected nodes are hidden");
+        let visible_node_count = rows
+            .iter()
+            .filter(|row| {
+                let row = row.trim_start();
+                (1..=9).any(|node_id| {
+                    row.starts_with(&format!("{node_id:02}")) && row.contains("MINING")
+                })
+            })
+            .count();
+        assert_eq!(visible_node_count, 4);
+        assert!(visible.contains("4/9 visible; resize"));
     }
 
     #[test]
@@ -2429,9 +2506,20 @@ mod tests {
                 text.contains("INJ BALANCE") || text.contains("INJ "),
                 "{width}x24: {text}"
             );
-            assert!(text.contains("9 selected / 9 total"), "{width}x24: {text}");
-            for id in 1..=9 {
+            let visible_nodes = if width < 45 { 8 } else { 9 };
+            if visible_nodes < 9 {
+                assert!(text.contains("8/9 visible; resize"), "{width}x24: {text}");
+            } else {
+                assert!(text.contains("9 selected / 9 total"), "{width}x24: {text}");
+            }
+            for id in 1..=visible_nodes {
                 assert!(text.contains(&format!("{id:02}")), "{width}x24: {text}");
+            }
+            if visible_nodes < 9 {
+                assert!(
+                    !text.contains("09 #109"),
+                    "partial node row must be hidden: {text}"
+                );
             }
         }
     }

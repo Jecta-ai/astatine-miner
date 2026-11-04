@@ -16228,6 +16228,13 @@ mod tests {
                     )
                     .await;
                     if test_device == DeviceChoice::Gpu {
+                        wait_for_proof_metric(
+                            &probe,
+                            *node_id,
+                            ProofMetric::GpuCandidatesCpuVerified,
+                            1,
+                        )
+                        .await;
                         assert!(
                             probe
                                 .proof_telemetry
@@ -16320,6 +16327,13 @@ mod tests {
                     wait_for_active_probe(&probe, *node_id, state.work.window_id).await;
                     wait_for_hash_increase(&probe, *node_id, previous_hashes).await;
                     if test_device == DeviceChoice::Gpu {
+                        wait_for_proof_metric(
+                            &probe,
+                            *node_id,
+                            ProofMetric::GpuCandidatesCpuVerified,
+                            1,
+                        )
+                        .await;
                         assert!(
                             probe
                                 .proof_telemetry
@@ -16377,6 +16391,13 @@ mod tests {
                 assert!(probe.proof_telemetry.count(1, ProofMetric::Broadcast) > 0);
                 assert!(probe.proof_telemetry.count(1, ProofMetric::ReceiptConfirmed) > 0);
                 if test_device == DeviceChoice::Gpu {
+                    wait_for_proof_metric(
+                        &probe,
+                        1,
+                        ProofMetric::GpuCandidatesCpuVerified,
+                        1,
+                    )
+                    .await;
                     assert!(
                         probe
                             .proof_telemetry
@@ -18277,6 +18298,13 @@ mod tests {
                     starting_generations[index] = probe.slots[index].generation();
                     wait_for_active_probe(&probe, node_id, state.work.window_id).await;
                     wait_for_hash_increase(&probe, node_id, starting_hashes[index]).await;
+                    wait_for_proof_metric(
+                        &probe,
+                        node_id,
+                        ProofMetric::GpuCandidatesCpuVerified,
+                        1,
+                    )
+                    .await;
                 }
                 for &node_id in selected_gpu_nodes {
                     assert!(

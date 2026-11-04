@@ -920,6 +920,8 @@ fn wait_for_event(event: &CudaEvent, timeout: Duration) -> Result<Duration> {
 
 fn wait_for_event_until(event: &CudaEvent, deadline: Instant) -> Result<()> {
     loop {
+        // This deadline bounds the polling loop only; it cannot preempt a driver call
+        // that blocks inside `try_is_complete`.
         match event
             .try_is_complete()
             .context("query CUDA event completion")?

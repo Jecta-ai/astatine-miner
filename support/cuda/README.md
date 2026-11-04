@@ -2,7 +2,7 @@
 
 `src/gpu/cuda/sha256d.cu` is the CUDA C++ source for the native Driver API SHA-256d backend. `src/gpu/cuda/sha256d.ptx` is the compiled PTX image embedded in Linux/Windows binaries. The kernel only computes candidate hashes; Rust re-hashes every candidate through the canonical `WorkHasher` before proof intake.
 
-The PTX is reproducibly built with NVIDIA CUDA Toolkit 12.0.1 from the immutable official container image `nvidia/cuda@sha256:0cca95cbbdbdc5011919e5182891bc944a159b9c529999c1e434b6406fa90f53` (Linux x86_64 image). It targets the virtual architecture `compute_52`, which lets the installed NVIDIA driver JIT the PTX for compatible compute-capability-5.2-and-newer GPUs. The build does not depend on an NVIDIA GPU; the script also runs `ptxas` for `sm_86` to validate the PTX for RTX 30-series-class devices.
+The PTX is reproducibly built with NVIDIA CUDA Toolkit 12.0.1 from the immutable official container image `nvidia/cuda@sha256:0cca95cbbdbdc5011919e5182891bc944a159b9c529999c1e434b6406fa90f53` (Linux x86_64 image). It targets the virtual architecture `compute_52`, which lets the installed NVIDIA driver JIT the PTX for compatible compute-capability-5.2-and-newer GPUs. The build does not depend on an NVIDIA GPU; the script also assembles the PTX for the generic `sm_86` target as a code-generation check, not as physical-device evidence.
 
 With Docker available, generate a comparison image and verify it against the checked-in PTX:
 
@@ -20,12 +20,28 @@ The PTX uses the same 32-bit big-endian SHA-256 words, 192-byte invariant prefix
 
 The checked-in `.cu` and `.ptx` are MIT-licensed with the rest of Astatine source. The CUDA Driver API itself remains an NVIDIA system component and is not bundled or redistributed.
 
+## Driver-call liveness and shutdown
+
+The CUDA backend polls event completion every 2 ms and applies a 15-second dispatch deadline. Engine shutdown attempts a shared-deadline drain of pending work for up to 2 seconds. These bounds limit polling only when each CUDA Driver API call returns: an application timeout cannot interrupt a driver call that blocks inside `try_is_complete` or another CUDA API operation.
+
+When a driver call returns an error or a backend operation panics, the mining controller can recover: `auto` starts CPU workers, while explicit `gpu` reports failure and does not substitute CPU mining. If a CUDA call never returns, the controller cannot process that recovery path. Mining shutdown requests stop and waits up to 10 seconds for the GPU controller; if it remains blocked, the controller thread is detached. If CUDA completion is uncertain, the engine leaks its bounded CUDA allocation until process exit rather than freeing buffers that may still be in use. These are best-effort safeguards, not a hard timeout guarantee against a non-returning driver call.
+
 ## Hardware validation
 
 Run the physical kernel self-test separately on Linux x86_64 and Windows x86_64 machines with supported NVIDIA drivers:
 
 ```sh
 cargo test --locked gpu::cuda::tests::physical_cuda_executes_canonical_sha256d_and_u128_differential_tests -- --ignored --exact --nocapture --test-threads=1
+```
+
+Then run the packaged executable's device probe, which performs the runtime kernel and canonical-work self-test without RPC or wallet access:
+
+```sh
+./target/release/astatine devices
+```
+
+```powershell
+.\target\release\astatine.exe devices
 ```
 
 The test performs actual CUDA kernel execution and CPU/CUDA differential checks over canonical work, target and incumbent boundaries, 128-bit nonce boundaries, varied work contexts, header padding boundaries, and deterministic workgroup minima. For the existing paid Anvil lifecycle and mining-worker shutdown path, set `ASTATINE_E2E_DEVICE=gpu` for the relevant ignored transaction lifecycle test. Repeat the physical tests independently on Linux and Windows. Native compilation or PTX assembly is not physical-driver evidence; record unsupported/unavailable hardware as pending and keep Testnet.17 release approval blocked until required platform evidence is supplied.
