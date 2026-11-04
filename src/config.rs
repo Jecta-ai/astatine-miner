@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, OnceLock},
+    time::SystemTime,
 };
 use tempfile::{NamedTempFile, PersistError};
 use zeroize::Zeroizing;
@@ -187,6 +188,26 @@ fn default_transaction_confirmations() -> u8 {
 pub struct ConfigStore {
     root: PathBuf,
     anchor_scope: Arc<OnceLock<std::result::Result<String, String>>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TransactionArchiveStamp {
+    length: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(windows)]
+    volume_serial_number: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
+    #[cfg(windows)]
+    last_write_time: u64,
 }
 
 impl ConfigStore {
@@ -518,6 +539,48 @@ impl ConfigStore {
         let path = self.transaction_archive_path(name)?;
         read_regular_limited(&path, MAX_TRANSACTION_ARCHIVE_BYTES, true)
             .context("read private transaction archive")
+    }
+
+    pub(crate) fn transaction_archive_stamp(&self, name: &str) -> Result<TransactionArchiveStamp> {
+        let path = self.transaction_archive_path(name)?;
+        let metadata =
+            fs::symlink_metadata(&path).context("inspect verified transaction archive metadata")?;
+        if !metadata.file_type().is_file() {
+            bail!("transaction archive is not a regular file");
+        }
+        let modified = metadata
+            .modified()
+            .context("read transaction archive modification time")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(TransactionArchiveStamp {
+                length: metadata.len(),
+                modified,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                changed_seconds: metadata.ctime(),
+                changed_nanoseconds: metadata.ctime_nsec(),
+            })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            Ok(TransactionArchiveStamp {
+                length: metadata.len(),
+                modified,
+                volume_serial_number: metadata.volume_serial_number(),
+                file_index: metadata.file_index(),
+                last_write_time: metadata.last_write_time(),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(TransactionArchiveStamp {
+                length: metadata.len(),
+                modified,
+            })
+        }
     }
 
     pub(crate) fn lock_transaction_journal(&self) -> Result<File> {
