@@ -69,8 +69,8 @@ def self_test() -> None:
         "env: ${{ toJSON(secrets) }}",
         "environment: testnet-release-signing",
         "environment: testnet-release-publish",
-        "run: gh release create v0.1.0-testnet.16",
-        "run: GH_TOKEN=$TOKEN gh release upload v0.1.0-testnet.16 asset.zip",
+        "run: gh release create v0.1.0-testnet.17",
+        "run: GH_TOKEN=$TOKEN gh release upload v0.1.0-testnet.17 asset.zip",
     ):
         try:
             validate_signing_isolation(privileged, pathlib.Path("synthetic-workflow.yml"))

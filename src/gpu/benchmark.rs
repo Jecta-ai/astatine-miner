@@ -1,7 +1,8 @@
 use super::{
-    GPU_BATCH_SIZE, GPU_BATCH_SIZES, GPU_WORKGROUP_SIZE, GpuBatchResult, GpuBatchTimings,
-    GpuDeviceInfo, GpuEngine, GpuInitializationTimings, PendingGpuBatch, SUPPORTED_WORKGROUP_SIZES,
-    benchmark_cpu_from, canonical_benchmark_context, verify_benchmark_batch,
+    GPU_BATCH_SIZE, GPU_BATCH_SIZES, GPU_WORKGROUP_SIZE, GpuBackendEngine, GpuBatchResult,
+    GpuBatchTimings, GpuDeviceInfo, GpuInitializationTimings, PendingGpuDispatch,
+    SUPPORTED_WORKGROUP_SIZES, benchmark_cpu_from, canonical_benchmark_context,
+    verify_benchmark_batch,
 };
 use crate::{cli::BenchmarkArgs, config::conservative_thread_budget, protocol::WorkHasher};
 use alloy_primitives::U256;
@@ -173,9 +174,9 @@ pub(crate) fn run(args: BenchmarkArgs) -> Result<()> {
         let batch_size = args.batch_size.unwrap_or(GPU_BATCH_SIZE);
         let workgroup_size = args.workgroup_size.unwrap_or(GPU_WORKGROUP_SIZE);
         let engine = if auto_config {
-            GpuEngine::initialize_auto_profiled()
+            GpuBackendEngine::initialize_auto_profiled()
         } else {
-            GpuEngine::initialize_profiled(batch_size, workgroup_size)
+            GpuBackendEngine::initialize_profiled(batch_size, workgroup_size)
         };
         let mut engine = match engine {
             Ok(engine) => engine,
@@ -297,7 +298,7 @@ fn run_gpu_configuration(
     hasher: &WorkHasher,
 ) -> Result<GpuConfigurationResult> {
     let mut engine =
-        GpuEngine::initialize_profiled_mode(batch_size, workgroup_size, midstate_enabled)?;
+        GpuBackendEngine::initialize_profiled_mode(batch_size, workgroup_size, midstate_enabled)?;
     let initialization = engine.initialization_timings();
     let info = engine.info().clone();
     let mut samples = Vec::with_capacity(runs as usize);
@@ -331,7 +332,7 @@ fn run_gpu_configuration(
 }
 
 fn warm_gpu(
-    engine: &mut GpuEngine,
+    engine: &mut GpuBackendEngine,
     hasher: &WorkHasher,
     batch_size: usize,
     mut first_nonce: u128,
@@ -347,7 +348,7 @@ fn warm_gpu(
 }
 
 fn run_gpu_sample(
-    engine: &mut GpuEngine,
+    engine: &mut GpuBackendEngine,
     hasher: &WorkHasher,
     batch_size: usize,
     duration: Duration,
@@ -357,7 +358,7 @@ fn run_gpu_sample(
     let started = Instant::now();
     let mut next_nonce = first_nonce;
     let stop = AtomicBool::new(false);
-    let mut pending: Option<(PendingGpuBatch, u128)> = None;
+    let mut pending: Option<(PendingGpuDispatch, u128)> = None;
     let mut sample = GpuSample {
         completed_hashes: 0,
         elapsed: Duration::ZERO,
@@ -417,11 +418,11 @@ fn run_gpu_sample(
 }
 
 fn collect_gpu_sample_batch(
-    engine: &mut GpuEngine,
+    engine: &mut GpuBackendEngine,
     hasher: &WorkHasher,
     batch_size: usize,
     first_nonce: u128,
-    pending: PendingGpuBatch,
+    pending: PendingGpuDispatch,
     sample: &mut GpuSample,
 ) -> Result<()> {
     let batch = engine.collect_batch(pending, None)?;

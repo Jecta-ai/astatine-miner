@@ -1,6 +1,6 @@
 [package]
 name = "astatine-cli-rust"
-version = "0.1.0-testnet.16"
+version = "0.1.0-testnet.17"
 edition = "2024"
 rust-version = "1.94.1"
 description = "A native Rust CPU and GPU command-line miner for Astatine"
@@ -57,6 +57,9 @@ keyring = { version = "=3.6.3", default-features = false, features = ["apple-nat
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }
 windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console"] }
+
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
+cudarc = { version = "=0.19.10", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12000", "nvrtc"] }
 
 [patch.crates-io]
 paste = { path = "support/paste-shim" }

@@ -4,9 +4,9 @@ This file is generated from the dependency graph in `Cargo.lock` with cargo-abou
 
 ## License summary
 
-- Apache License 2.0: 256 crate(s)
+- Apache License 2.0: 257 crate(s)
 - MIT License: 60 crate(s)
-- ISC License: 21 crate(s)
+- ISC License: 22 crate(s)
 - Unicode License v3: 20 crate(s)
 - Creative Commons Zero v1.0 Universal: 3 crate(s)
 - BSD 3-Clause "New" or "Revised" License: 2 crate(s)
@@ -7105,6 +7105,7 @@ Used by:
 - [anyhow 1.0.103](https://github.com/dtolnay/anyhow)
 - [aws-lc-sys 0.46.0](https://github.com/aws/aws-lc-rs)
 - [const-hex 1.19.3](https://github.com/danipopes/const-hex)
+- [cudarc 0.19.10](https://github.com/chelsea0x3b/cudarc)
 - [document-features 0.2.12](https://github.com/slint-ui/document-features)
 - [dunce 1.0.5](https://gitlab.com/kornelski/dunce)
 - [half 2.7.1](https://github.com/VoidStarKat/half-rs)
@@ -8091,6 +8092,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 Used by:
 - [libloading 0.8.9](https://github.com/nagisa/rust_libloading/)
+- [libloading 0.9.0](https://github.com/nagisa/rust_libloading/)
 <pre>
 Copyright © 2015, Simonas Kazlauskas
 
@@ -8872,7 +8874,7 @@ SOFTWARE.
 ### MIT License
 
 Used by:
-- [astatine-cli-rust 0.1.0-testnet.16](https://crates.io/crates/astatine-cli-rust)
+- [astatine-cli-rust 0.1.0-testnet.17](https://crates.io/crates/astatine-cli-rust)
 <pre>
 MIT License
 

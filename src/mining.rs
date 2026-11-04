@@ -8,7 +8,7 @@ use crate::{
     deployment::DeploymentManifest,
     diagnostics::DiagnosticBuffer,
     gpu::{
-        GPU_BATCH_SIZE, GpuBatchIdentity, GpuDeviceInfo, GpuEngine, PendingGpuBatch,
+        GPU_BATCH_SIZE, GpuBackendEngine, GpuBatchIdentity, GpuDeviceInfo, PendingGpuDispatch,
         benchmark_cpu_reference,
     },
     proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
@@ -159,15 +159,19 @@ impl ActiveBackend {
         match self {
             Self::Cpu { threads } => format!("{threads} Threads"),
             Self::Gpu(info) => {
+                let backend = if info.backend == "CUDA Driver API" {
+                    format!("{} · CUDA · {}", info.name, info.driver_info)
+                } else {
+                    format!("{} · {}", info.name, info.backend)
+                };
                 if info.tuned_hashes_per_second == 0 {
                     format!(
-                        "{} · batch {} · WG{} · CPU verify",
-                        info.name, info.batch_size, info.workgroup_size
+                        "{backend} · batch {} · WG{} · CPU verify",
+                        info.batch_size, info.workgroup_size
                     )
                 } else if info.cpu_comparison_threads > 0 {
                     format!(
-                        "{} · batch {} · WG{} · auto GPU {:.1}/CPU {:.1} MH/s",
-                        info.name,
+                        "{backend} · batch {} · WG{} · auto GPU {:.1}/CPU {:.1} MH/s",
                         info.batch_size,
                         info.workgroup_size,
                         info.tuned_hashes_per_second as f64 / 1_000_000.0,
@@ -175,8 +179,7 @@ impl ActiveBackend {
                     )
                 } else {
                     format!(
-                        "{} · batch {} · WG{} · {:.2} MH/s · CPU verify",
-                        info.name,
+                        "{backend} · batch {} · WG{} · {:.2} MH/s · CPU verify",
                         info.batch_size,
                         info.workgroup_size,
                         info.tuned_hashes_per_second as f64 / 1_000_000.0,
@@ -746,7 +749,7 @@ struct PendingGpuWorkBatch {
     slot_index: usize,
     work: Arc<WorkJob>,
     identity: GpuBatchIdentity,
-    pending: PendingGpuBatch,
+    pending: PendingGpuDispatch,
 }
 
 enum BackendEvent {
@@ -5310,7 +5313,7 @@ fn gpu_worker_controller(
         return;
     }
     let gpu_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-        let mut engine = GpuEngine::initialize()?;
+        let mut engine = GpuBackendEngine::initialize()?;
         if context.stop.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -5407,7 +5410,7 @@ fn activate_cpu_fallback(
     }
 }
 
-fn gpu_worker_loop(engine: &mut GpuEngine, context: &MiningWorkerContext) -> Result<()> {
+fn gpu_worker_loop(engine: &mut GpuBackendEngine, context: &MiningWorkerContext) -> Result<()> {
     let mut nonce_exhaustion_reported = false;
     let mut pending: Option<PendingGpuWorkBatch> = None;
     while !context.stop.load(Ordering::Acquire) {
@@ -5496,7 +5499,7 @@ fn gpu_worker_loop(engine: &mut GpuEngine, context: &MiningWorkerContext) -> Res
 }
 
 fn complete_gpu_work_batch(
-    engine: &mut GpuEngine,
+    engine: &mut GpuBackendEngine,
     context: &MiningWorkerContext,
     pending: PendingGpuWorkBatch,
 ) -> Result<()> {
@@ -6027,7 +6030,7 @@ mod tests {
         config::ConfigStore,
         dashboard::{NodeStatus, hashes_per_second},
         deployment::DeploymentManifest,
-        gpu::{GpuBatchIdentity, GpuEngine},
+        gpu::{GpuBackendEngine, GpuBatchIdentity},
         proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
         protocol::{WorkContext, WorkHasher, meets_target},
         rpc::{
@@ -8141,7 +8144,7 @@ mod tests {
     #[test]
     #[ignore = "requires a physical GPU adapter"]
     fn initialized_gpu_worker_loop_observes_terminal_stop_flag() {
-        let mut engine = GpuEngine::initialize().expect("physical GPU adapter is available");
+        let mut engine = GpuBackendEngine::initialize().expect("physical GPU adapter is available");
         let stop = Arc::new(AtomicBool::new(true));
         let (proofs, _receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), true);
         let context = MiningWorkerContext {
