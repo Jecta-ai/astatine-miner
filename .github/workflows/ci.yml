@@ -16,7 +16,7 @@ on:
       release_tag:
         description: Testnet package version used by the nonpublishing rehearsal
         required: true
-        default: v0.1.0-testnet.16
+        default: v0.1.0-testnet.17
         type: string
 
 permissions:
@@ -78,6 +78,14 @@ jobs:
           host="$(rustc -vV | awk '$1 == "host:" { print $2 }')"
           echo "Rust host: $host"
           test "$host" = "${{ matrix.target }}"
+      - name: Reproduce CUDA PTX and validate sm_86 assembly
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          generated="$RUNNER_TEMP/astatine-sha256d.ptx"
+          support/cuda/build-ptx.sh "$generated"
+          cmp src/gpu/cuda/sha256d.ptx "$generated"
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Check
@@ -277,9 +285,9 @@ jobs:
       - name: Verify local EVM tools
         run: forge --version && anvil --version
       - name: Run all local Anvil lifecycle tests
-        # This Linux runner is headless; the ignored GPU worker-loop test is
-        # exercised separately on physical hardware when an adapter is available.
-        run: cargo test --release --locked -- --ignored --test-threads=1 --skip mining::tests::initialized_gpu_worker_loop_observes_terminal_stop_flag
+        # This Linux runner is headless; physical GPU worker-loop and CUDA tests
+        # require separate runs on hardware with an available adapter/driver.
+        run: cargo test --release --locked -- --ignored --test-threads=1 --skip mining::tests::initialized_gpu_worker_loop_observes_terminal_stop_flag --skip gpu::cuda::tests::physical_cuda_executes_canonical_sha256d_and_u128_differential_tests
 
   build-release-package:
     name: Build unsigned Testnet release packages
