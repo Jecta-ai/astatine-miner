@@ -203,9 +203,7 @@ pub(crate) struct TransactionArchiveStamp {
     #[cfg(unix)]
     changed_nanoseconds: i64,
     #[cfg(windows)]
-    volume_serial_number: Option<u32>,
-    #[cfg(windows)]
-    file_index: Option<u64>,
+    creation_time: u64,
     #[cfg(windows)]
     last_write_time: u64,
 }
@@ -569,8 +567,7 @@ impl ConfigStore {
             Ok(TransactionArchiveStamp {
                 length: metadata.len(),
                 modified,
-                volume_serial_number: metadata.volume_serial_number(),
-                file_index: metadata.file_index(),
+                creation_time: metadata.creation_time(),
                 last_write_time: metadata.last_write_time(),
             })
         }
