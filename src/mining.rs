@@ -8,10 +8,10 @@ use crate::{
     deployment::DeploymentManifest,
     diagnostics::DiagnosticBuffer,
     gpu::{
-        GPU_BATCH_SIZE, GpuBatchIdentity, GpuDeviceInfo, GpuEngine, PendingGpuBatch,
+        GPU_BATCH_SIZE, GpuBackendEngine, GpuBatchIdentity, GpuDeviceInfo, PendingGpuDispatch,
         benchmark_cpu_reference,
     },
-    proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
+    proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{BlockSnapshot, NetworkClient, NodeState, ReadSnapshot, is_transient_rpc_error},
     startup::{CtrlCSignal, StartupProgress, race_with_ctrl_c},
@@ -159,15 +159,19 @@ impl ActiveBackend {
         match self {
             Self::Cpu { threads } => format!("{threads} Threads"),
             Self::Gpu(info) => {
+                let backend = if info.backend == "CUDA Driver API" {
+                    format!("{} · CUDA · {}", info.name, info.driver_info)
+                } else {
+                    format!("{} · {}", info.name, info.backend)
+                };
                 if info.tuned_hashes_per_second == 0 {
                     format!(
-                        "{} · batch {} · WG{} · CPU verify",
-                        info.name, info.batch_size, info.workgroup_size
+                        "{backend} · batch {} · WG{} · CPU verify",
+                        info.batch_size, info.workgroup_size
                     )
                 } else if info.cpu_comparison_threads > 0 {
                     format!(
-                        "{} · batch {} · WG{} · auto GPU {:.1}/CPU {:.1} MH/s",
-                        info.name,
+                        "{backend} · batch {} · WG{} · auto GPU {:.1}/CPU {:.1} MH/s",
                         info.batch_size,
                         info.workgroup_size,
                         info.tuned_hashes_per_second as f64 / 1_000_000.0,
@@ -175,8 +179,7 @@ impl ActiveBackend {
                     )
                 } else {
                     format!(
-                        "{} · batch {} · WG{} · {:.2} MH/s · CPU verify",
-                        info.name,
+                        "{backend} · batch {} · WG{} · {:.2} MH/s · CPU verify",
                         info.batch_size,
                         info.workgroup_size,
                         info.tuned_hashes_per_second as f64 / 1_000_000.0,
@@ -520,7 +523,6 @@ struct ProofFound {
 struct ProofInboxSender {
     pending: Arc<Mutex<[Option<ProofFound>; PENDING_PROOF_CANDIDATE_CAPACITY]>>,
     wake: mpsc::Sender<()>,
-    attempts: Arc<ProofAttemptGuard>,
 }
 
 struct ProofInboxReceiver {
@@ -531,10 +533,7 @@ struct ProofInboxReceiver {
     sender: ProofInboxSender,
 }
 
-fn proof_inbox(
-    attempts: Arc<ProofAttemptGuard>,
-    initially_paused: bool,
-) -> (ProofInboxSender, ProofInboxReceiver) {
+fn proof_inbox(initially_paused: bool) -> (ProofInboxSender, ProofInboxReceiver) {
     let pending = Arc::new(Mutex::new(std::array::from_fn(|_| None)));
     let paused = Arc::new(AtomicBool::new(initially_paused));
     let pause_latched = Arc::new(AtomicBool::new(false));
@@ -542,7 +541,6 @@ fn proof_inbox(
     let sender = ProofInboxSender {
         pending: Arc::clone(&pending),
         wake,
-        attempts,
     };
     (
         sender.clone(),
@@ -566,13 +564,6 @@ impl ProofInboxSender {
         else {
             return false;
         };
-        if self
-            .attempts
-            .suppresses(proof.node_id, proof.context.window_id)
-        {
-            telemetry.record(proof.node_id, ProofMetric::SuppressedPriorAttempt);
-            return false;
-        }
         if self.wake.is_closed() {
             telemetry.record(proof.node_id, ProofMetric::QueueReceiverClosed);
             return false;
@@ -746,7 +737,7 @@ struct PendingGpuWorkBatch {
     slot_index: usize,
     work: Arc<WorkJob>,
     identity: GpuBatchIdentity,
-    pending: PendingGpuBatch,
+    pending: PendingGpuDispatch,
 }
 
 enum BackendEvent {
@@ -1400,14 +1391,13 @@ async fn run_runtime(
         history_profile_enabled(std::env::var("ASTATINE_HISTORY_PROFILE").ok().as_deref());
     let probe_stop_signal = probe_sender.as_ref().map(|_| DashboardSignal::default());
     #[cfg(test)]
-    let (proof_processing_gate, mut proof_processing_gate_receiver) = if probe_sender.is_some() {
+    let (proof_processing_gate, proof_processing_gate_receiver) = if probe_sender.is_some() {
         let (sender, receiver) = watch::channel(true);
         (Some(sender), Some(receiver))
     } else {
         (None, None)
     };
     let proof_telemetry = Arc::new(ProofPipelineTelemetry::default());
-    let proof_attempt_guard = Arc::new(ProofAttemptGuard::default());
     if !args.compute_only && config.network != crate::cli::Network::Testnet {
         bail!("autonomous transaction signing is disabled outside Injective Testnet");
     }
@@ -1611,13 +1601,6 @@ async fn run_runtime(
         }
         manager.configure_reward_forwarding(args.send_rewards_to)?;
         manager.set_proof_telemetry(Arc::clone(&proof_telemetry));
-        manager.set_proof_attempt_guard(Arc::clone(&proof_attempt_guard));
-        for node in &client.manifest.nodes {
-            let contract = crate::deployment::parse_address(&node.address)?;
-            if let Some(window_id) = manager.proof_attempted_through(contract) {
-                proof_attempt_guard.record_attempt(node.id, window_id);
-            }
-        }
         match race_with_ctrl_c(manager.reconcile(&client), ctrl_c).await? {
             Some(Ok(())) => {
                 let legacy = manager.legacy_unverified_settled_count()?;
@@ -1879,8 +1862,7 @@ async fn run_runtime(
             || transactions
                 .as_ref()
                 .is_some_and(|manager| manager.signing_blocked_by_unresolved()));
-    let (proof_sender, mut proof_receiver) =
-        proof_inbox(Arc::clone(&proof_attempt_guard), proof_delivery_paused);
+    let (proof_sender, mut proof_receiver) = proof_inbox(proof_delivery_paused);
     if session_limit_reached.load(Ordering::Acquire) {
         proof_receiver.latch_paused();
     }
@@ -2183,7 +2165,15 @@ async fn run_runtime(
         .or_else(|| probe_stop_signal.clone());
 
     'mining_loop: loop {
+        #[cfg(test)]
+        let proof_processing_gate_open = proof_processing_gate_receiver
+            .as_ref()
+            .is_none_or(|gate| !*gate.borrow());
+        #[cfg(not(test))]
+        let proof_processing_gate_open = true;
         tokio::select! {
+            // Fresh chain observations must not starve behind a continuously-ready proof inbox.
+            biased;
             signal = ctrl_c.as_mut() => {
                 if let Err(error) = signal {
                     report_mining_warning(
@@ -2256,29 +2246,6 @@ async fn run_runtime(
                             fatal_error = Some(error.context("service historical reward verification"));
                             break 'mining_loop;
                         }
-                        if proof_receiver.has_pending()
-                            && let Some(manager) = transactions.as_mut()
-                            && manager.journal.has_unresolved()
-                        {
-                            if let Err(error) = manager
-                                .monitor_at_snapshot(&client, &snapshot.block)
-                                .await
-                            {
-                                fatal_error = Some(error.context(
-                                    "monitor transaction recovery while proof delivery is deferred",
-                                ));
-                                break 'mining_loop;
-                            }
-                            proof_receiver.set_paused(
-                                transaction_mode
-                                    && (signer.is_none()
-                                        || manager.signing_blocked_by_unresolved()),
-                            );
-                        }
-                        if proof_receiver.has_pending() {
-                            last_snapshot = snapshot;
-                            continue 'mining_loop;
-                        }
                         if let Some(manager) = transactions.as_mut()
                             && let Err(error) = manager
                                 .monitor_at_snapshot(&client, &snapshot.block)
@@ -2322,11 +2289,8 @@ async fn run_runtime(
                             last_snapshot = snapshot;
                             continue 'mining_loop;
                         }
-                        if proof_receiver.has_pending() {
-                            last_snapshot = snapshot;
-                            continue 'mining_loop;
-                        }
                         snapshot = observer.latest_snapshot().unwrap_or(snapshot);
+                        // Finalize expired nodes even while another active node has queued work.
                         if let (Some(manager), Some(signer)) =
                             (transactions.as_mut(), signer.as_ref())
                         {
@@ -2617,7 +2581,7 @@ async fn run_runtime(
                     None => backend_event_receiver = None,
                 }
             }
-            proof = proof_receiver.recv(), if proof_receiver_open => {
+            proof = proof_receiver.recv(), if proof_receiver_open && proof_processing_gate_open => {
                 let Some(proof) = proof else {
                     if session_limit_reached.load(Ordering::Acquire) {
                         proof_receiver_open = false;
@@ -2639,58 +2603,6 @@ async fn run_runtime(
                         ProofMetric::RefusedSpendingLimit,
                     );
                     continue;
-                }
-                #[cfg(test)]
-                if let Some(gate) = proof_processing_gate_receiver.as_mut() {
-                    while *gate.borrow() {
-                        tokio::select! {
-                            changed = gate.changed() => {
-                                if changed.is_err() {
-                                    break;
-                                }
-                            }
-                            _ = reward_scan_ticker.tick() => {
-                                let gate_snapshot = observer
-                                    .latest_snapshot()
-                                    .unwrap_or_else(|| last_snapshot.clone());
-                                last_snapshot = gate_snapshot.clone();
-                                if let Some(manager) = transactions.as_mut()
-                                    && let Err(error) = manager
-                                        .service_reward_reconciliation(&client, &gate_snapshot)
-                                        .await
-                                {
-                                    fatal_error = Some(error.context(
-                                        "service reward reconciliation while test proof processing is gated",
-                                    ));
-                                    break 'mining_loop;
-                                }
-                            }
-                            signal = ctrl_c.as_mut() => {
-                                if let Err(error) = signal {
-                                    report_mining_warning(
-                                        &dashboard,
-                                        format!("Ctrl+C signal handler failed: {error}"),
-                                    );
-                                }
-                                break 'mining_loop;
-                            }
-                            event = wait_for_dashboard_event(dashboard_signal.clone()), if dashboard_events_open => {
-                                match event {
-                                    DashboardEventKind::StopRequested => break 'mining_loop,
-                                    DashboardEventKind::Failure(error)
-                                        if session_limit_reached.load(Ordering::Acquire) =>
-                                    {
-                                        eprintln!("astatine: terminal dashboard failed; mining remains stopped until Ctrl+C: {error}");
-                                        dashboard_events_open = false;
-                                    }
-                                    DashboardEventKind::Failure(error) => {
-                                        fatal_error = Some(anyhow!("dashboard failed: {error}"));
-                                        break 'mining_loop;
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
                 let Some(slot) = slots.get(usize::from(proof.node_id.saturating_sub(1))) else {
                     continue;
@@ -2730,10 +2642,6 @@ async fn run_runtime(
                     .into_iter()
                     .map(|entry| entry.hash)
                     .collect::<HashSet<_>>();
-                if manager.proof_attempted(contract, window_id) {
-                    proof_telemetry.record(proof.node_id, ProofMetric::SuppressedPriorAttempt);
-                    continue;
-                }
                 if manager.signing_blocked_by_unresolved() {
                     proof_receiver.set_paused(true);
                     let _ = proof_receiver.requeue(proof.clone(), &proof_telemetry);
@@ -2846,7 +2754,7 @@ async fn run_runtime(
                                 report_mining_warning(
                                     &dashboard,
                                     format!(
-                                        "proof preflight for node {:02} window {window_id} hit a transient RPC error; reserved nonce and proof attempt remain untouched, retry {retry_attempts} will revalidate: {error:#}",
+                                        "proof preflight for node {:02} window {window_id} hit a transient RPC error; no transaction was signed or authorized, retry {retry_attempts} will revalidate: {error:#}",
                                         proof.node_id
                                     ),
                                 );
@@ -3529,6 +3437,9 @@ async fn maybe_finalize_expired(
                         TransactionPolicyRefusalKind::DuplicateFinalization => {
                             format!("duplicate finalization refused: {error:#}")
                         }
+                        TransactionPolicyRefusalKind::DuplicateProof => {
+                            format!("duplicate proof refused: {error:#}")
+                        }
                     };
                     record_finalization_state(
                         &options,
@@ -3756,7 +3667,6 @@ fn is_stale_proof(error: &anyhow::Error) -> bool {
         || message.contains("different window")
         || message.contains("no longer eligible")
         || message.contains("pending nonce changed")
-        || message.contains("paid proof attempt already journaled")
 }
 
 fn selected_nodes(nodes: &[u8]) -> Result<HashSet<u8>> {
@@ -5310,7 +5220,7 @@ fn gpu_worker_controller(
         return;
     }
     let gpu_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-        let mut engine = GpuEngine::initialize()?;
+        let mut engine = GpuBackendEngine::initialize()?;
         if context.stop.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -5407,7 +5317,7 @@ fn activate_cpu_fallback(
     }
 }
 
-fn gpu_worker_loop(engine: &mut GpuEngine, context: &MiningWorkerContext) -> Result<()> {
+fn gpu_worker_loop(engine: &mut GpuBackendEngine, context: &MiningWorkerContext) -> Result<()> {
     let mut nonce_exhaustion_reported = false;
     let mut pending: Option<PendingGpuWorkBatch> = None;
     while !context.stop.load(Ordering::Acquire) {
@@ -5496,7 +5406,7 @@ fn gpu_worker_loop(engine: &mut GpuEngine, context: &MiningWorkerContext) -> Res
 }
 
 fn complete_gpu_work_batch(
-    engine: &mut GpuEngine,
+    engine: &mut GpuBackendEngine,
     context: &MiningWorkerContext,
     pending: PendingGpuWorkBatch,
 ) -> Result<()> {
@@ -5652,13 +5562,6 @@ fn process_hashed_candidate(
         }
     }
     telemetry.record(slot.id, ProofMetric::NewLocalBestHashes);
-    if proofs
-        .attempts
-        .suppresses(slot.id, work.fingerprint.hashing_context.window_id)
-    {
-        telemetry.record(slot.id, ProofMetric::SuppressedPriorAttempt);
-        return Ok(());
-    }
     let _ = proofs.deliver(
         ProofFound {
             node_id: slot.id,
@@ -6027,8 +5930,8 @@ mod tests {
         config::ConfigStore,
         dashboard::{NodeStatus, hashes_per_second},
         deployment::DeploymentManifest,
-        gpu::{GpuBatchIdentity, GpuEngine},
-        proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
+        gpu::{GpuBackendEngine, GpuBatchIdentity},
+        proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
         protocol::{WorkContext, WorkHasher, meets_target},
         rpc::{
             BlockSnapshot, CandidateInfo, ContractPinStatus, NetworkClient, NodeState, NodeView,
@@ -7082,7 +6985,7 @@ mod tests {
             nonce_count: 3,
         };
         let telemetry = ProofPipelineTelemetry::default();
-        let (proofs, receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let (proofs, receiver) = proof_inbox(false);
 
         let mismatch = process_hashed_candidate(
             &slot,
@@ -7143,7 +7046,37 @@ mod tests {
         assert_eq!(queued.batch_identity, Some(batch));
         revalidate_queued_proof(&slot, &queued, &telemetry)
             .expect("GPU proof must pass the existing final CPU preflight");
-        assert_eq!(telemetry.count(1, ProofMetric::GpuCandidatesCpuVerified), 1);
+        let improved = (nonce + 1..nonce + 50_000)
+            .find_map(|next_nonce| {
+                let next_hash = work.hasher.hash(next_nonce);
+                (next_hash < queued.hash).then_some((next_nonce, next_hash))
+            })
+            .expect("GPU work should find a better same-window candidate");
+        let improved_batch = GpuBatchIdentity {
+            first_nonce: improved.0,
+            nonce_count: 1,
+            ..batch
+        };
+        process_hashed_candidate(
+            &slot,
+            &work,
+            HashedCandidate {
+                nonce: improved.0,
+                hash: improved.1,
+                reported_gpu_hash: Some(improved.1),
+                batch_identity: Some(improved_batch),
+            },
+            &proofs,
+            &telemetry,
+        )
+        .unwrap();
+        let improved_queued = receiver.take_next().unwrap();
+        assert_eq!(improved_queued.context.window_id, queued.context.window_id);
+        assert_eq!(improved_queued.hash, improved.1);
+        assert!(improved_queued.hash < queued.hash);
+        revalidate_queued_proof(&slot, &improved_queued, &telemetry)
+            .expect("the later GPU candidate still passes canonical CPU validation");
+        assert_eq!(telemetry.count(1, ProofMetric::GpuCandidatesCpuVerified), 2);
         assert_eq!(telemetry.count(1, ProofMetric::GpuBatchIdentityRejected), 1);
     }
 
@@ -7190,7 +7123,7 @@ mod tests {
         assert_ne!(slot.generation(), old_work.generation);
 
         let telemetry = ProofPipelineTelemetry::default();
-        let (proofs, receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let (proofs, receiver) = proof_inbox(false);
         process_hashed_candidate(
             &slot,
             &old_work,
@@ -7214,8 +7147,7 @@ mod tests {
     #[test]
     fn automatic_backend_fallback_starts_shared_allocator_cpu_workers() {
         let stop = Arc::new(AtomicBool::new(false));
-        let (proof_sender, _proof_receiver) =
-            proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let (proof_sender, _proof_receiver) = proof_inbox(false);
         let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let context = MiningWorkerContext {
             slots: Arc::new((1..=9).map(NodeSlot::new).collect()),
@@ -7508,7 +7440,7 @@ mod tests {
         let cursor = Arc::new(AtomicUsize::new(0));
         let hashes = Arc::new(AtomicU64::new(0));
         let telemetry = Arc::new(ProofPipelineTelemetry::default());
-        let (sender, mut receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let (sender, mut receiver) = proof_inbox(false);
         let worker_slots = Arc::clone(&slots);
         let worker_schedule = Arc::clone(&schedule);
         let worker_stop = Arc::clone(&stop);
@@ -7847,7 +7779,7 @@ mod tests {
         let cursor = Arc::new(AtomicUsize::new(0));
         let hashes = Arc::new(AtomicU64::new(0));
         let telemetry = Arc::new(ProofPipelineTelemetry::default());
-        let (sender, receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let (sender, receiver) = proof_inbox(false);
         let work = slots[0].current_work().unwrap();
         for node_id in 1..=PENDING_PROOF_CANDIDATE_CAPACITY as u8 {
             let queued_context = if node_id == 1 {
@@ -7943,7 +7875,7 @@ mod tests {
     #[test]
     fn proof_inbox_reports_receiver_closure_without_claiming_delivery() {
         let telemetry = ProofPipelineTelemetry::default();
-        let (sender, receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let (sender, receiver) = proof_inbox(false);
         drop(receiver);
         let proof = ProofFound {
             node_id: 1,
@@ -7969,10 +7901,49 @@ mod tests {
         assert_eq!(telemetry.count(1, ProofMetric::QueuedCandidates), 0);
     }
 
+    #[test]
+    fn proof_inbox_keeps_same_window_candidates_independent_across_all_nine_nodes() {
+        let telemetry = ProofPipelineTelemetry::default();
+        let (sender, receiver) = proof_inbox(false);
+        for node_id in 1..=9 {
+            assert!(sender.deliver(
+                ProofFound {
+                    node_id,
+                    generation: 1,
+                    context: HashingContext {
+                        chain_id: 1439,
+                        contract: Address::with_last_byte(node_id),
+                        window_id: 7,
+                        seed: B256::with_last_byte(7),
+                        miner: Address::with_last_byte(8),
+                        header: Vec::new(),
+                    },
+                    nonce: u128::from(node_id),
+                    hash: B256::with_last_byte(node_id),
+                    target: U256::MAX,
+                    incumbent: None,
+                    batch_identity: None,
+                    queued_at: Instant::now(),
+                },
+                &telemetry,
+            ));
+        }
+
+        let mut received = (0..9)
+            .map(|_| receiver.take_next().expect("one proof per selected node"))
+            .map(|proof| proof.node_id)
+            .collect::<Vec<_>>();
+        received.sort_unstable();
+        assert_eq!(received, (1..=9).collect::<Vec<_>>());
+        for node_id in 1..=9 {
+            assert_eq!(telemetry.count(node_id, ProofMetric::QueuedCandidates), 1);
+        }
+    }
+
     #[tokio::test]
     async fn proof_inbox_defers_and_releases_best_candidate_across_unresolved_transaction() {
         let telemetry = ProofPipelineTelemetry::default();
-        let (sender, mut receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), true);
+        let (sender, mut receiver) = proof_inbox(true);
         let proof = ProofFound {
             node_id: 1,
             generation: 1,
@@ -8024,7 +7995,7 @@ mod tests {
     #[test]
     fn terminal_pause_latches_and_discards_queued_proofs() {
         let telemetry = ProofPipelineTelemetry::default();
-        let (sender, receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let (sender, receiver) = proof_inbox(false);
         let proof = ProofFound {
             node_id: 1,
             generation: 1,
@@ -8088,7 +8059,7 @@ mod tests {
         let cursor = Arc::new(AtomicUsize::new(0));
         let total_hashes = Arc::new(AtomicU64::new(0));
         let telemetry = Arc::new(ProofPipelineTelemetry::default());
-        let (proofs, _receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let (proofs, _receiver) = proof_inbox(false);
         let workers = start_cpu_worker_threads(
             2,
             MiningWorkerContext {
@@ -8122,7 +8093,7 @@ mod tests {
     fn gpu_controller_does_not_initialize_or_fallback_after_terminal_stop() {
         let stop = Arc::new(AtomicBool::new(true));
         let telemetry = Arc::new(ProofPipelineTelemetry::default());
-        let (proofs, _receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), true);
+        let (proofs, _receiver) = proof_inbox(true);
         let context = MiningWorkerContext {
             slots: Arc::new(vec![NodeSlot::new(1)]),
             schedule: Arc::new(RwLock::new(Vec::new())),
@@ -8141,9 +8112,9 @@ mod tests {
     #[test]
     #[ignore = "requires a physical GPU adapter"]
     fn initialized_gpu_worker_loop_observes_terminal_stop_flag() {
-        let mut engine = GpuEngine::initialize().expect("physical GPU adapter is available");
+        let mut engine = GpuBackendEngine::initialize().expect("physical GPU adapter is available");
         let stop = Arc::new(AtomicBool::new(true));
-        let (proofs, _receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), true);
+        let (proofs, _receiver) = proof_inbox(true);
         let context = MiningWorkerContext {
             slots: Arc::new(vec![NodeSlot::new(1)]),
             schedule: Arc::new(RwLock::new(Vec::new())),
@@ -8313,7 +8284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_emits_a_locally_verified_proof_without_submitting_it() {
+    async fn worker_continues_same_window_search_for_strictly_better_proofs() {
         let manifest = DeploymentManifest::load(Network::Testnet).unwrap();
         let slot = NodeSlot::new(1);
         let miner = Address::with_last_byte(8);
@@ -8335,7 +8306,7 @@ mod tests {
         let cursor = Arc::new(AtomicUsize::new(0));
         let total_hashes = Arc::new(AtomicU64::new(0));
         let telemetry = Arc::new(ProofPipelineTelemetry::default());
-        let (sender, mut receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let (sender, mut receiver) = proof_inbox(false);
         let worker_slots = Arc::clone(&slots);
         let worker_schedule = Arc::clone(&schedule);
         let worker_stop = Arc::clone(&stop);
@@ -8354,12 +8325,16 @@ mod tests {
             );
         });
 
-        let proof_result = timeout(Duration::from_secs(2), receiver.recv()).await;
+        let first_result = timeout(Duration::from_secs(2), receiver.recv()).await;
+        let first = first_result
+            .expect("worker should find a proof under the maximum target")
+            .expect("worker should report its first proof");
+        let second_result = timeout(Duration::from_secs(2), receiver.recv()).await;
         stop.store(true, Ordering::Release);
         worker.join().expect("worker should stop cleanly");
-        let proof = proof_result
-            .expect("worker should find a proof under the maximum target")
-            .expect("worker should report its proof");
+        let second = second_result
+            .expect("worker should continue hashing after delivering its first proof")
+            .expect("worker should report a later improvement");
 
         let context = WorkContext {
             chain_id: manifest.chain_id,
@@ -8369,13 +8344,18 @@ mod tests {
             miner,
             header: Vec::new(),
         };
-        assert_eq!(proof.node_id, 1);
-        assert!(slots[0].is_generation_current(proof.generation));
-        assert_eq!(
-            WorkHasher::new(&context).unwrap().hash(proof.nonce),
-            proof.hash
-        );
-        assert!(meets_target(proof.hash, U256::MAX));
+        for proof in [&first, &second] {
+            assert_eq!(proof.node_id, 1);
+            assert_eq!(proof.context.window_id, state.work.window_id);
+            assert!(slots[0].is_generation_current(proof.generation));
+            assert_eq!(
+                WorkHasher::new(&context).unwrap().hash(proof.nonce),
+                proof.hash
+            );
+            assert!(meets_target(proof.hash, U256::MAX));
+        }
+        assert_ne!(first.nonce, second.nonce);
+        assert!(second.hash < first.hash);
         assert!(total_hashes.load(Ordering::Relaxed) > 0);
     }
 
@@ -8397,7 +8377,7 @@ mod tests {
         let cursor = Arc::new(AtomicUsize::new(0));
         let hashes = Arc::new(AtomicU64::new(0));
         let telemetry = Arc::new(ProofPipelineTelemetry::default());
-        let (sender, _receiver) = proof_inbox(Arc::new(ProofAttemptGuard::default()), false);
+        let (sender, _receiver) = proof_inbox(false);
         let worker_slots = Arc::clone(&slots);
         let worker_schedule = Arc::clone(&schedule);
         let worker_stop = Arc::clone(&stop);

@@ -4,7 +4,7 @@ use crate::{
     contracts::{AstatineMinerRead, IERC20Read},
     diagnostics::DiagnosticBuffer,
     history_telemetry::{HistoryCounter, HistoryDuration, HistoryTelemetry},
-    proof_telemetry::{ProofAttemptGuard, ProofMetric, ProofPipelineTelemetry},
+    proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{
         NetworkClient, ReadSnapshot, RpcLog, TransactionDetails, TransactionReceipt,
@@ -54,6 +54,8 @@ const REWARD_SCAN_RETRY_MAX: Duration = Duration::from_secs(30);
 const REWARD_EMPTY_SCAN_RETRY_BASE_SECS: u64 = 60;
 const REWARD_EMPTY_SCAN_RETRY_MAX_SECS: u64 = 3_600;
 const SUBMISSION_FEE_WEI: u128 = 10_000_000_000_000_000;
+const PROOF_IDENTITY_DOMAIN: &[u8] = b"astatine-paid-proof-identity-v1";
+const UNBOUND_PROOF_IDENTITY_DOMAIN: &[u8] = b"astatine-unbound-paid-proof-identity-v1";
 pub(crate) const AUTOMATIC_REWARD_FORWARDING_DISABLED: &str = "automatic AST reward forwarding is disabled because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually from your wallet";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,6 +91,7 @@ pub enum TransactionPolicyRefusalKind {
     SigningDisabled,
     UnresolvedNonce,
     DuplicateFinalization,
+    DuplicateProof,
 }
 
 #[derive(Debug)]
@@ -475,6 +478,8 @@ struct JournalState {
     entries: Vec<TransactionEntry>,
     #[serde(default)]
     pending_authorization: Option<PendingAuthorization>,
+    // Authenticated Testnet.16/17 history retained for journal compatibility.
+    // Admission uses canonical proof identities in entries and archives instead.
     #[serde(default)]
     proof_attempted_through: HashMap<String, u64>,
     #[serde(default)]
@@ -914,6 +919,7 @@ pub struct TransactionJournal {
     store: ConfigStore,
     state: JournalState,
     authenticator: JournalAuthenticator,
+    proof_identity_index: ProofIdentityIndex,
     _lock: File,
     history_telemetry: Arc<HistoryTelemetry>,
     allow_unresolved_transactions: bool,
@@ -991,7 +997,7 @@ impl TransactionJournal {
             serde_json::from_slice(&contents).context("decode transaction journal")?;
         let mut authenticator = JournalAuthenticator::for_existing_journal(store, &state)?;
         validate_journal(&state)?;
-        validate_archive_ledger(store, &state, None)?;
+        validate_archive_ledger(store, &state, None, None)?;
         if state.pending_authorization.is_some() {
             bail!(
                 "cannot change per-run policy while a signed transaction authorization is pending"
@@ -1057,7 +1063,7 @@ impl TransactionJournal {
             .context("transaction journal recovery requires the original wallet address")?;
         let (mut state, migrated) =
             migrate_journal(state, wallet, config.transaction_confirmations)?;
-        validate_archive_ledger(store, &state, None)?;
+        validate_archive_ledger(store, &state, None, None)?;
         let mut changed = initialize_session_accounting(
             store,
             &mut state,
@@ -1156,7 +1162,7 @@ impl TransactionJournal {
             return Ok(false);
         };
         validate_journal(&state)?;
-        validate_archive_ledger(store, &state, None)?;
+        validate_archive_ledger(store, &state, None, None)?;
         if state
             .entries
             .iter()
@@ -1390,10 +1396,16 @@ impl TransactionJournal {
         if state.pending_session_transition.is_some() && recovery_wallet.is_some() {
             bail!("a spending-session change is interrupted; run `astatine init` before recovery");
         }
+        let mut proof_identity_index = ProofIdentityIndex::default();
         let archive_validation = {
             let _archive_validation_timer =
                 history_telemetry.timer(HistoryDuration::ArchiveValidation);
-            validate_archive_ledger(store, &state, Some(&history_telemetry))
+            validate_archive_ledger(
+                store,
+                &state,
+                Some(&history_telemetry),
+                Some(&mut proof_identity_index),
+            )
         };
         if let Err(error) = archive_validation {
             history_telemetry.add(HistoryCounter::ArchiveValidationFailures, 1);
@@ -1410,6 +1422,13 @@ impl TransactionJournal {
             migrated |= initialize_legacy_history_accounting(&mut state, source_version)?;
         }
         validate_journal(&state)?;
+        for entry in &state.entries {
+            if entry.action == TransactionAction::SubmitProof {
+                proof_identity_index
+                    .identities
+                    .insert(ProofIdentity::from_entry(&state, entry)?.fingerprint());
+            }
+        }
         authenticator.sync_checkpoint(store)?;
         if state.pending_authorization.take().is_some() {
             // Signatures are never broadcast before their signed intent is durable.
@@ -1422,6 +1441,7 @@ impl TransactionJournal {
                 store: store.clone(),
                 state,
                 authenticator,
+                proof_identity_index,
                 _lock: lock,
                 history_telemetry,
                 allow_unresolved_transactions: false,
@@ -1776,6 +1796,26 @@ impl TransactionJournal {
         })
     }
 
+    fn proof_identity_is_journaled(&self, identity: &ProofIdentity) -> Result<bool> {
+        // A known replay is refused from the monotonic, digest-verified-on-load index
+        // immediately. Removing or corrupting an archive cannot remove this identity.
+        if self
+            .proof_identity_index
+            .identities
+            .contains(&identity.fingerprint())
+            || self
+                .proof_identity_index
+                .identities
+                .contains(&identity.unbound_fingerprint())
+        {
+            return Ok(true);
+        }
+        for meta in &self.state.archives {
+            verify_authenticated_archive_contents(&self.store, meta)?;
+        }
+        Ok(false)
+    }
+
     fn finalization_attempts(
         &self,
         contract: Address,
@@ -1796,9 +1836,7 @@ impl TransactionJournal {
             .cloned()
             .collect::<Vec<_>>();
         for meta in &self.state.archives {
-            let contents = self.store.read_transaction_archive(&meta.file_name)?;
-            let archive: JournalArchive =
-                serde_json::from_slice(&contents).context("decode transaction archive")?;
+            let archive = read_authenticated_archive(&self.store, meta)?;
             attempts.extend(archive.entries.into_iter().filter(matches_intent));
         }
         Ok(attempts)
@@ -2052,16 +2090,15 @@ impl TransactionJournal {
             }
             _ => {}
         }
-        if intent.action == TransactionAction::SubmitProof
-            && self
-                .state
-                .proof_attempted_through
-                .get(&proof_attempt_key(intent.contract))
-                .is_some_and(|window| intent.window_id <= *window)
-        {
-            bail!(
-                "paid proof attempt already journaled for this node/window; refusing a second fee"
-            );
+        if intent.action == TransactionAction::SubmitProof {
+            let identity = ProofIdentity::from_intent(request.chain_id, journal_wallet, intent)?;
+            if self.proof_identity_is_journaled(&identity)? {
+                return Err(TransactionPolicyRefusal {
+                    kind: TransactionPolicyRefusalKind::DuplicateProof,
+                    details: "the same canonical proof is already recorded in the active or archived transaction journal; refusing a duplicate paid submission".to_owned(),
+                }
+                .into());
+            }
         }
         let session = self
             .state
@@ -2255,11 +2292,7 @@ impl TransactionJournal {
 
     fn forwarding_payout_in_archives(&self, payout_id: &str) -> Result<bool> {
         for archive_meta in &self.state.archives {
-            let contents = self
-                .store
-                .read_transaction_archive(&archive_meta.file_name)?;
-            let archive: JournalArchive =
-                serde_json::from_slice(&contents).context("decode transaction archive")?;
+            let archive = read_authenticated_archive(&self.store, archive_meta)?;
             if archive.entries.iter().any(|entry| {
                 entry.action == TransactionAction::ForwardReward
                     && entry.forward_payout_id.as_deref() == Some(payout_id)
@@ -2318,6 +2351,15 @@ impl TransactionJournal {
         {
             bail!("signed transaction does not match its persisted local authorization");
         }
+        let proof_identity = if intent.action == TransactionAction::SubmitProof {
+            Some(ProofIdentity::from_intent(
+                request.chain_id,
+                Address::from_str(&wallet).context("active transaction wallet is invalid")?,
+                &intent,
+            )?)
+        } else {
+            None
+        };
 
         let (proof_nonce, proof_hash, header_hex) = match intent.proof.as_ref() {
             Some(proof) => (
@@ -2364,7 +2406,9 @@ impl TransactionJournal {
         if intent.action == TransactionAction::SubmitProof {
             self.state
                 .proof_attempted_through
-                .insert(proof_attempt_key(intent.contract), intent.window_id);
+                .entry(proof_attempt_key(intent.contract))
+                .and_modify(|window| *window = (*window).max(intent.window_id))
+                .or_insert(intent.window_id);
         }
         self.state.entries.push(TransactionEntry {
             chain_id: request.chain_id,
@@ -2409,6 +2453,11 @@ impl TransactionJournal {
             confirmations_required,
             created_unix_secs: unix_time_secs(),
         });
+        if let Some(proof_identity) = proof_identity {
+            self.proof_identity_index
+                .identities
+                .insert(proof_identity.fingerprint());
+        }
         if let Some(forwarding) = intent.forwarding {
             let source = self
                 .state
@@ -2970,6 +3019,9 @@ impl TransactionJournal {
         if self.state.entries.len() < ARCHIVE_TRIGGER_ENTRIES {
             return Ok(0);
         }
+        for meta in &self.state.archives {
+            verify_authenticated_archive_contents(&self.store, meta)?;
+        }
         let mut indices = Vec::new();
         let mut selected = HashSet::new();
         let mut index = 0;
@@ -3054,11 +3106,29 @@ impl TransactionJournal {
             serde_json::to_vec_pretty(&record).context("serialize transaction archive")?;
         let content_hash = format!("{:#x}", keccak256(&contents));
         let file_name = format!("archive-{}.json", &content_hash[2..]);
-        if let Err(error) = self.store.write_transaction_archive(&file_name, &contents) {
+        let archive_meta = ArchiveMeta {
+            file_name: file_name.clone(),
+            content_hash: content_hash.clone(),
+            entry_count: u32::try_from(entries.len()).context("archive entry count overflow")?,
+        };
+        let verified_archive = self
+            .store
+            .write_transaction_archive(&file_name, &contents)
+            .and_then(|()| read_authenticated_archive(&self.store, &archive_meta));
+        let verified_archive = match verified_archive {
+            Ok(archive) => archive,
+            Err(error) => {
+                self.history_telemetry
+                    .add(HistoryCounter::ArchiveWriteFailures, 1);
+                return Err(error).context("verify newly written transaction archive");
+            }
+        };
+        if let Err(error) = validate_archive_record_entries(&self.state, &verified_archive) {
             self.history_telemetry
                 .add(HistoryCounter::ArchiveWriteFailures, 1);
-            return Err(error);
+            return Err(error).context("validate newly written transaction archive");
         }
+        let entries = verified_archive.entries;
         self.history_telemetry
             .add(HistoryCounter::ArchiveFilesCreated, 1);
 
@@ -3094,17 +3164,16 @@ impl TransactionJournal {
             .entries
             .retain(|entry| !archived_hashes.contains(&entry.transaction_hash));
         self.state.archived_total_spending_wei = total_spending.to_string();
-        self.state.archives.push(ArchiveMeta {
-            file_name,
-            content_hash,
-            entry_count: u32::try_from(entries.len()).context("archive entry count overflow")?,
-        });
+        self.state.archives.push(archive_meta);
         self.state.next_archive_sequence = self
             .state
             .next_archive_sequence
             .checked_add(1)
             .context("archive sequence overflow")?;
         initialize_session_accounting(&self.store, &mut self.state, false, false)?;
+        for meta in &self.state.archives {
+            verify_authenticated_archive_contents(&self.store, meta)?;
+        }
         self.persist()?;
         Ok(entries.len())
     }
@@ -3183,7 +3252,6 @@ pub struct TransactionManager {
     diagnostics: Option<DiagnosticBuffer>,
     dashboard_sink: Option<TransactionDashboardSink>,
     proof_telemetry: Option<Arc<ProofPipelineTelemetry>>,
-    proof_attempt_guard: Option<Arc<ProofAttemptGuard>>,
     history_telemetry: Arc<HistoryTelemetry>,
     reward_scan_task: Option<JoinHandle<Result<RewardScanBatchOutput>>>,
     reward_scan_retry_at: Option<Instant>,
@@ -3254,6 +3322,113 @@ struct ProofData {
     nonce: u128,
     work_hash: B256,
     header: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProofIdentity {
+    chain_id: u64,
+    contract: Address,
+    window_id: u64,
+    wallet: Option<Address>,
+    nonce: u128,
+    work_hash: B256,
+    header: Vec<u8>,
+}
+
+#[derive(Clone, Default)]
+struct ProofIdentityIndex {
+    identities: HashSet<B256>,
+}
+
+impl ProofIdentityIndex {
+    #[cfg(test)]
+    fn estimated_heap_bytes(&self) -> usize {
+        self.identities.capacity() * std::mem::size_of::<B256>()
+    }
+}
+
+impl ProofIdentity {
+    fn from_intent(chain_id: u64, wallet: Address, intent: &TransactionIntent) -> Result<Self> {
+        let proof = intent
+            .proof
+            .as_ref()
+            .context("proof identity is missing its cryptographic intent")?;
+        Ok(Self {
+            chain_id,
+            contract: intent.contract,
+            window_id: intent.window_id,
+            wallet: Some(wallet),
+            nonce: proof.nonce,
+            work_hash: proof.work_hash,
+            header: proof.header.clone(),
+        })
+    }
+
+    fn from_entry(state: &JournalState, entry: &TransactionEntry) -> Result<Self> {
+        if entry.action != TransactionAction::SubmitProof {
+            bail!("cannot construct a proof identity from a non-proof transaction");
+        }
+        Ok(Self {
+            chain_id: entry.chain_id,
+            contract: Address::from_str(&entry.contract)
+                .context("journaled proof contract is invalid during identity indexing")?,
+            window_id: entry.window_id,
+            wallet: journal_entry_wallet(state, entry),
+            nonce: entry
+                .proof_nonce
+                .context("journaled proof has no nonce during identity indexing")?,
+            work_hash: B256::from_str(
+                entry
+                    .proof_hash
+                    .as_deref()
+                    .context("journaled proof has no work hash during identity indexing")?,
+            )
+            .context("journaled proof work hash is invalid during identity indexing")?,
+            header: hex::decode(
+                entry
+                    .header_hex
+                    .as_deref()
+                    .context("journaled proof has no header during identity indexing")?,
+            )
+            .context("journaled proof header is invalid during identity indexing")?,
+        })
+    }
+
+    fn fingerprint(&self) -> B256 {
+        let Some(wallet) = self.wallet else {
+            return self.unbound_fingerprint();
+        };
+        let mut encoded = Vec::with_capacity(
+            PROOF_IDENTITY_DOMAIN.len() + 1 + 8 + 20 + 8 + 20 + 16 + 32 + 8 + self.header.len(),
+        );
+        encoded.extend_from_slice(PROOF_IDENTITY_DOMAIN);
+        encoded.push(0);
+        encoded.extend_from_slice(&self.chain_id.to_be_bytes());
+        encoded.extend_from_slice(self.contract.as_slice());
+        encoded.extend_from_slice(&self.window_id.to_be_bytes());
+        encoded.extend_from_slice(wallet.as_slice());
+        encoded.extend_from_slice(&self.nonce.to_be_bytes());
+        encoded.extend_from_slice(self.work_hash.as_slice());
+        encoded.extend_from_slice(&(self.header.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(&self.header);
+        keccak256(encoded)
+    }
+
+    fn unbound_fingerprint(&self) -> B256 {
+        let mut encoded = Vec::with_capacity(
+            UNBOUND_PROOF_IDENTITY_DOMAIN.len() + 1 + 8 + 20 + 8 + 16 + 32 + 8 + self.header.len(),
+        );
+        encoded.extend_from_slice(UNBOUND_PROOF_IDENTITY_DOMAIN);
+        encoded.push(0);
+        encoded.extend_from_slice(&self.chain_id.to_be_bytes());
+        encoded.extend_from_slice(self.contract.as_slice());
+        encoded.extend_from_slice(&self.window_id.to_be_bytes());
+        encoded.extend_from_slice(&self.nonce.to_be_bytes());
+        encoded.extend_from_slice(self.work_hash.as_slice());
+        encoded.extend_from_slice(&(self.header.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(&self.header);
+        keccak256(encoded)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3484,7 +3659,6 @@ impl TransactionManager {
             diagnostics: None,
             dashboard_sink: None,
             proof_telemetry: None,
-            proof_attempt_guard: None,
             history_telemetry,
             reward_scan_task: None,
             reward_scan_retry_at: None,
@@ -3588,12 +3762,7 @@ impl TransactionManager {
             })
             .count();
         for archive_meta in &self.journal.state.archives {
-            let contents = self
-                .journal
-                .store
-                .read_transaction_archive(&archive_meta.file_name)?;
-            let archive: JournalArchive =
-                serde_json::from_slice(&contents).context("decode transaction archive")?;
+            let archive = read_authenticated_archive(&self.journal.store, archive_meta)?;
             count += archive
                 .entries
                 .iter()
@@ -3699,10 +3868,6 @@ impl TransactionManager {
 
     pub(crate) fn set_proof_telemetry(&mut self, telemetry: Arc<ProofPipelineTelemetry>) {
         self.proof_telemetry = Some(telemetry);
-    }
-
-    pub(crate) fn set_proof_attempt_guard(&mut self, guard: Arc<ProofAttemptGuard>) {
-        self.proof_attempt_guard = Some(guard);
     }
 
     pub(crate) fn configure_reward_forwarding(
@@ -4820,19 +4985,6 @@ impl TransactionManager {
         Ok(self.session_limit_reached)
     }
 
-    pub fn proof_attempted(&self, contract: Address, window_id: u64) -> bool {
-        self.proof_attempted_through(contract)
-            .is_some_and(|last_attempted| window_id <= last_attempted)
-    }
-
-    pub(crate) fn proof_attempted_through(&self, contract: Address) -> Option<u64> {
-        self.journal
-            .state
-            .proof_attempted_through
-            .get(&proof_attempt_key(contract))
-            .copied()
-    }
-
     pub fn authorization_used(&self) -> Result<Option<U256>> {
         if self.journal.state.active_session.is_none() {
             return Ok(None);
@@ -5050,21 +5202,32 @@ impl TransactionManager {
             value,
             data,
         };
-        let maximum_exposure = self.journal.authorize_exposure(
+        let node_id = intent.node_id;
+        let window_id = intent.window_id;
+        let action = intent.action;
+        let maximum_exposure = match self.journal.authorize_exposure(
             &request,
             &intent,
             self.session_limit,
             self.minimum_reserve,
             spendable_balance,
-        )?;
+        ) {
+            Ok(maximum_exposure) => maximum_exposure,
+            Err(error) => {
+                if action == TransactionAction::SubmitProof
+                    && transaction_policy_refusal(&error)
+                        == Some(TransactionPolicyRefusalKind::DuplicateProof)
+                {
+                    self.record_proof_metric(node_id, ProofMetric::DuplicateProofRejected);
+                }
+                return Err(error);
+            }
+        };
         // The journal authorization is durable before this check. If it moves
         // the remaining paid-session budget below the canonical proof fee, latch
         // the mining run now; this already-authorized transaction still follows
         // its normal signing, broadcast, and receipt-recovery path.
         self.refresh_session_limit_state()?;
-        let node_id = intent.node_id;
-        let window_id = intent.window_id;
-        let action = intent.action;
         let signed = match sign_eip1559(signer, &request) {
             Ok(signed) => signed,
             Err(error) => {
@@ -5094,11 +5257,6 @@ impl TransactionManager {
         }
         if action == TransactionAction::SubmitProof {
             self.current_process_proof_hashes.insert(signed.hash);
-        }
-        if action == TransactionAction::SubmitProof
-            && let Some(guard) = &self.proof_attempt_guard
-        {
-            guard.record_attempt(node_id, window_id);
         }
         self.publish_dashboard_state();
         self.report_info(format!(
@@ -6543,7 +6701,11 @@ fn validate_journal(state: &JournalState) -> Result<()> {
                 .get(&proof_attempt_key(contract))
                 .is_none_or(|last_attempt| *last_attempt < entry.window_id)
             {
-                bail!("proof attempt is missing from the persistent node/window guard");
+                // This remains a structural integrity field only; the high-water
+                // mark never excludes a distinct proof from the same window.
+                bail!(
+                    "proof transaction is missing from the historical node/window high-water mark"
+                );
             }
         }
     }
@@ -6717,10 +6879,87 @@ fn archive_entry_is_settled(entry: &TransactionEntry) -> bool {
     settled && reward_verified
 }
 
+fn authenticated_archive_bytes(store: &ConfigStore, meta: &ArchiveMeta) -> Result<Vec<u8>> {
+    let expected_hash =
+        B256::from_str(&meta.content_hash).context("transaction archive digest is invalid")?;
+    // Authenticate the bytes read through no-follow handles, then repeat the
+    // read to detect replacement or in-place changes during verification. A
+    // process with write access can still alter a file after the final read;
+    // admission rechecks content on every attempt and relies on the private
+    // configuration directory to bound that remaining local filesystem race.
+    let first_read = store.read_transaction_archive(&meta.file_name)?;
+    if keccak256(&first_read) != expected_hash {
+        bail!(
+            "transaction archive {} failed its authenticated content digest",
+            meta.file_name
+        );
+    }
+    let second_read = store.read_transaction_archive(&meta.file_name)?;
+    if keccak256(&second_read) != expected_hash || first_read != second_read {
+        bail!(
+            "transaction archive {} changed during authenticated content verification",
+            meta.file_name
+        );
+    }
+    Ok(first_read)
+}
+
+fn verify_authenticated_archive_contents(store: &ConfigStore, meta: &ArchiveMeta) -> Result<()> {
+    authenticated_archive_bytes(store, meta).map(drop)
+}
+
+fn read_authenticated_archive(store: &ConfigStore, meta: &ArchiveMeta) -> Result<JournalArchive> {
+    let contents = authenticated_archive_bytes(store, meta)?;
+    let archive: JournalArchive =
+        serde_json::from_slice(&contents).context("decode authenticated transaction archive")?;
+    if archive.version != ARCHIVE_VERSION || archive.entries.len() != meta.entry_count as usize {
+        bail!("transaction archive metadata does not match its authenticated contents");
+    }
+    Ok(archive)
+}
+
+fn validate_archive_record_entries(state: &JournalState, archive: &JournalArchive) -> Result<()> {
+    let archive_state = JournalState {
+        version: JOURNAL_VERSION,
+        integrity: None,
+        active_session: None,
+        per_run_policy_approval: None,
+        pending_session_transition: None,
+        session_history: Vec::new(),
+        entries: archive.entries.clone(),
+        pending_authorization: None,
+        proof_attempted_through: state.proof_attempted_through.clone(),
+        archives: Vec::new(),
+        archived_session_spending: HashMap::new(),
+        archived_total_spending_wei: "0".to_owned(),
+        next_archive_sequence: 0,
+        reward_scan_cursors: HashMap::new(),
+        reward_scan_anchor: None,
+    };
+    validate_journal(&archive_state)?;
+    for entry in &archive.entries {
+        if !archive_entry_is_settled(entry) {
+            bail!("transaction archive contains unsettled or shallowly confirmed exposure");
+        }
+        if entry.action == TransactionAction::SubmitProof
+            && entry.outcome.as_deref() == Some("candidate-updated")
+            && (!entry.reward_confirmed
+                || entry.reward_block_hash.is_none()
+                || entry.reward_confirmations < ARCHIVE_AFTER_CONFIRMATIONS)
+        {
+            bail!(
+                "transaction archive contains accepted work without sufficiently confirmed reward evidence"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_archive_ledger(
     store: &ConfigStore,
     state: &JournalState,
     telemetry: Option<&HistoryTelemetry>,
+    mut proof_index: Option<&mut ProofIdentityIndex>,
 ) -> Result<()> {
     let mut file_names = HashSet::new();
     let mut session_totals = HashMap::<String, U256>::new();
@@ -6732,62 +6971,21 @@ fn validate_archive_ledger(
         if !file_names.insert(meta.file_name.clone()) {
             bail!("transaction journal references a duplicate archive file");
         }
-        let expected_hash =
-            B256::from_str(&meta.content_hash).context("transaction archive digest is invalid")?;
-        let contents = store.read_transaction_archive(&meta.file_name)?;
-        if keccak256(&contents) != expected_hash {
-            bail!(
-                "transaction archive {} failed its journal digest",
-                meta.file_name
-            );
-        }
-        let archive: JournalArchive =
-            serde_json::from_slice(&contents).context("decode transaction archive")?;
-        if archive.version != ARCHIVE_VERSION || archive.entries.len() != meta.entry_count as usize
-        {
-            bail!("transaction archive metadata does not match its contents");
-        }
+        let archive = read_authenticated_archive(store, meta)?;
+        validate_archive_record_entries(state, &archive)?;
         if let Some(telemetry) = telemetry {
             telemetry.add(
                 HistoryCounter::ArchiveEntriesValidated,
                 u64::try_from(archive.entries.len()).unwrap_or(u64::MAX),
             );
         }
-        let archive_state = JournalState {
-            version: JOURNAL_VERSION,
-            integrity: None,
-            active_session: None,
-            per_run_policy_approval: None,
-            pending_session_transition: None,
-            session_history: Vec::new(),
-            entries: archive.entries.clone(),
-            pending_authorization: None,
-            proof_attempted_through: state.proof_attempted_through.clone(),
-            archives: Vec::new(),
-            archived_session_spending: HashMap::new(),
-            archived_total_spending_wei: "0".to_owned(),
-            next_archive_sequence: 0,
-            reward_scan_cursors: HashMap::new(),
-            reward_scan_anchor: None,
-        };
-        validate_journal(&archive_state)?;
         for entry in archive.entries {
-            if !matches!(
-                entry.status,
-                TransactionStatus::MinedSuccess | TransactionStatus::MinedReverted
-            ) || entry.confirmations < ARCHIVE_AFTER_CONFIRMATIONS
-            {
-                bail!("transaction archive contains unsettled or shallowly confirmed exposure");
-            }
             if entry.action == TransactionAction::SubmitProof
-                && entry.outcome.as_deref() == Some("candidate-updated")
-                && (!entry.reward_confirmed
-                    || entry.reward_block_hash.is_none()
-                    || entry.reward_confirmations < ARCHIVE_AFTER_CONFIRMATIONS)
+                && let Some(proof_index) = proof_index.as_deref_mut()
             {
-                bail!(
-                    "transaction archive contains accepted work without sufficiently confirmed reward evidence"
-                );
+                proof_index
+                    .identities
+                    .insert(ProofIdentity::from_entry(state, &entry)?.fingerprint());
             }
             let actual = parse_decimal_wei(
                 entry
@@ -6808,6 +7006,15 @@ fn validate_archive_ledger(
                     .checked_add(actual)
                     .context("archived session spending overflow")?,
             );
+        }
+    }
+    if let Some(proof_index) = proof_index {
+        for entry in &state.entries {
+            if entry.action == TransactionAction::SubmitProof {
+                proof_index
+                    .identities
+                    .insert(ProofIdentity::from_entry(state, entry)?.fingerprint());
+            }
         }
     }
     let recorded_sessions = state
@@ -6858,9 +7065,7 @@ fn initialize_session_accounting(
         account_entry(entry)?;
     }
     for meta in &state.archives {
-        let contents = store.read_transaction_archive(&meta.file_name)?;
-        let archive: JournalArchive =
-            serde_json::from_slice(&contents).context("decode transaction archive")?;
+        let archive = read_authenticated_archive(store, meta)?;
         for entry in &archive.entries {
             account_entry(entry)?;
         }
@@ -7151,22 +7356,22 @@ fn unix_time_secs() -> u64 {
 mod tests {
     use super::{
         ARCHIVE_AFTER_CONFIRMATIONS, ARCHIVE_TRIGGER_ENTRIES, AUTOMATIC_REWARD_FORWARDING_DISABLED,
-        Eip1559Request, ForwardingIntent, HistoryCounter, HistoryTelemetry, JOURNAL_VERSION,
-        PRE_PER_RUN_JOURNAL_VERSION, PreparedTransaction, ProofData, ProofSubmission,
-        REWARD_EMPTY_SCAN_RETRY_BASE_SECS, RewardForwardingStatus, RewardScanAnchor,
-        RewardScanBatchOutput, RewardScanCursor, RunSessionBudget, RunSessionLimitChanged,
-        SUBMISSION_FEE_WEI, TransactionAction, TransactionActivity, TransactionActivityState,
-        TransactionDashboardState, TransactionEntry, TransactionIntent, TransactionJournal,
-        TransactionManager, TransactionPolicyRefusal, TransactionPolicyRefusalKind,
-        TransactionStatus, encode_rlp_list, entry_hash, maximum_transaction_exposure,
-        parse_decimal_wei, reward_scan_key, rlp_bytes, rlp_u64, rlp_u256, run_reward_scan_batch,
-        sign_eip1559, transaction_policy_refusal, unix_time_secs, validate_archive_ledger,
-        validate_journal, validate_transaction_binding, verify_finalization_events,
-        verify_submission_events,
+        ArchiveMeta, Eip1559Request, ForwardingIntent, HistoryCounter, HistoryTelemetry,
+        JOURNAL_VERSION, PRE_PER_RUN_JOURNAL_VERSION, PreparedTransaction, ProofData,
+        ProofIdentity, ProofSubmission, REWARD_EMPTY_SCAN_RETRY_BASE_SECS, RewardForwardingStatus,
+        RewardScanAnchor, RewardScanBatchOutput, RewardScanCursor, RunSessionBudget,
+        RunSessionLimitChanged, SUBMISSION_FEE_WEI, TransactionAction, TransactionActivity,
+        TransactionActivityState, TransactionDashboardState, TransactionEntry, TransactionIntent,
+        TransactionJournal, TransactionManager, TransactionPolicyRefusal,
+        TransactionPolicyRefusalKind, TransactionStatus, encode_rlp_list, entry_hash,
+        maximum_transaction_exposure, parse_decimal_wei, proof_attempt_key, reward_scan_key,
+        rlp_bytes, rlp_u64, rlp_u256, run_reward_scan_batch, sign_eip1559,
+        transaction_policy_refusal, unix_time_secs, validate_archive_ledger, validate_journal,
+        validate_transaction_binding, verify_finalization_events, verify_submission_events,
     };
     use crate::{
         cli::{DeviceChoice, MineArgs, Network},
-        config::{AppConfig, ConfigStore, parse_inj_wei},
+        config::{AppConfig, ArchiveTamperPoint, ConfigStore, parse_inj_wei},
         contracts::{AstatineMinerRead, IERC20Read},
         diagnostics::DiagnosticBuffer,
         mining::{
@@ -7195,7 +7400,7 @@ mod tests {
             Arc, Mutex, RwLock,
             atomic::{AtomicBool, Ordering},
         },
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime},
     };
     use tempfile::tempdir;
     use tokio::time::sleep;
@@ -7256,6 +7461,45 @@ mod tests {
             value: U256::from(10_000_000_000_000_000_u128),
             data: vec![1, 2, 3, 4],
         }
+    }
+
+    fn archive_with_window_id_rewritten(contents: &[u8], from: u64, to: u64) -> Vec<u8> {
+        let to_id = to;
+        let from = format!("\"window_id\": {from}");
+        let to = format!("\"window_id\": {to}");
+        assert_eq!(
+            from.len(),
+            to.len(),
+            "fixture mutation must preserve length"
+        );
+        let mut rewritten = contents.to_vec();
+        let offset = rewritten
+            .windows(from.len())
+            .position(|window| window == from.as_bytes())
+            .expect("archive fixture contains the requested finalization window id");
+        rewritten[offset..offset + from.len()].copy_from_slice(to.as_bytes());
+        assert_eq!(rewritten.len(), contents.len());
+        let parsed: super::JournalArchive = serde_json::from_slice(&rewritten)
+            .expect("tampered archive remains syntactically valid JSON");
+        assert!(parsed.entries.iter().any(|entry| entry.window_id == to_id));
+        rewritten
+    }
+
+    fn restore_archive_file_times(
+        path: &Path,
+        modified: SystemTime,
+        created: Option<SystemTime>,
+    ) -> std::io::Result<()> {
+        let file = std::fs::OpenOptions::new().write(true).open(path)?;
+        let times = std::fs::FileTimes::new().set_modified(modified);
+        #[cfg(windows)]
+        let times = {
+            use std::os::windows::fs::FileTimesExt;
+            created.map_or(times, |created| times.set_created(created))
+        };
+        #[cfg(not(windows))]
+        let _ = created;
+        file.set_times(times)
     }
 
     fn seed_unknown_finalization_liability(
@@ -7441,8 +7685,7 @@ mod tests {
             }
         }
         for meta in &journal.state.archives {
-            let contents = journal.store.read_transaction_archive(&meta.file_name)?;
-            let archive: super::JournalArchive = serde_json::from_slice(&contents)?;
+            let archive = super::read_authenticated_archive(&journal.store, meta)?;
             for entry in archive.entries {
                 if entry.session_id == session_id {
                     total = total
@@ -7465,6 +7708,65 @@ mod tests {
             .context("test journal has no active session")?
             .authorized_exposure_wei = Some(recorded.max(total).to_string());
         Ok(())
+    }
+
+    fn populate_finalization_history(
+        journal: &mut TransactionJournal,
+        contract: Address,
+        wallet: Address,
+        target_window: u64,
+        target_attempts: usize,
+    ) -> anyhow::Result<()> {
+        let session_id = journal
+            .state
+            .active_session
+            .as_ref()
+            .context("test journal has no active session")?
+            .id
+            .clone();
+        journal.state.entries = (0..ARCHIVE_TRIGGER_ENTRIES)
+            .map(|index| {
+                let window_id = if index < target_attempts {
+                    target_window
+                } else {
+                    1_000 + index as u64
+                };
+                let mut entry = settled_history_entry(
+                    contract,
+                    1,
+                    wallet,
+                    &session_id,
+                    window_id,
+                    B256::from(U256::from(index + 1)),
+                    TransactionAction::FinalizeWindow,
+                    "window-finalized",
+                    None,
+                    ARCHIVE_AFTER_CONFIRMATIONS,
+                );
+                entry.nonce = index as u64;
+                entry
+            })
+            .collect();
+        sync_test_active_authorization(journal)?;
+        journal.persist()
+    }
+
+    fn seed_finalization_archive(
+        journal: &mut TransactionJournal,
+        contract: Address,
+        wallet: Address,
+        target_window: u64,
+        target_attempts: usize,
+    ) -> anyhow::Result<ArchiveMeta> {
+        populate_finalization_history(journal, contract, wallet, target_window, target_attempts)?;
+        let archived = journal.archive_settled()?;
+        anyhow::ensure!(archived >= target_attempts.max(1));
+        journal
+            .state
+            .archives
+            .first()
+            .cloned()
+            .context("test archive was not added to the journal ledger")
     }
 
     fn write_legacy_journal(
@@ -13896,7 +14198,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_proof_attempt_guard_survives_restart() {
+    fn settled_proof_identity_rejects_replay_after_restart_but_allows_an_improvement() {
         let root = tempdir().unwrap();
         let store = ConfigStore::at_root(PathBuf::from(root.path()));
         let config = AppConfig {
@@ -13939,11 +14241,28 @@ mod tests {
         entry.receipt_block_hash = Some(format!("{:#x}", B256::with_last_byte(10)));
         entry.receipt_status = Some(true);
         entry.confirmations = 2;
+        let prepared_identity =
+            ProofIdentity::from_entry(&journal.state, &journal.state.entries[0]).unwrap();
+        assert!(
+            journal
+                .proof_identity_index
+                .identities
+                .contains(&prepared_identity.fingerprint())
+        );
+        let authorized_before_migration = journal.session_authorized_total().unwrap();
+        journal.state.version = PRE_PER_RUN_JOURNAL_VERSION;
         journal.persist().unwrap();
         drop(journal);
 
         let mut resumed = TransactionJournal::open(&store, &config, wallet).unwrap();
-        let error = resumed
+        assert_eq!(resumed.state.version, JOURNAL_VERSION);
+        assert_eq!(resumed.state.entries.len(), 1);
+        assert_eq!(
+            resumed.session_authorized_total().unwrap(),
+            authorized_before_migration,
+            "Testnet.16 schema-v9 migration preserves the cumulative transaction authorization"
+        );
+        let duplicate = resumed
             .validate_exposure(
                 &request,
                 &intent,
@@ -13952,55 +14271,497 @@ mod tests {
                 U256::MAX,
             )
             .unwrap_err();
-        assert!(format!("{error:#}").contains("paid proof attempt already journaled"));
+        assert_eq!(
+            transaction_policy_refusal(&duplicate),
+            Some(TransactionPolicyRefusalKind::DuplicateProof)
+        );
+        assert!(format!("{duplicate:#}").contains("same canonical proof"));
+        assert_eq!(
+            resumed
+                .state
+                .proof_attempted_through
+                .get(&proof_attempt_key(request.to)),
+            Some(&4),
+            "the historical high-water mark remains intact but is not an admission rule"
+        );
+
+        let improved_intent = TransactionIntent {
+            proof: Some(ProofData {
+                nonce: 9,
+                work_hash: B256::with_last_byte(5),
+                header: b"better-header".to_vec(),
+            }),
+            ..intent
+        };
+        let mut improved_request = request.clone();
+        improved_request.nonce += 1;
+        assert!(
+            resumed
+                .validate_exposure(
+                    &improved_request,
+                    &improved_intent,
+                    U256::from(1_000_000_000_000_000_000_u128),
+                    U256::ZERO,
+                    U256::MAX,
+                )
+                .is_ok(),
+            "a different proof identity in the same contract/window may use normal admission"
+        );
     }
 
     #[test]
-    fn proof_attempt_guard_only_suppresses_the_same_contract_through_the_attempted_window() {
+    fn archived_proof_identity_rejects_replay_but_allows_a_new_same_window_proof() {
         let root = tempdir().unwrap();
         let store = ConfigStore::at_root(PathBuf::from(root.path()));
         let config = AppConfig {
             per_session_spending_limit_inj: "1".to_owned(),
             ..AppConfig::default()
         };
-        let wallet = signer_address(&test_signer());
+        let wallet = Address::with_last_byte(0x99);
         let contract = Address::with_last_byte(0x42);
-        let mut manager =
-            TransactionManager::open(&store, &config, wallet, Address::with_last_byte(0x88))
-                .unwrap();
-        let intent = TransactionIntent {
+        let proof_hash = B256::with_last_byte(0xa0);
+        let proof_header = b"archived-proof";
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+        let mut entries = vec![settled_history_entry(
+            contract,
+            1,
+            wallet,
+            &session_id,
+            4,
+            proof_hash,
+            TransactionAction::SubmitProof,
+            "candidate-updated",
+            Some("reward-paid:100".to_owned()),
+            ARCHIVE_AFTER_CONFIRMATIONS,
+        )];
+        entries[0].proof_nonce = Some(4);
+        entries[0].header_hex = Some(hex::encode(proof_header));
+        entries.extend((1..ARCHIVE_TRIGGER_ENTRIES).map(|index| {
+            settled_history_entry(
+                contract,
+                1,
+                wallet,
+                &session_id,
+                100 + index as u64,
+                B256::with_last_byte(index as u8),
+                TransactionAction::FinalizeWindow,
+                "window-finalized",
+                None,
+                ARCHIVE_AFTER_CONFIRMATIONS,
+            )
+        }));
+        journal.state.entries = entries;
+        let archived_identity =
+            ProofIdentity::from_entry(&journal.state, &journal.state.entries[0]).unwrap();
+        journal
+            .proof_identity_index
+            .identities
+            .insert(archived_identity.fingerprint());
+        journal
+            .state
+            .proof_attempted_through
+            .insert(proof_attempt_key(contract), 4);
+        let request = Eip1559Request {
+            to: contract,
+            ..test_request()
+        };
+        let repeated = TransactionIntent {
             contract,
             node_id: 1,
             window_id: 4,
             action: TransactionAction::SubmitProof,
             proof: Some(ProofData {
-                nonce: 8,
-                work_hash: B256::with_last_byte(7),
-                header: b"header".to_vec(),
+                nonce: 4,
+                work_hash: proof_hash,
+                header: proof_header.to_vec(),
             }),
             reward_destination: None,
             forwarding: None,
         };
-        let mut request = test_request();
-        request.to = contract;
-        let tx_hash = sign_eip1559(&test_signer(), &request).unwrap().hash;
-        manager
-            .journal
-            .prepare(PreparedTransaction {
-                request,
-                tx_hash,
-                intent: intent.clone(),
-                session_limit: U256::from(1_000_000_000_000_000_000_u128),
-                minimum_reserve: U256::ZERO,
-                confirmed_balance: U256::MAX,
-                confirmations_required: 1,
-            })
-            .unwrap();
+        sync_test_active_authorization(&mut journal).unwrap();
+        journal.persist().unwrap();
+        assert_eq!(journal.archive_settled().unwrap(), ARCHIVE_TRIGGER_ENTRIES);
+        assert!(journal.state.entries.is_empty());
+        let duplicate_after_archive = journal
+            .validate_exposure(
+                &request,
+                &repeated,
+                parse_inj_wei("1").unwrap(),
+                U256::ZERO,
+                U256::MAX,
+            )
+            .unwrap_err();
+        assert_eq!(
+            transaction_policy_refusal(&duplicate_after_archive),
+            Some(TransactionPolicyRefusalKind::DuplicateProof),
+            "archive creation must preserve the live proof index"
+        );
+        drop(journal);
 
-        assert!(manager.proof_attempted(contract, 4));
-        assert!(manager.proof_attempted(contract, 3));
-        assert!(!manager.proof_attempted(contract, 5));
-        assert!(!manager.proof_attempted(Address::with_last_byte(0x43), 4));
+        let mut archived = TransactionJournal::open(&store, &config, wallet).unwrap();
+        assert_eq!(archived.state.archives.len(), 1);
+        let duplicate = archived
+            .validate_exposure(
+                &request,
+                &repeated,
+                parse_inj_wei("1").unwrap(),
+                U256::ZERO,
+                U256::MAX,
+            )
+            .unwrap_err();
+        assert_eq!(
+            transaction_policy_refusal(&duplicate),
+            Some(TransactionPolicyRefusalKind::DuplicateProof)
+        );
+
+        let improvement = TransactionIntent {
+            proof: Some(ProofData {
+                nonce: 5,
+                work_hash: B256::with_last_byte(0x10),
+                header: b"new-improved-proof".to_vec(),
+            }),
+            ..repeated
+        };
+        assert!(
+            archived
+                .validate_exposure(
+                    &request,
+                    &improvement,
+                    parse_inj_wei("1").unwrap(),
+                    U256::ZERO,
+                    U256::MAX,
+                )
+                .is_ok(),
+            "an archived attempt in the same window does not block a distinct proof"
+        );
+
+        let archive_file_name = archived.state.archives[0].file_name.clone();
+        let archive_path = root
+            .path()
+            .join("transactions")
+            .join("archives")
+            .join(&archive_file_name);
+        let original_metadata = std::fs::metadata(&archive_path).unwrap();
+        let original_modified = original_metadata.modified().unwrap();
+        let original_created = original_metadata.created().ok();
+        let original_contents = std::fs::read(&archive_path).unwrap();
+        let tampered = archive_with_window_id_rewritten(&original_contents, 4, 5);
+        assert_eq!(tampered.len(), original_contents.len());
+        std::fs::write(&archive_path, &tampered).unwrap();
+        restore_archive_file_times(&archive_path, original_modified, original_created).unwrap();
+        let restored_metadata = std::fs::metadata(&archive_path).unwrap();
+        assert_eq!(restored_metadata.len(), original_metadata.len());
+        assert_eq!(restored_metadata.modified().unwrap(), original_modified);
+        #[cfg(windows)]
+        assert_eq!(
+            restored_metadata.created().unwrap(),
+            original_created.unwrap()
+        );
+        let journal_before_refusal = store.read_transaction_journal().unwrap().unwrap();
+        let authorization_before_refusal = archived.session_authorized_total().unwrap();
+        let corruption = archived
+            .validate_exposure(
+                &request,
+                &improvement,
+                parse_inj_wei("1").unwrap(),
+                U256::ZERO,
+                U256::MAX,
+            )
+            .unwrap_err();
+        assert!(format!("{corruption:#}").contains("failed its authenticated content digest"));
+        assert_eq!(
+            store.read_transaction_journal().unwrap().unwrap(),
+            journal_before_refusal,
+            "archive authentication failure must not create or persist an authorization"
+        );
+        assert_eq!(
+            archived.session_authorized_total().unwrap(),
+            authorization_before_refusal
+        );
+        assert!(archived.state.pending_authorization.is_none());
+        drop(archived);
+        let reopen_error = match TransactionJournal::open(&store, &config, wallet) {
+            Ok(_) => panic!("a restarted journal must authenticate archive contents"),
+            Err(error) => error,
+        };
+        assert!(format!("{reopen_error:#}").contains("failed its authenticated content digest"));
+    }
+
+    #[test]
+    #[ignore = "synthetic archive-admission benchmark; run with --release --ignored --exact --nocapture"]
+    fn benchmark_synthetic_proof_archive_admission_cost() {
+        fn synthetic_hash(id: u64) -> B256 {
+            let mut bytes = [0_u8; 32];
+            bytes[24..].copy_from_slice(&id.to_be_bytes());
+            B256::from(bytes)
+        }
+
+        fn measure(
+            journal: &mut TransactionJournal,
+            config: &AppConfig,
+            request: &Eip1559Request,
+            intent: &TransactionIntent,
+            samples: usize,
+            expect_duplicate: bool,
+        ) -> Vec<Duration> {
+            (0..samples)
+                .map(|_| {
+                    let started = Instant::now();
+                    let admission = journal.validate_exposure(
+                        request,
+                        intent,
+                        parse_inj_wei(&config.per_session_spending_limit_inj).unwrap(),
+                        U256::ZERO,
+                        U256::MAX,
+                    );
+                    let elapsed = started.elapsed();
+                    if expect_duplicate {
+                        assert_eq!(
+                            transaction_policy_refusal(&admission.unwrap_err()),
+                            Some(TransactionPolicyRefusalKind::DuplicateProof)
+                        );
+                    } else {
+                        admission.expect("synthetic new proof should pass admission");
+                    }
+                    elapsed
+                })
+                .collect()
+        }
+
+        fn report(label: &str, archive_count: usize, mut samples: Vec<Duration>) {
+            samples.sort_unstable();
+            let percentile = |percentile: usize| {
+                let index = samples
+                    .len()
+                    .saturating_mul(percentile)
+                    .div_ceil(100)
+                    .saturating_sub(1);
+                samples[index].as_secs_f64() * 1_000_000.0
+            };
+            println!(
+                "M-01 authenticated archives={archive_count} operation={label} samples={} median_us={:.1} p95_us={:.1}",
+                samples.len(),
+                percentile(50),
+                percentile(95),
+            );
+        }
+
+        fn measure_archive_authentication(
+            journal: &TransactionJournal,
+            samples: usize,
+        ) -> Vec<Duration> {
+            (0..samples)
+                .map(|_| {
+                    let started = Instant::now();
+                    for meta in &journal.state.archives {
+                        super::verify_authenticated_archive_contents(&journal.store, meta).unwrap();
+                    }
+                    started.elapsed()
+                })
+                .collect()
+        }
+
+        for archive_count in [0_usize, 10, 100, 1_000] {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(root.path().to_path_buf());
+            let config = AppConfig {
+                per_session_spending_limit_inj: "100".to_owned(),
+                ..AppConfig::default()
+            };
+            let wallet = Address::with_last_byte(0x99);
+            let contract = Address::with_last_byte(0x42);
+            let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+            let session_id = journal.state.active_session.as_ref().unwrap().id.clone();
+            let entries_per_archive = super::ARCHIVE_BATCH_SIZE;
+            let mut old_proof = None;
+            let mut recent_proof = None;
+            let mut archived_actual = U256::ZERO;
+
+            for archive_index in 0..archive_count {
+                let mut entries = Vec::with_capacity(entries_per_archive);
+                for entry_index in 0..entries_per_archive {
+                    let global_id = archive_index * entries_per_archive + entry_index + 1;
+                    let tx_hash = synthetic_hash(global_id as u64);
+                    let is_recent_proof = archive_index + 1 == archive_count
+                        && entry_index + 1 == entries_per_archive;
+                    let is_old_proof = archive_index == 0 && entry_index == 0;
+                    let is_competitive_proof = entry_index % 16 == 0 || is_recent_proof;
+                    let entry = if is_competitive_proof {
+                        let header =
+                            format!("synthetic-proof-{archive_index}-{entry_index}").into_bytes();
+                        let work_hash = synthetic_hash((global_id + 50_000) as u64);
+                        let mut entry = settled_history_entry(
+                            contract,
+                            1,
+                            wallet,
+                            &session_id,
+                            7,
+                            tx_hash,
+                            TransactionAction::SubmitProof,
+                            "candidate-updated",
+                            Some("reward-paid:100".to_owned()),
+                            ARCHIVE_AFTER_CONFIRMATIONS,
+                        );
+                        entry.proof_nonce = Some((global_id + 100_000) as u128);
+                        entry.proof_hash = Some(format!("{work_hash:#x}"));
+                        entry.header_hex = Some(hex::encode(&header));
+                        let proof = ProofData {
+                            nonce: entry.proof_nonce.unwrap(),
+                            work_hash,
+                            header,
+                        };
+                        if is_old_proof {
+                            old_proof = Some(proof.clone());
+                        }
+                        if is_recent_proof {
+                            recent_proof = Some(proof);
+                        }
+                        entry
+                    } else {
+                        settled_history_entry(
+                            contract,
+                            1,
+                            wallet,
+                            &session_id,
+                            10_000 + global_id as u64,
+                            tx_hash,
+                            TransactionAction::FinalizeWindow,
+                            "window-finalized",
+                            None,
+                            ARCHIVE_AFTER_CONFIRMATIONS,
+                        )
+                    };
+                    archived_actual = archived_actual
+                        .checked_add(
+                            parse_decimal_wei(entry.actual_cost_wei.as_deref().unwrap()).unwrap(),
+                        )
+                        .unwrap();
+                    entries.push(entry);
+                }
+                let contents = serde_json::to_vec_pretty(&super::JournalArchive {
+                    version: super::ARCHIVE_VERSION,
+                    entries,
+                })
+                .unwrap();
+                let content_hash = format!("{:#x}", keccak256(&contents));
+                let file_name = format!("archive-{}.json", &content_hash[2..]);
+                store
+                    .write_transaction_archive(&file_name, &contents)
+                    .unwrap();
+                journal.state.archives.push(super::ArchiveMeta {
+                    file_name,
+                    content_hash,
+                    entry_count: u32::try_from(entries_per_archive).unwrap(),
+                });
+            }
+            if archive_count > 0 {
+                let actual = archived_actual.to_string();
+                journal
+                    .state
+                    .archived_session_spending
+                    .insert(session_id, actual.clone());
+                journal.state.archived_total_spending_wei = actual;
+                journal.state.next_archive_sequence = archive_count as u64;
+                journal
+                    .state
+                    .proof_attempted_through
+                    .insert(proof_attempt_key(contract), 7);
+            }
+            sync_test_active_authorization(&mut journal).unwrap();
+            journal.persist().unwrap();
+            drop(journal);
+
+            let mut open_samples = Vec::new();
+            let open_sample_count = if archive_count == 1_000 { 3 } else { 5 };
+            for _ in 0..open_sample_count {
+                let started = Instant::now();
+                let opened = TransactionJournal::open(&store, &config, wallet).unwrap();
+                open_samples.push(started.elapsed());
+                drop(opened);
+            }
+            report("journal-open-validation", archive_count, open_samples);
+
+            let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+            println!(
+                "M-01 authenticated archives={} proof_identities={} estimated_identity_index_bytes={}",
+                journal.state.archives.len(),
+                journal.proof_identity_index.identities.len(),
+                journal.proof_identity_index.estimated_heap_bytes(),
+            );
+            let archive_authentication_samples = if archive_count == 1_000 { 3 } else { 10 };
+            report(
+                "archive-content-authentication",
+                archive_count,
+                measure_archive_authentication(&journal, archive_authentication_samples),
+            );
+            let make_admission = |proof: ProofData, tx_nonce: u64| {
+                let request = Eip1559Request {
+                    chain_id: 1439,
+                    nonce: tx_nonce,
+                    max_priority_fee_per_gas: U256::from(2_000_000_000_u64),
+                    max_fee_per_gas: U256::from(30_000_000_000_u64),
+                    gas_limit: 75_000,
+                    to: contract,
+                    value: U256::from(SUBMISSION_FEE_WEI),
+                    data: AstatineMinerRead::submitSolutionCall {
+                        header: Bytes::copy_from_slice(&proof.header),
+                        nonce: proof.nonce,
+                    }
+                    .abi_encode(),
+                };
+                let intent = TransactionIntent {
+                    contract,
+                    node_id: 1,
+                    window_id: 7,
+                    action: TransactionAction::SubmitProof,
+                    proof: Some(proof),
+                    reward_destination: None,
+                    forwarding: None,
+                };
+                (request, intent)
+            };
+            let new_proof = ProofData {
+                nonce: 900_000,
+                work_hash: synthetic_hash(900_001),
+                header: b"synthetic-new-proof".to_vec(),
+            };
+            let (new_request, new_intent) = make_admission(new_proof, 50);
+            let samples = match archive_count {
+                0 => 500,
+                10 => 40,
+                100 => 20,
+                _ => 5,
+            };
+            report(
+                "new-proof",
+                archive_count,
+                measure(
+                    &mut journal,
+                    &config,
+                    &new_request,
+                    &new_intent,
+                    samples,
+                    false,
+                ),
+            );
+            if let Some(proof) = old_proof {
+                let (request, intent) = make_admission(proof, 51);
+                report(
+                    "duplicate-old-archive",
+                    archive_count,
+                    measure(&mut journal, &config, &request, &intent, samples, true),
+                );
+            }
+            if archive_count > 1 {
+                let (request, intent) = make_admission(recent_proof.unwrap(), 52);
+                report(
+                    "duplicate-recent-archive",
+                    archive_count,
+                    measure(&mut journal, &config, &request, &intent, samples, true),
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -14045,7 +14806,13 @@ mod tests {
         assert!(format!("{error:#}").contains("does not match the configured wallet"));
         assert_eq!(telemetry.count(1, ProofMetric::SignerIdentityMismatch), 1);
         assert!(manager.journal.state.entries.is_empty());
-        assert!(!manager.proof_attempted(contract, 0));
+        assert!(
+            !manager
+                .journal
+                .state
+                .proof_attempted_through
+                .contains_key(&proof_attempt_key(contract))
+        );
     }
 
     #[test]
@@ -14124,6 +14891,17 @@ mod tests {
         assert_eq!(migrated.state.version, super::JOURNAL_VERSION);
         assert!(migrated.has_unresolved());
         let entry = &migrated.state.entries[0];
+        let unbound_identity = ProofIdentity::from_entry(&migrated.state, entry).unwrap();
+        assert!(unbound_identity.wallet.is_none());
+        let replay_as_selected_wallet = ProofIdentity {
+            wallet: Some(wallet),
+            ..unbound_identity
+        };
+        assert!(
+            migrated
+                .proof_identity_is_journaled(&replay_as_selected_wallet)
+                .unwrap()
+        );
         assert_eq!(entry.status, TransactionStatus::Unknown);
         assert_eq!(entry.last_known_cost_wei.as_deref(), Some("12345"));
         assert_eq!(entry.outcome.as_deref(), Some("receipt-event-unverified"));
@@ -14225,7 +15003,7 @@ mod tests {
             journal.session_authorized_total().unwrap(),
             U256::from((super::ARCHIVE_TRIGGER_ENTRIES as u64) * 200)
         );
-        validate_archive_ledger(&store, &journal.state, None).unwrap();
+        validate_archive_ledger(&store, &journal.state, None, None).unwrap();
         drop(journal);
         let reopened = TransactionJournal::open(&store, &config, wallet).unwrap();
         assert_eq!(
@@ -14300,12 +15078,202 @@ mod tests {
             Ok(_) => panic!("modified archive should fail digest validation"),
             Err(error) => error,
         };
-        assert!(open_error.to_string().contains("failed its journal digest"));
+        assert!(
+            open_error
+                .to_string()
+                .contains("failed its authenticated content digest")
+        );
         assert_eq!(
             telemetry.count(HistoryCounter::ArchiveValidationFailures),
             1
         );
         assert!(store.read_transaction_journal().unwrap().is_some());
+    }
+
+    #[test]
+    fn archive_creation_verifies_written_bytes_before_ledger_commit() {
+        for tamper_point in [
+            ArchiveTamperPoint::AtomicWrite,
+            ArchiveTamperPoint::WriteReadback,
+            ArchiveTamperPoint::ArchiveRead,
+        ] {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(PathBuf::from(root.path()));
+            let config = AppConfig {
+                per_session_spending_limit_inj: "1".to_owned(),
+                ..AppConfig::default()
+            };
+            let wallet = Address::with_last_byte(0x99);
+            let contract = Address::with_last_byte(1);
+            let telemetry = Arc::new(HistoryTelemetry::default());
+            let mut journal = TransactionJournal::open_with_history_telemetry(
+                &store,
+                &config,
+                wallet,
+                Arc::clone(&telemetry),
+            )
+            .unwrap();
+            populate_finalization_history(&mut journal, contract, wallet, 77, 2).unwrap();
+            let persisted_journal = store.read_transaction_journal().unwrap().unwrap();
+            let authorized_before = journal.session_authorized_total().unwrap();
+            store.tamper_archive_at_for_test(tamper_point).unwrap();
+
+            assert!(
+                journal.archive_settled().is_err(),
+                "archive corruption at {tamper_point:?} must fail closed before ledger commit"
+            );
+            assert_eq!(journal.state.entries.len(), ARCHIVE_TRIGGER_ENTRIES);
+            assert!(journal.state.archives.is_empty());
+            assert_eq!(
+                journal.session_authorized_total().unwrap(),
+                authorized_before
+            );
+            assert_eq!(
+                store.read_transaction_journal().unwrap().unwrap(),
+                persisted_journal,
+                "a corrupt archive must not replace the durable active history"
+            );
+            assert_eq!(telemetry.count(HistoryCounter::ArchiveWriteFailures), 1);
+        }
+    }
+
+    #[test]
+    fn missing_archive_refuses_new_proof_before_authorization() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x99);
+        let contract = Address::with_last_byte(1);
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let archive = seed_finalization_archive(&mut journal, contract, wallet, 77, 1).unwrap();
+        let archive_path = root
+            .path()
+            .join("transactions")
+            .join("archives")
+            .join(&archive.file_name);
+        drop(journal);
+
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        std::fs::remove_file(&archive_path).unwrap();
+        let journal_before = store.read_transaction_journal().unwrap().unwrap();
+        let authorized_before = journal.session_authorized_total().unwrap();
+        let proof = ProofData {
+            nonce: 900,
+            work_hash: B256::with_last_byte(0x91),
+            header: b"new-proof-with-missing-history".to_vec(),
+        };
+        let intent = TransactionIntent {
+            contract,
+            node_id: 1,
+            window_id: 77,
+            action: TransactionAction::SubmitProof,
+            proof: Some(proof.clone()),
+            reward_destination: None,
+            forwarding: None,
+        };
+        let request = Eip1559Request {
+            chain_id: 1439,
+            nonce: 900,
+            max_priority_fee_per_gas: U256::from(2_000_000_000_u64),
+            max_fee_per_gas: U256::from(30_000_000_000_u64),
+            gas_limit: 75_000,
+            to: contract,
+            value: U256::from(SUBMISSION_FEE_WEI),
+            data: AstatineMinerRead::submitSolutionCall {
+                header: Bytes::copy_from_slice(&proof.header),
+                nonce: proof.nonce,
+            }
+            .abi_encode(),
+        };
+        let refusal = journal
+            .validate_exposure(
+                &request,
+                &intent,
+                parse_inj_wei(&config.per_session_spending_limit_inj).unwrap(),
+                U256::ZERO,
+                U256::MAX,
+            )
+            .unwrap_err();
+        assert!(format!("{refusal:#}").contains("read private transaction archive"));
+        assert!(journal.state.pending_authorization.is_none());
+        assert_eq!(
+            journal.session_authorized_total().unwrap(),
+            authorized_before
+        );
+        assert_eq!(
+            store.read_transaction_journal().unwrap().unwrap(),
+            journal_before
+        );
+        drop(journal);
+        let missing_restart = match TransactionJournal::open(&store, &config, wallet) {
+            Ok(_) => panic!("a restarted journal must reject a missing authenticated archive"),
+            Err(error) => error,
+        };
+        assert!(format!("{missing_restart:#}").contains("read private transaction archive"));
+    }
+
+    #[test]
+    fn replaced_archived_finalization_cannot_hide_a_prior_attempt() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = Address::with_last_byte(0x99);
+        let contract = Address::with_last_byte(1);
+        let mut journal = TransactionJournal::open(&store, &config, wallet).unwrap();
+        let archive = seed_finalization_archive(&mut journal, contract, wallet, 77, 1).unwrap();
+
+        let intact = journal
+            .finalization_retry_entry(contract, 1, 77)
+            .unwrap_err();
+        assert_eq!(
+            transaction_policy_refusal(&intact),
+            Some(TransactionPolicyRefusalKind::DuplicateFinalization),
+            "the authenticated archive must enforce the existing finalization-attempt limit"
+        );
+        let authorized_before = journal.session_authorized_total().unwrap();
+        let archive_path = root
+            .path()
+            .join("transactions")
+            .join("archives")
+            .join(&archive.file_name);
+        let metadata = std::fs::metadata(&archive_path).unwrap();
+        let original_modified = metadata.modified().unwrap();
+        let original_created = metadata.created().ok();
+        let original = std::fs::read(&archive_path).unwrap();
+        let replacement_contents = archive_with_window_id_rewritten(&original, 77, 78);
+        let replacement_path = archive_path.with_extension("replacement");
+        std::fs::write(&replacement_path, replacement_contents).unwrap();
+        std::fs::remove_file(&archive_path).unwrap();
+        std::fs::rename(&replacement_path, &archive_path).unwrap();
+        restore_archive_file_times(&archive_path, original_modified, original_created).unwrap();
+        assert_eq!(
+            std::fs::metadata(&archive_path)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            original_modified
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            std::fs::metadata(&archive_path).unwrap().created().unwrap(),
+            original_created.unwrap()
+        );
+
+        let tampered = journal
+            .finalization_retry_entry(contract, 1, 77)
+            .unwrap_err();
+        assert!(format!("{tampered:#}").contains("failed its authenticated content digest"));
+        assert_eq!(
+            journal.session_authorized_total().unwrap(),
+            authorized_before
+        );
+        assert!(journal.state.pending_authorization.is_none());
     }
 
     #[test]
@@ -16228,6 +17196,13 @@ mod tests {
                     )
                     .await;
                     if test_device == DeviceChoice::Gpu {
+                        wait_for_proof_metric(
+                            &probe,
+                            *node_id,
+                            ProofMetric::GpuCandidatesCpuVerified,
+                            1,
+                        )
+                        .await;
                         assert!(
                             probe
                                 .proof_telemetry
@@ -16320,6 +17295,13 @@ mod tests {
                     wait_for_active_probe(&probe, *node_id, state.work.window_id).await;
                     wait_for_hash_increase(&probe, *node_id, previous_hashes).await;
                     if test_device == DeviceChoice::Gpu {
+                        wait_for_proof_metric(
+                            &probe,
+                            *node_id,
+                            ProofMetric::GpuCandidatesCpuVerified,
+                            1,
+                        )
+                        .await;
                         assert!(
                             probe
                                 .proof_telemetry
@@ -16377,6 +17359,13 @@ mod tests {
                 assert!(probe.proof_telemetry.count(1, ProofMetric::Broadcast) > 0);
                 assert!(probe.proof_telemetry.count(1, ProofMetric::ReceiptConfirmed) > 0);
                 if test_device == DeviceChoice::Gpu {
+                    wait_for_proof_metric(
+                        &probe,
+                        1,
+                        ProofMetric::GpuCandidatesCpuVerified,
+                        1,
+                    )
+                    .await;
                     assert!(
                         probe
                             .proof_telemetry
@@ -18277,6 +19266,13 @@ mod tests {
                     starting_generations[index] = probe.slots[index].generation();
                     wait_for_active_probe(&probe, node_id, state.work.window_id).await;
                     wait_for_hash_increase(&probe, node_id, starting_hashes[index]).await;
+                    wait_for_proof_metric(
+                        &probe,
+                        node_id,
+                        ProofMetric::GpuCandidatesCpuVerified,
+                        1,
+                    )
+                    .await;
                 }
                 for &node_id in selected_gpu_nodes {
                     assert!(
@@ -18511,6 +19507,8 @@ mod tests {
 
             let mut observed_updates = probe.observer_updates.clone();
             let _ = observed_updates.borrow_and_update();
+            probe.proof_processing_gate.send_replace(true);
+            wait_for_proof_pipeline_idle(&probe, &store, &[1, 3]).await;
             rpc_request_local(
                 &rpc,
                 &endpoint,
@@ -18521,12 +19519,35 @@ mod tests {
             .unwrap();
             advance_window_past_expiry(&rpc, &endpoint, &network, 3, &node3_window0).await;
             let while_node3_finalizing = network.snapshot(None).await.unwrap();
+            let node3_finalization_state = while_node3_finalizing
+                .nodes
+                .iter()
+                .find(|node| node.id == 3)
+                .and_then(|node| node.state.as_ref())
+                .unwrap();
+            assert!(
+                node3_finalization_state.finalizable && !node3_finalization_state.mining_paused,
+                "node 3 should remain permissionlessly finalizable: {node3_finalization_state:?}"
+            );
             assert!(while_node3_finalizing.nodes.iter().any(|node| {
                 node.id == 1
                     && node
                         .state
                         .as_ref()
                         .is_some_and(|state| state.work.window_id == 1 && state.eligible)
+            }));
+            probe.observer_refresh.force_refresh();
+            let observed_expiry = wait_for_observer_snapshot(
+                &mut observed_updates,
+                while_node3_finalizing.block.number,
+            )
+            .await;
+            assert!(observed_expiry.nodes.iter().any(|node| {
+                node.id == 3
+                    && node
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.finalizable && !state.eligible)
             }));
             let pending_node3_finalization = wait_for_journal_entry_for_window(
                 &store,
@@ -18578,6 +19599,7 @@ mod tests {
             )
             .await;
             assert!(node3_finalized.receipt_status.unwrap());
+            probe.proof_processing_gate.send_replace(false);
             wait_for_active_probe(&probe, 3, 1).await;
 
             let node1_window1 = wait_for_eligible_window(&network, 1, 1).await;
@@ -18637,6 +19659,7 @@ mod tests {
             let _node3_window1_candidate = wait_for_candidate(&network, 3, 1, account).await;
             wait_for_no_unresolved_transactions(&store).await;
             probe.proof_processing_gate.send_replace(true);
+            wait_for_proof_pipeline_idle(&probe, &store, &[1, 3]).await;
 
             rpc_request_local(
                 &rpc,
@@ -18928,9 +19951,11 @@ mod tests {
             let recovery_hashes =
                 recovery_probe.slots[usize::from(pending_proof.node_id - 1)].completed_hashes();
             tokio::time::sleep(Duration::from_millis(150)).await;
+            let nonce_after_recovery = local_pending_nonce(&rpc, &endpoint, account).await;
             assert_eq!(
-                local_pending_nonce(&rpc, &endpoint, account).await,
-                nonce_before_recovery
+                nonce_after_recovery,
+                nonce_before_recovery + 1,
+                "recovery may authorize one genuinely new proof at a distinct pending wallet nonce"
             );
             wait_for_hash_increase(&recovery_probe, pending_proof.node_id, recovery_hashes).await;
             let journal_during_recovery: super::JournalState =
@@ -18938,12 +19963,29 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 journal_during_recovery.entries.len(),
-                entry_count_before_recovery
+                entry_count_before_recovery + 1,
+                "recovery must not replay the pending proof, but can journal a different proof identity"
             );
             assert!(journal_during_recovery.entries.iter().any(|entry| {
                 entry_hash(entry).unwrap() == pending_hash
                     && entry.status == TransactionStatus::Broadcast
             }));
+            let additional_proof = journal_during_recovery
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.action == TransactionAction::SubmitProof
+                        && entry.node_id == pending_proof.node_id
+                        && entry.window_id == pending_proof.window_id
+                        && entry_hash(entry).ok() != Some(pending_hash)
+                })
+                .expect("recovery should journal the distinct competitive proof");
+            assert_eq!(additional_proof.nonce, pending_proof.nonce + 1);
+            assert_ne!(additional_proof.proof_nonce, pending_proof.proof_nonce);
+            assert_ne!(additional_proof.proof_hash, pending_proof.proof_hash);
+            // Freeze proof delivery while checking receipt recovery; otherwise
+            // a third naturally-improved hash can race this nonce assertion.
+            recovery_probe.proof_processing_gate.send_replace(true);
             assert!(
                 network
                     .transaction_receipt(pending_hash)
@@ -18970,10 +20012,10 @@ mod tests {
                 TransactionStatus::MinedSuccess,
             )
             .await;
-            assert_eq!(
+            assert!(matches!(
                 settled_pending.outcome.as_deref(),
-                Some("candidate-updated")
-            );
+                Some("candidate-updated" | "submission-rejected-fee-retained")
+            ));
             let _recovered_candidate = wait_for_candidate(
                 &network,
                 pending_proof.node_id,
@@ -18983,7 +20025,8 @@ mod tests {
             .await;
             assert_eq!(
                 local_pending_nonce(&rpc, &endpoint, account).await,
-                nonce_before_recovery
+                nonce_after_recovery,
+                "receipt recovery must not rebroadcast either journaled proof transaction"
             );
 
             recovery_probe.stop_signal.request_stop();
@@ -19215,6 +20258,432 @@ mod tests {
         assert_eq!(first_action.outcome, "candidate-updated");
         assert_eq!(manager.mined_rewards_total(), U256::ZERO);
 
+        let improvement_header = b"same-wallet-window-zero-improvement";
+        let improvement_context = WorkContext {
+            chain_id: network.manifest.chain_id,
+            contract: miner,
+            window_id: first_work.work.window_id,
+            seed: first_work.work.seed,
+            miner: wallet,
+            header: improvement_header.to_vec(),
+        };
+        let improvement = (0..50_000_u128)
+            .find_map(|nonce| {
+                let hash = WorkHasher::new(&improvement_context).unwrap().hash(nonce);
+                (hash < first_hash).then_some((nonce, hash))
+            })
+            .expect("same wallet must find a better proof for its own incumbent");
+        let (next_manager, improvement_action) = submit_local_proof_with_confirmation(
+            manager,
+            network.clone(),
+            clone_signer(&signer),
+            ProofSubmission {
+                contract: miner,
+                node_id: 1,
+                window_id: first_work.work.window_id,
+                nonce: improvement.0,
+                header: improvement_header.to_vec(),
+                work_hash: improvement.1,
+            },
+            &store,
+            &rpc,
+            &endpoint,
+        )
+        .await;
+        manager = next_manager;
+        assert_eq!(improvement_action.outcome, "candidate-updated");
+        assert_eq!(
+            network.snapshot(None).await.unwrap().nodes[0]
+                .state
+                .as_ref()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .work_hash,
+            improvement.1
+        );
+        let same_window_proofs = manager
+            .journal
+            .state
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.action == TransactionAction::SubmitProof
+                    && entry.contract.eq_ignore_ascii_case(&format!("{miner:#x}"))
+                    && entry.window_id == first_work.work.window_id
+                    && entry.wallet.eq_ignore_ascii_case(&format!("{wallet:#x}"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(same_window_proofs.len(), 2);
+        let proof_authorization_sum = same_window_proofs.iter().fold(U256::ZERO, |sum, entry| {
+            sum.checked_add(parse_decimal_wei(&entry.maximum_exposure_wei).unwrap())
+                .unwrap()
+        });
+        assert_eq!(
+            manager.journal.session_authorized_total().unwrap(),
+            proof_authorization_sum,
+            "each same-window proof consumes additional durable session authorization"
+        );
+
+        // Tampering an already-open archive must stop a real transaction
+        // manager before it reserves authorization, signs, or broadcasts.
+        let integrity_root = tempdir().unwrap();
+        let integrity_store = ConfigStore::at_root(integrity_root.path().to_path_buf());
+        let integrity_config = AppConfig {
+            network: Network::Testnet,
+            wallet_address: Some(format!("{wallet:#x}")),
+            minimum_reserve_inj: "0".to_owned(),
+            per_session_spending_limit_inj: "20".to_owned(),
+            transaction_confirmations: 2,
+            ..AppConfig::default()
+        };
+        let mut integrity_journal =
+            TransactionJournal::open(&integrity_store, &integrity_config, wallet).unwrap();
+        let integrity_archive =
+            seed_finalization_archive(&mut integrity_journal, miner, wallet, 77, 0).unwrap();
+        drop(integrity_journal);
+        let mut integrity_manager =
+            TransactionManager::open(&integrity_store, &integrity_config, wallet, token).unwrap();
+        let integrity_telemetry = Arc::new(ProofPipelineTelemetry::default());
+        integrity_manager.set_proof_telemetry(Arc::clone(&integrity_telemetry));
+
+        let integrity_snapshot = network.snapshot(None).await.unwrap();
+        let integrity_work = integrity_snapshot.nodes[0].state.as_ref().unwrap();
+        let incumbent = integrity_work.candidate.as_ref().unwrap().work_hash;
+        let integrity_header = b"archive-authentication-refusal";
+        let integrity_context = WorkContext {
+            chain_id: network.manifest.chain_id,
+            contract: miner,
+            window_id: integrity_work.work.window_id,
+            seed: integrity_work.work.seed,
+            miner: wallet,
+            header: integrity_header.to_vec(),
+        };
+        let integrity_proof = (0..50_000_u128)
+            .find_map(|nonce| {
+                let hash = WorkHasher::new(&integrity_context).unwrap().hash(nonce);
+                (hash < incumbent).then_some((nonce, hash))
+            })
+            .expect("fixture should yield a strictly improving proof for tamper admission");
+        let integrity_archive_path = integrity_root
+            .path()
+            .join("transactions")
+            .join("archives")
+            .join(&integrity_archive.file_name);
+        let integrity_metadata = std::fs::metadata(&integrity_archive_path).unwrap();
+        let integrity_modified = integrity_metadata.modified().unwrap();
+        let integrity_created = integrity_metadata.created().ok();
+        let integrity_original = std::fs::read(&integrity_archive_path).unwrap();
+        let integrity_tampered =
+            archive_with_window_id_rewritten(&integrity_original, 1_000, 9_999);
+        std::fs::write(&integrity_archive_path, &integrity_tampered).unwrap();
+        restore_archive_file_times(
+            &integrity_archive_path,
+            integrity_modified,
+            integrity_created,
+        )
+        .unwrap();
+
+        let integrity_journal_before = integrity_store.read_transaction_journal().unwrap().unwrap();
+        let integrity_authorization_before = integrity_manager
+            .journal
+            .session_authorized_total()
+            .unwrap();
+        let wallet_nonce_before = local_pending_nonce(&rpc, &endpoint, wallet).await;
+        let integrity_refusal = integrity_manager
+            .submit_proof(
+                &network,
+                &signer,
+                ProofSubmission {
+                    contract: miner,
+                    node_id: 1,
+                    window_id: integrity_work.work.window_id,
+                    nonce: integrity_proof.0,
+                    header: integrity_header.to_vec(),
+                    work_hash: integrity_proof.1,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{integrity_refusal:#}").contains("failed its authenticated content digest")
+        );
+        assert_eq!(
+            integrity_store.read_transaction_journal().unwrap().unwrap(),
+            integrity_journal_before,
+            "failed archive authentication must not reserve or persist an authorization"
+        );
+        assert_eq!(
+            integrity_manager
+                .journal
+                .session_authorized_total()
+                .unwrap(),
+            integrity_authorization_before
+        );
+        assert!(
+            integrity_manager
+                .journal
+                .state
+                .pending_authorization
+                .is_none()
+        );
+        assert_eq!(
+            integrity_telemetry.count(1, ProofMetric::Signed),
+            0,
+            "archive authentication failure must precede proof signing"
+        );
+        assert_eq!(
+            integrity_telemetry.count(1, ProofMetric::Broadcast),
+            0,
+            "archive authentication failure must precede transaction broadcast"
+        );
+        assert_eq!(
+            local_pending_nonce(&rpc, &endpoint, wallet).await,
+            wallet_nonce_before,
+            "archive authentication failure must not consume the wallet nonce"
+        );
+
+        // Exercise a separately approved paid session on the same real Anvil
+        // candidate. Three strictly improving proofs must each reserve their
+        // own maximum exposure; the next proof is blocked by the terminal cap.
+        let cap_snapshot =
+            rpc_request_local(&rpc, &endpoint, "evm_snapshot", serde_json::json!([]))
+                .await
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_owned();
+        let largest_proof_exposure = same_window_proofs
+            .iter()
+            .map(|entry| parse_decimal_wei(&entry.maximum_exposure_wei).unwrap())
+            .max()
+            .unwrap();
+        let cap_limit = largest_proof_exposure
+            .checked_mul(U256::from(3))
+            .unwrap()
+            .checked_add(parse_inj_wei("0.0075").unwrap())
+            .unwrap();
+        let inj_unit = U256::from(10_u8).pow(U256::from(18));
+        let cap_limit_inj = format!("{}.{:018}", cap_limit / inj_unit, cap_limit % inj_unit);
+        let cap_root = tempdir().unwrap();
+        let cap_store = ConfigStore::at_root(cap_root.path().to_path_buf());
+        let cap_config = AppConfig {
+            network: Network::Testnet,
+            wallet_address: Some(format!("{wallet:#x}")),
+            minimum_reserve_inj: "0".to_owned(),
+            per_session_spending_limit_inj: cap_limit_inj,
+            transaction_confirmations: 2,
+            ..AppConfig::default()
+        };
+        TransactionJournal::set_per_run_policy_approval(&cap_store, &cap_config, Some(wallet))
+            .unwrap();
+        let cap_balance = network
+            .snapshot(Some(wallet))
+            .await
+            .unwrap()
+            .native_balance
+            .unwrap();
+        let cap_budget = RunSessionBudget {
+            ceiling_wei: cap_limit,
+            approved_limit_wei: cap_limit,
+            confirmed_balance_wei: cap_balance,
+            minimum_reserve_wei: U256::ZERO,
+        };
+        let mut cap_manager = TransactionManager::open_for_per_run_session_with_lock(
+            &cap_store,
+            &cap_config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+            cap_store.lock_transaction_journal().unwrap(),
+            cap_budget,
+        )
+        .unwrap();
+        let terminal_latch = Arc::new(AtomicBool::new(false));
+        let latch_observer = Arc::clone(&terminal_latch);
+        assert!(
+            !cap_manager
+                .set_session_limit_reached_sink(Arc::new(move || {
+                    latch_observer.store(true, Ordering::Release);
+                }))
+                .unwrap()
+        );
+
+        let incumbent = network.snapshot(None).await.unwrap().nodes[0]
+            .state
+            .as_ref()
+            .unwrap()
+            .candidate
+            .as_ref()
+            .unwrap()
+            .work_hash;
+        let cap_header = b"same-window-session-cap-exhaustion";
+        let cap_context = WorkContext {
+            chain_id: network.manifest.chain_id,
+            contract: miner,
+            window_id: first_work.work.window_id,
+            seed: first_work.work.seed,
+            miner: wallet,
+            header: cap_header.to_vec(),
+        };
+        let cap_hasher = WorkHasher::new(&cap_context).unwrap();
+        let mut threshold = incumbent;
+        let mut cap_proofs = Vec::new();
+        for index in 0..4_u128 {
+            let start = index * 50_000;
+            let proof = (start..start + 50_000)
+                .find_map(|nonce| {
+                    let hash = cap_hasher.hash(nonce);
+                    (hash < threshold).then_some((nonce, hash))
+                })
+                .expect("Anvil fixture should have a strictly improving cap-test proof");
+            threshold = proof.1;
+            cap_proofs.push(proof);
+        }
+        for (nonce, work_hash) in cap_proofs.iter().take(3).copied() {
+            let (next_manager, action) = tokio::time::timeout(
+                Duration::from_secs(15),
+                submit_local_proof_with_confirmation(
+                    cap_manager,
+                    network.clone(),
+                    clone_signer(&signer),
+                    ProofSubmission {
+                        contract: miner,
+                        node_id: 1,
+                        window_id: first_work.work.window_id,
+                        nonce,
+                        header: cap_header.to_vec(),
+                        work_hash,
+                    },
+                    &cap_store,
+                    &rpc,
+                    &endpoint,
+                ),
+            )
+            .await
+            .expect("each within-cap proof should settle on Anvil");
+            cap_manager = next_manager;
+            assert_eq!(action.outcome, "candidate-updated");
+        }
+
+        let cap_proof_entries = cap_manager
+            .journal
+            .state
+            .entries
+            .iter()
+            .filter(|entry| entry.action == TransactionAction::SubmitProof)
+            .collect::<Vec<_>>();
+        assert_eq!(cap_proof_entries.len(), 3);
+        assert!(cap_proof_entries.iter().all(|entry| {
+            entry.status == TransactionStatus::MinedSuccess
+                && entry.outcome.as_deref() == Some("candidate-updated")
+                && parse_decimal_wei(&entry.maximum_exposure_wei)
+                    .is_ok_and(|exposure| exposure > U256::from(SUBMISSION_FEE_WEI))
+        }));
+        let cap_authorized = cap_proof_entries.iter().fold(U256::ZERO, |total, entry| {
+            total
+                .checked_add(parse_decimal_wei(&entry.maximum_exposure_wei).unwrap())
+                .unwrap()
+        });
+        assert_eq!(
+            cap_manager.journal.session_authorized_total().unwrap(),
+            cap_authorized,
+            "every improving proof permanently reserves its own maximum exposure"
+        );
+        assert!(cap_manager.budget_remaining().unwrap() < U256::from(SUBMISSION_FEE_WEI));
+        assert!(cap_manager.refresh_session_limit_state().unwrap());
+        assert!(terminal_latch.load(Ordering::Acquire));
+
+        let cap_journal_before_refusal = cap_store.read_transaction_journal().unwrap().unwrap();
+        let cap_authorized_before_refusal = cap_manager.journal.session_authorized_total().unwrap();
+        let nonce_before_refusal = local_pending_nonce(&rpc, &endpoint, wallet).await;
+        let exhausted = cap_manager
+            .submit_proof(
+                &network,
+                &signer,
+                ProofSubmission {
+                    contract: miner,
+                    node_id: 1,
+                    window_id: first_work.work.window_id,
+                    nonce: cap_proofs[3].0,
+                    header: cap_header.to_vec(),
+                    work_hash: cap_proofs[3].1,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{exhausted:#}").contains("terminal authorization limit"));
+        assert_eq!(
+            local_pending_nonce(&rpc, &endpoint, wallet).await,
+            nonce_before_refusal,
+            "a proof beyond the terminal session cap must not consume a wallet nonce"
+        );
+        assert_eq!(
+            cap_store.read_transaction_journal().unwrap().unwrap(),
+            cap_journal_before_refusal,
+            "a cap refusal must not change the journal or create a pending authorization"
+        );
+        assert_eq!(
+            cap_manager.journal.session_authorized_total().unwrap(),
+            cap_authorized_before_refusal,
+            "a refused proof must not increase the durable authorization counter"
+        );
+
+        let reverted = rpc_request_local(
+            &rpc,
+            &endpoint,
+            "evm_revert",
+            serde_json::json!([cap_snapshot]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reverted, serde_json::Value::Bool(true));
+        cap_manager.monitor(&network).await.unwrap();
+        assert_eq!(
+            cap_manager.journal.session_authorized_total().unwrap(),
+            cap_authorized_before_refusal,
+            "a chain reorg must not refund the session's reserved maximum exposure"
+        );
+        drop(cap_manager);
+
+        let mut restarted_cap_manager =
+            TransactionManager::open(&cap_store, &cap_config, wallet, token).unwrap();
+        let restarted_latch = Arc::new(AtomicBool::new(false));
+        let restarted_latch_observer = Arc::clone(&restarted_latch);
+        assert!(
+            restarted_cap_manager
+                .set_session_limit_reached_sink(Arc::new(move || {
+                    restarted_latch_observer.store(true, Ordering::Release);
+                }))
+                .unwrap()
+        );
+        assert!(restarted_latch.load(Ordering::Acquire));
+        assert_eq!(
+            restarted_cap_manager
+                .journal
+                .session_authorized_total()
+                .unwrap(),
+            cap_authorized_before_refusal,
+            "restart after reorg must retain the exhausted session authorization"
+        );
+        let restarted_refusal = restarted_cap_manager
+            .submit_proof(
+                &network,
+                &signer,
+                ProofSubmission {
+                    contract: miner,
+                    node_id: 1,
+                    window_id: first_work.work.window_id,
+                    nonce: cap_proofs[3].0,
+                    header: cap_header.to_vec(),
+                    work_hash: cap_proofs[3].1,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{restarted_refusal:#}").contains("terminal authorization limit"));
+
         let expired_window_zero = network.snapshot(None).await.unwrap();
         advance_window_past_expiry(&rpc, &endpoint, &network, 1, &expired_window_zero).await;
         let finalize = AstatineMinerRead::finalizeWindowCall {}.abi_encode();
@@ -19250,6 +20719,20 @@ mod tests {
             .iter()
             .find(|entry| entry.action == TransactionAction::SubmitProof && entry.window_id == 0)
             .unwrap();
+        let accepted_same_wallet_window = manager
+            .journal
+            .state
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.action == TransactionAction::SubmitProof
+                    && entry.contract.eq_ignore_ascii_case(&format!("{miner:#x}"))
+                    && entry.window_id == 0
+                    && entry.wallet.eq_ignore_ascii_case(&format!("{wallet:#x}"))
+                    && entry.outcome.as_deref() == Some("candidate-updated")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(accepted_same_wallet_window.len(), 2);
         assert!(first_reward_entry.reward_confirmed);
         assert!(
             first_reward_entry
@@ -19259,6 +20742,11 @@ mod tests {
         );
         assert_eq!(first_reward_entry.reward_forward_status, None);
         assert_eq!(manager.mined_rewards_total(), reward);
+        assert!(accepted_same_wallet_window.iter().all(|entry| {
+            entry.reward_confirmed
+                && entry.reward_outcome == first_reward_entry.reward_outcome
+                && entry.reward_block_hash == first_reward_entry.reward_block_hash
+        }));
         let paid_snapshot = network.snapshot(Some(wallet)).await.unwrap();
         assert_eq!(paid_snapshot.ast_balance, Some(reward));
         assert_eq!(manager.mined_rewards_total(), reward);
@@ -19899,7 +21387,13 @@ mod tests {
             let _ = observed_updates.borrow_and_update();
             wait_for_proof_metric(&probe, 1, ProofMetric::TargetValidHashes, 1).await;
             wait_for_proof_metric(&probe, 1, ProofMetric::QueuedCandidates, 1).await;
-            wait_for_proof_metric(&probe, 1, ProofMetric::MainLoopReceived, 1).await;
+            assert_eq!(
+                probe
+                    .proof_telemetry
+                    .count(1, ProofMetric::MainLoopReceived),
+                0,
+                "the test gate holds a queued proof without blocking observer/finalization work"
+            );
             assert_eq!(
                 probe
                     .proof_telemetry
@@ -19937,6 +21431,7 @@ mod tests {
                 "the main-loop receive is deliberately held until after the verified heads"
             );
             probe.proof_processing_gate.send_replace(false);
+            wait_for_proof_metric(&probe, 1, ProofMetric::MainLoopReceived, 1).await;
             wait_for_proof_metric(&probe, 1, ProofMetric::GenerationMismatchRevalidated, 1).await;
             wait_for_proof_metric(&probe, 1, ProofMetric::PreflightStarted, 1).await;
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -19988,13 +21483,13 @@ mod tests {
                 ProofMetric::ReceiptConfirmed,
                 ProofMetric::CandidateUpdated,
             ] {
-                assert_eq!(probe.proof_telemetry.count(1, metric), 1, "{metric:?}");
+                assert!(probe.proof_telemetry.count(1, metric) >= 1, "{metric:?}");
             }
-            assert_eq!(
+            assert!(
                 probe
                     .proof_telemetry
-                    .count(1, ProofMetric::PreflightStarted),
-                2
+                    .count(1, ProofMetric::PreflightStarted)
+                    >= 2
             );
             assert_eq!(
                 probe
@@ -20015,11 +21510,14 @@ mod tests {
                         && entry["window_id"] == 0
                 })
                 .count();
-            assert_eq!(
-                proof_entries, 1,
-                "one paid attempt is authorized per node/window"
+            assert!(
+                proof_entries >= 1,
+                "observed strictly-better worker candidates are durably journaled"
             );
 
+            probe.proof_processing_gate.send_replace(true);
+            wait_for_no_unresolved_transactions(&store).await;
+            wait_for_proof_pipeline_idle(&probe, &store, &[1]).await;
             probe.stop_signal.request_stop();
             tokio::time::timeout(Duration::from_secs(5), runtime)
                 .await
@@ -20029,16 +21527,43 @@ mod tests {
             let stopped_journal: super::JournalState =
                 serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
                     .unwrap();
-            assert!(
-                stopped_journal
-                    .entries
-                    .iter()
-                    .filter(|entry| {
-                        entry.action == TransactionAction::SubmitProof
-                            && entry.node_id == 1
-                            && entry.window_id == 0
-                    })
-                    .all(|entry| entry.status == TransactionStatus::MinedSuccess)
+            let stopped_proofs = stopped_journal
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.action == TransactionAction::SubmitProof
+                        && entry.node_id == 1
+                        && entry.window_id == 0
+                })
+                .collect::<Vec<_>>();
+            assert!(!stopped_proofs.is_empty());
+            assert!(stopped_proofs.iter().all(|entry| {
+                entry.status == TransactionStatus::MinedSuccess
+                    && entry.outcome.as_deref() == Some("candidate-updated")
+            }));
+            let unique_proofs = stopped_proofs
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.contract.clone(),
+                        entry.window_id,
+                        entry.wallet.clone(),
+                        entry.proof_nonce,
+                        entry.proof_hash.clone(),
+                        entry.header_hex.clone(),
+                    )
+                })
+                .collect::<HashSet<_>>();
+            assert_eq!(unique_proofs.len(), stopped_proofs.len());
+            assert_eq!(
+                probe.proof_telemetry.count(1, ProofMetric::Signed) as usize,
+                stopped_proofs.len()
+            );
+            assert_eq!(
+                probe
+                    .proof_telemetry
+                    .count(1, ProofMetric::CandidateUpdated) as usize,
+                stopped_proofs.len()
             );
             assert!(
                 !stopped_journal
@@ -20496,17 +22021,108 @@ mod tests {
         );
         observer.stop().await.unwrap();
 
-        let mut replacement = None;
-        for nonce in 1..10_000_u128 {
-            let hash = WorkHasher::new(&context).unwrap().hash(nonce);
-            if hash < work_hash {
-                replacement = Some((nonce, hash));
-                break;
-            }
+        let hash_value = |hash: B256| U256::from_be_bytes(hash.0);
+        let improvement = (1..50_000_u128)
+            .find_map(|nonce| {
+                let hash = WorkHasher::new(&context).unwrap().hash(nonce);
+                let value = hash_value(hash);
+                let incumbent = hash_value(work_hash);
+                (value < incumbent && value > incumbent / U256::from(2)).then_some((nonce, hash))
+            })
+            .expect("same wallet should find a strictly better same-window proof");
+        let (next_recovered, improved_action) = submit_local_proof_with_confirmation(
+            recovered,
+            (*network).clone(),
+            clone_signer(&signer),
+            ProofSubmission {
+                contract: miner,
+                node_id: 1,
+                window_id: work.2,
+                nonce: improvement.0,
+                header: header.to_vec(),
+                work_hash: improvement.1,
+            },
+            &store,
+            &client,
+            &endpoint,
+        )
+        .await;
+        recovered = next_recovered;
+        assert_eq!(improved_action.outcome, "candidate-updated");
+        assert_eq!(
+            network.snapshot(None).await.unwrap().nodes[0]
+                .state
+                .as_ref()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .work_hash,
+            improvement.1,
+            "the same wallet may replace its own incumbent with a strictly better proof"
+        );
+
+        let challenger_header = b"testnet17-competitive-challenger";
+        let challenger_context = WorkContext {
+            chain_id: 1439,
+            contract: miner,
+            window_id: work.2,
+            seed: work.5,
+            miner: deployment_wallet,
+            header: challenger_header.to_vec(),
+        };
+        let challenger = (0..50_000_u128)
+            .find_map(|nonce| {
+                let hash = WorkHasher::new(&challenger_context).unwrap().hash(nonce);
+                let value = hash_value(hash);
+                let incumbent = hash_value(improvement.1);
+                (value < incumbent && value > incumbent / U256::from(2)).then_some((nonce, hash))
+            })
+            .expect("the competing wallet should overtake the CLI's incumbent");
+        let stale_proof = (0..50_000_u128)
+            .find_map(|nonce| {
+                let hash = WorkHasher::new(&context).unwrap().hash(nonce);
+                let value = hash_value(hash);
+                (value > hash_value(challenger.1) && value < hash_value(improvement.1))
+                    .then_some((nonce, hash))
+            })
+            .expect("fixture should contain a stale local proof between the two incumbents");
+        let challenger_call = AstatineMinerRead::submitSolutionCall {
+            header: Bytes::copy_from_slice(challenger_header),
+            nonce: challenger.0,
         }
-        let (replacement_nonce, replacement_hash) = replacement.unwrap();
-        let nonce_before_rejected_attempt = local_pending_nonce(&client, &endpoint, account).await;
-        let duplicate = recovered
+        .abi_encode();
+        send_unlocked(
+            &client,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &challenger_call,
+            U256::from(SUBMISSION_FEE_WEI),
+        )
+        .await;
+        let overtaken = network.snapshot(None).await.unwrap();
+        assert_eq!(
+            overtaken.nodes[0]
+                .state
+                .as_ref()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .miner,
+            deployment_wallet,
+            "the competitor must become the verified canonical incumbent"
+        );
+        let nonce_before_stale_preflight = local_pending_nonce(&client, &endpoint, account).await;
+        let proof_count_before_stale_preflight = recovered
+            .journal
+            .state
+            .entries
+            .iter()
+            .filter(|entry| entry.action == TransactionAction::SubmitProof)
+            .count();
+        let stale = recovered
             .submit_proof(
                 &network,
                 &signer,
@@ -20514,19 +22130,314 @@ mod tests {
                     contract: miner,
                     node_id: 1,
                     window_id: work.2,
-                    nonce: replacement_nonce,
+                    nonce: stale_proof.0,
                     header: header.to_vec(),
-                    work_hash: replacement_hash,
+                    work_hash: stale_proof.1,
                 },
             )
             .await
             .unwrap_err();
-        assert!(format!("{duplicate:#}").contains("paid proof attempt already journaled"));
+        assert!(format!("{stale:#}").contains("fresh on-chain"));
         assert_eq!(
             local_pending_nonce(&client, &endpoint, account).await,
-            nonce_before_rejected_attempt,
-            "one-attempt guard must reject before signing or broadcasting another paid proof"
+            nonce_before_stale_preflight,
+            "fresh preflight must refuse a proof overtaken by a competitor"
         );
+        assert_eq!(
+            recovered
+                .journal
+                .state
+                .entries
+                .iter()
+                .filter(|entry| entry.action == TransactionAction::SubmitProof)
+                .count(),
+            proof_count_before_stale_preflight
+        );
+
+        let winning_proof = (0..50_000_u128)
+            .find_map(|nonce| {
+                let hash = WorkHasher::new(&context).unwrap().hash(nonce);
+                let value = hash_value(hash);
+                let incumbent = hash_value(challenger.1);
+                (value < incumbent && value > incumbent / U256::from(2)).then_some((nonce, hash))
+            })
+            .expect("the CLI should keep searching until it beats the latest incumbent");
+        let (next_recovered, winning_action) = submit_local_proof_with_confirmation(
+            recovered,
+            (*network).clone(),
+            clone_signer(&signer),
+            ProofSubmission {
+                contract: miner,
+                node_id: 1,
+                window_id: work.2,
+                nonce: winning_proof.0,
+                header: header.to_vec(),
+                work_hash: winning_proof.1,
+            },
+            &store,
+            &client,
+            &endpoint,
+        )
+        .await;
+        recovered = next_recovered;
+        assert_eq!(winning_action.outcome, "candidate-updated");
+        assert_eq!(
+            network.snapshot(None).await.unwrap().nodes[0]
+                .state
+                .as_ref()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .miner,
+            account,
+            "the CLI can reclaim the lead with a strictly better proof"
+        );
+        let race_challenger_header = b"testnet17-inclusion-race";
+        let race_challenger_context = WorkContext {
+            chain_id: 1439,
+            contract: miner,
+            window_id: work.2,
+            seed: work.5,
+            miner: deployment_wallet,
+            header: race_challenger_header.to_vec(),
+        };
+        let race_challenger = (0..50_000_u128)
+            .find_map(|nonce| {
+                let hash = WorkHasher::new(&race_challenger_context)
+                    .unwrap()
+                    .hash(nonce);
+                let value = hash_value(hash);
+                let incumbent = hash_value(winning_proof.1);
+                (value < incumbent && value > incumbent / U256::from(2)).then_some((nonce, hash))
+            })
+            .expect("race competitor should beat the current CLI incumbent");
+        let race_proof = (0..50_000_u128)
+            .find_map(|nonce| {
+                let hash = WorkHasher::new(&context).unwrap().hash(nonce);
+                let value = hash_value(hash);
+                (value > hash_value(race_challenger.1) && value < hash_value(winning_proof.1))
+                    .then_some((nonce, hash))
+            })
+            .expect("race proof is better than preflight state but worse than the competitor");
+        rpc_request_local(
+            &client,
+            &endpoint,
+            "anvil_setAutomine",
+            serde_json::json!([false]),
+        )
+        .await
+        .unwrap();
+        let race_challenger_call = AstatineMinerRead::submitSolutionCall {
+            header: Bytes::copy_from_slice(race_challenger_header),
+            nonce: race_challenger.0,
+        }
+        .abi_encode();
+        let race_challenger_tx = queue_unlocked_with_gas_price(
+            &client,
+            &endpoint,
+            deployment_wallet,
+            miner,
+            &race_challenger_call,
+            U256::from(SUBMISSION_FEE_WEI),
+            U256::from(100_000_000_000_u64),
+        )
+        .await;
+        assert!(
+            rpc_request_local(
+                &client,
+                &endpoint,
+                "eth_getTransactionReceipt",
+                serde_json::json!([race_challenger_tx.clone()]),
+            )
+            .await
+            .unwrap()
+            .is_null(),
+            "competitor remains pending during the CLI's canonical preflight"
+        );
+        assert_eq!(
+            network.snapshot(None).await.unwrap().nodes[0]
+                .state
+                .as_ref()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .work_hash,
+            winning_proof.1,
+            "unmined competitor data is not treated as canonical chain state"
+        );
+        drop(recovered);
+        let race_store = store.clone();
+        let race_network = Arc::clone(&network);
+        let race_config = config.clone();
+        let race_signer = clone_signer(&signer);
+        let race_task = tokio::spawn(async move {
+            let mut manager =
+                TransactionManager::open(&race_store, &race_config, account, token).unwrap();
+            manager
+                .submit_proof(
+                    &race_network,
+                    &race_signer,
+                    ProofSubmission {
+                        contract: miner,
+                        node_id: 1,
+                        window_id: work.2,
+                        nonce: race_proof.0,
+                        header: header.to_vec(),
+                        work_hash: race_proof.1,
+                    },
+                )
+                .await
+        });
+        let broadcast_race = wait_for_journal_entry_for_window(
+            &store,
+            1,
+            TransactionAction::SubmitProof,
+            work.2,
+            TransactionStatus::Broadcast,
+        )
+        .await;
+        let race_transaction_hash = entry_hash(&broadcast_race).unwrap();
+        rpc_request_local(&client, &endpoint, "anvil_mine", serde_json::json!([]))
+            .await
+            .unwrap();
+        let race_challenger_receipt =
+            wait_for_receipt(&client, &endpoint, &race_challenger_tx).await;
+        let race_receipt =
+            wait_for_receipt(&client, &endpoint, &format!("{race_transaction_hash:#x}")).await;
+        let tx_index = |receipt: &serde_json::Value| {
+            U256::from_str_radix(
+                receipt["transactionIndex"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+                16,
+            )
+            .unwrap()
+        };
+        assert!(
+            tx_index(&race_challenger_receipt) < tx_index(&race_receipt),
+            "higher-fee competitor must be included before the already-preflighted CLI proof"
+        );
+        rpc_request_local(&client, &endpoint, "anvil_mine", serde_json::json!([]))
+            .await
+            .unwrap();
+        rpc_request_local(
+            &client,
+            &endpoint,
+            "anvil_setAutomine",
+            serde_json::json!([true]),
+        )
+        .await
+        .unwrap();
+        let raced_action = tokio::time::timeout(Duration::from_secs(10), race_task)
+            .await
+            .expect("raced proof should settle after its receipt confirmations")
+            .expect("raced proof task should join")
+            .unwrap();
+        assert_eq!(raced_action.outcome, "submission-rejected-fee-retained");
+        assert!(raced_action.receipt.status);
+        let raced_manager = TransactionManager::open(&store, &config, account, token).unwrap();
+        let post_race_winning_proof = (0..50_000_u128)
+            .find_map(|nonce| {
+                let hash = WorkHasher::new(&context).unwrap().hash(nonce);
+                let value = hash_value(hash);
+                let incumbent = hash_value(race_challenger.1);
+                (value < incumbent && value > incumbent / U256::from(2)).then_some((nonce, hash))
+            })
+            .expect("CLI continues hashing after its raced proof is rejected");
+        let (raced_manager, retaken_action) = submit_local_proof_with_confirmation(
+            raced_manager,
+            (*network).clone(),
+            clone_signer(&signer),
+            ProofSubmission {
+                contract: miner,
+                node_id: 1,
+                window_id: work.2,
+                nonce: post_race_winning_proof.0,
+                header: header.to_vec(),
+                work_hash: post_race_winning_proof.1,
+            },
+            &store,
+            &client,
+            &endpoint,
+        )
+        .await;
+        assert_eq!(retaken_action.outcome, "candidate-updated");
+        assert_eq!(
+            network.snapshot(None).await.unwrap().nodes[0]
+                .state
+                .as_ref()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .miner,
+            account,
+            "the CLI can retake the lead after a proof loses the inclusion race"
+        );
+        let cli_proofs = raced_manager
+            .journal
+            .state
+            .entries
+            .iter()
+            .filter(|entry| entry.action == TransactionAction::SubmitProof)
+            .collect::<Vec<_>>();
+        assert_eq!(cli_proofs.len(), 5);
+        assert_eq!(
+            cli_proofs
+                .iter()
+                .filter(|entry| entry.outcome.as_deref() == Some("candidate-updated"))
+                .count(),
+            4,
+            "multiple distinct CLI proofs are accepted in the same node/window"
+        );
+        let rejected_race = cli_proofs
+            .iter()
+            .find(|entry| entry_hash(entry).ok() == Some(race_transaction_hash))
+            .unwrap();
+        assert_eq!(
+            rejected_race.outcome.as_deref(),
+            Some("submission-rejected-fee-retained")
+        );
+        assert_eq!(rejected_race.value_wei, SUBMISSION_FEE_WEI.to_string());
+        assert!(
+            parse_decimal_wei(rejected_race.actual_cost_wei.as_deref().unwrap()).unwrap()
+                >= U256::from(SUBMISSION_FEE_WEI),
+            "a proof that loses the inclusion race still consumes its on-chain fee"
+        );
+        let authorized_sum = cli_proofs.iter().fold(U256::ZERO, |sum, entry| {
+            sum.checked_add(parse_decimal_wei(&entry.maximum_exposure_wei).unwrap())
+                .unwrap()
+        });
+        assert_eq!(
+            raced_manager.journal.session_authorized_total().unwrap(),
+            authorized_sum,
+            "each accepted or on-chain-rejected send consumes its own session authorization"
+        );
+        assert_eq!(
+            network.snapshot(None).await.unwrap().nodes[0]
+                .state
+                .as_ref()
+                .unwrap()
+                .candidate
+                .as_ref()
+                .unwrap()
+                .miner,
+            account,
+            "after the raced submission is rejected, hashing and a better resubmission retake the lead"
+        );
+        drop(raced_manager);
+        let nonce_before_rejected_attempt = local_pending_nonce(&client, &endpoint, account).await;
+        let cap_attempt = (0..50_000_u128)
+            .find_map(|nonce| {
+                let hash = WorkHasher::new(&context).unwrap().hash(nonce);
+                (hash < post_race_winning_proof.1).then_some((nonce, hash))
+            })
+            .expect("cap test proof should be strictly better than the current incumbent");
+        let replacement_nonce = cap_attempt.0;
+        let replacement_hash = cap_attempt.1;
 
         let low_root = tempdir().unwrap();
         let low_store = ConfigStore::at_root(PathBuf::from(low_root.path()));
@@ -20575,6 +22486,42 @@ mod tests {
         rpc_request_local(&client, &endpoint, "evm_mine", serde_json::json!([]))
             .await
             .unwrap();
+        let nonce_before_expired_resubmission =
+            local_pending_nonce(&client, &endpoint, account).await;
+        let mut expired_manager =
+            TransactionManager::open(&store, &config, account, token).unwrap();
+        let expired_proof = expired_manager
+            .submit_proof(
+                &network,
+                &signer,
+                ProofSubmission {
+                    contract: miner,
+                    node_id: 1,
+                    window_id: work.2,
+                    nonce: post_race_winning_proof.0,
+                    header: header.to_vec(),
+                    work_hash: post_race_winning_proof.1,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{expired_proof:#}").contains("no longer eligible"));
+        assert_eq!(
+            local_pending_nonce(&client, &endpoint, account).await,
+            nonce_before_expired_resubmission,
+            "an expired window cannot authorize a further proof transaction"
+        );
+        assert_eq!(
+            expired_manager
+                .journal
+                .state
+                .entries
+                .iter()
+                .filter(|entry| entry.action == TransactionAction::SubmitProof)
+                .count(),
+            5
+        );
+        drop(expired_manager);
         let nonce_before_finalization_cap = local_pending_nonce(&client, &endpoint, account).await;
         let finalization_over_cap = low_cap_manager
             .finalize_window(&network, &signer, miner, 1, work.2)
@@ -20598,8 +22545,6 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .to_owned();
-        drop(recovered);
-
         let finalize_store = store.clone();
         let finalize_network = Arc::clone(&network);
         let finalize_signer = clone_signer(&signer);
@@ -20664,6 +22609,29 @@ mod tests {
                 .starts_with("reward-paid:")
         );
         assert!(accepted.reward_block_hash.is_some());
+        let nonce_before_finalized_resubmission =
+            local_pending_nonce(&client, &endpoint, account).await;
+        let finalized_proof = manager
+            .submit_proof(
+                &network,
+                &signer,
+                ProofSubmission {
+                    contract: miner,
+                    node_id: 1,
+                    window_id: work.2,
+                    nonce: post_race_winning_proof.0,
+                    header: header.to_vec(),
+                    work_hash: post_race_winning_proof.1,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{finalized_proof:#}").contains("different window"));
+        assert_eq!(
+            local_pending_nonce(&client, &endpoint, account).await,
+            nonce_before_finalized_resubmission,
+            "a finalized window cannot authorize another proof transaction"
+        );
         let balance_bytes = local_call(
             &client,
             &endpoint,
@@ -20905,6 +22873,35 @@ mod tests {
         assert_eq!(receipt["status"], "0x1", "setup transaction reverted");
     }
 
+    async fn queue_unlocked_with_gas_price(
+        client: &reqwest::Client,
+        endpoint: &str,
+        from: Address,
+        to: Address,
+        data: &[u8],
+        value: U256,
+        gas_price: U256,
+    ) -> String {
+        rpc_request_local(
+            client,
+            endpoint,
+            "eth_sendTransaction",
+            serde_json::json!([{
+                "from": format!("{from:#x}"),
+                "to": format!("{to:#x}"),
+                "data": format!("0x{}", hex::encode(data)),
+                "value": format!("{value:#x}"),
+                "gas": "0x989680",
+                "gasPrice": format!("{gas_price:#x}"),
+            }]),
+        )
+        .await
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned()
+    }
+
     async fn wait_for_receipt(
         client: &reqwest::Client,
         endpoint: &str,
@@ -21022,6 +23019,7 @@ mod tests {
                         entry.node_id == node_id
                             && entry.action == action
                             && entry.window_id == window_id
+                            && entry.status == status
                     }) {
                         if entry.status == TransactionStatus::MinedReverted {
                             panic!(
@@ -21029,9 +23027,7 @@ mod tests {
                                 entry.outcome
                             );
                         }
-                        if entry.status == status {
-                            return entry;
-                        }
+                        return entry;
                     }
                 }
                 sleep(Duration::from_millis(25)).await;
@@ -21264,6 +23260,47 @@ mod tests {
         })
         .await
         .expect("journaled transaction should settle before the next test action");
+    }
+
+    async fn wait_for_proof_pipeline_idle(
+        probe: &MiningProbe,
+        store: &ConfigStore,
+        node_ids: &[u8],
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let contents = store.read_transaction_journal().unwrap().unwrap();
+                let journal: super::JournalState = serde_json::from_slice(&contents).unwrap();
+                let preflight_pending = node_ids.iter().any(|node_id| {
+                    let started = probe
+                        .proof_telemetry
+                        .count(*node_id, ProofMetric::PreflightStarted);
+                    let completed = [
+                        ProofMetric::Signed,
+                        ProofMetric::PreflightRpcFailure,
+                        ProofMetric::PreflightStaleProof,
+                        ProofMetric::PreflightPolicyRefusal,
+                        ProofMetric::PreflightOtherFailure,
+                    ]
+                    .into_iter()
+                    .map(|metric| probe.proof_telemetry.count(*node_id, metric))
+                    .fold(0_u64, u64::saturating_add);
+                    started > completed
+                });
+                if !preflight_pending
+                    && journal.pending_authorization.is_none()
+                    && !journal
+                        .entries
+                        .iter()
+                        .any(|entry| entry.status.is_unresolved())
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("proof pipeline must finish any active preflight before external Anvil mining");
     }
 
     fn first_target_valid_nonce_parallel(
@@ -21572,11 +23609,30 @@ mod tests {
     ) -> (TransactionManager, super::ConfirmedAction) {
         let node_id = submission.node_id;
         let window_id = submission.window_id;
+        rpc_request_local(
+            rpc,
+            endpoint,
+            "anvil_setAutomine",
+            serde_json::json!([false]),
+        )
+        .await
+        .unwrap();
         let submission_task = tokio::spawn(async move {
             let mut manager = manager;
             let result = manager.submit_proof(&network, &signer, submission).await;
             (manager, result)
         });
+        let _broadcast = wait_for_journal_entry_for_window(
+            store,
+            node_id,
+            TransactionAction::SubmitProof,
+            window_id,
+            TransactionStatus::Broadcast,
+        )
+        .await;
+        rpc_request_local(rpc, endpoint, "evm_mine", serde_json::json!([]))
+            .await
+            .unwrap();
         let _included = wait_for_journal_entry_for_window(
             store,
             node_id,
@@ -21585,9 +23641,73 @@ mod tests {
             TransactionStatus::Included,
         )
         .await;
+        let before_confirmation_block =
+            rpc_request_local(rpc, endpoint, "eth_blockNumber", serde_json::json!([]))
+                .await
+                .unwrap();
         rpc_request_local(rpc, endpoint, "evm_mine", serde_json::json!([]))
             .await
             .unwrap();
+        let after_confirmation_block =
+            rpc_request_local(rpc, endpoint, "eth_blockNumber", serde_json::json!([]))
+                .await
+                .unwrap();
+        assert_ne!(
+            before_confirmation_block, after_confirmation_block,
+            "Anvil must advance a canonical block to satisfy receipt confirmations"
+        );
+        let head = u64::from_str_radix(
+            after_confirmation_block
+                .as_str()
+                .unwrap()
+                .trim_start_matches("0x"),
+            16,
+        )
+        .unwrap();
+        let included_block = _included.receipt_block.unwrap();
+        assert!(
+            head > included_block,
+            "Anvil advanced to block {head}, but the receipt is at block {included_block}"
+        );
+        let settled_entry = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state: super::JournalState =
+                    serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                        .unwrap();
+                if let Some(entry) = state
+                    .entries
+                    .into_iter()
+                    .find(|entry| entry.transaction_hash == _broadcast.transaction_hash)
+                    && matches!(
+                        entry.status,
+                        TransactionStatus::MinedSuccess | TransactionStatus::MinedReverted
+                    )
+                {
+                    break entry;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let state: super::JournalState =
+                serde_json::from_slice(&store.read_transaction_journal().unwrap().unwrap())
+                    .unwrap();
+            let entry = state
+                .entries
+                .iter()
+                .find(|entry| entry.transaction_hash == _broadcast.transaction_hash);
+            panic!("receipt at {included_block} and head {head} did not settle: {entry:?}")
+        });
+        assert_eq!(settled_entry.status, TransactionStatus::MinedSuccess);
+        rpc_request_local(
+            rpc,
+            endpoint,
+            "anvil_setAutomine",
+            serde_json::json!([true]),
+        )
+        .await
+        .unwrap();
         let (manager, result) = submission_task
             .await
             .expect("proof submission task should join after confirmation");

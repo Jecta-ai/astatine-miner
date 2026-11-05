@@ -20,6 +20,10 @@ use crate::cli::BenchmarkArgs;
 use crate::protocol::{MAX_HEADER_LENGTH, WorkContext, WorkHasher};
 
 mod benchmark;
+#[cfg(any(target_os = "linux", windows))]
+mod cuda;
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+mod cuda_abi;
 
 const ABI_SHA256_PREFIX_BYTES: usize = 192;
 const INPUT_HEADER_WORDS: usize = 31;
@@ -160,6 +164,226 @@ pub(crate) struct PendingGpuBatch {
     timings: GpuBatchTimings,
 }
 
+pub(crate) enum PendingGpuDispatch {
+    #[cfg(any(target_os = "linux", windows))]
+    Cuda(cuda::CudaPendingBatch),
+    Wgpu(PendingGpuBatch),
+}
+
+pub(crate) enum GpuBackendEngine {
+    #[cfg(any(target_os = "linux", windows))]
+    Cuda(Box<cuda::CudaEngine>),
+    Wgpu(Box<GpuEngine>),
+}
+
+impl GpuBackendEngine {
+    pub(crate) fn initialize() -> Result<Self> {
+        Self::initialize_with_config(MAX_GPU_BATCH_SIZE, GPU_WORKGROUP_SIZE, true, false, true)
+    }
+
+    pub(crate) fn initialize_auto_profiled() -> Result<Self> {
+        Self::initialize_with_config(MAX_GPU_BATCH_SIZE, GPU_WORKGROUP_SIZE, true, true, true)
+    }
+
+    pub(crate) fn initialize_profiled(batch_size: usize, workgroup_size: u32) -> Result<Self> {
+        Self::initialize_profiled_mode(batch_size, workgroup_size, true)
+    }
+
+    pub(crate) fn initialize_profiled_mode(
+        batch_size: usize,
+        workgroup_size: u32,
+        midstate_enabled: bool,
+    ) -> Result<Self> {
+        Self::initialize_with_config(batch_size, workgroup_size, midstate_enabled, true, false)
+    }
+
+    fn initialize_with_config(
+        batch_size: usize,
+        workgroup_size: u32,
+        midstate_enabled: bool,
+        timestamp_profile: bool,
+        tune_batch: bool,
+    ) -> Result<Self> {
+        validate_gpu_config(batch_size, workgroup_size)?;
+        let mut failures = Vec::new();
+        #[cfg(any(target_os = "linux", windows))]
+        match cuda::CudaEngine::initialize(batch_size, workgroup_size, midstate_enabled, tune_batch)
+        {
+            Ok(engine) => return Ok(Self::Cuda(Box::new(engine))),
+            Err(error) => failures.push(format!("native CUDA: {error:#}")),
+        }
+
+        match GpuEngine::initialize_with_config(
+            batch_size,
+            workgroup_size,
+            midstate_enabled,
+            timestamp_profile,
+            tune_batch,
+        ) {
+            #[allow(unused_mut)]
+            Ok(mut engine) => {
+                #[cfg(any(target_os = "linux", windows))]
+                if !failures.is_empty() {
+                    let prior_driver_info = engine.info.driver_info.trim();
+                    engine.info.driver_info = if prior_driver_info.is_empty() {
+                        format!("native CUDA unavailable: {}", failures.join("; "))
+                    } else {
+                        format!(
+                            "{prior_driver_info}; native CUDA unavailable: {}",
+                            failures.join("; ")
+                        )
+                    };
+                }
+                Ok(Self::Wgpu(Box::new(engine)))
+            }
+            Err(error) => {
+                failures.push(format!("Vulkan/Metal/DirectX compute: {error:#}"));
+                bail!(
+                    "no physical GPU backend passed the canonical SHA-256d self-test: {}",
+                    failures.join("; ")
+                )
+            }
+        }
+    }
+
+    pub(crate) fn info(&self) -> &GpuDeviceInfo {
+        match self {
+            #[cfg(any(target_os = "linux", windows))]
+            Self::Cuda(engine) => engine.info(),
+            Self::Wgpu(engine) => engine.info(),
+        }
+    }
+
+    pub(crate) fn initialization_timings(&self) -> GpuInitializationTimings {
+        match self {
+            #[cfg(any(target_os = "linux", windows))]
+            Self::Cuda(engine) => engine.initialization_timings(),
+            Self::Wgpu(engine) => engine.initialization_timings(),
+        }
+    }
+
+    pub(crate) fn batch_size(&self) -> usize {
+        match self {
+            #[cfg(any(target_os = "linux", windows))]
+            Self::Cuda(engine) => engine.batch_size(),
+            Self::Wgpu(engine) => engine.batch_size(),
+        }
+    }
+
+    pub(crate) fn record_cpu_comparison(&mut self, hashes_per_second: u64, threads: usize) {
+        match self {
+            #[cfg(any(target_os = "linux", windows))]
+            Self::Cuda(engine) => engine.record_cpu_comparison(hashes_per_second, threads),
+            Self::Wgpu(engine) => engine.record_cpu_comparison(hashes_per_second, threads),
+        }
+    }
+
+    pub(crate) fn observe_batch_latency(&mut self, latency: Duration) -> Option<usize> {
+        match self {
+            #[cfg(any(target_os = "linux", windows))]
+            Self::Cuda(engine) => engine.observe_batch_latency(latency),
+            Self::Wgpu(engine) => engine.observe_batch_latency(latency),
+        }
+    }
+
+    pub(crate) fn hash_batch(
+        &mut self,
+        hasher: &WorkHasher,
+        first_nonce: u128,
+        count: usize,
+        target: U256,
+        incumbent: Option<B256>,
+        stop: Option<&AtomicBool>,
+    ) -> Result<GpuBatchResult> {
+        match self {
+            #[cfg(any(target_os = "linux", windows))]
+            Self::Cuda(engine) => {
+                engine.hash_batch(hasher, first_nonce, count, target, incumbent, stop)
+            }
+            Self::Wgpu(engine) => {
+                engine.hash_batch(hasher, first_nonce, count, target, incumbent, stop)
+            }
+        }
+    }
+
+    pub(crate) fn hash_batch_profiled(
+        &mut self,
+        hasher: &WorkHasher,
+        first_nonce: u128,
+        count: usize,
+        target: U256,
+        incumbent: Option<B256>,
+    ) -> Result<GpuBatchResult> {
+        match self {
+            #[cfg(any(target_os = "linux", windows))]
+            Self::Cuda(engine) => {
+                engine.hash_batch_profiled(hasher, first_nonce, count, target, incumbent)
+            }
+            Self::Wgpu(engine) => {
+                engine.hash_batch_profiled(hasher, first_nonce, count, target, incumbent)
+            }
+        }
+    }
+
+    pub(crate) fn dispatch_batch(
+        &mut self,
+        hasher: &WorkHasher,
+        first_nonce: u128,
+        count: usize,
+        target: U256,
+        incumbent: Option<B256>,
+        stop: &AtomicBool,
+    ) -> Result<PendingGpuDispatch> {
+        match self {
+            #[cfg(any(target_os = "linux", windows))]
+            Self::Cuda(engine) => engine
+                .dispatch_batch(hasher, first_nonce, count, target, incumbent, stop)
+                .map(PendingGpuDispatch::Cuda),
+            Self::Wgpu(engine) => engine
+                .dispatch_batch(hasher, first_nonce, count, target, incumbent, stop)
+                .map(PendingGpuDispatch::Wgpu),
+        }
+    }
+
+    pub(crate) fn dispatch_batch_profiled(
+        &mut self,
+        hasher: &WorkHasher,
+        first_nonce: u128,
+        count: usize,
+        target: U256,
+        incumbent: Option<B256>,
+        stop: &AtomicBool,
+    ) -> Result<PendingGpuDispatch> {
+        match self {
+            #[cfg(any(target_os = "linux", windows))]
+            Self::Cuda(engine) => engine
+                .dispatch_batch_profiled(hasher, first_nonce, count, target, incumbent, stop)
+                .map(PendingGpuDispatch::Cuda),
+            Self::Wgpu(engine) => engine
+                .dispatch_batch_profiled(hasher, first_nonce, count, target, incumbent, stop)
+                .map(PendingGpuDispatch::Wgpu),
+        }
+    }
+
+    pub(crate) fn collect_batch(
+        &mut self,
+        pending: PendingGpuDispatch,
+        stop: Option<&AtomicBool>,
+    ) -> Result<GpuBatchResult> {
+        match (self, pending) {
+            #[cfg(any(target_os = "linux", windows))]
+            (Self::Cuda(engine), PendingGpuDispatch::Cuda(pending)) => {
+                engine.collect_batch(pending, stop)
+            }
+            (Self::Wgpu(engine), PendingGpuDispatch::Wgpu(pending)) => {
+                engine.collect_batch(pending, stop)
+            }
+            #[cfg(any(target_os = "linux", windows))]
+            _ => bail!("GPU pending batch belongs to a different compute backend"),
+        }
+    }
+}
+
 pub(crate) struct GpuEngine {
     _instance: Instance,
     device: Device,
@@ -182,24 +406,9 @@ pub(crate) struct GpuEngine {
 }
 
 impl GpuEngine {
+    #[cfg(test)]
     pub(crate) fn initialize() -> Result<Self> {
         Self::initialize_with_config(MAX_GPU_BATCH_SIZE, GPU_WORKGROUP_SIZE, true, false, true)
-    }
-
-    pub(crate) fn initialize_auto_profiled() -> Result<Self> {
-        Self::initialize_with_config(MAX_GPU_BATCH_SIZE, GPU_WORKGROUP_SIZE, true, true, true)
-    }
-
-    pub(crate) fn initialize_profiled(batch_size: usize, workgroup_size: u32) -> Result<Self> {
-        Self::initialize_profiled_mode(batch_size, workgroup_size, true)
-    }
-
-    pub(crate) fn initialize_profiled_mode(
-        batch_size: usize,
-        workgroup_size: u32,
-        midstate_enabled: bool,
-    ) -> Result<Self> {
-        Self::initialize_with_config(batch_size, workgroup_size, midstate_enabled, true, false)
     }
 
     fn initialize_with_config(
@@ -1384,6 +1593,59 @@ pub(crate) fn print_devices() -> Result<()> {
         std::thread::available_parallelism().map_or(1, |count| count.get())
     );
 
+    #[cfg(any(target_os = "linux", windows))]
+    let mut cuda_self_tested = 0_usize;
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        println!();
+        println!("CUDA · NVIDIA Driver API");
+        match cuda::CudaEngine::driver_device_count() {
+            Ok(None) => println!(
+                "  Available: No · expected libcuda.so.1 (Linux) or nvcuda.dll (Windows) was not found"
+            ),
+            Ok(Some((driver_version, 0))) => println!(
+                "  Driver API {} detected, but no NVIDIA compute device is visible",
+                cuda::driver_api_version_text(driver_version)
+            ),
+            Ok(Some((driver_version, device_count))) => {
+                println!(
+                    "  Driver API: {}",
+                    cuda::driver_api_version_text(driver_version)
+                );
+                for ordinal in 0..device_count {
+                    match cuda::CudaEngine::initialize_on_device(
+                        ordinal,
+                        driver_version,
+                        MAX_GPU_BATCH_SIZE,
+                        GPU_WORKGROUP_SIZE,
+                        true,
+                        true,
+                    ) {
+                        Ok(engine) => {
+                            let info = engine.info();
+                            println!("  NVIDIA GPU · {} · ordinal {ordinal}", info.name);
+                            println!("    Backend: CUDA Driver API · PTX compute_52");
+                            println!("    Driver/device: {}", info.driver_info);
+                            println!("    CUDA kernel execution: PASS");
+                            println!("    Canonical SHA-256d self-test: PASS");
+                            println!(
+                                "    Recommended mining batch: {} · {}-thread workgroups · {:.3} MH/s",
+                                info.batch_size,
+                                info.workgroup_size,
+                                info.tuned_hashes_per_second as f64 / 1_000_000.0,
+                            );
+                            cuda_self_tested += 1;
+                        }
+                        Err(error) => println!(
+                            "  NVIDIA GPU · ordinal {ordinal} · CUDA mining unavailable: {error:#}"
+                        ),
+                    }
+                }
+            }
+            Err(error) => println!("  CUDA Driver API probe failed: {error:#}"),
+        }
+    }
+
     let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
     let adapters = pollster::block_on(instance.enumerate_adapters(Backends::all()));
     let tuning_context = canonical_benchmark_context()?;
@@ -1458,6 +1720,24 @@ pub(crate) fn print_devices() -> Result<()> {
         }
     }
     println!();
+    #[cfg(any(target_os = "linux", windows))]
+    if cuda_self_tested > 0 {
+        println!(
+            "Recommended backend: native CUDA · {cuda_self_tested} NVIDIA device(s) passed kernel and canonical self-tests"
+        );
+    } else if self_tested > 0 {
+        println!(
+            "Recommended backend: GPU · {self_tested} physical wgpu adapter(s) passed self-test"
+        );
+    } else if physical == 0 {
+        #[cfg(any(target_os = "linux", windows))]
+        println!("Recommended backend: CPU · no validated CUDA or physical wgpu compute device");
+        #[cfg(not(any(target_os = "linux", windows)))]
+        println!("Recommended backend: CPU · no physical compute adapter was found");
+    } else {
+        println!("Recommended backend: CPU · no physical adapter passed self-test");
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     if physical == 0 {
         println!("Recommended backend: CPU · no physical compute adapter was found");
     } else if self_tested > 0 {

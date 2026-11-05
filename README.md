@@ -6,20 +6,20 @@ The protocol has nine independent mining nodes, each with its own work and windo
 
 ## Install
 
-Testnet.16 candidate installers verify the signed release manifest and the platform archive digest before installation. No root or administrator access is required. The installer replaces only the executable and license notices; configuration, wallets, and transaction journals are left untouched. The manifest is signed with the RSA release key pinned in the client and installer scripts.
+Testnet.17 installers verify the signed release manifest and the platform archive digest before installation. No root or administrator access is required. The installer replaces only the executable and license notices; configuration, wallets, and transaction journals are left untouched. The manifest is signed with the RSA release key pinned in the client and installer scripts.
 
 ### macOS and Linux
 
 Requires `curl`, `openssl`, `tar`, and `install`. Supported targets are Apple Silicon and Intel macOS, plus x86_64 and aarch64 Linux (glibc 2.35 or later).
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.16/support/install-unix.sh | sh
+curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.17/support/install-unix.sh | sh
 ```
 
 To download and review the installer before executing it:
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.16/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
+curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.17/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
 less "$HOME/astatine-install-unix.sh"
 sh "$HOME/astatine-install-unix.sh"
 ```
@@ -31,14 +31,14 @@ Apple Silicon requires macOS 11 or later; Intel requires macOS 10.12 or later. T
 Supported target: Windows 10 or later, x86_64. The executable is installed under your user profile.
 
 ```powershell
-$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.16/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
+$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.17/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
 ```
 
 To download and review the PowerShell installer before executing it:
 
 ```powershell
 $Installer = Join-Path $env:TEMP 'astatine-install.ps1'
-Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.16/support/install-windows.ps1' -OutFile $Installer
+Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.17/support/install-windows.ps1' -OutFile $Installer
 Get-Content -LiteralPath $Installer -Raw
 # After reviewing the script:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
@@ -55,6 +55,10 @@ Add `$HOME\bin` to your user `Path`, then open a new PowerShell window and verif
 Paid mining checks the durable remaining session authorization against the canonical 0.01 INJ proof fee. When less than one proof fee remains, the run latches `SESSION LIMIT REACHED`: CPU/GPU workers stop, queued proofs are discarded, and no new proof or finalization transaction is signed. The comparison is strict, so exactly 0.01 INJ remaining is not treated as exhausted. The authorization counter is not reduced by a later receipt or observer snapshot.
 
 The dashboard remains open until Ctrl+C, displays the terminal state, and continues read-only chain observation and recovery of transactions that were already in flight. If the observer stalls or fails, the miner reports monitoring degradation and marks its last verified block stale; it does not exit or start a new session automatically. Starting below the proof-fee threshold skips worker initialization and signer unlocking. In per-run policy mode, a later explicit `astatine mine` invocation starts its own fresh session under the existing approved policy; the current run is never automatically refilled.
+
+### Competitive proof resubmission
+
+Mining continues after a proof is submitted. The CLI can submit another proof for the same node and window only after a fresh verified chain snapshot confirms that it is strictly better than the current incumbent. Each additional on-chain submission costs the existing `0.01 INJ` fee plus gas; if another miner takes the lead after preflight but before inclusion, the contract can reject the proof while the fee is still spent. A temporary lead does not guarantee a reward: only the winning wallet at window finalization receives that window's reward.
 
 ### GPU mining
 
@@ -73,13 +77,19 @@ astatine mine --device gpu --nodes 1,3,5
 astatine mine --device gpu --compute-only
 ```
 
-Explicit `gpu` mode stops with an actionable error if no physical adapter passes the actual WGSL SHA-256d self-test. It never silently becomes CPU mining. `auto` performs a short canonical-work comparison and chooses GPU only when its measured throughput is more than 10% faster than CPU; otherwise it chooses CPU. Auto mode also falls back to CPU if GPU operation later fails. Any in-flight GPU nonce range is abandoned on failure, not reassigned. `--threads` controls CPU mining workers; GPU mode uses a dedicated controller and does not start the full CPU mining pool.
+Explicit `gpu` mode validates the selected physical GPU backend by executing its canonical SHA-256d self-test before mining. On supported Linux and Windows systems, native CUDA is preferred; the existing physical Vulkan, DirectX 12, and Metal backends remain available where supported. If no physical GPU backend passes its self-test, explicit GPU mode stops with an actionable error and never substitutes CPU mining. `auto` performs a short canonical-work comparison and chooses GPU only when its measured throughput is more than 10% faster than CPU; otherwise it chooses CPU. Auto mode also falls back to CPU if GPU operation later fails. Any in-flight GPU nonce range is abandoned on failure, not reassigned. `--threads` controls CPU mining workers; GPU mode uses a dedicated controller and does not start the full CPU mining pool.
 
 Every GPU candidate is rehashed with the canonical Rust `WorkHasher` before it enters the existing bounded proof inbox. The existing proof preflight, journal, signing, submission, finalization, and reward-reconciliation paths remain authoritative. The GPU module does not own wallets, RPC connections, or transaction signing.
 
+### Native NVIDIA CUDA mining
+
+On Linux x86_64/aarch64 and Windows x86_64, `--device gpu` prefers the native CUDA Driver API backend when an NVIDIA device passes its runtime SHA-256d self-test. A compatible CUDA 12.0-or-newer driver and compute capability 5.2 or newer are required. The miner dynamically loads the driver (`libcuda.so.1` on Linux or `nvcuda.dll` on Windows); a CUDA Toolkit, `nvcc`, NVRTC, Vulkan graphics libraries, and a display server are not required on the mining host.
+
+The CUDA kernel is precompiled PTX embedded in the executable. Its `.cu` source and pinned-container reproduction instructions are in `src/gpu/cuda/` and `support/cuda/`. Every CUDA candidate is rehashed by the canonical CPU implementation. CUDA is only selected after actual kernel execution and self-test; if it is unavailable, existing physical Vulkan/DirectX backends may be tried. Explicit GPU mode never substitutes CPU hashing.
+
 ### Starting before genesis
 
-Testnet.16 can be started before selected mining contracts activate. Verified, inactive nodes show `WAIT GENESIS`; when all selected nodes are inactive the dashboard shows `WAITING FOR GENESIS`. The observer checks selected inactive nodes approximately once per second with read-only `work()` calls and a bounded three-node concurrency limit. Active nodes keep the normal observer cadence.
+Mining can be started before selected contracts activate. Verified, inactive nodes show `WAIT GENESIS`; when all selected nodes are inactive the dashboard shows `WAITING FOR GENESIS`. The observer checks selected inactive nodes approximately once per second with read-only `work()` calls and a bounded three-node concurrency limit. Active nodes keep the normal observer cadence.
 
 An activation candidate triggers the existing canonical full-snapshot path. The miner rechecks the chain ID, pinned runtime code, ABI coherence and canonical Rust/Solidity `computeWorkHash` parity before publishing eligible work to the existing node scheduler. Partial activation is handled independently per node; nine-node atomic Coordinator activation is discovered by the same mechanism. The CLI never calls `activateGenesis()` or the Coordinator, never asks the user to restart, and does not create mining nonce ranges or paid transactions for unstarted nodes. There is no new init configuration.
 
@@ -99,14 +109,16 @@ Inspect local compute adapters and run their real shader self-test without conne
 astatine devices
 ```
 
-The wgpu backends target Metal on macOS, Direct3D 12 or Vulkan on Windows, and Vulkan on Linux. Driver and hardware support varies:
+The wgpu backends target Metal on macOS, Direct3D 12 or Vulkan on Windows, and Vulkan on Linux. Driver and hardware support varies. Testnet.17 adds the native CUDA Driver API for compatible NVIDIA devices.
 
-| Platform / GPU | Preferred backend | Testnet.12 evidence |
+Physical mining tests have been performed on Linux and macOS, including NVIDIA CUDA mining on Linux and Apple Metal mining on macOS. Physical mining and GPU runtime testing have not yet been performed on Windows. Windows builds and automated CI tests have passed, but Windows GPU functionality remains physically unverified.
+
+| Platform / GPU | Preferred backend | Testnet.17 qualification |
 |---|---|---|
-| Apple Silicon · Apple M4 | Metal | Physical shader parity, three-window mining/reward reconciliation, 1/3/9-node genesis activation, and one-second pre-genesis polling tested |
-| Intel macOS GPU | Metal | Native target CI passes; physical GPU runtime not tested |
-| NVIDIA / AMD Windows GPU | Direct3D 12 or Vulkan | Native Windows CI passes; physical GPU runtime not tested |
-| NVIDIA / AMD Linux GPU | Vulkan | Native Linux CI passes; physical GPU runtime not tested |
+| Linux x86_64 · NVIDIA RTX 3070 | CUDA Driver API | Physical CUDA mining and runtime testing performed |
+| macOS · Apple Silicon M4 | Metal | Physical Metal mining and shader/Anvil lifecycle testing performed |
+| Windows x86_64 · NVIDIA GPU | CUDA Driver API | Native builds and automated CI passed; no physical mining or GPU runtime testing |
+| Other supported adapters | Vulkan / Direct3D 12 / Metal | Runtime selection still requires the backend self-test; physical validation depends on the specific device and driver |
 
 Adapter enumeration or a successful native build is not itself a GPU correctness test.
 
@@ -133,11 +145,11 @@ HTTPS. The currently embedded key's SHA-256 SubjectPublicKeyInfo fingerprint is
 owner-supplied key is integrated across the Rust updater, Unix/Windows
 installers, and release validators; `support/release-key-fingerprint.txt`
 contains the matching active fingerprint. Before signing, the offline signer
-requires the selected private key to derive this exact public anchor. Replacing
-the pin means existing Testnet.12 clients with the legacy key cannot verify
-releases signed only by the new key. This candidate does not include a
-backward-compatible bridge; clients that require automatic updates from
-Testnet.12 need a migration path before release. macOS binaries are not
+requires the selected private key to derive this exact public anchor. Existing
+Testnet.12 installations pinned to the former signing key cannot authenticate
+releases signed exclusively with the current key; they need a trusted key
+migration or a fresh trusted installation before they can receive Testnet.17
+updates. Testnet.17 does not include a dual-key bridge. macOS binaries are not
 Developer ID signed or notarized, and Windows binaries are not Authenticode
 signed.
 
@@ -188,7 +200,7 @@ Set `ASTATINE_HISTORY_PROFILE=1` before `astatine mine` (or `$env:ASTATINE_HISTO
 
 New encrypted Ethereum V3 keystores require passwords of at least 12 Unicode characters and at most 1024 bytes. Input is hidden and confirmed. A brief, non-blocking warning recommends a longer unique passphrase when fewer than 16 characters are chosen. This applies to new wallets and mnemonic imports; importing an existing V3 keystore continues to use its original password without a new minimum.
 
-**Transaction costs and authorization cap:** Each proof submission pays a `0.01 INJ` fee. Finalizing a window consumes INJ gas, including when the window is empty or another miner wins. For every signed transaction, Astatine durably charges `gas_limit × max_fee_per_gas + transaction_value` against the current run cap before producing the signature. That maximum authorization is never refunded or reduced by RPC receipts, reported gas usage, or a completed transaction. Unresolved exposure remains reserved across runs and reduces the next run's available cap. The dashboard separates maximum authorized exposure from RPC-reported actual costs. A zero cap disables signing. Schema-v1 accounts retain cumulative session behavior until explicitly migrated; `--new-session` remains available for that legacy mode. Mainnet transaction signing is disabled.
+**Transaction costs and authorization cap:** Each proof submission, including a competitive improvement within the same window, pays a `0.01 INJ` fee. A proof overtaken between preflight and inclusion may still consume that fee and gas without changing the incumbent. Finalizing a window consumes INJ gas, including when the window is empty or another miner wins. For every signed transaction, Astatine durably charges `gas_limit × max_fee_per_gas + transaction_value` against the current run cap before producing the signature. That maximum authorization is never refunded or reduced by RPC receipts, reported gas usage, or a completed transaction. Unresolved exposure remains reserved across runs and reduces the next run's available cap. The dashboard separates maximum authorized exposure from RPC-reported actual costs. A zero cap disables signing. Schema-v1 accounts retain cumulative session behavior until explicitly migrated; `--new-session` remains available for that legacy mode. Mainnet transaction signing is disabled.
 
 Journal schema v10 authenticates the full journal with HMAC-SHA-256 and keeps its key and latest revision checkpoint in the OS credential store: macOS Keychain, Windows Credential Manager, or the Linux Secret Service. The authenticated journal now also carries the approved per-run policy identity (network/chain, wallet, ceiling, and reserve). Schema-v9 journals migrate without changing existing session counters or transaction liabilities. The credential store must be available; Linux headless systems need an unlocked Secret Service session. A missing, unavailable, or mismatched journal/checkpoint fails closed and does not create an empty journal or fresh allowance. Restoring an older journal is rejected while its matching credential-store checkpoint remains intact. The checkpoint is not a hardware monotonic counter: rolling back or compromising both the journal and the OS credential store, or malware running as the same OS user, is outside this protection. Restore a matching trusted journal and credential-store backup if integrity validation fails.
 
