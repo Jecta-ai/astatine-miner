@@ -7493,7 +7493,10 @@ mod tests {
         let file = std::fs::OpenOptions::new().write(true).open(path)?;
         let times = std::fs::FileTimes::new().set_modified(modified);
         #[cfg(windows)]
-        let times = created.map_or(times, |created| times.set_created(created));
+        let times = {
+            use std::os::windows::fs::FileTimesExt;
+            created.map_or(times, |created| times.set_created(created))
+        };
         #[cfg(not(windows))]
         let _ = created;
         file.set_times(times)
