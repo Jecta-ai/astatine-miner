@@ -14,7 +14,6 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, OnceLock},
-    time::SystemTime,
 };
 use tempfile::{NamedTempFile, PersistError};
 use zeroize::Zeroizing;
@@ -53,6 +52,11 @@ static TEST_ATOMIC_WRITE_FAILURES: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
+static TEST_ARCHIVE_TAMPER_POINTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, ArchiveTamperPoint>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AtomicWriteFailPoint {
     BeforeWrite,
@@ -61,6 +65,14 @@ pub(crate) enum AtomicWriteFailPoint {
     AfterRename,
     BeforeDirectorySync,
     AfterDirectorySync,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArchiveTamperPoint {
+    AtomicWrite,
+    WriteReadback,
+    ArchiveRead,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -188,24 +200,6 @@ fn default_transaction_confirmations() -> u8 {
 pub struct ConfigStore {
     root: PathBuf,
     anchor_scope: Arc<OnceLock<std::result::Result<String, String>>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TransactionArchiveStamp {
-    length: u64,
-    modified: SystemTime,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    changed_seconds: i64,
-    #[cfg(unix)]
-    changed_nanoseconds: i64,
-    #[cfg(windows)]
-    creation_time: u64,
-    #[cfg(windows)]
-    last_write_time: u64,
 }
 
 impl ConfigStore {
@@ -491,6 +485,16 @@ impl ConfigStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn tamper_archive_at_for_test(&self, point: ArchiveTamperPoint) -> Result<()> {
+        TEST_ARCHIVE_TAMPER_POINTS
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| anyhow!("test archive-tamper mutex was poisoned"))?
+            .insert(self.root.clone(), point);
+        Ok(())
+    }
+
     fn journal_anchor_account(&self) -> Result<String> {
         self.anchor_scope
             .get_or_init(|| {
@@ -527,7 +531,21 @@ impl ConfigStore {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 atomic_write(&path, data, false)
-                    .context("atomically create private transaction archive")
+                    .context("atomically create private transaction archive")?;
+                #[cfg(test)]
+                if take_archive_tamper_point(&self.root, ArchiveTamperPoint::AtomicWrite)? {
+                    tamper_archive_for_test(&path)?;
+                }
+                let stored = read_regular_limited(&path, MAX_TRANSACTION_ARCHIVE_BYTES, true)
+                    .context("read back newly written private transaction archive")?;
+                if stored != data {
+                    bail!("transaction archive bytes differ from the authenticated write payload");
+                }
+                #[cfg(test)]
+                if take_archive_tamper_point(&self.root, ArchiveTamperPoint::WriteReadback)? {
+                    tamper_archive_for_test(&path)?;
+                }
+                Ok(())
             }
             Err(error) => Err(error).context("inspect private transaction archive"),
         }
@@ -535,49 +553,13 @@ impl ConfigStore {
 
     pub(crate) fn read_transaction_archive(&self, name: &str) -> Result<Vec<u8>> {
         let path = self.transaction_archive_path(name)?;
-        read_regular_limited(&path, MAX_TRANSACTION_ARCHIVE_BYTES, true)
-            .context("read private transaction archive")
-    }
-
-    pub(crate) fn transaction_archive_stamp(&self, name: &str) -> Result<TransactionArchiveStamp> {
-        let path = self.transaction_archive_path(name)?;
-        let metadata =
-            fs::symlink_metadata(&path).context("inspect verified transaction archive metadata")?;
-        if !metadata.file_type().is_file() {
-            bail!("transaction archive is not a regular file");
+        let contents = read_regular_limited(&path, MAX_TRANSACTION_ARCHIVE_BYTES, true)
+            .context("read private transaction archive")?;
+        #[cfg(test)]
+        if take_archive_tamper_point(&self.root, ArchiveTamperPoint::ArchiveRead)? {
+            tamper_archive_for_test(&path)?;
         }
-        let modified = metadata
-            .modified()
-            .context("read transaction archive modification time")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Ok(TransactionArchiveStamp {
-                length: metadata.len(),
-                modified,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                changed_seconds: metadata.ctime(),
-                changed_nanoseconds: metadata.ctime_nsec(),
-            })
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            Ok(TransactionArchiveStamp {
-                length: metadata.len(),
-                modified,
-                creation_time: metadata.creation_time(),
-                last_write_time: metadata.last_write_time(),
-            })
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            Ok(TransactionArchiveStamp {
-                length: metadata.len(),
-                modified,
-            })
-        }
+        Ok(contents)
     }
 
     pub(crate) fn lock_transaction_journal(&self) -> Result<File> {
@@ -1043,6 +1025,30 @@ fn fail_atomic_write_if_requested(path: &Path, point: AtomicWriteFailPoint) -> R
         bail!("injected atomic-write failure at {point:?}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn take_archive_tamper_point(root: &Path, expected: ArchiveTamperPoint) -> Result<bool> {
+    let mut points = TEST_ARCHIVE_TAMPER_POINTS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| anyhow!("test archive-tamper mutex was poisoned"))?;
+    if points.get(root) == Some(&expected) {
+        points.remove(root);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[cfg(test)]
+fn tamper_archive_for_test(path: &Path) -> Result<()> {
+    let mut contents = fs::read(path).context("read archive for injected test tampering")?;
+    let first = contents
+        .first_mut()
+        .context("archive test fixture unexpectedly has no bytes")?;
+    *first ^= 1;
+    fs::write(path, contents).context("write injected archive test tampering")
 }
 
 fn persist_replace(file: NamedTempFile, path: &Path) -> Result<()> {
