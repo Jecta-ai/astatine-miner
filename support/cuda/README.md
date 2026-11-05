@@ -28,7 +28,13 @@ When a driver call returns an error or a backend operation panics, the mining co
 
 ## Hardware validation
 
-Run the physical kernel self-test separately on Linux x86_64 and Windows x86_64 machines with supported NVIDIA drivers:
+Physical CUDA mining and runtime testing have been performed on Linux x86_64 with an NVIDIA RTX 3070. macOS physical mining testing has been performed separately on Apple Silicon M4 using Metal.
+
+Physical mining tests have been performed on Linux and macOS, including NVIDIA CUDA mining on Linux and Apple Metal mining on macOS. Physical mining and GPU runtime testing have not yet been performed on Windows. Windows builds and automated CI tests have passed, but Windows GPU functionality remains physically unverified.
+
+Windows x86_64 native compilation and automated CI validation passed. No physical Windows mining run or Windows CUDA Driver API runtime test has been performed for Testnet.17. The owner has deferred Windows physical CUDA runtime testing; do not treat build, PTX assembly, or CI-only checks as physical runtime evidence. The runtime still requires a compatible driver, device, and successful self-test before CUDA is selected.
+
+The physical kernel self-test can be run on a supported NVIDIA system when hardware is available:
 
 ```sh
 cargo test --locked gpu::cuda::tests::physical_cuda_executes_canonical_sha256d_and_u128_differential_tests -- --ignored --exact --nocapture --test-threads=1
@@ -44,4 +50,4 @@ Then run the packaged executable's device probe, which performs the runtime kern
 .\target\release\astatine.exe devices
 ```
 
-The test performs actual CUDA kernel execution and CPU/CUDA differential checks over canonical work, target and incumbent boundaries, 128-bit nonce boundaries, varied work contexts, header padding boundaries, and deterministic workgroup minima. For the existing paid Anvil lifecycle and mining-worker shutdown path, set `ASTATINE_E2E_DEVICE=gpu` for the relevant ignored transaction lifecycle test. Repeat the physical tests independently on Linux and Windows. Native compilation or PTX assembly is not physical-driver evidence; record unsupported/unavailable hardware as pending and keep Testnet.17 release approval blocked until required platform evidence is supplied.
+The test performs actual CUDA kernel execution and CPU/CUDA differential checks over canonical work, target and incumbent boundaries, 128-bit nonce boundaries, varied work contexts, header padding boundaries, and deterministic workgroup minima. The Linux RTX 3070 result is historical physical evidence; Windows physical runtime remains explicitly unverified. For the existing paid Anvil lifecycle and mining-worker shutdown path, set `ASTATINE_E2E_DEVICE=gpu` for the relevant ignored transaction lifecycle test on a machine with a physical NVIDIA adapter.

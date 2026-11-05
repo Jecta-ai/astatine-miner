@@ -109,14 +109,16 @@ Inspect local compute adapters and run their real shader self-test without conne
 astatine devices
 ```
 
-The wgpu backends target Metal on macOS, Direct3D 12 or Vulkan on Windows, and Vulkan on Linux. Driver and hardware support varies:
+The wgpu backends target Metal on macOS, Direct3D 12 or Vulkan on Windows, and Vulkan on Linux. Driver and hardware support varies. Testnet.17 adds the native CUDA Driver API for compatible NVIDIA devices.
 
-| Platform / GPU | Preferred backend | Testnet.12 evidence |
+Physical mining tests have been performed on Linux and macOS, including NVIDIA CUDA mining on Linux and Apple Metal mining on macOS. Physical mining and GPU runtime testing have not yet been performed on Windows. Windows builds and automated CI tests have passed, but Windows GPU functionality remains physically unverified.
+
+| Platform / GPU | Preferred backend | Testnet.17 qualification |
 |---|---|---|
-| Apple Silicon · Apple M4 | Metal | Physical shader parity, three-window mining/reward reconciliation, 1/3/9-node genesis activation, and one-second pre-genesis polling tested |
-| Intel macOS GPU | Metal | Native target CI passes; physical GPU runtime not tested |
-| NVIDIA / AMD Windows GPU | Direct3D 12 or Vulkan | Native Windows CI passes; physical GPU runtime not tested |
-| NVIDIA / AMD Linux GPU | Vulkan | Native Linux CI passes; physical GPU runtime not tested |
+| Linux x86_64 · NVIDIA RTX 3070 | CUDA Driver API | Physical CUDA mining and runtime testing performed |
+| macOS · Apple Silicon M4 | Metal | Physical Metal mining and shader/Anvil lifecycle testing performed |
+| Windows x86_64 · NVIDIA GPU | CUDA Driver API | Native builds and automated CI passed; no physical mining or GPU runtime testing |
+| Other supported adapters | Vulkan / Direct3D 12 / Metal | Runtime selection still requires the backend self-test; physical validation depends on the specific device and driver |
 
 Adapter enumeration or a successful native build is not itself a GPU correctness test.
 
@@ -143,11 +145,11 @@ HTTPS. The currently embedded key's SHA-256 SubjectPublicKeyInfo fingerprint is
 owner-supplied key is integrated across the Rust updater, Unix/Windows
 installers, and release validators; `support/release-key-fingerprint.txt`
 contains the matching active fingerprint. Before signing, the offline signer
-requires the selected private key to derive this exact public anchor. Replacing
-the pin means existing Testnet.12 clients with the legacy key cannot verify
-releases signed only by the new key. This candidate does not include a
-backward-compatible bridge; clients that require automatic updates from
-Testnet.12 need a migration path before release. macOS binaries are not
+requires the selected private key to derive this exact public anchor. Existing
+Testnet.12 installations pinned to the former signing key cannot authenticate
+releases signed exclusively with the current key; they need a trusted key
+migration or a fresh trusted installation before they can receive Testnet.17
+updates. Testnet.17 does not include a dual-key bridge. macOS binaries are not
 Developer ID signed or notarized, and Windows binaries are not Authenticode
 signed.
 
