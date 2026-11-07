@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 
-SOURCE_COMMIT = "54588aa7b020cd7e49fa2275a560cde8138dd707"
+SOURCE_COMMIT = "c710b4d7add5f10de326487d0ff851eb926499c6"
 ARTIFACT_RELATIVE_PATH = Path("out/AstatineGenesisCoordinator.sol/AstatineGenesisCoordinator.json")
 
 
@@ -22,6 +22,10 @@ def main() -> None:
         help="compiled Forge artifact (defaults to coordinator_root/out/...)",
     )
     parser.add_argument(
+        "--source-commit",
+        help="expected source commit when using an artifact built from a separate pinned checkout",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path(__file__).resolve().parents[1]
@@ -31,12 +35,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    source_commit = subprocess.check_output(
+    checkout_commit = subprocess.check_output(
         ["git", "-C", str(args.coordinator_root), "rev-parse", "HEAD"], text=True
     ).strip()
+    source_commit = args.source_commit or checkout_commit
     if source_commit != SOURCE_COMMIT:
         raise SystemExit(
             f"expected Coordinator source commit {SOURCE_COMMIT}, found {source_commit}"
+        )
+    if checkout_commit != source_commit and args.artifact is None:
+        raise SystemExit(
+            "a compiled artifact is required when the source checkout differs from the pinned commit"
         )
 
     artifact_path = args.artifact or (args.coordinator_root / ARTIFACT_RELATIVE_PATH)

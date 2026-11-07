@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 use sha2::{Digest, Sha256, block_api::compress256};
 
 pub const MAX_HEADER_LENGTH: usize = 1_024;
+pub const SUBMISSION_FEE_WEI: u128 = 3_000_000_000_000_000;
 const NONCE_WORD_OFFSET: usize = 6 * 32;
 const SHA256_PREFIX_BLOCKS: usize = NONCE_WORD_OFFSET / 64;
 const SHA256_PREFIX_BYTES: usize = SHA256_PREFIX_BLOCKS * 64;

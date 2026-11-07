@@ -1676,7 +1676,7 @@ async fn run_runtime(
     let signer = if initial_session_limit_reached {
         if let Some(startup) = startup {
             startup.note(
-                "Session limit is below the 0.01 INJ proof fee; compute workers will not start",
+                "Session limit is below the 0.003 INJ proof fee; compute workers will not start",
             );
         }
         None

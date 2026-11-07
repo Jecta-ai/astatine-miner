@@ -6,20 +6,20 @@ The protocol has nine independent mining nodes, each with its own work and windo
 
 ## Install
 
-Testnet.17 installers verify the signed release manifest and the platform archive digest before installation. No root or administrator access is required. The installer replaces only the executable and license notices; configuration, wallets, and transaction journals are left untouched. The manifest is signed with the RSA release key pinned in the client and installer scripts.
+Testnet.18 installers verify the signed release manifest and the platform archive digest before installation. No root or administrator access is required. The installer replaces only the executable and license notices; configuration, wallets, and transaction journals are left untouched. The manifest is signed with the RSA release key pinned in the client and installer scripts.
 
 ### macOS and Linux
 
 Requires `curl`, `openssl`, `tar`, and `install`. Supported targets are Apple Silicon and Intel macOS, plus x86_64 and aarch64 Linux (glibc 2.35 or later).
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.17/support/install-unix.sh | sh
+curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.18/support/install-unix.sh | sh
 ```
 
 To download and review the installer before executing it:
 
 ```sh
-curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.17/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
+curl --fail --show-error --location https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.18/support/install-unix.sh -o "$HOME/astatine-install-unix.sh"
 less "$HOME/astatine-install-unix.sh"
 sh "$HOME/astatine-install-unix.sh"
 ```
@@ -31,14 +31,14 @@ Apple Silicon requires macOS 11 or later; Intel requires macOS 10.12 or later. T
 Supported target: Windows 10 or later, x86_64. The executable is installed under your user profile.
 
 ```powershell
-$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.17/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
+$Installer = Join-Path $env:TEMP 'astatine-install.ps1'; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.18/support/install-windows.ps1' -OutFile $Installer; powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
 ```
 
 To download and review the PowerShell installer before executing it:
 
 ```powershell
 $Installer = Join-Path $env:TEMP 'astatine-install.ps1'
-Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.17/support/install-windows.ps1' -OutFile $Installer
+Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Jecta-ai/astatine-miner/v0.1.0-testnet.18/support/install-windows.ps1' -OutFile $Installer
 Get-Content -LiteralPath $Installer -Raw
 # After reviewing the script:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Installer
@@ -52,13 +52,13 @@ Add `$HOME\bin` to your user `Path`, then open a new PowerShell window and verif
 
 ### Paid-session authorization limit
 
-Paid mining checks the durable remaining session authorization against the canonical 0.01 INJ proof fee. When less than one proof fee remains, the run latches `SESSION LIMIT REACHED`: CPU/GPU workers stop, queued proofs are discarded, and no new proof or finalization transaction is signed. The comparison is strict, so exactly 0.01 INJ remaining is not treated as exhausted. The authorization counter is not reduced by a later receipt or observer snapshot.
+Paid mining checks the durable remaining session authorization against the canonical 0.003 INJ proof fee. When less than one proof fee remains, the run latches `SESSION LIMIT REACHED`: CPU/GPU workers stop, queued proofs are discarded, and no new proof or finalization transaction is signed. The comparison is strict, so exactly 0.003 INJ remaining is not treated as exhausted. The authorization counter is not reduced by a later receipt or observer snapshot.
 
 The dashboard remains open until Ctrl+C, displays the terminal state, and continues read-only chain observation and recovery of transactions that were already in flight. If the observer stalls or fails, the miner reports monitoring degradation and marks its last verified block stale; it does not exit or start a new session automatically. Starting below the proof-fee threshold skips worker initialization and signer unlocking. In per-run policy mode, a later explicit `astatine mine` invocation starts its own fresh session under the existing approved policy; the current run is never automatically refilled.
 
 ### Competitive proof resubmission
 
-Mining continues after a proof is submitted. The CLI can submit another proof for the same node and window only after a fresh verified chain snapshot confirms that it is strictly better than the current incumbent. Each additional on-chain submission costs the existing `0.01 INJ` fee plus gas; if another miner takes the lead after preflight but before inclusion, the contract can reject the proof while the fee is still spent. A temporary lead does not guarantee a reward: only the winning wallet at window finalization receives that window's reward.
+Mining continues after a proof is submitted. The CLI can submit another proof for the same node and window only after a fresh verified chain snapshot confirms that it is strictly better than the current incumbent. Each additional on-chain submission costs the current `0.003 INJ` fee plus gas; if another miner takes the lead after preflight but before inclusion, the contract can reject the proof while the fee is still spent. A temporary lead does not guarantee a reward: only the winning wallet at window finalization receives that window's reward.
 
 ### GPU mining
 
@@ -101,7 +101,7 @@ The existing proof verification, spending cap, minimum reserve, transaction jour
 
 ### Pinned local Anvil fixtures
 
-Lifecycle and nine-node Anvil tests use the checked-in Testnet.15 bytecode fixtures and do not build an adjacent `astatineEVM` checkout. The Astatine miner fixture is pinned to Solidity source commit `eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30`; the Coordinator fixture is pinned to `54588aa7b020cd7e49fa2275a560cde8138dd707`. The miner fixture's `work().submissionFee` is validated against the protocol constant `10000000000000000` wei (`0.01 INJ`).
+Lifecycle and nine-node Anvil tests use checked-in bytecode fixtures and do not build adjacent contract worktrees. The miner fixture is pinned to Solidity source commit `80e8f7cbeb21b18bc5f7475d8b751c9d9e8fb9d1`; the Genesis Coordinator fixture is pinned to `c710b4d7add5f10de326487d0ff851eb926499c6`. The local `MockAST` remains a test-only fixture from its separately recorded source. The miner fixture's `work().submissionFee` is validated against the protocol constant `3000000000000000` wei (`0.003 INJ`).
 
 Inspect local compute adapters and run their real shader self-test without connecting to RPC or unlocking a wallet:
 
@@ -148,8 +148,8 @@ contains the matching active fingerprint. Before signing, the offline signer
 requires the selected private key to derive this exact public anchor. Existing
 Testnet.12 installations pinned to the former signing key cannot authenticate
 releases signed exclusively with the current key; they need a trusted key
-migration or a fresh trusted installation before they can receive Testnet.17
-updates. Testnet.17 does not include a dual-key bridge. macOS binaries are not
+migration or a fresh trusted installation before they can receive Testnet.18
+updates. Testnet.18 does not include a dual-key bridge. macOS binaries are not
 Developer ID signed or notarized, and Windows binaries are not Authenticode
 signed.
 
@@ -200,7 +200,7 @@ Set `ASTATINE_HISTORY_PROFILE=1` before `astatine mine` (or `$env:ASTATINE_HISTO
 
 New encrypted Ethereum V3 keystores require passwords of at least 12 Unicode characters and at most 1024 bytes. Input is hidden and confirmed. A brief, non-blocking warning recommends a longer unique passphrase when fewer than 16 characters are chosen. This applies to new wallets and mnemonic imports; importing an existing V3 keystore continues to use its original password without a new minimum.
 
-**Transaction costs and authorization cap:** Each proof submission, including a competitive improvement within the same window, pays a `0.01 INJ` fee. A proof overtaken between preflight and inclusion may still consume that fee and gas without changing the incumbent. Finalizing a window consumes INJ gas, including when the window is empty or another miner wins. For every signed transaction, Astatine durably charges `gas_limit × max_fee_per_gas + transaction_value` against the current run cap before producing the signature. That maximum authorization is never refunded or reduced by RPC receipts, reported gas usage, or a completed transaction. Unresolved exposure remains reserved across runs and reduces the next run's available cap. The dashboard separates maximum authorized exposure from RPC-reported actual costs. A zero cap disables signing. Schema-v1 accounts retain cumulative session behavior until explicitly migrated; `--new-session` remains available for that legacy mode. Mainnet transaction signing is disabled.
+**Transaction costs and authorization cap:** Each proof submission, including a competitive improvement within the same window, pays a `0.003 INJ` fee. A proof overtaken between preflight and inclusion may still consume that fee and gas without changing the incumbent. Finalizing a window consumes INJ gas, including when the window is empty or another miner wins. For every signed transaction, Astatine durably charges `gas_limit × max_fee_per_gas + transaction_value` against the current run cap before producing the signature. That maximum authorization is never refunded or reduced by RPC receipts, reported gas usage, or a completed transaction. Unresolved exposure remains reserved across runs and reduces the next run's available cap. The dashboard separates maximum authorized exposure from RPC-reported actual costs. A zero cap disables signing. Schema-v1 accounts retain cumulative session behavior until explicitly migrated; `--new-session` remains available for that legacy mode. Mainnet transaction signing is disabled.
 
 Journal schema v10 authenticates the full journal with HMAC-SHA-256 and keeps its key and latest revision checkpoint in the OS credential store: macOS Keychain, Windows Credential Manager, or the Linux Secret Service. The authenticated journal now also carries the approved per-run policy identity (network/chain, wallet, ceiling, and reserve). Schema-v9 journals migrate without changing existing session counters or transaction liabilities. The credential store must be available; Linux headless systems need an unlocked Secret Service session. A missing, unavailable, or mismatched journal/checkpoint fails closed and does not create an empty journal or fresh allowance. Restoring an older journal is rejected while its matching credential-store checkpoint remains intact. The checkpoint is not a hardware monotonic counter: rolling back or compromising both the journal and the OS credential store, or malware running as the same OS user, is outside this protection. Restore a matching trusted journal and credential-store backup if integrity validation fails.
 
@@ -254,6 +254,10 @@ replenish signing authority. Journal changes and stale snapshots are rejected
 when the OS credential-store checkpoint is intact. The credential store itself
 is the trust boundary; it does not provide hardware-backed anti-rollback if the
 entire user credential store is also restored or compromised.
+
+## Testnet.18 deployment
+
+The bundled Testnet manifest pins chain `1439`, the AST token `0x5C730A3110a565bf388120ce64F37bb7dd0c7F83`, nine miner contracts, and their configured Genesis Coordinator. The miners are pinned to source commit `80e8f7cbeb21b18bc5f7475d8b751c9d9e8fb9d1`; the Coordinator is pinned to source commit `c710b4d7add5f10de326487d0ff851eb926499c6`. Startup verifies runtime hashes, token identity, miner constructor parameters, the `0.003 INJ` submission fee, and the Coordinator's configured owner, token, and ordered node list. The deployed miners are initially unstarted; the CLI displays `WAIT GENESIS` and never activates Genesis. Mainnet remains read-only.
 
 ## License
 

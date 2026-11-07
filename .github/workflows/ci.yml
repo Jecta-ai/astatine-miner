@@ -16,7 +16,7 @@ on:
       release_tag:
         description: Testnet package version used by the nonpublishing rehearsal
         required: true
-        default: v0.1.0-testnet.17
+        default: v0.1.0-testnet.18
         type: string
 
 permissions:
@@ -256,9 +256,9 @@ jobs:
 
           fixtures = pathlib.Path("tests/fixtures")
           expected_sources = {
-              "AstatineMiner.json": "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30",
+              "AstatineMiner.json": "80e8f7cbeb21b18bc5f7475d8b751c9d9e8fb9d1",
               "MockAST.json": "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30",
-              "AstatineGenesisCoordinator.json": "54588aa7b020cd7e49fa2275a560cde8138dd707",
+              "AstatineGenesisCoordinator.json": "c710b4d7add5f10de326487d0ff851eb926499c6",
           }
           for name, expected_commit in expected_sources.items():
               actual_commit = json.loads((fixtures / name).read_text())["source_commit"]

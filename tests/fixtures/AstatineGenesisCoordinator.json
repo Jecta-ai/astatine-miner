@@ -1,5 +1,5 @@
 {
-  "source_commit": "54588aa7b020cd7e49fa2275a560cde8138dd707",
+  "source_commit": "c710b4d7add5f10de326487d0ff851eb926499c6",
   "contract": "AstatineGenesisCoordinator",
   "compiler": {
     "version": "0.8.28",

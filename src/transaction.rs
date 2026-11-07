@@ -5,7 +5,7 @@ use crate::{
     diagnostics::DiagnosticBuffer,
     history_telemetry::{HistoryCounter, HistoryDuration, HistoryTelemetry},
     proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
-    protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
+    protocol::{SUBMISSION_FEE_WEI, WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{
         NetworkClient, ReadSnapshot, RpcLog, TransactionDetails, TransactionReceipt,
         is_transient_receipt_error, is_transient_rpc_error, is_window_expired_revert,
@@ -53,7 +53,6 @@ const REWARD_SCAN_RETRY_BASE: Duration = Duration::from_secs(1);
 const REWARD_SCAN_RETRY_MAX: Duration = Duration::from_secs(30);
 const REWARD_EMPTY_SCAN_RETRY_BASE_SECS: u64 = 60;
 const REWARD_EMPTY_SCAN_RETRY_MAX_SECS: u64 = 3_600;
-const SUBMISSION_FEE_WEI: u128 = 10_000_000_000_000_000;
 const PROOF_IDENTITY_DOMAIN: &[u8] = b"astatine-paid-proof-identity-v1";
 const UNBOUND_PROOF_IDENTITY_DOMAIN: &[u8] = b"astatine-unbound-paid-proof-identity-v1";
 pub(crate) const AUTOMATIC_REWARD_FORWARDING_DISABLED: &str = "automatic AST reward forwarding is disabled because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually from your wallet";
@@ -7458,7 +7457,7 @@ mod tests {
             max_fee_per_gas: U256::from(30_000_000_000_u64),
             gas_limit: 75_000,
             to: Address::with_last_byte(0x42),
-            value: U256::from(10_000_000_000_000_000_u128),
+            value: U256::from(SUBMISSION_FEE_WEI),
             data: vec![1, 2, 3, 4],
         }
     }
@@ -9692,7 +9691,7 @@ mod tests {
         request.gas_limit = 1;
         request.max_fee_per_gas = U256::from(290_000_000_000_000_000_u128);
         let maximum = maximum_transaction_exposure(&request).unwrap();
-        assert_eq!(maximum, U256::from(300_000_000_000_000_000_u128));
+        assert_eq!(maximum, U256::from(293_000_000_000_000_000_u128));
         let intent = TransactionIntent {
             contract,
             node_id: 1,
@@ -9729,7 +9728,7 @@ mod tests {
         );
         assert_eq!(
             manager_a.budget_remaining().unwrap(),
-            parse_inj_wei("0.2").unwrap()
+            parse_inj_wei("0.207").unwrap()
         );
         drop(manager_a);
         let state_a = TransactionJournal::inspect_session(&store_a, &config).unwrap();
@@ -15336,7 +15335,7 @@ mod tests {
         let capped_root = tempdir().unwrap();
         let capped_store = ConfigStore::at_root(PathBuf::from(capped_root.path()));
         let capped_config = AppConfig {
-            per_session_spending_limit_inj: "0.01".to_owned(),
+            per_session_spending_limit_inj: "0.002".to_owned(),
             minimum_reserve_inj: "0".to_owned(),
             ..AppConfig::default()
         };
@@ -15347,7 +15346,7 @@ mod tests {
             .prepare(prepared_test_transaction(
                 &request,
                 hash,
-                U256::from(10_000_000_000_000_000_u128),
+                U256::from(2_000_000_000_000_000_u128),
                 U256::ZERO,
                 U256::MAX,
                 Some(ProofData {
@@ -15378,7 +15377,7 @@ mod tests {
                 hash,
                 U256::from(1_000_000_000_000_000_000_u128),
                 U256::from(100_000_000_000_000_000_u128),
-                U256::from(110_000_000_000_000_000_u128),
+                U256::from(102_000_000_000_000_000_u128),
                 Some(ProofData {
                     nonce: 8,
                     work_hash: B256::with_last_byte(7),
@@ -22715,9 +22714,10 @@ mod tests {
         .expect("decode local EVM contract artifact")
     }
 
-    const LOCAL_EVM_FIXTURE_SOURCE_COMMIT: &str = "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30";
+    const LOCAL_EVM_FIXTURE_SOURCE_COMMIT: &str = "80e8f7cbeb21b18bc5f7475d8b751c9d9e8fb9d1";
+    const LOCAL_MOCK_AST_FIXTURE_SOURCE_COMMIT: &str = "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30";
     const LOCAL_COORDINATOR_FIXTURE_SOURCE_COMMIT: &str =
-        "54588aa7b020cd7e49fa2275a560cde8138dd707";
+        "c710b4d7add5f10de326487d0ff851eb926499c6";
 
     fn prepare_local_test_contracts(root: &std::path::Path) {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
@@ -22725,7 +22725,10 @@ mod tests {
             root, fixtures,
             "Anvil tests must use the checked-in pinned fixture root"
         );
-        for artifact in ["AstatineMiner.json", "MockAST.json"] {
+        for (artifact, expected_source_commit) in [
+            ("AstatineMiner.json", LOCAL_EVM_FIXTURE_SOURCE_COMMIT),
+            ("MockAST.json", LOCAL_MOCK_AST_FIXTURE_SOURCE_COMMIT),
+        ] {
             let fixture = fixtures.join(artifact);
             assert!(
                 fixture.is_file(),
@@ -22735,7 +22738,7 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
             assert_eq!(
                 fixture["source_commit"].as_str(),
-                Some(LOCAL_EVM_FIXTURE_SOURCE_COMMIT),
+                Some(expected_source_commit),
                 "local EVM fixture provenance must match the pinned source commit"
             );
         }
