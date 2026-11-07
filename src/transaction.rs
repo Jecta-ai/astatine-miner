@@ -5,7 +5,7 @@ use crate::{
     diagnostics::DiagnosticBuffer,
     history_telemetry::{HistoryCounter, HistoryDuration, HistoryTelemetry},
     proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
-    protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
+    protocol::{SUBMISSION_FEE_WEI, WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{
         NetworkClient, ReadSnapshot, RpcLog, TransactionDetails, TransactionReceipt,
         is_transient_receipt_error, is_transient_rpc_error, is_window_expired_revert,
@@ -53,7 +53,6 @@ const REWARD_SCAN_RETRY_BASE: Duration = Duration::from_secs(1);
 const REWARD_SCAN_RETRY_MAX: Duration = Duration::from_secs(30);
 const REWARD_EMPTY_SCAN_RETRY_BASE_SECS: u64 = 60;
 const REWARD_EMPTY_SCAN_RETRY_MAX_SECS: u64 = 3_600;
-const SUBMISSION_FEE_WEI: u128 = 10_000_000_000_000_000;
 const PROOF_IDENTITY_DOMAIN: &[u8] = b"astatine-paid-proof-identity-v1";
 const UNBOUND_PROOF_IDENTITY_DOMAIN: &[u8] = b"astatine-unbound-paid-proof-identity-v1";
 pub(crate) const AUTOMATIC_REWARD_FORWARDING_DISABLED: &str = "automatic AST reward forwarding is disabled because the selected RPC can fabricate reward evidence; verify rewards independently and transfer manually from your wallet";
@@ -5496,30 +5495,10 @@ impl TransactionManager {
         let contract =
             Address::from_str(&entry.contract).context("journal contract address is invalid")?;
         match entry.action {
-            TransactionAction::SubmitProof => {
-                let expected_hash = entry
-                    .proof_hash
-                    .as_deref()
-                    .context("proof hash is missing from submission journal")?;
-                let expected_hash =
-                    B256::from_str(expected_hash).context("journal proof hash is invalid")?;
-                let nonce = entry
-                    .proof_nonce
-                    .context("proof nonce is missing from journal")?;
-                match verify_submission_events(
-                    &evm_logs,
-                    contract,
-                    entry_wallet,
-                    entry.window_id,
-                    expected_hash,
-                    nonce,
-                )? {
-                    SubmissionOutcome::Accepted => Ok("candidate-updated".to_owned()),
-                    SubmissionOutcome::Rejected => {
-                        Ok("submission-rejected-fee-retained".to_owned())
-                    }
-                }
-            }
+            TransactionAction::SubmitProof => match verify_submission_events(&evm_logs, entry)? {
+                SubmissionOutcome::Accepted => Ok("candidate-updated".to_owned()),
+                SubmissionOutcome::Rejected => Ok("submission-rejected-fee-retained".to_owned()),
+            },
             TransactionAction::FinalizeWindow => {
                 let (winner, payout) = verify_finalization_events(
                     &evm_logs,
@@ -5990,15 +5969,39 @@ enum SubmissionOutcome {
 
 fn verify_submission_events(
     logs: &[RpcLog],
-    contract: Address,
-    wallet: Address,
-    window_id: u64,
-    work_hash: B256,
-    nonce: u128,
+    entry: &TransactionEntry,
 ) -> Result<SubmissionOutcome> {
+    if entry.action != TransactionAction::SubmitProof {
+        bail!("submission receipt verification requires a proof journal entry");
+    }
+    let contract =
+        Address::from_str(&entry.contract).context("journal contract address is invalid")?;
+    let wallet = Address::from_str(&entry.wallet).context("journal wallet address is invalid")?;
+    let transaction_hash = entry_hash(entry)?;
+    let window_id = entry.window_id;
+    let work_hash = B256::from_str(
+        entry
+            .proof_hash
+            .as_deref()
+            .context("proof hash is missing from submission journal")?,
+    )
+    .context("journal proof hash is invalid")?;
+    let nonce = entry
+        .proof_nonce
+        .context("proof nonce is missing from journal")?;
+    // process_receipt invokes this only after validate_transaction_binding has
+    // matched the selected RPC transaction's value to this authenticated entry.
+    let transaction_value = parse_decimal_wei(&entry.value_wei)
+        .context("journal proof transaction value is invalid")?;
+    if transaction_value.is_zero() {
+        bail!("journaled proof transaction has no authenticated submission fee");
+    }
     let mut outcome = None;
     for log in logs.iter().filter(|log| log.address == contract) {
         if log.topics.first() == Some(&AstatineMinerRead::CandidateUpdated::SIGNATURE_HASH) {
+            if log.transaction_hash != Some(transaction_hash) {
+                bail!("CandidateUpdated log is not bound to its journaled transaction");
+            }
             let event = AstatineMinerRead::CandidateUpdated::decode_raw_log_validate(
                 log.topics.iter().copied(),
                 log.data.as_ref(),
@@ -6013,16 +6016,20 @@ fn verify_submission_events(
             }
         } else if log.topics.first() == Some(&AstatineMinerRead::SubmissionRejected::SIGNATURE_HASH)
         {
+            if log.transaction_hash != Some(transaction_hash) {
+                bail!("SubmissionRejected log is not bound to its journaled transaction");
+            }
             let event = AstatineMinerRead::SubmissionRejected::decode_raw_log_validate(
                 log.topics.iter().copied(),
                 log.data.as_ref(),
             )
             .context("decode SubmissionRejected receipt event")?;
-            if event.windowId == window_id
-                && event.miner == wallet
-                && event.workHash == work_hash
-                && event.fee == U256::from(SUBMISSION_FEE_WEI)
-            {
+            if event.windowId == window_id && event.miner == wallet && event.workHash == work_hash {
+                if event.fee != transaction_value {
+                    bail!(
+                        "SubmissionRejected fee differs from the authenticated journaled transaction value"
+                    );
+                }
                 set_submission_outcome(&mut outcome, SubmissionOutcome::Rejected)?;
             }
         }
@@ -7458,7 +7465,7 @@ mod tests {
             max_fee_per_gas: U256::from(30_000_000_000_u64),
             gas_limit: 75_000,
             to: Address::with_last_byte(0x42),
-            value: U256::from(10_000_000_000_000_000_u128),
+            value: U256::from(SUBMISSION_FEE_WEI),
             data: vec![1, 2, 3, 4],
         }
     }
@@ -7835,7 +7842,7 @@ mod tests {
             nonce: 3,
             value: U256::from(SUBMISSION_FEE_WEI),
             gas_limit: 75_000,
-            input: Bytes::from(input),
+            input: Bytes::from(input.clone()),
             gas_price: None,
             max_fee_per_gas: Some(U256::from(30)),
             max_priority_fee_per_gas: Some(U256::from(2)),
@@ -7857,6 +7864,64 @@ mod tests {
         };
 
         assert!(validate_transaction_binding(&entry, &transaction, &receipt).is_ok());
+
+        let historical_request = Eip1559Request {
+            chain_id: 1439,
+            nonce: 3,
+            max_priority_fee_per_gas: U256::from(2),
+            max_fee_per_gas: U256::from(30),
+            gas_limit: 75_000,
+            to: contract,
+            value: U256::from(10_000_000_000_000_000_u128),
+            data: input.clone(),
+        };
+        let historical_hash = sign_eip1559(&test_signer(), &historical_request)
+            .unwrap()
+            .hash;
+        let mut historical_entry = entry.clone();
+        historical_entry.transaction_hash = format!("{historical_hash:#x}");
+        historical_entry.value_wei = historical_request.value.to_string();
+        historical_entry.maximum_exposure_wei = maximum_transaction_exposure(&historical_request)
+            .unwrap()
+            .to_string();
+        let mut historical_transaction = transaction.clone();
+        historical_transaction.hash = historical_hash;
+        historical_transaction.value = historical_request.value;
+        let mut historical_receipt = receipt.clone();
+        historical_receipt.transaction_hash = historical_hash;
+        assert!(
+            validate_transaction_binding(
+                &historical_entry,
+                &historical_transaction,
+                &historical_receipt
+            )
+            .is_ok()
+        );
+
+        let mut mismatched_historical_value = historical_transaction.clone();
+        mismatched_historical_value.value += U256::from(1);
+        assert!(
+            validate_transaction_binding(
+                &historical_entry,
+                &mismatched_historical_value,
+                &historical_receipt
+            )
+            .is_err()
+        );
+        let mut mismatched_journal_value = historical_entry.clone();
+        mismatched_journal_value.value_wei = (historical_request.value + U256::from(1)).to_string();
+        assert!(
+            validate_transaction_binding(
+                &mismatched_journal_value,
+                &historical_transaction,
+                &historical_receipt
+            )
+            .is_err()
+        );
+
+        let mut altered = transaction.clone();
+        altered.hash = B256::with_last_byte(0x52);
+        assert!(validate_transaction_binding(&entry, &altered, &receipt).is_err());
 
         let mut altered = transaction.clone();
         altered.from = Address::with_last_byte(0x32);
@@ -7904,6 +7969,10 @@ mod tests {
 
         let mut altered_receipt = receipt.clone();
         altered_receipt.from = Address::with_last_byte(0x32);
+        assert!(validate_transaction_binding(&entry, &transaction, &altered_receipt).is_err());
+
+        let mut altered_receipt = receipt.clone();
+        altered_receipt.transaction_hash = B256::with_last_byte(0x52);
         assert!(validate_transaction_binding(&entry, &transaction, &altered_receipt).is_err());
 
         let mut altered_receipt = receipt.clone();
@@ -8080,6 +8149,308 @@ mod tests {
             manager.journal.entry(tx_hash).unwrap().status,
             TransactionStatus::Unknown
         );
+    }
+
+    #[tokio::test]
+    async fn submission_rejection_receipts_settle_only_against_the_authenticated_signed_value() {
+        run_submission_rejection_receipt_case(
+            U256::from(10_000_000_000_000_000_u128),
+            U256::from(10_000_000_000_000_000_u128),
+            true,
+        )
+        .await;
+        run_submission_rejection_receipt_case(
+            U256::from(SUBMISSION_FEE_WEI),
+            U256::from(SUBMISSION_FEE_WEI),
+            true,
+        )
+        .await;
+        run_submission_rejection_receipt_case(
+            U256::from(SUBMISSION_FEE_WEI),
+            U256::from(10_000_000_000_000_000_u128),
+            false,
+        )
+        .await;
+    }
+
+    async fn run_submission_rejection_receipt_case(
+        signed_value: U256,
+        event_fee: U256,
+        should_settle: bool,
+    ) {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            minimum_reserve_inj: "0".to_owned(),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        let signer = test_signer();
+        let wallet = signer_address(&signer);
+        let contract = Address::with_last_byte(0x42);
+        let token = Address::with_last_byte(0x43);
+        let window_id = 12;
+        let proof_nonce = 8_u128;
+        let work_hash = B256::with_last_byte(0x51);
+        let header = vec![0x01, 0x02, 0x03];
+        let proof = ProofData {
+            nonce: proof_nonce,
+            work_hash,
+            header: header.clone(),
+        };
+        let intent = TransactionIntent {
+            contract,
+            node_id: 1,
+            window_id,
+            action: TransactionAction::SubmitProof,
+            proof: Some(proof.clone()),
+            reward_destination: None,
+            forwarding: None,
+        };
+        let mut request = test_request();
+        request.to = contract;
+        request.nonce = 7;
+        request.value = U256::from(SUBMISSION_FEE_WEI);
+        request.data = AstatineMinerRead::submitSolutionCall {
+            header: Bytes::from(header),
+            nonce: proof_nonce,
+        }
+        .abi_encode();
+
+        let mut manager = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        let current_fee_hash = sign_eip1559(&signer, &request).unwrap().hash;
+        let session_limit = parse_inj_wei("1").unwrap();
+        manager
+            .journal
+            .prepare(PreparedTransaction {
+                request: request.clone(),
+                tx_hash: current_fee_hash,
+                intent: intent.clone(),
+                session_limit,
+                minimum_reserve: U256::ZERO,
+                confirmed_balance: U256::MAX,
+                confirmations_required: 2,
+            })
+            .unwrap();
+        manager
+            .journal
+            .set_broadcast_state(current_fee_hash, TransactionStatus::Broadcast)
+            .unwrap();
+
+        // Rebuild an authenticated pending-transaction fixture representing a
+        // previously signed Testnet.17 request, then reopen it as Testnet.18.
+        request.value = signed_value;
+        let signed_hash = sign_eip1559(&signer, &request).unwrap().hash;
+        let maximum_exposure = maximum_transaction_exposure(&request).unwrap();
+        {
+            let entry = manager.journal.entry_mut(current_fee_hash).unwrap();
+            entry.transaction_hash = format!("{signed_hash:#x}");
+            entry.value_wei = signed_value.to_string();
+            entry.maximum_exposure_wei = maximum_exposure.to_string();
+        }
+        manager
+            .journal
+            .state
+            .active_session
+            .as_mut()
+            .unwrap()
+            .authorized_exposure_wei = Some(maximum_exposure.to_string());
+        manager.journal.persist().unwrap();
+        drop(manager);
+        let mut manager = TransactionManager::open(&store, &config, wallet, token)
+            .expect("reopen the authenticated historical journal after upgrade");
+        let entry = manager.journal.entry(signed_hash).unwrap();
+        let authorized_before = manager.journal.session_authorized_total().unwrap();
+        assert_eq!(authorized_before, maximum_exposure);
+
+        let rejected = AstatineMinerRead::SubmissionRejected {
+            windowId: window_id,
+            miner: wallet,
+            workHash: work_hash,
+            reason: 1,
+            fee: event_fee,
+        };
+        let receipt_block_hash = B256::with_last_byte(0x61);
+        let receipt_log = RpcLog {
+            address: contract,
+            topics: rejected
+                .encode_topics()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            data: Bytes::from(rejected.encode_data()),
+            block_number: Some(10),
+            block_hash: Some(receipt_block_hash),
+            transaction_hash: Some(signed_hash),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+            virtual_log: false,
+        };
+        let receipt = TransactionReceipt {
+            transaction_hash: signed_hash,
+            transaction_index: 0,
+            from: wallet,
+            to: Some(contract),
+            status: true,
+            gas_used: U256::from(50_000),
+            cumulative_gas_used: U256::from(50_000),
+            effective_gas_price: Some(U256::from(2)),
+            transaction_type: Some(2),
+            block_number: 10,
+            block_hash: receipt_block_hash,
+            logs: vec![receipt_log],
+        };
+        let head_hash = B256::with_last_byte(0x62);
+        let head_block = serde_json::json!({
+            "number": "0xb",
+            "timestamp": "0x64",
+            "hash": format!("{head_hash:#x}"),
+        });
+        let receipt_block = serde_json::json!({
+            "number": "0xa",
+            "timestamp": "0x63",
+            "hash": format!("{receipt_block_hash:#x}"),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let transaction_json = recovery_transaction_json(&request, signed_hash, wallet);
+        let responses = vec![
+            ("eth_getTransactionByHash", transaction_json),
+            ("eth_getBlockByNumber", head_block),
+            ("eth_getBlockByNumber", receipt_block),
+        ];
+        let server = std::thread::spawn(move || {
+            for (expected_method, result) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_history_http_request(&mut stream);
+                assert_eq!(request["method"], expected_method);
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result,
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .unwrap();
+            }
+        });
+        let endpoint = format!("http://{address}");
+        let client = NetworkClient::local_test_client(
+            &endpoint,
+            contract,
+            B256::with_last_byte(0x71),
+            token,
+            B256::with_last_byte(0x72),
+            9,
+        )
+        .unwrap();
+
+        let progress = manager
+            .process_receipt(&client, &entry, &receipt, 11)
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            manager.journal.session_authorized_total().unwrap(),
+            authorized_before,
+            "receipt recovery must not reset or refund the original session authorization"
+        );
+        assert_eq!(
+            manager.budget_remaining().unwrap(),
+            session_limit - authorized_before
+        );
+        if should_settle {
+            assert!(matches!(
+                progress,
+                super::ReceiptProgress::Settled(ref outcome)
+                    if outcome == "submission-rejected-fee-retained"
+            ));
+            let settled = manager.journal.entry(signed_hash).unwrap();
+            assert_eq!(settled.status, TransactionStatus::MinedSuccess);
+            assert_eq!(settled.value_wei, signed_value.to_string());
+            assert_eq!(
+                settled.outcome.as_deref(),
+                Some("submission-rejected-fee-retained")
+            );
+            assert!(manager.journal.pending_exposure().unwrap().is_zero());
+            assert!(
+                !manager
+                    .journal
+                    .unresolved_nonce_conflict(wallet, request.nonce)
+            );
+
+            let duplicate = manager
+                .journal
+                .authorize_exposure(
+                    &{
+                        let mut current_request = request.clone();
+                        current_request.value = U256::from(SUBMISSION_FEE_WEI);
+                        current_request
+                    },
+                    &intent,
+                    session_limit,
+                    U256::ZERO,
+                    U256::MAX,
+                )
+                .unwrap_err();
+            assert_eq!(
+                transaction_policy_refusal(&duplicate),
+                Some(TransactionPolicyRefusalKind::DuplicateProof)
+            );
+            assert_eq!(
+                manager.journal.session_authorized_total().unwrap(),
+                authorized_before,
+                "blocked duplicate proof must not reset or increase the spending cap"
+            );
+        } else {
+            assert!(matches!(progress, super::ReceiptProgress::Pending));
+            let ambiguous = manager.journal.entry(signed_hash).unwrap();
+            assert_eq!(ambiguous.status, TransactionStatus::Included);
+            assert_eq!(ambiguous.value_wei, signed_value.to_string());
+            assert_eq!(
+                ambiguous.outcome.as_deref(),
+                Some("receipt-event-unverified")
+            );
+            assert_eq!(
+                manager.journal.pending_exposure().unwrap(),
+                maximum_exposure
+            );
+            assert!(
+                manager
+                    .journal
+                    .unresolved_nonce_conflict(wallet, request.nonce)
+            );
+
+            let mut conflicting_intent = intent;
+            conflicting_intent.proof.as_mut().unwrap().work_hash = B256::with_last_byte(0x52);
+            let mut conflicting_request = request;
+            conflicting_request.value = U256::from(SUBMISSION_FEE_WEI);
+            let error = manager
+                .journal
+                .authorize_exposure(
+                    &conflicting_request,
+                    &conflicting_intent,
+                    session_limit,
+                    U256::ZERO,
+                    U256::MAX,
+                )
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("earlier transaction")
+                    || transaction_policy_refusal(&error)
+                        == Some(TransactionPolicyRefusalKind::UnresolvedNonce)
+            );
+            assert_eq!(
+                manager.journal.session_authorized_total().unwrap(),
+                authorized_before
+            );
+        }
     }
 
     fn prepared_test_transaction(
@@ -9692,7 +10063,7 @@ mod tests {
         request.gas_limit = 1;
         request.max_fee_per_gas = U256::from(290_000_000_000_000_000_u128);
         let maximum = maximum_transaction_exposure(&request).unwrap();
-        assert_eq!(maximum, U256::from(300_000_000_000_000_000_u128));
+        assert_eq!(maximum, U256::from(293_000_000_000_000_000_u128));
         let intent = TransactionIntent {
             contract,
             node_id: 1,
@@ -9729,7 +10100,7 @@ mod tests {
         );
         assert_eq!(
             manager_a.budget_remaining().unwrap(),
-            parse_inj_wei("0.2").unwrap()
+            parse_inj_wei("0.207").unwrap()
         );
         drop(manager_a);
         let state_a = TransactionJournal::inspect_session(&store_a, &config).unwrap();
@@ -15336,7 +15707,7 @@ mod tests {
         let capped_root = tempdir().unwrap();
         let capped_store = ConfigStore::at_root(PathBuf::from(capped_root.path()));
         let capped_config = AppConfig {
-            per_session_spending_limit_inj: "0.01".to_owned(),
+            per_session_spending_limit_inj: "0.002".to_owned(),
             minimum_reserve_inj: "0".to_owned(),
             ..AppConfig::default()
         };
@@ -15347,7 +15718,7 @@ mod tests {
             .prepare(prepared_test_transaction(
                 &request,
                 hash,
-                U256::from(10_000_000_000_000_000_u128),
+                U256::from(2_000_000_000_000_000_u128),
                 U256::ZERO,
                 U256::MAX,
                 Some(ProofData {
@@ -15378,7 +15749,7 @@ mod tests {
                 hash,
                 U256::from(1_000_000_000_000_000_000_u128),
                 U256::from(100_000_000_000_000_000_u128),
-                U256::from(110_000_000_000_000_000_u128),
+                U256::from(102_000_000_000_000_000_u128),
                 Some(ProofData {
                     nonce: 8,
                     work_hash: B256::with_last_byte(7),
@@ -15392,6 +15763,103 @@ mod tests {
             Some(TransactionPolicyRefusalKind::InsufficientConfirmedBalance)
         );
         assert!(!reserve.has_unresolved());
+    }
+
+    #[test]
+    fn new_proof_authorization_requires_the_exact_testnet18_fee_and_reserves_nonce() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let config = AppConfig {
+            per_session_spending_limit_inj: "1".to_owned(),
+            minimum_reserve_inj: "0".to_owned(),
+            ..AppConfig::default()
+        };
+        let wallet = signer_address(&test_signer());
+        let contract = Address::with_last_byte(0x42);
+        let mut request = test_request();
+        request.to = contract;
+        request.nonce = 7;
+        let header = vec![0xaa, 0xbb];
+        let proof = ProofData {
+            nonce: 17,
+            work_hash: B256::with_last_byte(0x71),
+            header: header.clone(),
+        };
+        request.data = AstatineMinerRead::submitSolutionCall {
+            header: Bytes::from(header),
+            nonce: proof.nonce,
+        }
+        .abi_encode();
+        let session_limit = parse_inj_wei("1").unwrap();
+        let mut journal =
+            TransactionJournal::open(&store, &config, wallet).expect("create isolated journal");
+
+        for incorrect_fee in [
+            U256::from(SUBMISSION_FEE_WEI - 1),
+            U256::from(SUBMISSION_FEE_WEI + 1),
+            U256::from(10_000_000_000_000_000_u128),
+        ] {
+            let mut incorrect_request = request.clone();
+            incorrect_request.value = incorrect_fee;
+            let incorrect_hash = sign_eip1559(&test_signer(), &incorrect_request)
+                .unwrap()
+                .hash;
+            let error = journal
+                .prepare(prepared_test_transaction(
+                    &incorrect_request,
+                    incorrect_hash,
+                    session_limit,
+                    U256::ZERO,
+                    U256::MAX,
+                    Some(proof.clone()),
+                ))
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("canonical submission fee"));
+            assert!(journal.state.entries.is_empty());
+            assert!(journal.session_authorized_total().unwrap().is_zero());
+        }
+
+        request.value = U256::from(SUBMISSION_FEE_WEI);
+        let accepted_hash = sign_eip1559(&test_signer(), &request).unwrap().hash;
+        journal
+            .prepare(prepared_test_transaction(
+                &request,
+                accepted_hash,
+                session_limit,
+                U256::ZERO,
+                U256::MAX,
+                Some(proof.clone()),
+            ))
+            .unwrap();
+        let maximum = maximum_transaction_exposure(&request).unwrap();
+        let accepted = journal.entry(accepted_hash).unwrap();
+        assert_eq!(accepted.value_wei, "3000000000000000");
+        assert_eq!(journal.session_authorized_total().unwrap(), maximum);
+        assert!(journal.unresolved_nonce_conflict(wallet, request.nonce));
+
+        let conflicting_intent = TransactionIntent {
+            contract,
+            node_id: 1,
+            window_id: 5,
+            action: TransactionAction::SubmitProof,
+            proof: Some(ProofData {
+                work_hash: B256::with_last_byte(0x72),
+                ..proof
+            }),
+            reward_destination: None,
+            forwarding: None,
+        };
+        let conflict = journal
+            .authorize_exposure(
+                &request,
+                &conflicting_intent,
+                session_limit,
+                U256::ZERO,
+                U256::MAX,
+            )
+            .unwrap_err();
+        assert!(format!("{conflict:#}").contains("earlier transaction"));
+        assert_eq!(journal.session_authorized_total().unwrap(), maximum);
     }
 
     #[test]
@@ -15419,7 +15887,22 @@ mod tests {
     fn submission_receipt_requires_matching_canonical_event() {
         let wallet = signer_address(&test_signer());
         let contract = Address::with_last_byte(0x42);
+        let transaction_hash = B256::with_last_byte(0x51);
         let work_hash = B256::with_last_byte(7);
+        let mut entry = settled_history_entry(
+            contract,
+            1,
+            wallet,
+            "receipt-binding",
+            12,
+            transaction_hash,
+            TransactionAction::SubmitProof,
+            "candidate-updated",
+            None,
+            0,
+        );
+        entry.proof_nonce = Some(8);
+        entry.proof_hash = Some(format!("{work_hash:#x}"));
         let event = AstatineMinerRead::CandidateUpdated {
             windowId: 12,
             miner: wallet,
@@ -15434,32 +15917,23 @@ mod tests {
             data: Bytes::from(event.encode_data()),
             block_number: None,
             block_hash: None,
-            transaction_hash: None,
+            transaction_hash: Some(transaction_hash),
             transaction_index: None,
             log_index: None,
             removed: false,
             virtual_log: false,
         };
         assert_eq!(
-            verify_submission_events(
-                std::slice::from_ref(&log),
-                contract,
-                wallet,
-                12,
-                work_hash,
-                8
-            )
-            .unwrap(),
+            verify_submission_events(std::slice::from_ref(&log), &entry).unwrap(),
             super::SubmissionOutcome::Accepted
         );
         assert!(
             verify_submission_events(
                 std::slice::from_ref(&log),
-                contract,
-                wallet,
-                13,
-                work_hash,
-                8
+                &TransactionEntry {
+                    window_id: 13,
+                    ..entry.clone()
+                }
             )
             .is_err()
         );
@@ -15481,24 +15955,69 @@ mod tests {
             data: Bytes::from(rejected.encode_data()),
             block_number: None,
             block_hash: None,
-            transaction_hash: None,
+            transaction_hash: Some(transaction_hash),
             transaction_index: None,
             log_index: None,
             removed: false,
             virtual_log: false,
         };
         assert_eq!(
+            verify_submission_events(std::slice::from_ref(&rejected_log), &entry).unwrap(),
+            super::SubmissionOutcome::Rejected
+        );
+
+        let mut historical_entry = entry.clone();
+        historical_entry.value_wei = "10000000000000000".to_owned();
+        let historical_rejected = AstatineMinerRead::SubmissionRejected {
+            fee: U256::from(10_000_000_000_000_000_u128),
+            ..rejected.clone()
+        };
+        let historical_rejected_log = RpcLog {
+            data: Bytes::from(historical_rejected.encode_data()),
+            ..rejected_log.clone()
+        };
+        assert_eq!(
             verify_submission_events(
-                std::slice::from_ref(&rejected_log),
-                contract,
-                wallet,
-                12,
-                work_hash,
-                8,
+                std::slice::from_ref(&historical_rejected_log),
+                &historical_entry,
             )
             .unwrap(),
             super::SubmissionOutcome::Rejected
         );
+
+        assert!(
+            verify_submission_events(std::slice::from_ref(&rejected_log), &historical_entry)
+                .is_err(),
+            "a new-fee rejection event cannot settle a historical 0.01 INJ transaction"
+        );
+
+        let mut forged_fee = rejected.clone();
+        forged_fee.fee += U256::from(1);
+        let forged_fee_log = RpcLog {
+            data: Bytes::from(forged_fee.encode_data()),
+            ..rejected_log.clone()
+        };
+        assert!(verify_submission_events(&[forged_fee_log], &entry).is_err());
+
+        let mut wrong_transaction = rejected_log.clone();
+        wrong_transaction.transaction_hash = Some(B256::with_last_byte(0x52));
+        assert!(verify_submission_events(&[wrong_transaction], &entry).is_err());
+
+        let mut wrong_contract = rejected_log.clone();
+        wrong_contract.address = Address::with_last_byte(0x43);
+        assert!(verify_submission_events(&[wrong_contract], &entry).is_err());
+
+        let mut wrong_proof = rejected.clone();
+        wrong_proof.workHash = B256::with_last_byte(0x73);
+        let wrong_proof_log = RpcLog {
+            data: Bytes::from(wrong_proof.encode_data()),
+            ..rejected_log
+        };
+        assert!(verify_submission_events(&[wrong_proof_log], &entry).is_err());
+
+        let mut wrong_action = entry;
+        wrong_action.action = TransactionAction::FinalizeWindow;
+        assert!(verify_submission_events(&[historical_rejected_log], &wrong_action).is_err());
     }
 
     #[test]
@@ -22715,9 +23234,10 @@ mod tests {
         .expect("decode local EVM contract artifact")
     }
 
-    const LOCAL_EVM_FIXTURE_SOURCE_COMMIT: &str = "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30";
+    const LOCAL_EVM_FIXTURE_SOURCE_COMMIT: &str = "80e8f7cbeb21b18bc5f7475d8b751c9d9e8fb9d1";
+    const LOCAL_MOCK_AST_FIXTURE_SOURCE_COMMIT: &str = "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30";
     const LOCAL_COORDINATOR_FIXTURE_SOURCE_COMMIT: &str =
-        "54588aa7b020cd7e49fa2275a560cde8138dd707";
+        "c710b4d7add5f10de326487d0ff851eb926499c6";
 
     fn prepare_local_test_contracts(root: &std::path::Path) {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
@@ -22725,7 +23245,10 @@ mod tests {
             root, fixtures,
             "Anvil tests must use the checked-in pinned fixture root"
         );
-        for artifact in ["AstatineMiner.json", "MockAST.json"] {
+        for (artifact, expected_source_commit) in [
+            ("AstatineMiner.json", LOCAL_EVM_FIXTURE_SOURCE_COMMIT),
+            ("MockAST.json", LOCAL_MOCK_AST_FIXTURE_SOURCE_COMMIT),
+        ] {
             let fixture = fixtures.join(artifact);
             assert!(
                 fixture.is_file(),
@@ -22735,7 +23258,7 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(fixture).unwrap()).unwrap();
             assert_eq!(
                 fixture["source_commit"].as_str(),
-                Some(LOCAL_EVM_FIXTURE_SOURCE_COMMIT),
+                Some(expected_source_commit),
                 "local EVM fixture provenance must match the pinned source commit"
             );
         }

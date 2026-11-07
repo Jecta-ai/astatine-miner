@@ -1058,6 +1058,11 @@ mod tests {
                 draft: false,
             },
             GitHubRelease {
+                tag_name: "v0.1.0-testnet.18".to_owned(),
+                prerelease: true,
+                draft: false,
+            },
+            GitHubRelease {
                 tag_name: "v0.2.0-testnet.10".to_owned(),
                 prerelease: true,
                 draft: false,
@@ -1071,16 +1076,17 @@ mod tests {
         assert_eq!(
             latest_testnet_release(releases, &current),
             Some((
-                semver::Version::parse("0.1.0-testnet.17").unwrap(),
-                "v0.1.0-testnet.17".to_owned(),
+                semver::Version::parse("0.1.0-testnet.18").unwrap(),
+                "v0.1.0-testnet.18".to_owned(),
             ))
         );
     }
 
     #[test]
     fn rust_updater_only_selects_canonical_numeric_testnet_versions() {
-        let current = semver::Version::parse("0.1.0-testnet.17").unwrap();
+        let current = semver::Version::parse("0.1.0-testnet.18").unwrap();
         let releases = [
+            ("v0.1.0-testnet.18", true),
             ("v0.1.0-testnet.17", true),
             ("v0.1.0-testnet.16", true),
             ("v0.1.0-testnet.15", true),
@@ -1119,32 +1125,33 @@ mod tests {
 
     #[test]
     fn executable_version_output_must_be_one_exact_supported_version() {
-        let expected = semver::Version::parse("0.1.0-testnet.17").unwrap();
+        let expected = semver::Version::parse("0.1.0-testnet.18").unwrap();
         for output in [
-            "astatine 0.1.0-testnet.17\n",
-            "astatine 0.1.0-testnet.17\r\n",
+            "astatine 0.1.0-testnet.18\n",
+            "astatine 0.1.0-testnet.18\r\n",
         ] {
             assert_eq!(parse_executable_version_output(output).unwrap(), expected);
-            assert!(verify_executable_version_output(output, "0.1.0-testnet.17").is_ok());
+            assert!(verify_executable_version_output(output, "0.1.0-testnet.18").is_ok());
         }
         for output in [
-            "astatine 0.1.0-testnet.170\n",
+            "astatine 0.1.0-testnet.180\n",
+            "astatine 0.1.0-testnet.17\n",
             "astatine 0.1.0-testnet.16\n",
             "astatine 0.1.0-testnet.15\n",
             "astatine 0.1.0-testnet.14\n",
         ] {
             assert!(parse_executable_version_output(output).is_ok());
             assert!(
-                verify_executable_version_output(output, "0.1.0-testnet.17").is_err(),
-                "{output:?} must not match .17"
+                verify_executable_version_output(output, "0.1.0-testnet.18").is_err(),
+                "{output:?} must not match .18"
             );
         }
         for output in [
-            "0.1.0-testnet.17\n",
+            "0.1.0-testnet.18\n",
             "astatine 0.1.0-testnet.foo\n",
-            "astatine 0.1.0-testnet.17 \n",
-            "astatine 0.1.0-testnet.17\nextra output\n",
-            "astatine 0.1.0-testnet.17\n\n",
+            "astatine 0.1.0-testnet.18 \n",
+            "astatine 0.1.0-testnet.18\nextra output\n",
+            "astatine 0.1.0-testnet.18\n\n",
             "not an Astatine version\n",
         ] {
             assert!(
@@ -1163,17 +1170,18 @@ mod tests {
         let directory = tempdir().unwrap();
         let executable = directory.path().join("astatine");
         for (output, expected_to_pass) in [
-            ("astatine 0.1.0-testnet.17\n", true),
-            ("astatine 0.1.0-testnet.170\n", false),
+            ("astatine 0.1.0-testnet.18\n", true),
+            ("astatine 0.1.0-testnet.180\n", false),
+            ("astatine 0.1.0-testnet.17\n", false),
             ("astatine 0.1.0-testnet.foo\n", false),
             ("astatine 0.1.0-testnet.16\n", false),
-            ("astatine 0.1.0-testnet.17\nextra output\n", false),
+            ("astatine 0.1.0-testnet.18\nextra output\n", false),
             ("malformed version output\n", false),
         ] {
             fs::write(&executable, format!("#!/bin/sh\nprintf '%s' '{output}'\n")).unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
             assert_eq!(
-                smoke_test_binary(&executable, "0.1.0-testnet.17").is_ok(),
+                smoke_test_binary(&executable, "0.1.0-testnet.18").is_ok(),
                 expected_to_pass,
                 "version output: {output:?}"
             );

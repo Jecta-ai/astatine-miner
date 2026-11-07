@@ -11,9 +11,8 @@ from pathlib import Path
 
 CONTRACTS = {
     "AstatineMiner": "AstatineMiner.sol/AstatineMiner.json",
-    "MockAST": "MockAST.sol/MockAST.json",
 }
-SOURCE_COMMIT = "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30"
+SOURCE_COMMIT = "80e8f7cbeb21b18bc5f7475d8b751c9d9e8fb9d1"
 
 
 def main() -> None:

@@ -1,10 +1,10 @@
 use crate::{
     config::validate_rpc_url,
-    contracts::{AstatineMinerRead, IERC20Read},
+    contracts::{AstatineGenesisCoordinatorRead, AstatineMinerRead, IERC20Read},
     deployment::{DeploymentManifest, NodePin, parse_address, parse_hash},
     diagnostics::DiagnosticBuffer,
     history_telemetry::{HistoryCounter, HistoryDuration, HistoryTelemetry},
-    protocol::{WorkContext, WorkHasher, meets_target, work_domain_v2},
+    protocol::{SUBMISSION_FEE_WEI, WorkContext, WorkHasher, meets_target, work_domain_v2},
     startup::StartupProgress,
 };
 use alloy_primitives::{Address, B256, Bytes, U256, hex, keccak256};
@@ -14,6 +14,7 @@ use reqwest::Url;
 use serde::{Deserialize, de::DeserializeOwned};
 use std::{
     collections::{HashMap, HashSet},
+    str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -31,7 +32,6 @@ use crate::deployment::TokenPin;
 const RPC_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_RPC_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_LOG_QUERY_RANGE: u64 = 10_000;
-const SUBMISSION_FEE_WEI: u128 = 10_000_000_000_000_000;
 const ABI_PROBE_NONCE: u128 = u128::MAX - 7;
 const GENESIS_PROBE_CONCURRENCY: usize = 3;
 
@@ -359,6 +359,7 @@ struct RpcEndpoint {
 #[derive(Clone, Debug)]
 pub struct DeploymentVerification {
     pub token_verified: bool,
+    pub coordinator: ContractPinStatus,
     pub reference_snapshot_verified: bool,
     pub nodes: HashMap<u8, ContractPinStatus>,
 }
@@ -569,6 +570,11 @@ impl NetworkClient {
             fail_next_snapshots: Arc::new(AtomicUsize::new(0)),
             verification: DeploymentVerification {
                 token_verified: false,
+                coordinator: ContractPinStatus {
+                    runtime_verified: false,
+                    abi_verified: false,
+                    error: None,
+                },
                 reference_snapshot_verified: false,
                 nodes: HashMap::new(),
             },
@@ -622,6 +628,7 @@ impl NetworkClient {
                 .endpoints
                 .iter()
                 .any(|endpoint| endpoint.name == "primary")
+            && self.verification.coordinator.abi_verified
     }
 
     pub async fn verify_node_runtime_at(&self, node_id: u8, block: u64) -> Result<Address> {
@@ -1416,7 +1423,7 @@ impl NetworkClient {
                 .context("create local Anvil RPC client")?,
         };
         let manifest = DeploymentManifest {
-            schema_version: 1,
+            schema_version: 2,
             network: crate::cli::Network::Testnet,
             chain_id: 1439,
             native_symbol: "INJ".to_owned(),
@@ -1424,11 +1431,19 @@ impl NetworkClient {
             primary_rpc: url.to_owned(),
             archival_rpc: None,
             mining_enabled: true,
+            submission_fee_wei: Some(SUBMISSION_FEE_WEI as u64),
             solidity_source: None,
             reference_snapshot: None,
+            miner_config: None,
             ast_token: Some(TokenPin {
                 address: format!("{token:#x}"),
+                name: "Astatine".to_owned(),
+                symbol: "AST".to_owned(),
                 decimals: token_decimals,
+                total_supply_base_units: "3000000000000000".to_owned(),
+                owner: format!("{:#x}", Address::with_last_byte(0xfe)),
+                bank_denom: "factory/inj1ul7kn48kdd8ysn0ar4s6nshymvteeeuapsnqnw/AST".to_owned(),
+                token_factory_admin: "inj1ul7kn48kdd8ysn0ar4s6nshymvteeeuapsnqnw".to_owned(),
                 runtime_code_hash: format!("{token_runtime_hash:#x}"),
             }),
             nodes: miners
@@ -1437,8 +1452,11 @@ impl NetworkClient {
                     id: *id,
                     address: format!("{address:#x}"),
                     runtime_code_hash: format!("{runtime_hash:#x}"),
+                    deployment_tx_hash: format!("{:#x}", B256::with_last_byte(*id)),
+                    deployment_block_number: 1,
                 })
                 .collect(),
+            genesis_coordinator: None,
         };
         Ok(Self {
             manifest,
@@ -1476,6 +1494,11 @@ impl NetworkClient {
             fail_next_snapshots: Arc::new(AtomicUsize::new(0)),
             verification: DeploymentVerification {
                 token_verified: true,
+                coordinator: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
                 reference_snapshot_verified: false,
                 nodes: miners
                     .iter()
@@ -1626,6 +1649,34 @@ impl NetworkClient {
             }
         }
 
+        if let Some(coordinator) = &self.manifest.genesis_coordinator {
+            if let Some(progress) = progress {
+                progress.begin("Verifying Genesis Coordinator");
+            }
+            let status = self
+                .verify_coordinator_pin(&endpoints, &block, coordinator)
+                .await;
+            if status.abi_verified {
+                if let Some(progress) = progress {
+                    progress.complete("Genesis Coordinator verified");
+                }
+            } else {
+                let message = format!(
+                    "Genesis Coordinator is unverified: {}",
+                    status
+                        .error
+                        .as_deref()
+                        .unwrap_or("runtime or configuration pin did not verify")
+                );
+                if let Some(progress) = progress {
+                    progress.warn(&message);
+                } else {
+                    self.report_diagnostic(message);
+                }
+            }
+            self.verification.coordinator = status;
+        }
+
         let total = self.manifest.nodes.len();
         if total == 0 {
             if let Some(progress) = progress {
@@ -1712,10 +1763,22 @@ impl NetworkClient {
             if code.is_empty() || keccak256(code) != expected_hash {
                 bail!("AST token runtime hash does not match the deployment pin");
             }
-            let decimals =
-                call_contract(endpoint, address, IERC20Read::decimalsCall {}, block).await?;
-            if decode_return::<u64>(&decimals)? != u64::from(token.decimals) {
-                bail!("AST token decimals do not match the deployment pin");
+            let (name, symbol, decimals, total_supply, owner) = tokio::try_join!(
+                call_contract(endpoint, address, IERC20Read::nameCall {}, block),
+                call_contract(endpoint, address, IERC20Read::symbolCall {}, block),
+                call_contract(endpoint, address, IERC20Read::decimalsCall {}, block),
+                call_contract(endpoint, address, IERC20Read::totalSupplyCall {}, block),
+                call_contract(endpoint, address, IERC20Read::ownerCall {}, block),
+            )?;
+            if decode_return::<String>(&name)? != token.name
+                || decode_return::<String>(&symbol)? != token.symbol
+                || decode_return::<u64>(&decimals)? != u64::from(token.decimals)
+                || decode_return::<U256>(&total_supply)?
+                    != U256::from_str(&token.total_supply_base_units)?
+                || decode_return::<Address>(&owner)?
+                    != parse_address(&token.owner).context("invalid AST token owner")?
+            {
+                bail!("AST token metadata or ownership does not match the deployment pin");
             }
             Ok::<(), anyhow::Error>(())
         }
@@ -1780,6 +1843,32 @@ impl NetworkClient {
                     bail!("miner AST token does not match its deployment manifest");
                 }
             }
+            if let (Some(config), Some(token), Some(coordinator)) = (
+                &self.manifest.miner_config,
+                &self.manifest.ast_token,
+                &self.manifest.genesis_coordinator,
+            ) {
+                self.verify_node_constructor_pin(
+                    endpoint,
+                    address,
+                    block.number,
+                    config,
+                    token,
+                    coordinator,
+                )
+                .await?;
+                let fee_bytes = call_contract(
+                    endpoint,
+                    address,
+                    AstatineMinerRead::SUBMISSION_FEECall {},
+                    block.number,
+                )
+                .await?;
+                let expected_fee = U256::from(self.manifest.submission_fee_wei.unwrap_or_default());
+                if decode_return::<U256>(&fee_bytes)? != expected_fee {
+                    bail!("SUBMISSION_FEE() does not match the pinned Testnet submission fee");
+                }
+            }
             let domain_bytes = call_contract(
                 endpoint,
                 address,
@@ -1839,6 +1928,263 @@ impl NetworkClient {
                 runtime_verified: true,
                 abi_verified: false,
                 error: Some(format!("ABI/protocol verification failed: {error:#}")),
+            },
+        }
+    }
+
+    async fn verify_node_constructor_pin(
+        &self,
+        endpoint: &RpcEndpoint,
+        address: Address,
+        block: u64,
+        config: &crate::deployment::MinerConfigPin,
+        token: &crate::deployment::TokenPin,
+        coordinator: &crate::deployment::CoordinatorPin,
+    ) -> Result<()> {
+        let (
+            owner,
+            ast_token,
+            ast_decimals,
+            genesis_activator,
+            revenue_handler,
+            revenue_recipient,
+            allocation,
+            initial_reward,
+            initial_target,
+            min_target,
+            max_target,
+            window_secs,
+            target_spacing_secs,
+            ema_alpha_bps,
+            retarget_interval,
+            retarget_clamp_num,
+            retarget_clamp_den,
+            max_header_length,
+            max_empty_sample_secs,
+        ) = tokio::try_join!(
+            call_contract(endpoint, address, AstatineMinerRead::ownerCall {}, block),
+            call_contract(endpoint, address, AstatineMinerRead::astTokenCall {}, block),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::astDecimalsCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::genesisActivatorCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::revenueHandlerCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::revenueRecipientCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::allocationBaseUnitsCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::initialRewardCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::initialTargetCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::minTargetCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::maxTargetCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::windowSecsCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::targetSpacingSecsCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::emaAlphaBpsCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::retargetIntervalCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::retargetClampNumCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::retargetClampDenCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::maxHeaderLengthCall {},
+                block
+            ),
+            call_contract(
+                endpoint,
+                address,
+                AstatineMinerRead::maxEmptySampleSecsCall {},
+                block
+            ),
+        )?;
+
+        let matches = decode_return::<Address>(&owner)?
+            == parse_address(&config.genesis_authority)?
+            && decode_return::<Address>(&ast_token)? == parse_address(&token.address)?
+            && decode_return::<u64>(&ast_decimals)? == u64::from(config.expected_ast_decimals)
+            && decode_return::<Address>(&genesis_activator)?
+                == parse_address(&coordinator.address)?
+            && decode_return::<Address>(&revenue_handler)?
+                == parse_address(&config.revenue_handler)?
+            && decode_return::<Address>(&revenue_recipient)?
+                == parse_address(&config.revenue_recipient)?
+            && decode_return::<U256>(&allocation)?
+                == U256::from_str(&config.per_node_allocation_base_units)?
+            && decode_return::<U256>(&initial_reward)?
+                == U256::from_str(&config.initial_reward_base_units)?
+            && decode_return::<U256>(&initial_target)? == U256::from_str(&config.initial_target)?
+            && decode_return::<U256>(&min_target)? == U256::from_str(&config.min_target)?
+            && decode_return::<U256>(&max_target)? == U256::from_str(&config.max_target)?
+            && decode_return::<u64>(&window_secs)? == config.window_secs
+            && decode_return::<u64>(&target_spacing_secs)? == config.target_spacing_secs
+            && decode_return::<u64>(&ema_alpha_bps)? == u64::from(config.ema_alpha_bps)
+            && decode_return::<u64>(&retarget_interval)? == config.retarget_interval
+            && decode_return::<u64>(&retarget_clamp_num)? == config.retarget_clamp_num
+            && decode_return::<u64>(&retarget_clamp_den)? == config.retarget_clamp_den
+            && decode_return::<u64>(&max_header_length)? == u64::from(config.max_header_length)
+            && decode_return::<u64>(&max_empty_sample_secs)? == config.max_empty_sample_secs;
+        if !matches {
+            bail!("miner constructor or role state does not match the deployment manifest");
+        }
+        Ok(())
+    }
+
+    async fn verify_coordinator_pin(
+        &self,
+        endpoints: &[RpcEndpoint],
+        block: &BlockSnapshot,
+        pin: &crate::deployment::CoordinatorPin,
+    ) -> ContractPinStatus {
+        let mut runtime_verified = false;
+        let result = async {
+            if endpoints.is_empty() {
+                bail!("no selected RPC endpoint is available for Coordinator verification");
+            }
+            let address = parse_address(&pin.address)?;
+            let expected_hash = parse_hash(&pin.runtime_code_hash)?;
+            let expected_owner = parse_address(&pin.owner)?;
+            let expected_token = parse_address(&pin.expected_ast_token)?;
+            for endpoint in endpoints {
+                let code = get_code(endpoint, address, block.number)
+                    .await
+                    .with_context(|| format!("read Genesis Coordinator code from {}", endpoint.name))?;
+                if code.is_empty() || keccak256(code) != expected_hash {
+                    bail!("Genesis Coordinator runtime hash does not match the deployment pin");
+                }
+            }
+            runtime_verified = true;
+
+            for endpoint in endpoints {
+                let (owner, token, count, configured, nodes) = tokio::try_join!(
+                    call_contract(
+                        endpoint,
+                        address,
+                        AstatineGenesisCoordinatorRead::ownerCall {},
+                        block.number,
+                    ),
+                    call_contract(
+                        endpoint,
+                        address,
+                        AstatineGenesisCoordinatorRead::expectedAstTokenCall {},
+                        block.number,
+                    ),
+                    call_contract(
+                        endpoint,
+                        address,
+                        AstatineGenesisCoordinatorRead::NODE_COUNTCall {},
+                        block.number,
+                    ),
+                    call_contract(
+                        endpoint,
+                        address,
+                        AstatineGenesisCoordinatorRead::nodesConfiguredCall {},
+                        block.number,
+                    ),
+                    call_contract(
+                        endpoint,
+                        address,
+                        AstatineGenesisCoordinatorRead::configuredNodesCall {},
+                        block.number,
+                    ),
+                )?;
+                if decode_return::<Address>(&owner)? != expected_owner
+                    || decode_return::<Address>(&token)? != expected_token
+                    || decode_return::<U256>(&count)? != U256::from(self.manifest.nodes.len())
+                    || !decode_return::<bool>(&configured)?
+                {
+                    bail!("Genesis Coordinator owner, AST token, node count, or configuration differs from the pin");
+                }
+                let configured_nodes = decode_return::<[Address; 9]>(&nodes)?;
+                for (configured, node) in configured_nodes.iter().zip(&self.manifest.nodes) {
+                    if *configured != parse_address(&node.address)? {
+                        bail!("Genesis Coordinator configured node order differs from the manifest");
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => ContractPinStatus {
+                runtime_verified: true,
+                abi_verified: true,
+                error: None,
+            },
+            Err(error) => ContractPinStatus {
+                runtime_verified,
+                abi_verified: false,
+                error: Some(format!("Coordinator verification failed: {error:#}")),
             },
         }
     }
@@ -2749,7 +3095,7 @@ async fn fetch_node(
     let mining_paused = decode_return::<bool>(&paused_bytes)?;
     validate_coherent_state(&work, &mining)?;
     if work.submission_fee != U256::from(SUBMISSION_FEE_WEI) {
-        bail!("on-chain submission fee does not match the 0.01 INJ protocol constant");
+        bail!("on-chain submission fee does not match the 0.003 INJ protocol constant");
     }
     if let Some(candidate) = &candidate {
         if candidate.header.len() > work.max_header_length as usize {
@@ -3419,6 +3765,8 @@ mod tests {
                 id,
                 address: format!("{:#x}", Address::with_last_byte(id)),
                 runtime_code_hash: format!("{:#x}", B256::with_last_byte(id)),
+                deployment_tx_hash: format!("{:#x}", B256::with_last_byte(id)),
+                deployment_block_number: 1,
             })
             .collect();
 

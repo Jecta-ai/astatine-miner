@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION="0.1.0-testnet.17"
+VERSION="0.1.0-testnet.18"
 REPOSITORY="Jecta-ai/astatine-miner"
 
 compare_testnet_versions() {

@@ -1290,12 +1290,12 @@ fn render_narrow(
     } else {
         let authorization = if area.width < 24 {
             if model.session_limit_reached {
-                "AUTH <0.01".to_owned()
+                "AUTH <0.003".to_owned()
             } else {
                 "AUTH".to_owned()
             }
         } else if model.session_limit_reached {
-            "AUTH LEFT <0.01 INJ".to_owned()
+            "AUTH LEFT <0.003 INJ".to_owned()
         } else {
             match (model.authorization_used, model.session_limit) {
                 (Some(used), Some(limit)) => format!(

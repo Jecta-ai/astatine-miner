@@ -50,6 +50,26 @@ alloy_sol_types::sol! {
         function miningPaused() external view returns (bool);
         function hasBest() external view returns (bool);
         function astToken() external view returns (address);
+        function astDecimals() external view returns (uint8);
+        function owner() external view returns (address);
+        function genesisActivator() external view returns (address);
+        function revenueHandler() external view returns (address);
+        function revenueRecipient() external view returns (address);
+        function allocationBaseUnits() external view returns (uint256);
+        function initialReward() external view returns (uint256);
+        function initialTarget() external view returns (uint256);
+        function minTarget() external view returns (uint256);
+        function maxTarget() external view returns (uint256);
+        function windowSecs() external view returns (uint64);
+        function targetSpacingSecs() external view returns (uint64);
+        function emaAlphaBps() external view returns (uint16);
+        function retargetInterval() external view returns (uint64);
+        function retargetClampNum() external view returns (uint64);
+        function retargetClampDen() external view returns (uint64);
+        function maxHeaderLength() external view returns (uint32);
+        function maxEmptySampleSecs() external view returns (uint64);
+        function totalDistributed() external view returns (uint256);
+        function rewardReserve() external view returns (uint256);
         function SUBMISSION_FEE() external view returns (uint256);
         function WORK_DOMAIN_V2() external view returns (bytes32);
         function computeWorkHash(address miner, uint128 nonce, bytes calldata header)
@@ -94,9 +114,22 @@ alloy_sol_types::sol! {
     }
 
     interface IERC20Read {
+        function name() external view returns (string memory);
+        function symbol() external view returns (string memory);
         function decimals() external view returns (uint8);
+        function totalSupply() external view returns (uint256);
+        function owner() external view returns (address);
         function balanceOf(address account) external view returns (uint256);
         function transfer(address to, uint256 amount) external returns (bool);
         event Transfer(address indexed from, address indexed to, uint256 value);
+    }
+
+    interface AstatineGenesisCoordinatorRead {
+        function owner() external view returns (address);
+        function expectedAstToken() external view returns (address);
+        function NODE_COUNT() external view returns (uint256);
+        function nodesConfigured() external view returns (bool);
+        function configuredNodes() external view returns (address[9] memory);
+        function genesisActivated() external view returns (bool);
     }
 }
