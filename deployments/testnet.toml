@@ -1,0 +1,127 @@
+schema-version = 2
+network = "testnet"
+chain-id = 1439
+native-symbol = "INJ"
+native-decimals = 18
+primary-rpc = "https://k8s.testnet.json-rpc.injective.network/"
+archival-rpc = "https://testnet.evm.archival.chain.virtual.json-rpc.injective.network/"
+mining-enabled = true
+submission-fee-wei = 3000000000000000
+
+[solidity-source]
+canonical-main-commit = "80e8f7cbeb21b18bc5f7475d8b751c9d9e8fb9d1"
+observed-deployment-checkout = "80e8f7cbeb21b18bc5f7475d8b751c9d9e8fb9d1"
+observed-deployment-branch = "main"
+deployment-label-reference = "80e8f7cbeb21b18bc5f7475d8b751c9d9e8fb9d1"
+work-codec-identical-to-canonical-main = true
+
+[reference-snapshot]
+block-number = 147415188
+block-hash = "0xb878a9168270cd0c371a2c2f173aa8dac042a136cac577d42fa37796477ef95d"
+
+[ast-token]
+address = "0x5C730A3110a565bf388120ce64F37bb7dd0c7F83"
+name = "Astatine"
+symbol = "AST"
+decimals = 9
+total-supply-base-units = "3000000000000000"
+owner = "0xe7fd69d4f66b4e484dfd1d61a9c2e4db179ce79d"
+bank-denom = "factory/inj1ul7kn48kdd8ysn0ar4s6nshymvteeeuapsnqnw/AST"
+token-factory-admin = "inj1ul7kn48kdd8ysn0ar4s6nshymvteeeuapsnqnw"
+runtime-code-hash = "0x374e8e354b84990e6fb359b78f1b32e4c56c857facd619ceb223d5ed270b4d1d"
+
+[miner-config]
+expected-ast-decimals = 9
+total-mining-allocation-base-units = "2943000000000000"
+other-allocations-base-units = "57000000000000"
+per-node-allocation-base-units = "327000000000000"
+unassigned-node-remainder-base-units = "0"
+initial-reward-base-units = "16350000000000"
+initial-target = "287572764449606824476448160928209393852129540507099439798438509324970"
+min-target = "75557863725914323419135"
+max-target = "117789804318558955305553166716194567721832259791707930541440413419507985"
+window-secs = 180
+target-spacing-secs = 180
+ema-alpha-bps = 200
+retarget-interval = 120
+retarget-clamp-num = 3
+retarget-clamp-den = 2
+max-header-length = 64
+max-empty-sample-secs = 360
+genesis-authority = "0x7292b8ef9d9cdec82c5047d957ee799701026f24"
+revenue-handler = "0x612f3b903aef39e03af3a40f097e66482bae0dea"
+revenue-recipient = "0x796aaf7798fe2d44d3c72410d16da27f8c2d4c8c"
+
+[[nodes]]
+id = 1
+address = "0xd85330911C21830F5e3E15e63cE29655Db9D6FBb"
+runtime-code-hash = "0x20565315a805a9daef551ca34a8026f14e4b14b16f293615367cfbf619cd4f0f"
+deployment-tx-hash = "0xd1e49727ed0650395bc7e3be544d2bd385b86040646ddfab9f6efc9c8446f901"
+deployment-block-number = 147410561
+
+[[nodes]]
+id = 2
+address = "0x5E3c74B8D2438066745470D2dA4268E974f114E7"
+runtime-code-hash = "0x20565315a805a9daef551ca34a8026f14e4b14b16f293615367cfbf619cd4f0f"
+deployment-tx-hash = "0x00fc223c89b87c19831c98b2c0453f805315f639e413b3762a2d8e0725c3bdf7"
+deployment-block-number = 147410574
+
+[[nodes]]
+id = 3
+address = "0xcA00B4dD1c66ddE648e3940651c7Ee863E7c8E73"
+runtime-code-hash = "0x20565315a805a9daef551ca34a8026f14e4b14b16f293615367cfbf619cd4f0f"
+deployment-tx-hash = "0x748659572a396aa5565a3a6e6da26293457b9f35ad9e3ca06b5dbd9cf6c8b8c3"
+deployment-block-number = 147410587
+
+[[nodes]]
+id = 4
+address = "0x130db0fEAB2a2C3c84cCFF12a46a459981E3c4cc"
+runtime-code-hash = "0x20565315a805a9daef551ca34a8026f14e4b14b16f293615367cfbf619cd4f0f"
+deployment-tx-hash = "0xfec5dc271b00251e39f8646dea96562c704ece8dd683a85e9a2c1f38d82133c0"
+deployment-block-number = 147410600
+
+[[nodes]]
+id = 5
+address = "0x34Ec787364CD3c4f7b989b659C132877780Bbb5a"
+runtime-code-hash = "0x20565315a805a9daef551ca34a8026f14e4b14b16f293615367cfbf619cd4f0f"
+deployment-tx-hash = "0xbc67c5580c8c6ac7e7ac94269814868da29b179525504f37501f01889267d7ba"
+deployment-block-number = 147410613
+
+[[nodes]]
+id = 6
+address = "0xdc28e75D4a44BcB0829F2e534f0010b4417352f5"
+runtime-code-hash = "0x20565315a805a9daef551ca34a8026f14e4b14b16f293615367cfbf619cd4f0f"
+deployment-tx-hash = "0xc8dcf89ecd055e47e0372573048d905f38e16383017d708847a1ad4dfc18ca91"
+deployment-block-number = 147410626
+
+[[nodes]]
+id = 7
+address = "0x1264b8899697764c5b1a0AF35F02423DaDaabAEE"
+runtime-code-hash = "0x20565315a805a9daef551ca34a8026f14e4b14b16f293615367cfbf619cd4f0f"
+deployment-tx-hash = "0xa8d0e592c35b746db3b85fa1aeed17d390b34bf1868d4e39f4f18776c1f45b3c"
+deployment-block-number = 147410639
+
+[[nodes]]
+id = 8
+address = "0x6E01106a5c988aCd7ED09a0d298fc72fb1c59fCE"
+runtime-code-hash = "0x20565315a805a9daef551ca34a8026f14e4b14b16f293615367cfbf619cd4f0f"
+deployment-tx-hash = "0x81f831e2f6791c0e93e56faf3e2a8bd5206e9e106f49889637f322ffee67e5d4"
+deployment-block-number = 147410652
+
+[[nodes]]
+id = 9
+address = "0x494297C9f48Ac2EF77eC2bF383D9c154e8816bf5"
+runtime-code-hash = "0x20565315a805a9daef551ca34a8026f14e4b14b16f293615367cfbf619cd4f0f"
+deployment-tx-hash = "0x36d0d478441623b78f8aa92bcdd6de3e0dd6a74399f684febb29a98dfdb6dc78"
+deployment-block-number = 147410665
+
+[genesis-coordinator]
+address = "0x126DeE584cd3b643374b6BC464242581d1bF5d1f"
+runtime-code-hash = "0xd76d991f9332b0eb6291f7b86888b88e0fdc895eb6f76f18e10fe6ba388eb1f8"
+deployment-tx-hash = "0x1ca0f15579b18fc6592fa5d3ac5cddff11250ea6224af4ccb226640c54862892"
+deployment-block-number = 147410705
+source-commit = "c710b4d7add5f10de326487d0ff851eb926499c6"
+owner = "0x7292b8Ef9D9CdeC82c5047d957eE799701026F24"
+expected-ast-token = "0x5C730A3110a565bf388120ce64F37bb7dd0c7F83"
+configuration-tx-hash = "0x992059700eb53a5c72a310ac560f53b97b4997ea737e7e8d0afc131826dad80f"
+configuration-block-number = 147411829

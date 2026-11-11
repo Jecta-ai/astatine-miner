@@ -1,0 +1,264 @@
+{
+  "schema": "astatine-fixture-provenance/v1",
+  "scope": "Offline inventory for tests/fixtures only. No upstream source is copied here and no upstream build was performed for this inventory.",
+  "baseline": {
+    "canonical_repository_head": "7ba0ff6136c1ed7d084939cce44b8a7da669b671",
+    "canonical_tree": "09b7387d6fb9ddc86ac37f105c5f3dd4ceccc417",
+    "note": "Historical reviewed baseline only. These values identify the source baseline recorded by this inventory; they are not a commit of this source tree."
+  },
+  "verification": {
+    "command": "python3 support/verify-fixture-provenance.py",
+    "test_command": "python3 -m unittest discover -s support/tests -p 'test_*.py'",
+    "network_required": false,
+    "build_required": false,
+    "regenerated_in_this_review": false,
+    "date_utc": "2026-11-11"
+  },
+  "fixtures": [
+    {
+      "id": "FIX-01",
+      "path": "tests/fixtures/AstatineMiner.json",
+      "kind": "contract_creation_bytecode",
+      "contract": "AstatineMiner",
+      "source_origin": "private upstream EVM source repository (name withheld)",
+      "source_commit": "80e8f7cbeb21b18bc5f7475d8b751c9d9e8fb9d1",
+      "canonical_git_blob_sha1": "7dd3cc5bb6a2096b8f9f11d9372e72e90d2305f3",
+      "sha256": "f76d41fb4b17411c2f9817091944ab75b69189587a11339a9b7639d9fdbd83f2",
+      "bytes": 42705,
+      "json_keys": [
+        "bytecode",
+        "contract",
+        "source_commit"
+      ],
+      "bytecode": {
+        "encoding": "0x-prefixed hex",
+        "hex_chars": 42568,
+        "bytes": 21284,
+        "sha256": "beec2f3d3d72a347954cc216edd88ab86ccdf8402a0f4aa3fc8993493eadc200"
+      },
+      "compiler": null,
+      "compiler_evidence": "Declared in tests/fixtures/README.md as Solidity 0.8.28, Shanghai EVM, optimizer enabled with 200 runs, bytecode_hash=none. Compiler settings are not embedded in this fixture.",
+      "runtime_purpose": "Test-only creation bytecode deployed by local Anvil lifecycle and integration tests; it is not loaded by the production miner runtime.",
+      "production_runtime_use": false,
+      "release_archive_member": false,
+      "consumers": [
+        "src/transaction.rs:read_artifact",
+        "src/transaction.rs:prepare_local_test_contracts",
+        "src/transaction.rs:artifact_bytecode"
+      ],
+      "license": {
+        "declared_spdx": "Apache-2.0",
+        "declaration_evidence": "SPDX header in the pinned source blob d1fc2c6a91c290ce8d4be353a232dc41769f2c51; the file contains no copyright statement.",
+        "rights_status": "unresolved; license identity is declared but redistribution authority and applicable notices are not established"
+      },
+      "regeneration": {
+        "status": "scripted",
+        "script": "support/update-evm-test-fixtures.py",
+        "script_sha256": "8d96c7ee80c021de9d3f679c17322db4da1fa7433c23429fde9eef1407b18615",
+        "requires": "isolated private upstream checkout at the exact pin and a Forge build",
+        "performed_in_this_review": false
+      }
+    },
+    {
+      "id": "FIX-02",
+      "path": "tests/fixtures/AstatineGenesisCoordinator.json",
+      "kind": "contract_creation_bytecode",
+      "contract": "AstatineGenesisCoordinator",
+      "source_origin": "private upstream Genesis Coordinator source repository (name withheld)",
+      "source_commit": "c710b4d7add5f10de326487d0ff851eb926499c6",
+      "canonical_git_blob_sha1": "5ab489c99b9aeaf84d279ef353425685e6b86286",
+      "sha256": "0a3a2c54b97e38af018e6c4ae1b09ed151b5be8a5ed3b9475df23f7b5177364d",
+      "bytes": 10223,
+      "json_keys": [
+        "bytecode",
+        "compiler",
+        "contract",
+        "source_commit"
+      ],
+      "bytecode": {
+        "encoding": "0x-prefixed hex",
+        "hex_chars": 9918,
+        "bytes": 4959,
+        "sha256": "a4da83f9028ccc20a6dd260851fe20c73b28be474431bc5d70724774eebee8d0"
+      },
+      "compiler": {
+        "version": "0.8.28",
+        "evm_version": "shanghai",
+        "optimizer": true,
+        "optimizer_runs": 200,
+        "bytecode_hash": "none"
+      },
+      "compiler_evidence": "Embedded exactly in the fixture compiler object; the pinned source repository also uses pinned Foundry settings.",
+      "runtime_purpose": "Test-only creation bytecode deployed by local Anvil nine-node genesis tests; it is not loaded by the production miner runtime.",
+      "production_runtime_use": false,
+      "release_archive_member": false,
+      "consumers": [
+        "src/transaction.rs:read_artifact",
+        "src/transaction.rs:prepare_local_test_contracts",
+        "src/transaction.rs:artifact_bytecode"
+      ],
+      "license": {
+        "declared_spdx": "Apache-2.0",
+        "declaration_evidence": "SPDX header in the pinned source blob abd2ebd9fcefd1c62dc7b17939b3d3f875d09df8; the file contains no copyright statement and has zero direct OpenZeppelin imports.",
+        "rights_status": "unresolved; the pinned source repository tree contains no LICENSE/NOTICE and redistribution authority is not established"
+      },
+      "regeneration": {
+        "status": "scripted",
+        "script": "support/update-genesis-coordinator-fixture.py",
+        "script_sha256": "1cbfcddb96d72127e1e281ffea85d7b98bab825e007493668c197b477842dbba",
+        "requires": "the pinned private upstream coordinator checkout, its pinned Foundry settings and a compiled artifact",
+        "performed_in_this_review": false
+      }
+    },
+    {
+      "id": "FIX-03",
+      "path": "tests/fixtures/MockAST.json",
+      "kind": "contract_creation_bytecode",
+      "contract": "MockAST",
+      "source_origin": "private upstream EVM source repository (name withheld)",
+      "source_commit": "eb9ea498ed4da10536cd6b4d5d8b55cf38e8aa30",
+      "canonical_git_blob_sha1": "ca2a6307b868d0fe314cbb79fc3f008eba995562",
+      "sha256": "f867698b80a9aa252e56f8fb407b26fd4f344558a1989729cbb353c28b500d0e",
+      "bytes": 9765,
+      "json_keys": [
+        "bytecode",
+        "contract",
+        "source_commit"
+      ],
+      "bytecode": {
+        "encoding": "0x-prefixed hex",
+        "hex_chars": 9634,
+        "bytes": 4817,
+        "sha256": "42e6579f0263767e6e704743f3763d97aa96b7c03ca7fa103e57955555c3ebae"
+      },
+      "compiler": null,
+      "compiler_evidence": "No compiler block is embedded and no compiler settings are declared for this fixture. The fixture is test-only and must remain byte-identical.",
+      "runtime_purpose": "Test-only ERC-20 mock deployed by local Anvil tests; it is never deployed to a public network and is not loaded by the production miner runtime.",
+      "production_runtime_use": false,
+      "release_archive_member": false,
+      "consumers": [
+        "src/transaction.rs:read_artifact",
+        "src/transaction.rs:prepare_local_test_contracts",
+        "src/transaction.rs:artifact_bytecode"
+      ],
+      "license": {
+        "declared_spdx": "MIT",
+        "declaration_evidence": "SPDX header in the pinned source blob 0a7480c5586ac26897cbadc4db83c5225ad46c58; the file contains no copyright statement and imports one OpenZeppelin component.",
+        "rights_status": "unresolved; authorship and redistribution authority remain for the rights holder to confirm"
+      },
+      "regeneration": {
+        "status": "not_scripted",
+        "detail": "No script in this tree regenerates MockAST.json. Its provenance is the fixture source_commit field plus the fixture README declaration; the bytecode is preserved manually.",
+        "performed_in_this_review": false
+      }
+    },
+    {
+      "id": "FIX-04",
+      "path": "tests/fixtures/injective-testnet-virtual-receipt.json",
+      "kind": "public_chain_receipt",
+      "contract": null,
+      "source_origin": "public Injective Testnet transaction receipt capture",
+      "source_commit": null,
+      "canonical_git_blob_sha1": "c067c654667ed214fa40b6387137500d25b80daf",
+      "sha256": "afa2890260b22d4a20f36729e7d7459e97cd0fcb1408a9b8d1e886214244d84c",
+      "bytes": 7722,
+      "json_keys": [
+        "blockHash",
+        "blockNumber",
+        "cumulativeGasUsed",
+        "effectiveGasPrice",
+        "from",
+        "gasUsed",
+        "logs",
+        "status",
+        "to",
+        "transactionHash",
+        "transactionIndex",
+        "type"
+      ],
+      "bytecode": null,
+      "compiler": null,
+      "compiler_evidence": "Not applicable; this is transaction receipt data, not compiled code.",
+      "runtime_purpose": "RPC parser regression fixture embedded at compile time only under cfg(test) via include_str!; it is not part of the release binary.",
+      "production_runtime_use": false,
+      "release_archive_member": false,
+      "consumers": [
+        "src/rpc.rs:test module include_str!"
+      ],
+      "license": {
+        "declared_spdx": null,
+        "declaration_evidence": "Public-chain transaction receipt data. No contract source or bytecode is included.",
+        "rights_status": "not a contract-code fixture; residual address-linkage review is a separate privacy decision"
+      },
+      "regeneration": {
+        "status": "captured_not_regenerated",
+        "detail": "Captured from public Testnet chain data; the Rust parser test asserts the recorded hash and block values. No regeneration script is provided.",
+        "performed_in_this_review": false
+      }
+    }
+  ],
+  "documents": [
+    {
+      "path": "tests/fixtures/README.md",
+      "sha256": "c63d3952fefdb9a98c789101ee0b7cb64190f6b701d4df77d26a47ed43dd504d",
+      "bytes": 3167
+    }
+  ],
+  "legal_artifacts": [
+    {
+      "path": "tests/fixtures/OPENZEPPELIN_LICENSE.txt",
+      "sha256": "0e05b4f45c8769ece14ba2d202bf6f5ed7132600b642c981266f7255e0187ea3",
+      "bytes": 1107,
+      "license": "MIT",
+      "copyright": "Copyright (c) 2016-2023 zOS Global Limited and contributors",
+      "provenance": "OpenZeppelin Contracts LICENSE at commit dbb6104ce834628e473d2173bbc9d47f81a9eec3",
+      "evidence": "The staged file is byte-identical to the pinned local submodule LICENSE and the retained exact-pin license evidence."
+    }
+  ],
+  "openzeppelin": {
+    "repository": "OpenZeppelin/openzeppelin-contracts",
+    "pinned_commit": "dbb6104ce834628e473d2173bbc9d47f81a9eec3",
+    "license": "MIT",
+    "copyright": "Copyright (c) 2016-2023 zOS Global Limited and contributors",
+    "license_text": "tests/fixtures/OPENZEPPELIN_LICENSE.txt",
+    "verified": true,
+    "evidence_scope": "Exact pinned LICENSE verified locally and against retained upstream license evidence. This resolves license identity only, not first-party rights or notice applicability."
+  },
+  "rights_review": {
+    "first_party_license_identity": "The pinned AstatineMiner and AstatineGenesisCoordinator source files declare Apache-2.0; the pinned MockAST source file declares MIT.",
+    "copyright_evidence": "The contract files contain no copyright statements. The private EVM origin contains an Apache NOTICE scoped to a separate Rust subtree; the EVM tree root and contract subtree have no LICENSE/NOTICE at the pin. The coordinator origin tree at its pin contains no LICENSE/NOTICE.",
+    "rights_holder_authority": "OWNER-ATTESTED \u2014 not independently verified",
+    "owner_attestation": {
+      "status": "OWNER-ATTESTED \u2014 not independently verified",
+      "scope": "The AstatineMiner and AstatineGenesisCoordinator contracts are first-party works developed and owned by the project owner.",
+      "attested_on": "2026-11-11",
+      "attestation_source": "Explicit statement by the project owner; not independently verified.",
+      "independent_verification": false
+    },
+    "notice_applicability": "UNRESOLVED",
+    "publication_decision": "BLOCKED pending review of rights and notice applicability; first-party ownership is owner-attested and not independently verified.",
+    "not_inferred": "Repository owner identity, commit-author metadata, a personal handle or the CLI MIT license do not by themselves establish ownership or redistribution authority. The owner attestation is an explicit statement of first-party ownership; it is recorded as OWNER-ATTESTED and is not independently verified."
+  },
+  "scrub_policy": {
+    "scope": "Source tree only; exact deployment pins, protocol identities, contract names and fixture hashes are retained.",
+    "prohibited_name_marker_sha256": [
+      "dc89c3c8d6473e598bdf24889eb348cb625d362d51f2cd2eaf11683da2c3e65d",
+      "b6947854ec434189b2fb7c345bcb4e3aeefe24c34ed41c10db9ce1a2e42d1548",
+      "eadb388c9b61b5fcea50bb3f0468318785b025dfb4f108d3ea3b9932f199075f"
+    ],
+    "marker_check": "SHA-256 of each lowercase OWNER/REPOSITORY token found in the scrub paths is compared with the withheld marker digests. The private-origin names themselves are not stored in this source tree.",
+    "paths": [
+      "README.md",
+      "MACOS_ARM64.md",
+      "support/update-evm-test-fixtures.py",
+      "support/update-genesis-coordinator-fixture.py",
+      "tests/fixtures/README.md"
+    ],
+    "retained_private_origin_reference": {
+      "path": "src/protocol.rs",
+      "status": "retained in source",
+      "reason": "`src/protocol.rs` is production Rust source. The reference is a comment inside the `#[cfg(test)]` test module and is not compiled into the release binary. It is retained unchanged in this source tree; any privacy decision about it is outside this inventory."
+    },
+    "note": "Private-origin repository names were replaced with generic descriptions in prose and help text. No fixture bytes, deployment pins or protocol identifiers were changed."
+  }
+}

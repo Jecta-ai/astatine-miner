@@ -1,0 +1,143 @@
+# Build, compile, and safe-smoke checks on GitHub-hosted runners. This workflow
+# does not execute the unit-test suite, run Anvil integration tests, publish,
+# sign, attest, create releases, or read any deployment credential.
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: "1.94.1"
+
+jobs:
+  native-checks:
+    name: Native checks (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            binary: astatine
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            binary: astatine
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            binary: astatine
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            binary: astatine
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            binary: astatine.exe
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain components
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+      - name: Verify native runner architecture
+        # A cross-compiled binary is not native-smoke-verified.
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | awk '$1 == "host:" { print $2 }')"
+          echo "Rust host: $host"
+          test "$host" = "${{ matrix.target }}"
+      - name: Reproduce CUDA PTX and validate sm_86 assembly
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          generated="$RUNNER_TEMP/astatine-sha256d.ptx"
+          support/cuda/build-ptx.sh "$generated"
+          cmp src/gpu/cuda/sha256d.ptx "$generated"
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Check
+        run: cargo check --locked
+      - name: Compile tests without executing them
+        # Test execution is outside this workflow. Focused fixture and safe
+        # tests, plus the proof-lifecycle regressions, are run locally; see README.md.
+        run: cargo test --locked --no-run
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Native release build
+        run: cargo build --locked --release
+      - name: Build Windows password prompt smoke
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo build --locked --release --example windows_password_prompt
+      - name: Native executable smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/release/${{ matrix.binary }}"
+          "$binary" --version
+          "$binary" --help >/dev/null
+          "$binary" mine --help >/dev/null
+          if [[ "${{ matrix.target }}" == *linux* ]]; then
+            file "$binary"
+            ldd "$binary"
+          elif [[ "${{ matrix.target }}" == *apple* ]]; then
+            file "$binary"
+            otool -L "$binary"
+          fi
+      - name: Windows hidden-password console smoke
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $PromptExe = Join-Path $env:GITHUB_WORKSPACE 'target\release\examples\windows_password_prompt.exe'
+          $Prompt = Start-Process -FilePath $PromptExe -PassThru -NoNewWindow
+          if (-not $Prompt.WaitForExit(15000)) {
+            $Prompt.Kill()
+            throw 'Windows hidden-password console smoke timed out'
+          }
+          if ($Prompt.ExitCode -ne 0) { throw "Windows hidden-password console smoke failed (exit code $($Prompt.ExitCode))" }
+
+  dependency-policy:
+    name: Dependency, advisory, and license checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require immutable full-SHA workflow action references
+        run: python3 support/check_workflow_pins.py
+      - name: Install pinned Rust toolchain components
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+      - name: Install pinned dependency validation tools
+        run: |
+          cargo install cargo-deny --locked --version 0.20.2
+          cargo install cargo-about --locked --version 0.9.2 --features cli
+          cargo install cargo-audit --locked --version 0.22.2
+      - name: Validate dependency policies
+        run: cargo deny check
+      - name: Keep inactive vulnerable optional package out of the active graph
+        run: |
+          set -euo pipefail
+          cargo tree --locked --all-features --target all -i crypto-bigint@0.5.5 > "$RUNNER_TEMP/crypto-bigint-0.5.5-tree.txt" 2>&1
+          python3 - "$RUNNER_TEMP/crypto-bigint-0.5.5-tree.txt" <<'PY'
+          import pathlib
+          import sys
+
+          tree = pathlib.Path(sys.argv[1]).read_text()
+          assert "crypto-bigint v0.5.5" not in tree, "RUSTSEC-2026-0387 package entered the active all-features/all-targets graph"
+          PY
+      - name: Audit locked dependencies
+        run: cargo audit --ignore RUSTSEC-2026-0387
+      - name: Regenerate third-party license notices
+        run: |
+          cargo about generate --locked about.hbs --output-file "$RUNNER_TEMP/THIRD_PARTY_LICENSES.md"
+          cmp THIRD_PARTY_LICENSES.md "$RUNNER_TEMP/THIRD_PARTY_LICENSES.md"

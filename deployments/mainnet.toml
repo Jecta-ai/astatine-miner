@@ -1,0 +1,9 @@
+schema-version = 1
+network = "mainnet"
+chain-id = 1776
+native-symbol = "INJ"
+native-decimals = 18
+primary-rpc = "https://sentry.evm-rpc.injective.network/"
+archival-rpc = "https://evm.archival.chain.virtual.json-rpc.injective.network/"
+mining-enabled = false
+nodes = []
