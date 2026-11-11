@@ -1,6 +1,6 @@
-# Build, compile, and safe-smoke checks on GitHub-hosted runners. This workflow
-# does not execute the unit-test suite, run Anvil integration tests, publish,
-# sign, attest, create releases, or read any deployment credential.
+# Build, isolated Linux unit tests, and safe-smoke checks on GitHub-hosted runners.
+# This workflow does not run Anvil integration tests, publish, sign, attest,
+# create releases, or read any deployment credential.
 name: Rust CI
 
 on:
@@ -107,7 +107,7 @@ jobs:
 
   linux-safe-tests:
     name: Linux safe unit tests (no native keyring, Anvil, or GPU)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       CARGO_TARGET_DIR: target
