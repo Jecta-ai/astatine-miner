@@ -3311,6 +3311,9 @@ pub struct TransactionManager {
     session_limit_reached: bool,
     session_limit_sink_notified: bool,
     session_limit_reached_sink: Option<SessionLimitReachedSink>,
+    shutdown_request: Option<crate::shutdown::ShutdownRequest>,
+    #[cfg(test)]
+    pre_sign_boundary_hook: Option<Box<dyn FnOnce() + Send>>,
 }
 
 #[derive(Clone, Debug)]
@@ -3718,7 +3721,82 @@ impl TransactionManager {
             session_limit_reached: false,
             session_limit_sink_notified: false,
             session_limit_reached_sink: None,
+            shutdown_request: None,
+            #[cfg(test)]
+            pre_sign_boundary_hook: None,
         })
+    }
+
+    pub(crate) fn set_shutdown_request(&mut self, request: crate::shutdown::ShutdownRequest) {
+        self.shutdown_request = Some(request);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pre_sign_boundary_hook(&mut self, hook: Box<dyn FnOnce() + Send>) {
+        self.pre_sign_boundary_hook = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_id_for_test(&self) -> Option<String> {
+        self.journal
+            .state
+            .active_session
+            .as_ref()
+            .map(|session| session.id.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_unresolved_liability_for_test(
+        &mut self,
+        signer: &SigningKey,
+        contract: Address,
+    ) -> Result<(B256, U256)> {
+        let request = Eip1559Request {
+            chain_id: self.chain_id,
+            nonce: 0,
+            max_priority_fee_per_gas: U256::from(1_000_000_000_u64),
+            max_fee_per_gas: U256::from(30_000_000_000_u64),
+            gas_limit: 75_000,
+            to: contract,
+            value: U256::ZERO,
+            data: crate::contracts::AstatineMinerRead::finalizeWindowCall {}.abi_encode(),
+        };
+        let intent = TransactionIntent {
+            contract,
+            node_id: 1,
+            window_id: 99,
+            action: TransactionAction::FinalizeWindow,
+            proof: None,
+            reward_destination: None,
+            forwarding: None,
+        };
+        let confirmed_balance = U256::MAX;
+        let maximum_exposure = self.journal.authorize_exposure(
+            &request,
+            &intent,
+            self.session_limit,
+            self.minimum_reserve,
+            confirmed_balance,
+        )?;
+        let signed = sign_eip1559(signer, &request)?;
+        self.journal.prepare(PreparedTransaction {
+            request,
+            tx_hash: signed.hash,
+            intent,
+            session_limit: self.session_limit,
+            minimum_reserve: self.minimum_reserve,
+            confirmed_balance,
+            confirmations_required: self.confirmations_required,
+        })?;
+        self.journal
+            .set_broadcast_state(signed.hash, TransactionStatus::Unknown)?;
+        Ok((signed.hash, maximum_exposure))
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_request
+            .as_ref()
+            .is_some_and(crate::shutdown::ShutdownRequest::is_requested)
     }
 
     pub(crate) fn history_profile_line(&self) -> String {
@@ -4904,6 +4982,11 @@ impl TransactionManager {
         if self.read_only_recovery {
             bail!("read-only transaction recovery cannot sign or broadcast transactions");
         }
+        if self.shutdown_requested() {
+            bail!(
+                "a shutdown signal was received; refusing to sign or broadcast a new transaction"
+            );
+        }
         if self.session_limit_reached {
             bail!("paid mining session reached its terminal authorization limit");
         }
@@ -5258,6 +5341,10 @@ impl TransactionManager {
         let node_id = intent.node_id;
         let window_id = intent.window_id;
         let action = intent.action;
+        // A shutdown may have been requested while the preflight RPC calls
+        // above were in flight. Re-check before creating a durable
+        // authorization or signing anything.
+        self.require_signing_enabled()?;
         let maximum_exposure = match self.journal.authorize_exposure(
             &request,
             &intent,
@@ -5281,6 +5368,28 @@ impl TransactionManager {
         // the mining run now; this already-authorized transaction still follows
         // its normal signing, broadcast, and receipt-recovery path.
         self.refresh_session_limit_state()?;
+        #[cfg(test)]
+        if let Some(hook) = self.pre_sign_boundary_hook.take() {
+            hook();
+        }
+        // The permit acquisition is the pre-sign linearization point. If
+        // shutdown delivery is visible before the permit is acquired, retire
+        // only the unbound marker; the already-charged session authorization
+        // intentionally remains. If the permit was acquired first, this signing
+        // section is already in flight and its journaled Prepared state is
+        // preserved by the normal cancellation path.
+        let _signing_permit = match self.shutdown_request.as_ref() {
+            Some(request) => match request.begin_signing() {
+                Some(permit) => Some(permit),
+                None => {
+                    self.journal.abandon_pending_authorization()?;
+                    bail!(
+                        "a shutdown signal was received before the signing barrier; refusing to sign a new transaction"
+                    );
+                }
+            },
+            None => None,
+        };
         let signed = match sign_eip1559(signer, &request) {
             Ok(signed) => signed,
             Err(error) => {
@@ -7464,7 +7573,7 @@ mod tests {
         time::{Duration, Instant, SystemTime},
     };
     use tempfile::tempdir;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
 
     alloy_sol_types::sol! {
         interface LocalMockAST {
@@ -12286,11 +12395,19 @@ mod tests {
             Arc::new(HistoryTelemetry::default()),
         )
         .unwrap();
-        let mut ctrl_c: crate::startup::CtrlCSignal = Box::pin(async { Ok(()) });
+        let mut shutdown = crate::shutdown::ShutdownSignal::synthetic();
+        #[cfg(unix)]
+        shutdown.trigger_for_test(crate::shutdown::ShutdownReason::Interrupt);
+        #[cfg(not(unix))]
+        shutdown.trigger_for_test(crate::shutdown::ShutdownReason::CtrlC);
         assert!(
-            !crate::commands::reconcile_recovery_or_interrupt(&mut recovery, &client, &mut ctrl_c,)
-                .await
-                .unwrap()
+            !crate::commands::reconcile_recovery_or_interrupt(
+                &mut recovery,
+                &client,
+                &mut shutdown,
+            )
+            .await
+            .unwrap()
         );
         drop(recovery);
 
@@ -12315,6 +12432,265 @@ mod tests {
         assert_eq!(
             resumed_recovery.journal.pending_exposure().unwrap(),
             exposure
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_request_blocks_new_signing_and_preserves_the_closed_journal() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let signer = test_signer();
+        let wallet = signer_address(&signer);
+        let contract = Address::with_last_byte(0xc1);
+        let token = Address::with_last_byte(0xc2);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        let mut manager = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        let request = crate::shutdown::ShutdownRequest::default();
+        request.request_for_test();
+        manager.set_shutdown_request(request);
+
+        let client = NetworkClient::local_test_client(
+            "http://127.0.0.1:1",
+            contract,
+            B256::with_last_byte(0xc3),
+            token,
+            B256::with_last_byte(0xc4),
+            18,
+        )
+        .unwrap();
+        let submission = ProofSubmission {
+            contract,
+            node_id: 1,
+            window_id: 7,
+            nonce: 1,
+            header: b"shutdown-race".to_vec(),
+            work_hash: B256::with_last_byte(0xc5),
+        };
+        let error = manager
+            .submit_proof(&client, &signer, submission)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("shutdown signal"),
+            "a stop request must refuse signing before any journal authorization: {error:#}"
+        );
+        assert!(manager.journal.state.entries.is_empty());
+        assert!(manager.journal.state.pending_authorization.is_none());
+        assert_eq!(
+            manager.journal.session_authorized_total().unwrap(),
+            U256::ZERO
+        );
+
+        manager.close_session().unwrap();
+        drop(manager);
+
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(snapshot.closed);
+        assert!(snapshot.unresolved.is_empty());
+        assert_eq!(snapshot.authorized_exposure_wei.as_deref(), Some("0"));
+
+        // Restarting after the stop must not silently reopen a paid session.
+        let restarted = TransactionManager::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        );
+        assert!(
+            restarted.is_err(),
+            "restart must require explicit new-session authorization"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_pending_broadcast_preserves_prepared_liability() {
+        let fixture = submit_preflight_fixture();
+        fixture.client.delay_next_broadcast(Duration::from_secs(30));
+        let mut manager = TransactionManager::open(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+        )
+        .unwrap();
+        let session_id = manager
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+
+        let submit_client = fixture.client.clone();
+        let submit_signer = clone_signer(&fixture.signer);
+        let submission = fixture.submission.clone();
+        let submit_task = tokio::spawn(async move {
+            manager
+                .submit_proof(&submit_client, &submit_signer, submission)
+                .await
+        });
+        timeout(Duration::from_secs(5), async {
+            while fixture.client.broadcast_delays_started() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("submit should reach the pending raw-broadcast boundary");
+        // This models the runtime select dropping the in-flight submission
+        // future after a shutdown signal. The durable journal state must
+        // survive even though the local signing/authorization step completed.
+        submit_task.abort();
+        let _ = submit_task.await;
+
+        let bytes = fixture.store.read_transaction_journal().unwrap().unwrap();
+        let journal: super::JournalState = serde_json::from_slice(&bytes).unwrap();
+        assert!(journal.pending_authorization.is_none());
+        let entry = journal
+            .entries
+            .iter()
+            .find(|entry| entry.action == TransactionAction::SubmitProof)
+            .expect("the prepared transaction must remain journaled");
+        assert_eq!(entry.status, TransactionStatus::Prepared);
+        assert!(entry.status.is_unresolved());
+        let exposure = parse_decimal_wei(&entry.maximum_exposure_wei).unwrap();
+        assert!(exposure > U256::ZERO);
+        assert_eq!(
+            journal
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some(exposure.to_string().as_str())
+        );
+        assert_eq!(
+            journal.active_session.as_ref().unwrap().id,
+            session_id,
+            "the cancelled in-flight transaction must stay bound to its session"
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "the delayed raw broadcast must not have been sent"
+        );
+
+        // Restart sees the Prepared liability. It must not be dropped, and a
+        // shutdown request must stop the next signing attempt before it starts.
+        let mut restarted = TransactionManager::open_with_session_policy(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(restarted.signing_blocked_by_unresolved());
+        assert_eq!(restarted.journal.pending_exposure().unwrap(), exposure);
+        let request = crate::shutdown::ShutdownRequest::default();
+        request.request_for_test();
+        restarted.set_shutdown_request(request);
+        let retry_submission = ProofSubmission {
+            contract: fixture.contract,
+            node_id: 1,
+            window_id: 7,
+            nonce: 2,
+            header: b"pending-broadcast-cancellation-retry".to_vec(),
+            work_hash: fixture.submission.work_hash,
+        };
+        let error = restarted
+            .submit_proof(&fixture.client, &fixture.signer, retry_submission)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("shutdown signal"),
+            "a shutdown request must refuse the retry before it can sign: {error:#}"
+        );
+        assert_eq!(restarted.journal.state.entries.len(), 1);
+        assert!(restarted.journal.state.pending_authorization.is_none());
+        let close_error = restarted.close_session().unwrap_err();
+        assert!(
+            format!("{close_error:#}").contains("unresolved"),
+            "legacy unresolved exposure must keep the session open for read-only recovery: {close_error:#}"
+        );
+        drop(restarted);
+
+        let inspected =
+            TransactionJournal::inspect_session(&fixture.store, &fixture.config).unwrap();
+        assert!(!inspected.closed);
+        assert_eq!(inspected.unresolved.len(), 1);
+        assert_eq!(
+            inspected.pending_exposure_wei.as_deref(),
+            Some(exposure.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_at_pre_sign_boundary_abandons_authorization_without_signing() {
+        let fixture = submit_preflight_fixture();
+        let mut manager = TransactionManager::open(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+        )
+        .unwrap();
+        let request = crate::shutdown::ShutdownRequest::default();
+        manager.set_shutdown_request(request.clone());
+        manager.set_pre_sign_boundary_hook(Box::new(move || request.request_for_test()));
+
+        let error = manager
+            .submit_proof(&fixture.client, &fixture.signer, fixture.submission.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("signing barrier"),
+            "the pre-sign barrier must refuse signing: {error:#}"
+        );
+        assert!(manager.journal.state.entries.is_empty());
+        assert!(manager.journal.state.pending_authorization.is_none());
+        let charged = manager.journal.session_authorized_total().unwrap();
+        assert!(
+            charged > U256::ZERO,
+            "the durable pre-sign authorization must remain charged"
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "the refused signing must not broadcast"
+        );
+
+        manager.close_session().unwrap();
+        drop(manager);
+        let inspected =
+            TransactionJournal::inspect_session(&fixture.store, &fixture.config).unwrap();
+        assert!(inspected.closed);
+        assert!(inspected.unresolved.is_empty());
+        assert_eq!(
+            parse_decimal_wei(inspected.authorized_exposure_wei.as_deref().unwrap()).unwrap(),
+            charged
         );
     }
 
@@ -12583,6 +12959,206 @@ mod tests {
             }
         });
         (format!("http://{address}"), counts, stop_server, thread)
+    }
+
+    fn submit_preflight_rpc_server(code: Vec<u8>) -> HistoryRpcServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+        let server_counts = Arc::clone(&counts);
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop_server);
+        let thread = std::thread::spawn(move || {
+            loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if server_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("accept submit preflight RPC request: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let request = read_history_http_request(&mut stream);
+                let method = request["method"].as_str().unwrap().to_owned();
+                *server_counts
+                    .lock()
+                    .unwrap()
+                    .entry(method.clone())
+                    .or_insert(0) += 1;
+                let result = match method.as_str() {
+                    "eth_estimateGas" => serde_json::json!("0x5208"),
+                    "eth_getBlockByNumber" => {
+                        let tag = request["params"][0].as_str().unwrap();
+                        let number = if tag == "latest" {
+                            1
+                        } else {
+                            u64::from_str_radix(tag.trim_start_matches("0x"), 16).unwrap()
+                        };
+                        serde_json::json!({
+                            "number": format!("0x{number:x}"),
+                            "timestamp": "0x1",
+                            "hash": format!("{:#x}", B256::with_last_byte(number as u8)),
+                            "baseFeePerGas": "0x3b9aca00",
+                        })
+                    }
+                    "eth_maxPriorityFeePerGas" => serde_json::json!("0x3b9aca00"),
+                    "eth_getTransactionCount" => serde_json::json!("0x0"),
+                    "eth_getBalance" => serde_json::json!("0xde0b6b3a7640000"),
+                    "eth_blockNumber" => serde_json::json!("0x1"),
+                    "eth_getCode" => serde_json::json!(format!("0x{}", hex::encode(&code))),
+                    "eth_sendRawTransaction" => {
+                        serde_json::Value::String(format!("{:#x}", B256::with_last_byte(0xdd)))
+                    }
+                    other => panic!("unexpected submit preflight RPC method {other}"),
+                };
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result,
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                )
+                .unwrap();
+            }
+        });
+        (format!("http://{address}"), counts, stop_server, thread)
+    }
+
+    struct SubmitPreflightFixture {
+        _root: tempfile::TempDir,
+        store: ConfigStore,
+        config: AppConfig,
+        client: NetworkClient,
+        signer: SigningKey,
+        wallet: Address,
+        contract: Address,
+        token: Address,
+        submission: ProofSubmission,
+        rpc_counts: HistoryRpcCounts,
+        stop_server: Arc<AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for SubmitPreflightFixture {
+        fn drop(&mut self) {
+            self.stop_server.store(true, Ordering::Release);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    fn submit_preflight_fixture() -> SubmitPreflightFixture {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let signer = test_signer();
+        let wallet = signer_address(&signer);
+        let contract = Address::with_last_byte(0xd1);
+        let token = Address::with_last_byte(0xd2);
+        let code = b"submit-preflight-runtime-code".to_vec();
+        let code_hash = keccak256(&code);
+        let (url, rpc_counts, stop_server, server) = submit_preflight_rpc_server(code);
+        let mut client = NetworkClient::local_test_client(
+            &url,
+            contract,
+            code_hash,
+            token,
+            B256::with_last_byte(0xd3),
+            18,
+        )
+        .unwrap();
+        let state = crate::rpc::NodeState {
+            work: crate::rpc::WorkInfo {
+                started: true,
+                ended: false,
+                window_id: 7,
+                window_start_time: 100,
+                window_expiry_time: 200,
+                seed: B256::with_last_byte(0x01),
+                prev_hash: B256::ZERO,
+                target: U256::MAX,
+                reward_per_window: U256::ZERO,
+                remaining_allocation: U256::from(1),
+                max_header_length: 128,
+                submission_fee: U256::from(SUBMISSION_FEE_WEI),
+            },
+            candidate: None,
+            mining_paused: false,
+            eligible: true,
+            finalizable: false,
+            eligibility_reason: "eligible",
+        };
+        client.synthetic_snapshot = Some(crate::rpc::ReadSnapshot {
+            block: crate::rpc::BlockSnapshot {
+                number: 1,
+                timestamp: 100,
+                hash: B256::with_last_byte(1),
+            },
+            native_balance: Some(U256::from(1_000_000_000_000_000_000_u128)),
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![crate::rpc::NodeView {
+                id: 1,
+                address: contract,
+                pin: crate::rpc::ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(state.clone()),
+                error: None,
+            }],
+        });
+
+        let header = b"submit-preflight-fixture".to_vec();
+        let context = WorkContext {
+            chain_id: 1439,
+            contract,
+            window_id: 7,
+            seed: state.work.seed,
+            miner: wallet,
+            header: header.clone(),
+        };
+        let work_hash = WorkHasher::new(&context).unwrap().hash(1);
+        let submission = ProofSubmission {
+            contract,
+            node_id: 1,
+            window_id: 7,
+            nonce: 1,
+            header,
+            work_hash,
+        };
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            minimum_reserve_inj: "0.1".to_owned(),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        SubmitPreflightFixture {
+            _root: root,
+            store,
+            config,
+            client,
+            signer,
+            wallet,
+            contract,
+            token,
+            submission,
+            rpc_counts,
+            stop_server,
+            server: Some(server),
+        }
     }
 
     fn recovery_transaction_json(

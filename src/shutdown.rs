@@ -1,0 +1,594 @@
+//! Shared graceful-shutdown signalling for the mining runtime.
+//!
+//! Unix handles SIGINT and SIGTERM, and Linux additionally handles SIGHUP, all
+//! through the same monitor. The delivery flag is set synchronously from the
+//! operating-system signal handler (via `signal-hook`), not later by a runtime
+//! task. That gives transaction signing a real linearization point: a signing
+//! permit is refused if shutdown delivery is visible before the permit is
+//! acquired. A permit acquired first classifies the signing section as already
+//! in flight; its durable journal authorization and `Prepared` state are
+//! preserved and it is never silently rebroadcast.
+//!
+//! macOS keeps the same SIGINT/SIGTERM graceful path and deliberately does not
+//! install a SIGHUP handler, so terminal-hangup semantics remain unchanged.
+//! Windows keeps the Tokio Ctrl+C handler.
+//!
+//! The operating system installs one signal handler at a time. A signal
+//! delivered before its handler is installed retains the OS default
+//! disposition. Mining and recovery install this signal at the start of the
+//! command, before configuration, journal, or signing activity; the residual
+//! process-start window cannot be made atomic with these OS APIs.
+
+use std::{
+    future::Future,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+/// The fallback poll interval for observing a synchronously delivered flag if
+/// the async wake-up path loses a race during handler registration.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[cfg(not(unix))]
+const CTRL_C_CODE: usize = usize::MAX;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ShutdownReason {
+    #[cfg(unix)]
+    Interrupt,
+    #[cfg(unix)]
+    Terminate,
+    #[cfg(target_os = "linux")]
+    Hangup,
+    #[cfg(not(unix))]
+    CtrlC,
+}
+
+impl ShutdownReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            #[cfg(unix)]
+            Self::Interrupt => "SIGINT",
+            #[cfg(unix)]
+            Self::Terminate => "SIGTERM",
+            #[cfg(target_os = "linux")]
+            Self::Hangup => "SIGHUP",
+            #[cfg(not(unix))]
+            Self::CtrlC => "Ctrl+C",
+        }
+    }
+
+    fn code(self) -> usize {
+        #[cfg(unix)]
+        {
+            #[cfg(target_os = "linux")]
+            use signal_hook::consts::signal::SIGHUP;
+            use signal_hook::consts::signal::{SIGINT, SIGTERM};
+
+            match self {
+                Self::Interrupt => SIGINT as usize,
+                Self::Terminate => SIGTERM as usize,
+                #[cfg(target_os = "linux")]
+                Self::Hangup => SIGHUP as usize,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            CTRL_C_CODE
+        }
+    }
+
+    fn from_code(code: usize) -> Option<Self> {
+        if code == 0 {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            #[cfg(target_os = "linux")]
+            use signal_hook::consts::signal::SIGHUP;
+            use signal_hook::consts::signal::{SIGINT, SIGTERM};
+
+            if code == SIGINT as usize {
+                Some(Self::Interrupt)
+            } else if code == SIGTERM as usize {
+                Some(Self::Terminate)
+            } else {
+                #[cfg(target_os = "linux")]
+                if code == SIGHUP as usize {
+                    return Some(Self::Hangup);
+                }
+                None
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            (code == CTRL_C_CODE).then_some(Self::CtrlC)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_request_reason() -> Self {
+        #[cfg(unix)]
+        {
+            Self::Terminate
+        }
+        #[cfg(not(unix))]
+        {
+            Self::CtrlC
+        }
+    }
+}
+
+/// Synchronous delivery flag and the signing-permit state shared with the
+/// transaction manager.
+#[derive(Clone, Default)]
+pub(crate) struct ShutdownRequest {
+    delivered: Arc<AtomicUsize>,
+    signing: Arc<AtomicBool>,
+}
+
+impl ShutdownRequest {
+    pub(crate) fn is_requested(&self) -> bool {
+        self.delivered.load(Ordering::SeqCst) != 0
+    }
+
+    pub(crate) fn reason(&self) -> Option<ShutdownReason> {
+        ShutdownReason::from_code(self.delivered.load(Ordering::SeqCst))
+    }
+
+    fn mark_delivered(&self, reason: ShutdownReason) {
+        let _ =
+            self.delivered
+                .compare_exchange(0, reason.code(), Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Acquire the exclusive pre-signing permit.
+    ///
+    /// The successful compare-exchange followed by the second delivery check is
+    /// the linearization point:
+    /// - delivery visible before the second check refuses the permit;
+    /// - delivery visible only after the second check means the signing section
+    ///   was already in flight when shutdown was delivered.
+    pub(crate) fn begin_signing(&self) -> Option<SigningPermit> {
+        if self.is_requested() {
+            return None;
+        }
+        if self
+            .signing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return None;
+        }
+        if self.is_requested() {
+            self.signing.store(false, Ordering::SeqCst);
+            return None;
+        }
+        Some(SigningPermit {
+            signing: Arc::clone(&self.signing),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_for_test(&self) {
+        self.mark_delivered(ShutdownReason::test_request_reason());
+    }
+}
+
+/// Held across a synchronous signing section. Dropping it releases the permit;
+/// a delivered shutdown flag remains latched and refuses later permits.
+#[must_use = "hold the signing permit across the signing section"]
+pub(crate) struct SigningPermit {
+    signing: Arc<AtomicBool>,
+}
+
+impl Drop for SigningPermit {
+    fn drop(&mut self) {
+        self.signing.store(false, Ordering::SeqCst);
+    }
+}
+
+type ShutdownEvent = std::result::Result<ShutdownReason, String>;
+
+/// Owns the OS signal monitor and provides a cancel-safe receive operation.
+pub(crate) struct ShutdownSignal {
+    request: ShutdownRequest,
+    receiver: tokio::sync::watch::Receiver<Option<ShutdownEvent>>,
+    task: tokio::task::JoinHandle<()>,
+    #[cfg(unix)]
+    signal_ids: Vec<signal_hook::SigId>,
+    #[cfg(test)]
+    sender: tokio::sync::watch::Sender<Option<ShutdownEvent>>,
+}
+
+impl ShutdownSignal {
+    pub(crate) fn new() -> io::Result<Self> {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let request = ShutdownRequest::default();
+        // Create the async wake-up streams first, then add the synchronous
+        // signal-handler flags. A signal in this short registration window is
+        // queued by the async stream and the monitor records it; a signal after
+        // flag registration is visible synchronously to the signing barrier.
+        let streams = os_signal_streams()?;
+        #[cfg(unix)]
+        let signal_ids = register_os_signal_flags(&request)?;
+        let task = tokio::spawn(monitor_os_signals(request.clone(), sender.clone(), streams));
+        Ok(Self {
+            request,
+            receiver,
+            task,
+            #[cfg(unix)]
+            signal_ids,
+            #[cfg(test)]
+            sender,
+        })
+    }
+
+    /// A signal that never receives an OS event unless a test triggers it.
+    #[cfg(test)]
+    pub(crate) fn synthetic() -> Self {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let task = tokio::spawn(std::future::pending::<()>());
+        Self {
+            request: ShutdownRequest::default(),
+            receiver,
+            task,
+            #[cfg(unix)]
+            signal_ids: Vec::new(),
+            sender,
+        }
+    }
+
+    pub(crate) fn request(&self) -> ShutdownRequest {
+        self.request.clone()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_requested(&self) -> bool {
+        self.request.is_requested()
+    }
+
+    /// Wait for the first shutdown signal. This is cancel-safe: the delivery
+    /// flag is synchronous, and the watch channel retains the reason event even
+    /// if the caller is cancelled by a surrounding `select!`.
+    pub(crate) async fn recv(&mut self) -> io::Result<ShutdownReason> {
+        loop {
+            if let Some(reason) = self.request.reason() {
+                return Ok(reason);
+            }
+            if self.request.is_requested() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "shutdown was delivered with an unknown signal code",
+                ));
+            }
+            if let Some(event) = self.receiver.borrow_and_update().clone() {
+                return event.map_err(io::Error::other);
+            }
+            tokio::select! {
+                changed = self.receiver.changed() => {
+                    changed.map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "shutdown signal monitor stopped before delivering a signal",
+                        )
+                    })?;
+                }
+                _ = tokio::time::sleep(SHUTDOWN_POLL_INTERVAL) => {}
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trigger_for_test(&self, reason: ShutdownReason) {
+        self.request.mark_delivered(reason);
+        let _ = self.sender.send(Some(Ok(reason)));
+    }
+}
+
+impl Drop for ShutdownSignal {
+    fn drop(&mut self) {
+        self.task.abort();
+        #[cfg(unix)]
+        for id in self.signal_ids.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
+    }
+}
+
+async fn monitor_os_signals(
+    request: ShutdownRequest,
+    sender: tokio::sync::watch::Sender<Option<ShutdownEvent>>,
+    streams: OsSignalStreams,
+) {
+    let event = wait_for_os_signal(streams)
+        .await
+        .map_err(|error| error.to_string());
+    if let Ok(reason) = &event {
+        request.mark_delivered(*reason);
+    }
+    let _ = sender.send(Some(event));
+}
+
+#[cfg(unix)]
+fn register_os_signal_flags(request: &ShutdownRequest) -> io::Result<Vec<signal_hook::SigId>> {
+    use signal_hook::consts::signal::{SIGINT, SIGTERM};
+
+    #[cfg(target_os = "linux")]
+    let signals: &[(libc::c_int, usize)] = &[
+        (SIGINT, SIGINT as usize),
+        (SIGTERM, SIGTERM as usize),
+        (
+            signal_hook::consts::signal::SIGHUP,
+            signal_hook::consts::signal::SIGHUP as usize,
+        ),
+    ];
+    #[cfg(not(target_os = "linux"))]
+    let signals: &[(libc::c_int, usize)] =
+        &[(SIGINT, SIGINT as usize), (SIGTERM, SIGTERM as usize)];
+
+    let mut ids = Vec::with_capacity(signals.len());
+    for (signal, code) in signals {
+        match signal_hook::flag::register_usize(*signal, Arc::clone(&request.delivered), *code) {
+            Ok(id) => ids.push(id),
+            Err(error) => {
+                for id in ids.drain(..) {
+                    signal_hook::low_level::unregister(id);
+                }
+                return Err(io::Error::other(error.to_string()));
+            }
+        }
+    }
+    Ok(ids)
+}
+
+#[cfg(unix)]
+struct OsSignalStreams {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(target_os = "linux")]
+    hangup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+fn os_signal_streams() -> io::Result<OsSignalStreams> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    Ok(OsSignalStreams {
+        interrupt: signal(SignalKind::interrupt())?,
+        terminate: signal(SignalKind::terminate())?,
+        #[cfg(target_os = "linux")]
+        hangup: signal(SignalKind::hangup())?,
+    })
+}
+
+#[cfg(unix)]
+async fn wait_for_os_signal(streams: OsSignalStreams) -> io::Result<ShutdownReason> {
+    let OsSignalStreams {
+        mut interrupt,
+        mut terminate,
+        #[cfg(target_os = "linux")]
+        mut hangup,
+    } = streams;
+
+    #[cfg(target_os = "linux")]
+    {
+        tokio::select! {
+            received = interrupt.recv() => signal_reason(received, ShutdownReason::Interrupt),
+            received = terminate.recv() => signal_reason(received, ShutdownReason::Terminate),
+            received = hangup.recv() => signal_reason(received, ShutdownReason::Hangup),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        tokio::select! {
+            received = interrupt.recv() => signal_reason(received, ShutdownReason::Interrupt),
+            received = terminate.recv() => signal_reason(received, ShutdownReason::Terminate),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_reason(received: Option<()>, reason: ShutdownReason) -> io::Result<ShutdownReason> {
+    received.map(|()| reason).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "OS shutdown signal stream closed before delivering a signal",
+        )
+    })
+}
+
+#[cfg(not(unix))]
+type OsSignalStreams = ();
+
+#[cfg(not(unix))]
+fn os_signal_streams() -> io::Result<OsSignalStreams> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_os_signal(_: OsSignalStreams) -> io::Result<ShutdownReason> {
+    tokio::signal::ctrl_c().await?;
+    Ok(ShutdownReason::CtrlC)
+}
+
+/// Race an operation against the shared shutdown signal. The signal is polled
+/// first so an already-delivered shutdown is observed before starting work.
+pub(crate) async fn race_with_shutdown<F, T>(
+    future: F,
+    shutdown: &mut ShutdownSignal,
+) -> std::result::Result<Option<T>, io::Error>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        signal = shutdown.recv() => {
+            signal?;
+            Ok(None)
+        }
+        result = future => Ok(Some(result)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ShutdownReason, ShutdownRequest, ShutdownSignal, SigningPermit, race_with_shutdown,
+    };
+    use std::{thread, time::Duration};
+
+    fn test_reason() -> ShutdownReason {
+        ShutdownReason::test_request_reason()
+    }
+
+    #[tokio::test]
+    async fn shutdown_receive_is_cancel_safe() {
+        let mut shutdown = ShutdownSignal::synthetic();
+        assert!(!shutdown.is_requested());
+        let cancelled = tokio::time::timeout(Duration::from_millis(10), shutdown.recv()).await;
+        assert!(
+            cancelled.is_err(),
+            "synthetic signal must not resolve early"
+        );
+
+        shutdown.trigger_for_test(test_reason());
+        let reason = tokio::time::timeout(Duration::from_secs(1), shutdown.recv())
+            .await
+            .expect("triggered shutdown signal should resolve")
+            .expect("triggered shutdown signal should not fail");
+        assert_eq!(reason, test_reason());
+        assert!(shutdown.is_requested());
+    }
+
+    #[tokio::test]
+    async fn shutdown_race_prefers_the_pending_signal_over_an_incomplete_operation() {
+        let mut shutdown = ShutdownSignal::synthetic();
+        shutdown.trigger_for_test(test_reason());
+        let result = race_with_shutdown(std::future::pending::<()>(), &mut shutdown)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_race_keeps_a_completed_operation() {
+        let mut shutdown = ShutdownSignal::synthetic();
+        let result = race_with_shutdown(async { 1439_u64 }, &mut shutdown)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(1439));
+    }
+
+    #[test]
+    fn shutdown_request_is_monotonic_and_visible_across_threads() {
+        let request = ShutdownRequest::default();
+        let waiter = {
+            let request = request.clone();
+            thread::spawn(move || {
+                while !request.is_requested() {
+                    std::hint::spin_loop();
+                }
+            })
+        };
+        assert!(!request.is_requested());
+        request.request_for_test();
+        waiter.join().unwrap();
+        assert!(request.is_requested());
+        request.request_for_test();
+        assert!(request.is_requested());
+    }
+
+    #[test]
+    fn shutdown_barrier_refuses_a_permit_after_delivery() {
+        let request = ShutdownRequest::default();
+        request.request_for_test();
+        assert!(
+            request.begin_signing().is_none(),
+            "delivery before permit acquisition must refuse signing"
+        );
+    }
+
+    #[test]
+    fn shutdown_barrier_classifies_an_acquired_permit_as_in_flight() {
+        let request = ShutdownRequest::default();
+        let permit: SigningPermit = request
+            .begin_signing()
+            .expect("permit should be available before delivery");
+        request.request_for_test();
+        assert!(request.is_requested());
+        drop(permit);
+        assert!(
+            request.begin_signing().is_none(),
+            "the delivered flag remains latched after the in-flight permit is released"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supported_os_signals_resolve_the_shutdown_signal() {
+        const CHILD: &str = "ASTATINE_TEST_SHUTDOWN_SIGNAL_CHILD";
+        const SIGNAL: &str = "ASTATINE_TEST_SHUTDOWN_SIGNAL";
+
+        if std::env::var_os(CHILD).is_none() {
+            #[allow(unused_mut)]
+            let mut signals = vec!["sigint", "sigterm"];
+            #[cfg(target_os = "linux")]
+            signals.push("sighup");
+            for signal in signals {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "shutdown::tests::supported_os_signals_resolve_the_shutdown_signal",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env(SIGNAL, signal)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "child {signal} signal test failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+
+        let signal = std::env::var(SIGNAL).unwrap();
+        let (signal_number, expected) = match signal.as_str() {
+            "sigint" => (libc::SIGINT, ShutdownReason::Interrupt),
+            "sigterm" => (libc::SIGTERM, ShutdownReason::Terminate),
+            #[cfg(target_os = "linux")]
+            "sighup" => (libc::SIGHUP, ShutdownReason::Hangup),
+            other => panic!("unsupported child signal {other}"),
+        };
+
+        let mut shutdown = ShutdownSignal::new().unwrap();
+        assert!(!shutdown.is_requested());
+        // The synchronous signal-hook flag is registered by `new`, so raising
+        // the signal in this isolated child process is safe even before the
+        // monitor task is first polled.
+        assert_eq!(unsafe { libc::raise(signal_number) }, 0);
+        let reason = tokio::time::timeout(Duration::from_secs(2), shutdown.recv())
+            .await
+            .expect("OS signal should resolve the shutdown monitor")
+            .expect("OS signal should not report a monitor failure");
+        assert_eq!(reason, expected);
+        assert!(shutdown.is_requested());
+    }
+
+    #[test]
+    fn shutdown_request_flag_is_not_shared_between_independent_signals() {
+        let first = ShutdownRequest::default();
+        let second = ShutdownRequest::default();
+        first.request_for_test();
+        assert!(first.is_requested());
+        assert!(!second.is_requested());
+    }
+}

@@ -12,7 +12,7 @@ use crate::{
 use alloy_primitives::{Address, U256};
 use anyhow::{Context, Result, bail};
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     num::NonZeroUsize,
     path::PathBuf,
     str::FromStr,
@@ -112,18 +112,22 @@ pub async fn dispatch(command: Command) -> Result<()> {
 
 async fn run_init(args: InitArgs) -> Result<()> {
     let store = ConfigStore::system_default()?;
+    run_init_with_store(&store, args).await
+}
+
+async fn run_init_with_store(store: &ConfigStore, args: InitArgs) -> Result<()> {
     let mut config = store.load()?;
-    let initial_snapshot = TransactionJournal::inspect_session(&store, &config)?;
+    let initial_snapshot = TransactionJournal::inspect_session(store, &config)?;
     if let Some(pending) = initial_snapshot.pending_transition.as_ref() {
         println!(
             "An earlier init spending-session change was interrupted. Previous limit: {} INJ; proposed limit: {} INJ.",
             pending.previous_config_limit_inj, pending.proposed_config_limit_inj
         );
-        if prompt_yes_no("Complete that approved change now?", false)? {
-            TransactionJournal::resolve_pending_session_transition(&store, &mut config, true)?;
+        if prompt_paid_consent("Complete that approved change now?", false)? {
+            TransactionJournal::resolve_pending_session_transition(store, &mut config, true)?;
             println!("Completed the interrupted spending-session transition.");
         } else {
-            TransactionJournal::resolve_pending_session_transition(&store, &mut config, false)?;
+            TransactionJournal::resolve_pending_session_transition(store, &mut config, false)?;
             println!("Restored the previous spending session and limit.");
         }
         config = store.load()?;
@@ -141,12 +145,12 @@ async fn run_init(args: InitArgs) -> Result<()> {
         println!(
             "This existing schema-v1 account keeps its legacy spending-session policy unless you explicitly migrate. Per-run mode starts a fresh allowance for each paid `astatine mine` invocation; the effective cap is reduced by confirmed balance, the reserve, and unresolved maximum exposure."
         );
-        if prompt_yes_no("Migrate this account to per-run spending sessions?", false)? {
+        if prompt_paid_consent("Migrate this account to per-run spending sessions?", false)? {
             config.schema_version = 2;
         }
     }
     let per_run_sessions = config.per_run_sessions_enabled();
-    let mut session_snapshot = TransactionJournal::inspect_session(&store, &config)?;
+    let mut session_snapshot = TransactionJournal::inspect_session(store, &config)?;
     let effective_limit = session_effective_limit(&session_snapshot, &config)?;
     let stored_limit_wei = parse_inj_wei(&config.per_session_spending_limit_inj)?;
     let journal_limit_wei = session_snapshot
@@ -178,7 +182,7 @@ async fn run_init(args: InitArgs) -> Result<()> {
         if repaired != persisted_config {
             store.save(&repaired)?;
             config = repaired;
-            session_snapshot = TransactionJournal::inspect_session(&store, &config)?;
+            session_snapshot = TransactionJournal::inspect_session(store, &config)?;
             println!(
                 "Restored the original session wallet for read-only recovery at {} INJ.",
                 session_effective_limit(&session_snapshot, &config)?
@@ -285,11 +289,11 @@ async fn run_init(args: InitArgs) -> Result<()> {
         );
         match prompt_choice("Choose 1, 2, or 3", &["1", "2", "3"])? {
             "1" => {
-                wallet::create_interactive_staged(&store, &mut config)?;
+                wallet::create_interactive_staged(store, &mut config)?;
             }
             "2" => {
                 wallet::import_interactive_staged(
-                    &store,
+                    store,
                     &mut config,
                     crate::cli::ImportArgs {
                         keystore: None,
@@ -300,7 +304,7 @@ async fn run_init(args: InitArgs) -> Result<()> {
             "3" => {
                 let path = prompt_value("Path to encrypted V3 keyfile", "")?;
                 wallet::import_interactive_staged(
-                    &store,
+                    store,
                     &mut config,
                     crate::cli::ImportArgs {
                         keystore: Some(PathBuf::from(path)),
@@ -331,7 +335,7 @@ async fn run_init(args: InitArgs) -> Result<()> {
             .transpose()
             .context("selected wallet address is invalid")?;
         if previous_wallet != selected_wallet
-            && !prompt_yes_no(
+            && !prompt_paid_consent(
                 "Use the selected wallet for future per-run spending sessions?",
                 false,
             )?
@@ -357,7 +361,7 @@ async fn run_init(args: InitArgs) -> Result<()> {
             );
             return Ok(());
         }
-        TransactionJournal::set_per_run_policy_approval(&store, &config, approved_wallet)?;
+        TransactionJournal::set_per_run_policy_approval(store, &config, approved_wallet)?;
         store.save(&config)?;
         println!(
             "Configured {} | {} CPU worker(s) | reserve {} INJ | per-run authorization ceiling {} INJ | confirmations {} block(s)",
@@ -478,7 +482,7 @@ async fn run_init(args: InitArgs) -> Result<()> {
         config.per_session_spending_limit_inj = proposed_limit.clone();
         let mut journal =
             match TransactionJournal::open_for_init_session_transition(
-                &store,
+                store,
                 &config,
                 wallet,
                 safe_config_limit.clone(),
@@ -526,6 +530,11 @@ async fn run_init(args: InitArgs) -> Result<()> {
 }
 
 async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
+    // Install handlers before configuration, journal inspection, or any
+    // interactive session prompt. A signal before this point still retains the
+    // OS default disposition; CLI parsing/dispatch precedes this command.
+    let mut shutdown = crate::shutdown::ShutdownSignal::new()
+        .context("install shutdown signal handlers for mining")?;
     let store = ConfigStore::system_default()?;
     let config = store.load()?;
     let session = if args.compute_only {
@@ -558,10 +567,11 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
                         "per-run spending approval does not match the selected wallet, network, ceiling, or reserve; run `astatine init` to review and explicitly approve the policy"
                     );
                 }
-                return mining::run_with_session_confirmation(&store, args, true).await;
+                return mining::run_with_session_confirmation(&store, args, true, &mut shutdown)
+                    .await;
             }
         }
-        return mining::run_with_session_confirmation(&store, args, false).await;
+        return mining::run_with_session_confirmation(&store, args, false, &mut shutdown).await;
     }
     if !args.compute_only
         && !parse_inj_wei(&config.per_session_spending_limit_inj)?.is_zero()
@@ -605,7 +615,7 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
             println!("Cancelled. No spending session was changed.");
             return Ok(());
         }
-        return mining::run_with_session_confirmation(&store, args, true).await;
+        return mining::run_with_session_confirmation(&store, args, true, &mut shutdown).await;
     }
     if mining::unresolved_session_blocks_mining(
         args.compute_only,
@@ -657,13 +667,30 @@ async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
                 println!("Cancelled. No spending session was changed.");
                 return Ok(());
             }
-            return mining::run_with_session_confirmation(&store, args, true).await;
+            return mining::run_with_session_confirmation(&store, args, true, &mut shutdown).await;
         }
     }
-    mining::run_with_session_confirmation(&store, args, false).await
+    if requires_open_legacy_session_confirmation(
+        args.compute_only,
+        config.per_run_sessions_enabled(),
+        configured_limit,
+        &session,
+        args.new_session,
+    ) && !prompt_resume_open_legacy_session_confirmation(&session)?
+    {
+        println!(
+            "No session was resumed. Run `astatine init` or `astatine mine --new-session` to explicitly authorize a new spending session."
+        );
+        return Ok(());
+    }
+    mining::run_with_session_confirmation(&store, args, false, &mut shutdown).await
 }
 
 async fn run_recover() -> Result<()> {
+    // Install handlers before configuration, network, or journal access so a
+    // shutdown during recovery cannot fall back to the OS default disposition.
+    let mut shutdown = crate::shutdown::ShutdownSignal::new()
+        .context("install shutdown signal handlers for transaction recovery")?;
     let store = ConfigStore::system_default()?;
     let config = store.load()?;
     if config.network != Network::Testnet {
@@ -695,9 +722,18 @@ async fn run_recover() -> Result<()> {
     );
     print_unresolved_transactions(&session);
 
-    let client =
-        NetworkClient::connect_with_rpc(config.network, config.rpc_override(config.network))
-            .await?;
+    let connected = crate::shutdown::race_with_shutdown(
+        NetworkClient::connect_with_rpc(config.network, config.rpc_override(config.network)),
+        &mut shutdown,
+    )
+    .await?;
+    let Some(connected) = connected else {
+        println!(
+            "RECOVERY PAUSED • WALLET LOCKED\nNo spending session was changed. Rerun `astatine recover` to continue read-only verification."
+        );
+        return Ok(());
+    };
+    let client = connected?;
     if !client.has_mining_deployment() {
         bail!(
             "verified Testnet mining deployment is unavailable; transaction recovery cannot continue"
@@ -717,10 +753,10 @@ async fn run_recover() -> Result<()> {
         client.history_telemetry(),
     )?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    let mut ctrl_c: crate::startup::CtrlCSignal = Box::pin(tokio::signal::ctrl_c());
+    manager.set_shutdown_request(shutdown.request());
     let mut last_status = Vec::new();
     loop {
-        if !reconcile_recovery_or_interrupt(&mut manager, &client, &mut ctrl_c).await? {
+        if !reconcile_recovery_or_interrupt(&mut manager, &client, &mut shutdown).await? {
             println!(
                 "RECOVERY PAUSED • WALLET LOCKED\nNo spending session was changed. Rerun `astatine recover` to continue read-only verification."
             );
@@ -756,12 +792,12 @@ async fn run_recover() -> Result<()> {
 pub(crate) async fn reconcile_recovery_or_interrupt(
     manager: &mut TransactionManager,
     client: &NetworkClient,
-    ctrl_c: &mut crate::startup::CtrlCSignal,
+    shutdown: &mut crate::shutdown::ShutdownSignal,
 ) -> Result<bool> {
     tokio::select! {
         biased;
-        signal = ctrl_c.as_mut() => {
-            signal.context("listen for Ctrl+C during transaction recovery")?;
+        signal = shutdown.recv() => {
+            signal.context("listen for a shutdown signal during transaction recovery")?;
             Ok(false)
         }
         result = manager.reconcile(client) => {
@@ -820,7 +856,7 @@ fn prompt_per_run_policy_approval(config: &AppConfig, wallet: Address) -> Result
         "Each run automatically uses the full cap when confirmed balance, the {} INJ reserve, and unresolved liabilities allow it. A reduced cap requires a separate one-time approval for that run.",
         config.minimum_reserve_inj
     );
-    prompt_yes_no(
+    prompt_paid_consent(
         "Persist and approve this per-run policy for the selected wallet and network?",
         false,
     )
@@ -864,6 +900,46 @@ fn mine_requires_session_confirmation(
         && (session.session_id.is_none()
             || session.closed
             || mine_session_wallet_changed(session, selected_wallet))
+}
+
+/// A legacy session that is still open after a process boundary is not
+/// silently resumable. It may be an init-created session or a session whose
+/// clean close failed; either way the operator must explicitly confirm before
+/// its remaining authorization is reused. Unresolved sessions are handled by
+/// the existing recovery path before this check.
+pub(crate) fn requires_open_legacy_session_confirmation(
+    compute_only: bool,
+    per_run_sessions_enabled: bool,
+    configured_limit: U256,
+    session: &SessionJournalSnapshot,
+    new_session: bool,
+) -> bool {
+    !compute_only
+        && !per_run_sessions_enabled
+        && !configured_limit.is_zero()
+        && !new_session
+        && session.session_id.is_some()
+        && !session.closed
+        && session.unresolved.is_empty()
+}
+
+fn prompt_resume_open_legacy_session_confirmation(
+    session: &SessionJournalSnapshot,
+) -> Result<bool> {
+    let authorized = session
+        .authorized_exposure_wei
+        .as_deref()
+        .map(|value| {
+            U256::from_str_radix(value, 10)
+                .map(|wei| format_token_units(wei, 18))
+                .unwrap_or_else(|_| value.to_owned())
+        })
+        .unwrap_or_else(|| "0".to_owned());
+    println!("An existing legacy spending session is open from a previous command.");
+    println!(
+        "It has already authorized up to {authorized} INJ; resuming it keeps the same remaining authorization and does not create a fresh allowance or refund prior authorization."
+    );
+    prompt_paid_consent("Resume the existing open spending session?", false)
 }
 
 fn mine_session_wallet_changed(
@@ -977,7 +1053,7 @@ fn prompt_new_session_confirmation(
         );
         println!("The new session will be bound to the selected wallet above.");
     }
-    prompt_yes_no(
+    prompt_paid_consent(
         &format!("Start a new spending session with {proposed_limit} INJ?"),
         false,
     )
@@ -998,7 +1074,7 @@ fn prompt_resume_existing_session_confirmation(
         format_token_units(authorized, 18)
     );
     println!("Resuming this session does not reset its allowance or refund prior authorization.");
-    prompt_yes_no(
+    prompt_paid_consent(
         "Enable paid transactions using only the existing session's remaining allowance?",
         false,
     )
@@ -1395,6 +1471,22 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
     }
 }
 
+/// Paid authorization must come from a real interactive terminal. Redirected
+/// stdin/stdout, pipes, and CI runners cannot accidentally approve spending.
+pub(crate) fn require_paid_consent_terminal(action: &str) -> Result<()> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!(
+            "refusing to read {action} consent from redirected or non-interactive input; run this command directly in an interactive terminal"
+        );
+    }
+    Ok(())
+}
+
+fn prompt_paid_consent(prompt: &str, default_yes: bool) -> Result<bool> {
+    require_paid_consent_terminal("paid spending authorization")?;
+    prompt_yes_no(prompt, default_yes)
+}
+
 fn prompt_choice<'a>(prompt: &str, choices: &'a [&'a str]) -> Result<&'a str> {
     loop {
         let value = prompt_value(prompt, "1")?;
@@ -1444,12 +1536,13 @@ mod tests {
     use super::{
         configure_init_rpc, declined_new_session_limit, ensure_standalone_wallet_change_allowed,
         mine_requires_session_confirmation, persist_rpc_override, redact_rpc_url,
-        requires_new_paid_session, select_rpc_override, should_confirm_existing_session_resume,
+        requires_new_paid_session, requires_open_legacy_session_confirmation, select_rpc_override,
+        should_confirm_existing_session_resume,
     };
     use crate::{
         cli::Network,
         config::{AppConfig, ConfigStore},
-        transaction::{SessionJournalSnapshot, TransactionJournal},
+        transaction::{SessionJournalSnapshot, TransactionJournal, UnresolvedTransactionSummary},
     };
     use alloy_primitives::{Address, U256};
     use std::{
@@ -1585,6 +1678,242 @@ mod tests {
             current_limit,
             Some(Address::with_last_byte(0xa2))
         ));
+    }
+
+    #[test]
+    fn open_legacy_session_requires_confirmation_on_process_restart() {
+        let limit = U256::from(500_000_000_000_000_000_u128);
+        let open = SessionJournalSnapshot {
+            session_id: Some("open".to_owned()),
+            closed: false,
+            ..SessionJournalSnapshot::default()
+        };
+        let closed = SessionJournalSnapshot {
+            session_id: Some("closed".to_owned()),
+            closed: true,
+            ..SessionJournalSnapshot::default()
+        };
+        let unresolved = SessionJournalSnapshot {
+            session_id: Some("unresolved".to_owned()),
+            closed: false,
+            unresolved: vec![UnresolvedTransactionSummary {
+                hash: "0xabc".to_owned(),
+                node_id: 1,
+                window_id: 7,
+                status: "Broadcast".to_owned(),
+            }],
+            ..SessionJournalSnapshot::default()
+        };
+
+        assert!(requires_open_legacy_session_confirmation(
+            false, false, limit, &open, false
+        ));
+        assert!(!requires_open_legacy_session_confirmation(
+            true, false, limit, &open, false
+        ));
+        assert!(!requires_open_legacy_session_confirmation(
+            false, true, limit, &open, false
+        ));
+        assert!(!requires_open_legacy_session_confirmation(
+            false,
+            false,
+            U256::ZERO,
+            &open,
+            false
+        ));
+        assert!(!requires_open_legacy_session_confirmation(
+            false, false, limit, &open, true
+        ));
+        assert!(!requires_open_legacy_session_confirmation(
+            false, false, limit, &closed, false
+        ));
+        assert!(!requires_open_legacy_session_confirmation(
+            false,
+            false,
+            limit,
+            &unresolved,
+            false
+        ));
+    }
+
+    fn dummy_v3_keystore(address: Address) -> Vec<u8> {
+        let address = format!("{address:#x}");
+        let address = address.strip_prefix("0x").unwrap();
+        serde_json::to_vec(&serde_json::json!({
+            "version": 3,
+            "id": "f0e1d2c3-b4a5-4678-89ab-cdef01234567",
+            "address": address,
+            "crypto": {
+                "cipher": "aes-128-ctr",
+                "cipherparams": { "iv": "00000000000000000000000000000000" },
+                "ciphertext": "0000000000000000000000000000000000000000000000000000000000000000",
+                "kdf": "scrypt",
+                "kdfparams": {
+                    "dklen": 32,
+                    "n": 4096,
+                    "p": 1,
+                    "r": 8,
+                    "salt": "0000000000000000000000000000000000000000000000000000000000000000"
+                },
+                "mac": "0000000000000000000000000000000000000000000000000000000000000000"
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn init_wallet_change_requires_paid_terminal_consent() {
+        const CHILD: &str = "ASTATINE_INIT_WALLET_CONSENT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let temp = tempfile::tempdir().unwrap();
+            let store = ConfigStore::at_root(temp.path().to_path_buf());
+            let wallet_a = Address::with_last_byte(0xa1);
+            let wallet_b = Address::with_last_byte(0xb1);
+            let token = Address::with_last_byte(0xc1);
+            let base = AppConfig {
+                schema_version: 2,
+                network: Network::Testnet,
+                wallet_address: Some(format!("{wallet_a:#x}")),
+                per_session_spending_limit_inj: "1".to_owned(),
+                minimum_reserve_inj: "0.1".to_owned(),
+                transaction_confirmations: 2,
+                testnet_rpc: Some("https://rpc.test.example".to_owned()),
+                ..AppConfig::default()
+            };
+            store.save(&base).unwrap();
+            let manager = crate::transaction::TransactionManager::open_with_session_policy(
+                &store,
+                &base,
+                wallet_a,
+                token,
+                std::sync::Arc::new(crate::history_telemetry::HistoryTelemetry::default()),
+                true,
+                false,
+            )
+            .unwrap();
+            drop(manager);
+
+            let selected = AppConfig {
+                wallet_address: Some(format!("{wallet_b:#x}")),
+                ..base.clone()
+            };
+            store.save(&selected).unwrap();
+            TransactionJournal::set_per_run_policy_approval(&store, &selected, Some(wallet_b))
+                .unwrap();
+            store
+                .store_keystore(wallet_b, &dummy_v3_keystore(wallet_b))
+                .unwrap();
+
+            let config_before = store.load().unwrap();
+            let journal_before = store.read_transaction_journal().unwrap().unwrap();
+            let error = super::run_init_with_store(
+                &store,
+                crate::cli::InitArgs {
+                    network: Some(Network::Testnet),
+                    threads: Some(std::num::NonZeroUsize::new(1).unwrap()),
+                    minimum_reserve_inj: Some("0.1".to_owned()),
+                    spending_limit_inj: Some("1".to_owned()),
+                    transaction_confirmations: Some(2),
+                    rpc: None,
+                    per_run_sessions: true,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("interactive terminal"),
+                "unexpected wallet-consent error: {error:#}"
+            );
+            assert_eq!(store.load().unwrap(), config_before);
+            assert_eq!(
+                store.read_transaction_journal().unwrap().unwrap(),
+                journal_before
+            );
+            eprintln!("init-wallet-consent-child-ran");
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::tests::init_wallet_change_requires_paid_terminal_consent",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"yes\nyes\nyes\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "init wallet-consent child failed: {stderr}"
+        );
+        assert!(
+            stderr.contains("init-wallet-consent-child-ran"),
+            "the child branch must have executed: {stderr}"
+        );
+    }
+
+    #[test]
+    fn paid_consent_rejects_piped_yes_without_a_terminal() {
+        const CHILD: &str = "ASTATINE_PAID_CONSENT_PIPED_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let error =
+                super::prompt_new_session_confirmation("1", "1", None, false, false, None, None)
+                    .unwrap_err();
+            assert!(format!("{error:#}").contains("interactive terminal"));
+            let error = super::prompt_resume_existing_session_confirmation("1", None).unwrap_err();
+            assert!(format!("{error:#}").contains("interactive terminal"));
+            let error = super::prompt_per_run_policy_approval(
+                &AppConfig::default(),
+                Address::with_last_byte(0xa1),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("interactive terminal"));
+            let session = SessionJournalSnapshot {
+                session_id: Some("open".to_owned()),
+                authorized_exposure_wei: Some("0".to_owned()),
+                ..SessionJournalSnapshot::default()
+            };
+            let error =
+                super::prompt_resume_open_legacy_session_confirmation(&session).unwrap_err();
+            assert!(format!("{error:#}").contains("interactive terminal"));
+            eprintln!("paid-consent-piped-child-ran");
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::tests::paid_consent_rejects_piped_yes_without_a_terminal",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"yes\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "piped paid-consent child failed: {stderr}"
+        );
+        assert!(
+            stderr.contains("paid-consent-piped-child-ran"),
+            "the child branch must have executed: {stderr}"
+        );
     }
 
     #[test]

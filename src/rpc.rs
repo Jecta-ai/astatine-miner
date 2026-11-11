@@ -387,6 +387,10 @@ pub struct NetworkClient {
     #[cfg(test)]
     delay_next_finalization_fee_quote_ms: std::sync::Arc<AtomicU64>,
     #[cfg(test)]
+    delay_next_broadcast_ms: std::sync::Arc<AtomicU64>,
+    #[cfg(test)]
+    broadcast_delays_started: std::sync::Arc<AtomicU64>,
+    #[cfg(test)]
     fee_quote_delays_started: std::sync::Arc<AtomicU64>,
     #[cfg(test)]
     proof_nonce_starts: TestProofNonceStarts,
@@ -554,6 +558,10 @@ impl NetworkClient {
             delay_next_proof_fee_quote_ms: std::sync::Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             delay_next_finalization_fee_quote_ms: std::sync::Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            delay_next_broadcast_ms: std::sync::Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            broadcast_delays_started: std::sync::Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             fee_quote_delays_started: std::sync::Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -897,6 +905,15 @@ impl NetworkClient {
     }
 
     pub async fn broadcast_raw_transaction(&self, raw_transaction: &[u8]) -> Result<B256> {
+        #[cfg(test)]
+        {
+            let delay_ms = self.delay_next_broadcast_ms.swap(0, Ordering::AcqRel);
+            if delay_ms > 0 {
+                self.broadcast_delays_started
+                    .fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
         let result = rpc_request::<String>(
             self.primary_endpoint()?,
             "eth_sendRawTransaction",
@@ -1481,6 +1498,10 @@ impl NetworkClient {
             #[cfg(test)]
             delay_next_finalization_fee_quote_ms: std::sync::Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
+            delay_next_broadcast_ms: std::sync::Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            broadcast_delays_started: std::sync::Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
             fee_quote_delays_started: std::sync::Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             proof_nonce_starts: std::sync::Arc::new(Mutex::new(HashMap::new())),
@@ -1554,6 +1575,19 @@ impl NetworkClient {
     #[cfg(test)]
     pub(crate) fn fee_quote_delays_started(&self) -> u64 {
         self.fee_quote_delays_started.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delay_next_broadcast(&self, delay: Duration) {
+        self.delay_next_broadcast_ms.store(
+            delay.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::Release,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn broadcast_delays_started(&self) -> u64 {
+        self.broadcast_delays_started.load(Ordering::Acquire)
     }
 
     #[cfg(test)]

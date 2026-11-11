@@ -68,8 +68,8 @@ jobs:
       - name: Check
         run: cargo check --locked
       - name: Compile tests without executing them
-        # Test execution is outside this workflow. Focused fixture and safe
-        # tests, plus the proof-lifecycle regressions, are run locally; see README.md.
+        # Safe Linux test execution is in the linux-safe-tests job. Anvil,
+        # native credential-store, and physical GPU tests remain opt-in.
         run: cargo test --locked --no-run
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
@@ -104,6 +104,50 @@ jobs:
             throw 'Windows hidden-password console smoke timed out'
           }
           if ($Prompt.ExitCode -ne 0) { throw "Windows hidden-password console smoke failed (exit code $($Prompt.ExitCode))" }
+
+  linux-safe-tests:
+    name: Linux safe unit tests (no native keyring, Anvil, or GPU)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain components
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+      - name: Run isolated safe unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          real_home="$HOME"
+          export CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}"
+          test_home="$RUNNER_TEMP/astatine-safe-test-home"
+          mkdir -p "$test_home"
+          export HOME="$test_home"
+          export XDG_CONFIG_HOME="$test_home/.config"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNNER_TEMP/astatine-no-secret-service"
+          unset ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE
+          unset ASTATINE_E2E_DEVICE
+          unset ASTATINE_E2E_GPU_NODE_SET
+          cargo test --locked --bin astatine -- \
+            --skip config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped \
+            --skip config::tests::linux_secret_service_unavailable_fails_closed_without_native_keyring
+      - name: Verify isolated Linux Secret Service failure path
+        shell: bash
+        run: |
+          set -euo pipefail
+          real_home="$HOME"
+          export CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}"
+          test_home="$RUNNER_TEMP/astatine-secret-service-test-home"
+          mkdir -p "$test_home"
+          export HOME="$test_home"
+          export XDG_CONFIG_HOME="$test_home/.config"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNNER_TEMP/astatine-no-secret-service"
+          cargo test --locked --bin astatine -- --exact config::tests::linux_secret_service_unavailable_fails_closed_without_native_keyring --nocapture
 
   dependency-policy:
     name: Dependency, advisory, and license checks

@@ -14,7 +14,8 @@ use crate::{
     proof_telemetry::{ProofMetric, ProofPipelineTelemetry},
     protocol::{WorkContext, WorkHasher, beats_incumbent, meets_target},
     rpc::{BlockSnapshot, NetworkClient, NodeState, ReadSnapshot, is_transient_rpc_error},
-    startup::{CtrlCSignal, StartupProgress, race_with_ctrl_c},
+    shutdown::{ShutdownSignal, race_with_shutdown},
+    startup::StartupProgress,
     transaction::{
         AUTOMATIC_REWARD_FORWARDING_DISABLED, ConfirmedAction, ProofSubmission, RunSessionBudget,
         RunSessionLimitChanged, SessionJournalSnapshot, TransactionAction,
@@ -1052,7 +1053,7 @@ enum BackendEvent {
 }
 
 struct StartupControl<'a> {
-    ctrl_c: &'a mut CtrlCSignal,
+    shutdown: &'a mut ShutdownSignal,
     progress: Option<&'a StartupProgress>,
     new_session_authorized: bool,
 }
@@ -1061,6 +1062,12 @@ struct StartupControl<'a> {
 struct RuntimeTestOptions {
     #[cfg(test)]
     skip_workers: bool,
+    #[cfg(test)]
+    pre_trigger_shutdown: bool,
+    #[cfg(test)]
+    fail_dashboard_start: bool,
+    #[cfg(test)]
+    fail_reconcile: bool,
     #[cfg(test)]
     preflight_failures: Arc<Mutex<HashMap<u128, anyhow::Error>>>,
     #[cfg(test)]
@@ -1463,13 +1470,15 @@ pub(crate) async fn run(store: &ConfigStore, args: MineArgs) -> Result<()> {
             "`--new-session` requires explicit spending authorization through the interactive CLI"
         );
     }
-    run_with_session_confirmation(store, args, false).await
+    let mut shutdown = ShutdownSignal::new().context("install shutdown signal handlers")?;
+    run_with_session_confirmation(store, args, false, &mut shutdown).await
 }
 
 pub(crate) async fn run_with_session_confirmation(
     store: &ConfigStore,
     args: MineArgs,
     new_session_authorized: bool,
+    shutdown: &mut ShutdownSignal,
 ) -> Result<()> {
     if args.new_session && !new_session_authorized {
         bail!("a new spending session requires explicit interactive authorization");
@@ -1478,7 +1487,6 @@ pub(crate) async fn run_with_session_confirmation(
         bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
     }
     let progress = StartupProgress::start();
-    let mut ctrl_c: CtrlCSignal = Box::pin(tokio::signal::ctrl_c());
     progress.begin("Loading configuration");
     let config = match store.load() {
         Ok(config) => config,
@@ -1570,13 +1578,13 @@ pub(crate) async fn run_with_session_confirmation(
     }
     progress.complete("Selected wallet checked");
     progress.begin("Connecting to RPC · validating Chain ID");
-    let connected = race_with_ctrl_c(
+    let connected = race_with_shutdown(
         NetworkClient::connect_with_progress(
             config.network,
             config.rpc_override(config.network),
             Some(&progress),
         ),
-        &mut ctrl_c,
+        shutdown,
     )
     .await?;
     let Some(client) = connected else {
@@ -1592,7 +1600,7 @@ pub(crate) async fn run_with_session_confirmation(
         None,
         None,
         StartupControl {
-            ctrl_c: &mut ctrl_c,
+            shutdown,
             progress: Some(&progress),
             new_session_authorized,
         },
@@ -1880,7 +1888,11 @@ async fn run_with_client_test_options(
             )?;
         }
     }
-    let mut ctrl_c: CtrlCSignal = Box::pin(tokio::signal::ctrl_c());
+    let mut shutdown = ShutdownSignal::new().context("install shutdown signal handlers")?;
+    #[cfg(test)]
+    if test_options.pre_trigger_shutdown {
+        shutdown.trigger_for_test(crate::shutdown::ShutdownReason::test_request_reason());
+    }
     run_runtime(
         store,
         config,
@@ -1889,13 +1901,159 @@ async fn run_with_client_test_options(
         supplied_signer,
         probe_sender,
         StartupControl {
-            ctrl_c: &mut ctrl_c,
+            shutdown: &mut shutdown,
             progress: None,
             new_session_authorized,
         },
         test_options,
     )
     .await
+}
+
+fn combine_runtime_results(
+    inner: Result<()>,
+    finalized: Result<Option<&'static str>>,
+) -> Result<()> {
+    match (inner, finalized) {
+        (Ok(()), Ok(message)) => {
+            if let Some(message) = message {
+                println!("{}", crate::diagnostics::terminal_text(message));
+            }
+            Ok(())
+        }
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Ok(_)) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            Err(error.context(format!("runtime cleanup also failed: {cleanup_error:#}")))
+        }
+    }
+}
+
+struct RuntimeLifecycle {
+    transactions: Option<TransactionManager>,
+    worker_guard: Option<MiningWorkers>,
+    observer: Option<ReadOnlyObserver>,
+    dashboard: Option<Dashboard>,
+    finalized: bool,
+}
+
+impl RuntimeLifecycle {
+    fn new() -> Self {
+        Self {
+            transactions: None,
+            worker_guard: None,
+            observer: None,
+            dashboard: None,
+            finalized: false,
+        }
+    }
+
+    /// Single idempotent finalizer for every post-manager exit path.
+    ///
+    /// It stops workers, stops the observer, closes the spending session while
+    /// preserving unresolved liabilities, updates and restores the dashboard,
+    /// and combines cleanup failures with the caller's original error.
+    async fn finalize(
+        &mut self,
+        inner_error: Option<&str>,
+        compute_only: bool,
+        runtime_started: bool,
+        per_run_sessions_enabled: bool,
+        diagnostics: &DiagnosticBuffer,
+    ) -> Result<Option<&'static str>> {
+        if self.finalized {
+            return Ok(None);
+        }
+        self.finalized = true;
+
+        let mut cleanup_error: Option<anyhow::Error> = None;
+
+        if let Some(mut workers) = self.worker_guard.take()
+            && workers.stop_and_join()
+        {
+            report_mining_warning(
+                &self.dashboard,
+                "Compute worker stopped abnormally or exceeded the bounded shutdown interval.",
+            );
+        }
+
+        if let Some(mut observer) = self.observer.take()
+            && let Err(error) = observer.stop().await
+        {
+            cleanup_error = Some(match cleanup_error.take() {
+                Some(existing) => existing.context(format!(
+                    "also failed to stop read-only chain observer: {error:#}"
+                )),
+                None => error.context("stop read-only chain observer"),
+            });
+        }
+
+        let stopped_message = if let Some(mut manager) = self.transactions.take() {
+            let has_unresolved = manager.journal.has_unresolved();
+            if has_unresolved && !per_run_sessions_enabled {
+                Some(
+                    "Stopped with transaction exposure reserved for read-only recovery. The session remains open in the private journal.",
+                )
+            } else if let Err(error) = manager.close_session() {
+                cleanup_error = Some(match cleanup_error.take() {
+                    Some(existing) => existing.context(format!(
+                        "also failed to close transaction spending session: {error:#}"
+                    )),
+                    None => error.context("close transaction spending session"),
+                });
+                None
+            } else if has_unresolved {
+                Some(
+                    "Stopped paid mining. This invocation's session is closed; unresolved transaction exposure remains reserved in the private journal.",
+                )
+            } else {
+                Some(
+                    "Stopped autonomous Testnet mining. Transaction journal retained without private key material.",
+                )
+            }
+        } else if !runtime_started {
+            None
+        } else if compute_only {
+            Some("Stopped compute-only mining. No transactions were signed or sent.")
+        } else {
+            Some(
+                "Stopped mining. No transactions were signed or sent because the session limit is zero.",
+            )
+        };
+
+        if let Some(error) = inner_error
+            && let Some(dashboard) = self.dashboard.as_ref()
+        {
+            dashboard.update(|model| {
+                model.critical_error = Some(error.to_owned());
+                model.current_action = None;
+            });
+        }
+
+        let restore_result = if let Some(mut dashboard) = self.dashboard.take() {
+            let result = dashboard.stop().await;
+            flush_dashboard_diagnostics(&dashboard);
+            result
+        } else {
+            for message in diagnostics.drain() {
+                eprintln!("astatine: {message}");
+            }
+            Ok(())
+        };
+        if let Err(error) = restore_result {
+            cleanup_error = Some(match cleanup_error.take() {
+                Some(existing) => existing.context(format!(
+                    "also failed to restore mining dashboard terminal: {error:#}"
+                )),
+                None => error.context("restore mining dashboard terminal"),
+            });
+        }
+
+        match cleanup_error {
+            Some(error) => Err(error),
+            None => Ok(stopped_message),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1912,10 +2070,11 @@ async fn run_runtime(
     #[cfg(not(test))]
     let _ = test_options;
     let StartupControl {
-        ctrl_c,
+        shutdown,
         progress: startup,
         new_session_authorized,
     } = startup_control;
+    let mut shutdown_reason = None;
     let per_run_sessions_enabled = config.per_run_sessions_enabled();
     if args.send_rewards_to.is_some() {
         bail!("{AUTOMATIC_REWARD_FORWARDING_DISABLED}");
@@ -2065,7 +2224,19 @@ async fn run_runtime(
         };
     let transaction_manager_mode =
         should_open_transaction_manager(args.compute_only, transaction_mode, readonly_recovery);
-    let mut transactions = if transaction_manager_mode {
+    let compute_only = args.compute_only;
+    let mut runtime_started = false;
+    let mut lifecycle = RuntimeLifecycle::new();
+    let diagnostics = DiagnosticBuffer::default();
+    let inner_result = async {
+        let RuntimeLifecycle {
+            transactions,
+            worker_guard,
+            observer,
+            dashboard,
+            ..
+        } = &mut lifecycle;
+    if transaction_manager_mode {
         let token = client
             .manifest
             .ast_token
@@ -2103,7 +2274,7 @@ async fn run_runtime(
                 )
                 .map(|manager| Some((manager, spending_limit)))
             };
-        let (mut manager, approved_limit) = match manager_result {
+        let (manager, approved_limit) = match manager_result {
             Ok(Some((manager, approved_limit))) => (manager, approved_limit),
             Ok(None) => return Ok(()),
             Err(error) => {
@@ -2115,6 +2286,10 @@ async fn run_runtime(
                 return Err(error).context("open transaction journal for startup recovery");
             }
         };
+        *transactions = Some(manager);
+        let manager = transactions
+            .as_mut()
+            .expect("transaction manager was just assigned");
         if config.per_run_sessions_enabled() && transaction_mode && new_session_authorized {
             spending_limit = approved_limit;
         }
@@ -2146,7 +2321,15 @@ async fn run_runtime(
         }
         manager.configure_reward_forwarding(args.send_rewards_to)?;
         manager.set_proof_telemetry(Arc::clone(&proof_telemetry));
-        match race_with_ctrl_c(manager.reconcile(&client), ctrl_c).await? {
+        #[cfg(test)]
+        if test_options.fail_reconcile {
+            let error = anyhow!("test-injected reconcile failure");
+            if let Some(startup) = startup {
+                startup.fail(format!("Transaction recovery failed: {error:#}"));
+            }
+            return Err(error).context("recover previous Testnet transactions");
+        }
+        match race_with_shutdown(manager.reconcile(&client), shutdown).await? {
             Some(Ok(())) => {
                 let legacy = manager.legacy_unverified_settled_count()?;
                 if legacy > 0 {
@@ -2173,10 +2356,10 @@ async fn run_runtime(
                 return Ok(());
             }
         }
-        Some(manager)
-    } else {
-        None
-    };
+    }
+    if let Some(manager) = transactions.as_mut() {
+        manager.set_shutdown_request(shutdown.request());
+    }
     if let Some(startup) = startup {
         if transaction_manager_mode {
             startup.complete("Transaction recovery complete");
@@ -2231,24 +2414,29 @@ async fn run_runtime(
         } else if signing_ready {
             if let Some(startup) = startup {
                 startup.begin("Unlocking wallet");
-                match crate::wallet::unlock_selected_interactive_with_progress(
-                    store, &config, startup,
-                ) {
-                    Ok(signer) => {
+                match unlock_result(|| {
+                    crate::wallet::unlock_selected_interactive_with_progress(
+                        store, &config, startup,
+                    )
+                }) {
+                    Ok(UnlockOutcome::Unlocked(signer)) => {
                         startup.complete("Wallet unlocked");
                         Some(signer)
                     }
-                    Err(error) if crate::wallet::is_password_prompt_interrupted(&error) => {
+                    Ok(UnlockOutcome::Cancelled) => {
                         startup.cancel();
                         return Ok(());
                     }
                     Err(error) => {
                         startup.fail(format!("Wallet unlock failed: {error:#}"));
-                        return Err(error).context("unlock selected wallet for mining");
+                        return Err(error);
                     }
                 }
             } else {
-                Some(unlock_selected_interactive(store, &config)?)
+                match unlock_result(|| unlock_selected_interactive(store, &config))? {
+                    UnlockOutcome::Unlocked(signer) => Some(signer),
+                    UnlockOutcome::Cancelled => return Ok(()),
+                }
             }
         } else {
             if let Some(startup) = startup {
@@ -2277,7 +2465,6 @@ async fn run_runtime(
     let cursor = Arc::new(AtomicUsize::new(0));
     let total_hashes = Arc::new(AtomicU64::new(0));
     let active_backend = Arc::new(RwLock::new(ActiveBackend::Cpu { threads }));
-    let diagnostics = DiagnosticBuffer::default();
     let transaction_state = Arc::new(RwLock::new(initial_transaction_dashboard_state(
         transactions.as_ref(),
         &diagnostics,
@@ -2307,7 +2494,7 @@ async fn run_runtime(
         startup.begin("Loading latest mining work");
     }
     let mut terminal_startup_monitoring_error = None;
-    let snapshot = match race_with_ctrl_c(client.snapshot(Some(address)), ctrl_c).await? {
+    let snapshot = match race_with_shutdown(client.snapshot(Some(address)), shutdown).await? {
         Some(Ok(snapshot)) => snapshot,
         Some(Err(error)) if initial_session_limit_reached => {
             let message = format!(
@@ -2431,11 +2618,14 @@ async fn run_runtime(
             }
         });
     }
-    let mut worker_guard = MiningWorkers {
+    *worker_guard = Some(MiningWorkers {
         stop: Arc::clone(&stop),
         workers: Vec::new(),
         has_gpu_controller: false,
-    };
+    });
+    let worker_guard = worker_guard
+        .as_mut()
+        .expect("worker guard was just initialized");
     let mut backend_event_receiver = None;
     if initial_session_limit_reached {
         stop.store(true, Ordering::Release);
@@ -2477,13 +2667,12 @@ async fn run_runtime(
 
                 let initial_event = tokio::select! {
                     event = receive_backend_event(&mut backend_event_receiver) => event,
-                    signal = ctrl_c.as_mut() => {
+                    signal = shutdown.recv() => {
                         if let Err(error) = signal {
-                            report_mining_warning(&None, format!("Ctrl+C signal handler failed: {error}"));
+                            report_mining_warning(&None, format!("shutdown signal handler failed: {error}"));
                         }
                         stop.store(true, Ordering::Release);
                         if let Some(startup) = startup { startup.cancel(); }
-                        let _ = worker_guard.stop_and_join();
                         return Ok(());
                     }
                 };
@@ -2523,7 +2712,6 @@ async fn run_runtime(
                     }
                     Some(BackendEvent::Failed(message)) => {
                         stop.store(true, Ordering::Release);
-                        let _ = worker_guard.stop_and_join();
                         if let Some(startup) = startup {
                             startup.fail(message.clone());
                         }
@@ -2531,7 +2719,6 @@ async fn run_runtime(
                     }
                     None => {
                         stop.store(true, Ordering::Release);
-                        let _ = worker_guard.stop_and_join();
                         let error = anyhow!("GPU backend stopped before initialization completed");
                         if let Some(startup) = startup {
                             startup.fail(format!("{error:#}"));
@@ -2558,17 +2745,24 @@ async fn run_runtime(
         model.monitoring_error = terminal_startup_monitoring_error.clone();
         model.latch_session_limit();
     }
-    let mut dashboard =
-        match Dashboard::start(model, Arc::clone(&total_hashes), diagnostics.clone()) {
-            Ok(dashboard) => dashboard,
-            Err(error) => {
-                if let Some(startup) = startup {
-                    startup.fail(format!("Mining dashboard could not start: {error:#}"));
-                }
-                return Err(error).context("initialize mining dashboard terminal");
+    #[cfg(test)]
+    if test_options.fail_dashboard_start {
+        let error = anyhow!("test-injected dashboard start failure");
+        if let Some(startup) = startup {
+            startup.fail(format!("Mining dashboard could not start: {error:#}"));
+        }
+        return Err(error).context("initialize mining dashboard terminal");
+    }
+    *dashboard = match Dashboard::start(model, Arc::clone(&total_hashes), diagnostics.clone()) {
+        Ok(dashboard) => dashboard,
+        Err(error) => {
+            if let Some(startup) = startup {
+                startup.fail(format!("Mining dashboard could not start: {error:#}"));
             }
-        };
-    if let Some(dashboard) = &dashboard {
+            return Err(error).context("initialize mining dashboard terminal");
+        }
+    };
+    if let Some(dashboard) = dashboard.as_ref() {
         let diagnostics = dashboard.diagnostics();
         client.set_diagnostics(diagnostics.clone());
         if let Some(manager) = transactions.as_mut() {
@@ -2583,8 +2777,8 @@ async fn run_runtime(
         proof_pause_latched: Arc::clone(&proof_receiver.pause_latched),
     });
     connect_transaction_dashboard(
-        &mut transactions,
-        &dashboard,
+        transactions,
+        dashboard,
         Arc::clone(&transaction_state),
         session_limit_control,
     )?;
@@ -2594,7 +2788,7 @@ async fn run_runtime(
     refresh_dashboard(dashboard_updater.as_ref(), &dashboard_context, &snapshot);
     if let Some(error) = terminal_startup_monitoring_error.clone() {
         report_terminal_monitoring_degraded(
-            &dashboard,
+            dashboard,
             dashboard_updater.as_ref(),
             &observer_monitoring_degraded,
             &mut terminal_monitoring_error,
@@ -2603,7 +2797,7 @@ async fn run_runtime(
     }
     if !client.verification.token_verified {
         report_mining_warning(
-            &dashboard,
+            dashboard,
             "AST token runtime pin is unavailable; mining proofs can still be computed, but AST balance is not trusted.",
         );
     }
@@ -2629,13 +2823,16 @@ async fn run_runtime(
             );
         }
     }
-    let mut observer = start_read_only_observer(
+    *observer = Some(start_read_only_observer(
         client.clone(),
         dashboard_context.clone(),
         snapshot.clone(),
         dashboard_updater.clone(),
         diagnostics.clone(),
-    );
+    ));
+    let observer = observer
+        .as_mut()
+        .expect("read-only observer was just initialized");
     let mut observed_updates = observer.updates.clone();
     let _ = observed_updates.borrow_and_update();
     observer.force_refresh();
@@ -2712,6 +2909,7 @@ async fn run_runtime(
         .map(Dashboard::signal)
         .or_else(|| probe_stop_signal.clone());
 
+    runtime_started = true;
     'mining_loop: loop {
         #[cfg(test)]
         let proof_processing_gate_open = proof_processing_gate_receiver
@@ -2722,12 +2920,13 @@ async fn run_runtime(
         tokio::select! {
             // Fresh chain observations must not starve behind a continuously-ready proof inbox.
             biased;
-            signal = ctrl_c.as_mut() => {
-                if let Err(error) = signal {
-                    report_mining_warning(
-                        &dashboard,
-                        format!("Ctrl+C signal handler failed: {error}"),
-                    );
+            signal = shutdown.recv() => {
+                match signal {
+                    Ok(reason) => shutdown_reason = Some(reason),
+                    Err(error) => report_mining_warning(
+                        dashboard,
+                        format!("shutdown signal handler failed: {error}"),
+                    ),
                 }
                 break;
             }
@@ -2741,7 +2940,7 @@ async fn run_runtime(
                             let message = format!(
                                 "terminal dashboard failed; paid mining remains stopped until Ctrl+C: {error}"
                             );
-                            report_terminal_dashboard_failure(&dashboard, message);
+                            report_terminal_dashboard_failure(dashboard, message);
                             #[cfg(test)]
                             runtime_lifecycle
                                 .terminal_dashboard_failures
@@ -2759,7 +2958,7 @@ async fn run_runtime(
                     if session_limit_reached.load(Ordering::Acquire) {
                         observer_updates_open = false;
                         report_terminal_monitoring_degraded(
-                            &dashboard,
+                            dashboard,
                             dashboard_updater.as_ref(),
                             &observer_monitoring_degraded,
                             &mut terminal_monitoring_error,
@@ -2916,7 +3115,7 @@ async fn run_runtime(
                                     ProofMetric::PreflightStaleProof,
                                 );
                                 report_mining_warning(
-                                    &dashboard,
+                                    dashboard,
                                     format!(
                                         "a correlated verified snapshot invalidated the retained proof for node {} window {} ({reason:?}); no retry transaction was authorized",
                                         proof.node_id,
@@ -2936,7 +3135,7 @@ async fn run_runtime(
                                     );
                                 }
                                 report_mining_warning(
-                                    &dashboard,
+                                    dashboard,
                                     format!(
                                         "retained proof for node {} window {} reached its local safe submission deadline without a qualifying verified snapshot; no transaction was signed or broadcast",
                                         proof.node_id,
@@ -2959,7 +3158,7 @@ async fn run_runtime(
                                 &snapshot,
                                 FinalizationOptions {
                                     finalization_state: &dashboard_context.finalization_state,
-                                    dashboard: &dashboard,
+                                    dashboard: &*dashboard,
                                     pending_sync: &dashboard_context.pending_sync,
                                 },
                             );
@@ -2967,9 +3166,10 @@ async fn run_runtime(
                             let finalization_result = loop {
                                 tokio::select! {
                                     result = &mut finalization => break Some(result),
-                                    signal = ctrl_c.as_mut() => {
-                                        if let Err(error) = signal {
-                                            report_mining_warning(&dashboard, format!("Ctrl+C signal handler failed: {error}"));
+                                    signal = shutdown.recv() => {
+                                        match signal {
+                                            Ok(reason) => shutdown_reason = Some(reason),
+                                            Err(error) => report_mining_warning(dashboard, format!("shutdown signal handler failed: {error}")),
                                         }
                                         break None;
                                     }
@@ -2984,7 +3184,7 @@ async fn run_runtime(
                                                 let message = format!(
                                                     "terminal dashboard failed; the already-authorized transaction remains in recovery and mining stays stopped: {error}"
                                                 );
-                                                report_terminal_dashboard_failure(&dashboard, message);
+                                                report_terminal_dashboard_failure(dashboard, message);
                                                 #[cfg(test)]
                                                 runtime_lifecycle
                                                     .terminal_dashboard_failures
@@ -3011,7 +3211,7 @@ async fn run_runtime(
                                         && is_transient_rpc_error(&error) =>
                                 {
                                     report_mining_warning(
-                                        &dashboard,
+                                        dashboard,
                                         format!(
                                             "the already-authorized finalization is not yet settled; terminal mining stays stopped and journaled liabilities remain reserved: {error:#}"
                                         ),
@@ -3093,7 +3293,7 @@ async fn run_runtime(
                                 String::new()
                             };
                             report_terminal_monitoring_degraded(
-                                &dashboard,
+                                dashboard,
                                 dashboard_updater.as_ref(),
                                 &observer_monitoring_degraded,
                                 &mut terminal_monitoring_error,
@@ -3103,7 +3303,7 @@ async fn run_runtime(
                                 ),
                             );
                         } else if report && dashboard.is_none() {
-                            report_mining_warning(&dashboard, message);
+                            report_mining_warning(dashboard, message);
                         }
                         if dashboard.is_none() {
                             total_hashes.store(0, Ordering::Relaxed);
@@ -3136,7 +3336,7 @@ async fn run_runtime(
                                 String::new()
                             };
                             report_terminal_monitoring_degraded(
-                                &dashboard,
+                                dashboard,
                                 dashboard_updater.as_ref(),
                                 &observer_monitoring_degraded,
                                 &mut terminal_monitoring_error,
@@ -3145,14 +3345,14 @@ async fn run_runtime(
                                 ),
                             );
                         } else if report && dashboard.is_none() {
-                            report_mining_warning(&dashboard, message);
+                            report_mining_warning(dashboard, message);
                         }
                     }
                     ObserverUpdate::Fatal(error) => {
                         if session_limit_reached.load(Ordering::Acquire) {
                             observer_updates_open = false;
                             report_terminal_monitoring_degraded(
-                                &dashboard,
+                                dashboard,
                                 dashboard_updater.as_ref(),
                                 &observer_monitoring_degraded,
                                 &mut terminal_monitoring_error,
@@ -3182,7 +3382,7 @@ async fn run_runtime(
                         );
                     }
                     report_mining_warning(
-                        &dashboard,
+                        dashboard,
                         format!(
                             "retained proof for node {} window {} reached its local safe submission deadline without a qualifying verified snapshot; no transaction was signed or broadcast",
                             proof.node_id,
@@ -3196,7 +3396,7 @@ async fn run_runtime(
                     && session_limit_reached.load(Ordering::Acquire)
                 {
                     report_terminal_monitoring_degraded(
-                        &dashboard,
+                        dashboard,
                         dashboard_updater.as_ref(),
                         &observer_monitoring_degraded,
                         &mut terminal_monitoring_error,
@@ -3256,7 +3456,7 @@ async fn run_runtime(
                 if session_limit_reached.load(Ordering::Acquire) {
                     if let Some(BackendEvent::Failed(message) | BackendEvent::FallbackNotice(message)) = event {
                         report_mining_warning(
-                            &dashboard,
+                            dashboard,
                             format!("Compute backend stopped after the session limit latched; mining remains stopped: {message}"),
                         );
                     }
@@ -3278,11 +3478,11 @@ async fn run_runtime(
                         }
                         match backend {
                             ActiveBackend::Cpu { threads } => report_mining_warning(
-                                &dashboard,
+                                dashboard,
                                 format!("GPU backend stopped; safely continuing on CPU ({threads} worker thread(s)); reserved GPU nonce ranges will not be reused."),
                             ),
                             ActiveBackend::Gpu(info) => report_mining_info(
-                                &dashboard,
+                                dashboard,
                                 format!("GPU backend active · {} · {}", info.name, info.backend),
                             ),
                         }
@@ -3293,7 +3493,7 @@ async fn run_runtime(
                     }
                     Some(BackendEvent::FallbackNotice(reason)) => {
                         report_mining_warning(
-                            &dashboard,
+                            dashboard,
                             format!("{reason}; continuing with the CPU backend."),
                         );
                     }
@@ -3305,7 +3505,7 @@ async fn run_runtime(
                     if session_limit_reached.load(Ordering::Acquire) {
                         proof_receiver_open = false;
                         report_mining_warning(
-                            &dashboard,
+                            dashboard,
                             "proof inbox closed after SESSION LIMIT REACHED; mining remains stopped until Ctrl+C",
                         );
                         continue 'mining_loop;
@@ -3390,7 +3590,7 @@ async fn run_runtime(
                 let window_id = work.fingerprint.hashing_context.window_id;
                 if args.compute_only {
                     report_mining_info(
-                        &dashboard,
+                        dashboard,
                         format!(
                             "valid local proof: node={} window={} nonce={} hash={:#x} target={:#x}{}; compute-only, not submitted",
                             proof.node_id, window_id, proof.nonce, proof.hash, proof.target, incumbent
@@ -3430,7 +3630,7 @@ async fn run_runtime(
                 }
                 let header = work.fingerprint.hashing_context.header.clone();
                 mark_dashboard_nodes(
-                    &dashboard,
+                    dashboard,
                     [proof.node_id],
                     NodeStatus::CheckingProof,
                     Some(format!(
@@ -3456,9 +3656,10 @@ async fn run_runtime(
                     loop {
                         tokio::select! {
                             result = &mut submission => break Some(result),
-                            signal = ctrl_c.as_mut() => {
-                                if let Err(error) = signal {
-                                    report_mining_warning(&dashboard, format!("Ctrl+C signal handler failed: {error}"));
+                            signal = shutdown.recv() => {
+                                match signal {
+                                    Ok(reason) => shutdown_reason = Some(reason),
+                                    Err(error) => report_mining_warning(dashboard, format!("shutdown signal handler failed: {error}")),
                                 }
                                 break None;
                             }
@@ -3473,7 +3674,7 @@ async fn run_runtime(
                                         let message = format!(
                                             "terminal dashboard failed; the already-authorized transaction remains in recovery and mining stays stopped: {error}"
                                         );
-                                        report_terminal_dashboard_failure(&dashboard, message);
+                                        report_terminal_dashboard_failure(dashboard, message);
                                         #[cfg(test)]
                                         runtime_lifecycle
                                             .terminal_dashboard_failures
@@ -3507,7 +3708,7 @@ async fn run_runtime(
                 match submission_result {
                     Ok(action) => {
                         report_mining_info(
-                            &dashboard,
+                            dashboard,
                             confirmed_action_message("proof", &action),
                         );
                         dashboard_context
@@ -3522,7 +3723,7 @@ async fn run_runtime(
                                 },
                             );
                         mark_dashboard_nodes(
-                            &dashboard,
+                            dashboard,
                             [proof.node_id],
                             NodeStatus::Syncing,
                             Some(format!(
@@ -3545,7 +3746,7 @@ async fn run_runtime(
                             || (!per_run_sessions_enabled && manager.journal.has_unresolved()) =>
                     {
                         report_mining_warning(
-                            &dashboard,
+                            dashboard,
                             if per_run_sessions_enabled {
                                 format!(
                                     "proof outcome remains journaled as unresolved; its maximum exposure and nonce remain reserved while receipt recovery continues read-only. Later transactions require a distinct pending nonce and sufficient balance/cap: {error:#}"
@@ -3558,7 +3759,7 @@ async fn run_runtime(
                         );
                         proof_receiver.set_paused(manager.signing_blocked_by_unresolved());
                         mark_dashboard_nodes(
-                            &dashboard,
+                            dashboard,
                             [proof.node_id],
                             NodeStatus::Recovering,
                             Some(format!(
@@ -3594,14 +3795,14 @@ async fn run_runtime(
                             &observer.refresh_handle(),
                         );
                         report_mining_warning(
-                            &dashboard,
+                            dashboard,
                             format!(
                                 "proof candidate for node {:02} window {window_id} is retained pending a correlated verified snapshot; no new transaction authorization was recorded: {error:#}",
                                 proof.node_id
                             ),
                         );
                         mark_dashboard_nodes(
-                            &dashboard,
+                            dashboard,
                             [proof.node_id],
                             NodeStatus::Syncing,
                             Some(format!(
@@ -3619,13 +3820,13 @@ async fn run_runtime(
                         let _ = proof_receiver.requeue(proof.clone(), &proof_telemetry);
                         proof_receiver.set_paused(true);
                         report_mining_warning(
-                            &dashboard,
+                            dashboard,
                             format!(
                                 "proof retained while an unresolved transaction owns the wallet's current pending nonce; receipt recovery remains read-only and hashing continues: {error:#}"
                             ),
                         );
                         mark_dashboard_nodes(
-                            &dashboard,
+                            dashboard,
                             [proof.node_id],
                             NodeStatus::Recovering,
                             Some(format!(
@@ -3642,17 +3843,17 @@ async fn run_runtime(
                             proof_receiver.set_paused(true);
                         }
                         report_mining_warning(
-                            &dashboard,
+                            dashboard,
                             format!("valid proof was not submitted: {error:#}"),
                         );
-                        mark_dashboard_nodes(&dashboard, [proof.node_id], NodeStatus::Mining, None);
+                        mark_dashboard_nodes(dashboard, [proof.node_id], NodeStatus::Mining, None);
                     }
                     Err(error) if is_stale_proof(&error) => {
                         proof_telemetry.record(proof.node_id, ProofMetric::PreflightStaleProof);
                         if stale_proof_warning_window.get(&proof.node_id) != Some(&window_id) {
                             stale_proof_warning_window.insert(proof.node_id, window_id);
                             report_mining_warning(
-                                &dashboard,
+                                dashboard,
                                 format!(
                                     "discarded stale proof for node {} window {window_id}: {error:#}",
                                     proof.node_id
@@ -3660,7 +3861,7 @@ async fn run_runtime(
                             );
                         }
                         mark_dashboard_nodes(
-                            &dashboard,
+                            dashboard,
                             [proof.node_id],
                             NodeStatus::Syncing,
                             Some(format!(
@@ -3672,13 +3873,13 @@ async fn run_runtime(
                     }
                     Err(error) if session_limit_reached.load(Ordering::Acquire) => {
                         report_mining_warning(
-                            &dashboard,
+                            dashboard,
                             format!(
                                 "the already-authorized proof did not settle successfully; terminal state remains latched and its journaled exposure is preserved: {error:#}"
                             ),
                         );
                         mark_dashboard_nodes(
-                            &dashboard,
+                            dashboard,
                             [proof.node_id],
                             NodeStatus::Recovering,
                             Some(format!(
@@ -3697,16 +3898,10 @@ async fn run_runtime(
         }
     }
 
-    if worker_guard.stop_and_join() {
-        report_mining_warning(
-            &dashboard,
-            "Compute worker stopped abnormally or exceeded the bounded shutdown interval.",
-        );
-    }
     if let Some(proof) = proof_refresh.take_for_shutdown() {
         proof_telemetry.record(proof.node_id, ProofMetric::DroppedOnShutdown);
         report_mining_warning(
-            &dashboard,
+            dashboard,
             format!(
                 "unsubmitted proof for node {} window {} was retained only in memory and is discarded on shutdown; no transaction authorization or broadcast was created for this pending proof",
                 proof.node_id, proof.context.window_id
@@ -3716,88 +3911,42 @@ async fn run_runtime(
     for pending in proof_receiver.drain_pending() {
         proof_telemetry.record(pending.node_id, ProofMetric::DroppedOnShutdown);
     }
-    if let Err(error) = observer.stop().await
-        && fatal_error.is_none()
-    {
-        fatal_error = Some(error);
-    }
-
-    let mut stopped_message = None;
-    if let Some(manager) = transactions.as_mut() {
-        let has_unresolved = manager.journal.has_unresolved();
-        if has_unresolved && !per_run_sessions_enabled {
-            if fatal_error.is_none() {
-                stopped_message = Some(
-                    "Stopped with transaction exposure reserved for read-only recovery. The session remains open in the private journal.",
-                );
-            }
-        } else if let Err(error) = manager.close_session() {
-            let error = error.context("close transaction spending session");
-            fatal_error = Some(match fatal_error.take() {
-                Some(existing) => {
-                    existing.context(format!("also failed to close session: {error:#}"))
-                }
-                None => error,
-            });
-        } else if fatal_error.is_none() && has_unresolved {
-            stopped_message = Some(
-                "Stopped paid mining. This invocation's session is closed; unresolved transaction exposure remains reserved in the private journal.",
-            );
-        } else if fatal_error.is_none() {
-            stopped_message = Some(
-                "Stopped autonomous Testnet mining. Transaction journal retained without private key material.",
-            );
-        }
-    } else if fatal_error.is_none() {
-        if args.compute_only {
-            stopped_message =
-                Some("Stopped compute-only mining. No transactions were signed or sent.");
-        } else {
-            stopped_message = Some(
-                "Stopped mining. No transactions were signed or sent because the session limit is zero.",
-            );
-        }
-    }
-
-    if let Some(error) = fatal_error.as_ref()
-        && let Some(dashboard) = &dashboard
-    {
-        dashboard.update(|model| {
-            model.critical_error = Some(format!("{error:#}"));
-            model.current_action = None;
-        });
+    if let Some(reason) = shutdown_reason {
+        report_mining_info(
+            dashboard,
+            format!("Shutdown signal received: {}", reason.as_str()),
+        );
     }
     if let Some(manager) = transactions.as_ref()
         && let Some(profile) =
             optional_history_profile(show_history_profile, || manager.history_profile_line())
     {
-        report_mining_info(&dashboard, profile);
+        report_mining_info(dashboard, profile);
     }
     for line in proof_telemetry.report_lines() {
-        report_mining_info(&dashboard, line);
-    }
-    let restore_result = if let Some(dashboard) = dashboard.as_mut() {
-        let result = dashboard.stop().await;
-        flush_dashboard_diagnostics(dashboard);
-        result
-    } else {
-        for message in diagnostics.drain() {
-            eprintln!("astatine: {message}");
-        }
-        Ok(())
-    };
-    if let Err(error) = restore_result
-        && fatal_error.is_none()
-    {
-        fatal_error = Some(error.context("restore mining dashboard terminal"));
+        report_mining_info(dashboard, line);
     }
     if let Some(error) = fatal_error {
         return Err(error);
     }
-    if let Some(message) = stopped_message {
-        println!("{}", crate::diagnostics::terminal_text(message));
-    }
     Ok(())
+    }
+    .await;
+
+    let inner_error = inner_result
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"));
+    let finalize_result = lifecycle
+        .finalize(
+            inner_error.as_deref(),
+            compute_only,
+            runtime_started,
+            per_run_sessions_enabled,
+            &diagnostics,
+        )
+        .await;
+    combine_runtime_results(inner_result, finalize_result)
 }
 
 fn take_observer_update(updates: &mut watch::Receiver<ObserverUpdate>) -> ObserverUpdate {
@@ -6571,6 +6720,7 @@ fn prompt_reduced_run_limit(
     suggested: U256,
     startup: Option<&StartupProgress>,
 ) -> Result<bool> {
+    crate::commands::require_paid_consent_terminal("a reduced session limit")?;
     if let Some(startup) = startup {
         startup.pause_for_prompt("Approve reduced session limit");
     }
@@ -6609,11 +6759,23 @@ fn prompt_reduced_run_limit(
     if let Some(startup) = startup {
         startup.resume_after_prompt("Rechecking balance and pending liabilities");
     }
-    read_result.context("read reduced session limit confirmation")?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+    reduced_limit_consent_result(read_result, &answer)
+}
+
+fn reduced_limit_consent_result(read_result: io::Result<usize>, answer: &str) -> Result<bool> {
+    match read_result {
+        Ok(_) => Ok(consent_approved(answer)),
+        // A shutdown signal interrupts the blocking consent read. Treat it as
+        // a refusal so the runtime can take its normal graceful-stop path.
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
+        Err(error) => Err(error).context("read reduced session limit confirmation"),
+    }
+}
+
+/// EOF and unrecognized input are treated as refusal. Only an explicit
+/// affirmative answer approves a reduced spending limit.
+fn consent_approved(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn format_inj_two_decimals(value: U256) -> String {
@@ -6663,6 +6825,24 @@ fn should_open_transaction_manager(
     readonly_recovery: bool,
 ) -> bool {
     !compute_only && (transaction_mode || readonly_recovery)
+}
+
+enum UnlockOutcome {
+    Unlocked(bip32::secp256k1::ecdsa::SigningKey),
+    Cancelled,
+}
+
+fn unlock_result<F>(unlock: F) -> Result<UnlockOutcome>
+where
+    F: FnOnce() -> Result<bip32::secp256k1::ecdsa::SigningKey>,
+{
+    match unlock() {
+        Ok(signer) => Ok(UnlockOutcome::Unlocked(signer)),
+        Err(error) if crate::wallet::is_password_prompt_interrupted(&error) => {
+            Ok(UnlockOutcome::Cancelled)
+        }
+        Err(error) => Err(error).context("unlock selected wallet for mining"),
+    }
 }
 
 fn format_inj(value: Option<U256>) -> String {
@@ -6995,6 +7175,51 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for {reason}"));
+    }
+
+    #[cfg(unix)]
+    async fn start_compute_only_test_runtime(
+        store: &ConfigStore,
+        config: crate::config::AppConfig,
+        client: NetworkClient,
+    ) -> (
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        super::MiningProbe,
+    ) {
+        let (probe_sender, probe_receiver) = oneshot::channel();
+        let run_store = store.clone();
+        let runtime = tokio::spawn(async move {
+            super::run_with_client_test_options(
+                &run_store,
+                config,
+                MineArgs {
+                    device: DeviceChoice::Cpu,
+                    compute_only: true,
+                    new_session: false,
+                    threads: None,
+                    nodes: vec![1],
+                    send_rewards_to: None,
+                },
+                client,
+                None,
+                Some(probe_sender),
+                false,
+                super::RuntimeTestOptions {
+                    skip_workers: true,
+                    ..super::RuntimeTestOptions::default()
+                },
+            )
+            .await
+        });
+        let probe = match timeout(Duration::from_secs(5), probe_receiver).await {
+            Ok(Ok(probe)) => probe,
+            Ok(Err(error)) => panic!(
+                "runtime probe sender closed ({error}); runtime result: {:?}",
+                runtime.await
+            ),
+            Err(error) => panic!("runtime probe was not published: {error}"),
+        };
+        (runtime, probe)
     }
 
     fn runtime_test_proof(probe: &super::MiningProbe, preflight_retries: u8) -> ProofFound {
@@ -7660,6 +7885,818 @@ mod tests {
         let text = String::from_utf8(output.stderr).unwrap();
         assert_sanitized_terminal_failure_output(&text);
         assert_eq!(text.matches("terminal dashboard failed").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_unix_shutdown_signals_stop_cleanly_and_restart_without_signing() {
+        const CHILD: &str = "ASTATINE_TEST_RUNTIME_SIGNAL_CHILD";
+        const SIGNAL: &str = "ASTATINE_TEST_RUNTIME_SIGNAL";
+
+        if std::env::var_os(CHILD).is_none() {
+            #[allow(unused_mut)]
+            let mut signals = vec!["sigterm"];
+            #[cfg(target_os = "linux")]
+            signals.push("sighup");
+            for signal in signals {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "mining::tests::runtime_unix_shutdown_signals_stop_cleanly_and_restart_without_signing",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env(SIGNAL, signal)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "child runtime {signal} test failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert!(
+                    stdout.contains("Stopped compute-only mining"),
+                    "the runtime must take the graceful shutdown path for {signal}: stdout={stdout:?} stderr={stderr:?}"
+                );
+                assert!(
+                    stdout.contains("Shutdown signal received:"),
+                    "the runtime must report the delivered shutdown signal for {signal}: stdout={stdout:?} stderr={stderr:?}"
+                );
+            }
+            return;
+        }
+
+        let signal = std::env::var(SIGNAL).unwrap();
+        let temp = tempdir().unwrap();
+        let store = ConfigStore::at_root(temp.path().to_path_buf());
+        let wallet = Address::with_last_byte(0x68);
+        let contract = Address::with_last_byte(0x69);
+        let token = Address::with_last_byte(0x6a);
+        let node_pins = (1..=9)
+            .map(|id| {
+                (
+                    id,
+                    Address::with_last_byte(0x70 + id),
+                    B256::with_last_byte(id),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut client = NetworkClient::local_test_client_with_nodes(
+            "http://127.0.0.1:1",
+            &node_pins,
+            token,
+            B256::with_last_byte(0x6b),
+            9,
+        )
+        .unwrap();
+        let snapshot = ReadSnapshot {
+            block: test_block(1, 100),
+            native_balance: None,
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![NodeView {
+                id: 1,
+                address: contract,
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(eligible_state()),
+                error: None,
+            }],
+        };
+        client.synthetic_snapshot = Some(snapshot);
+        let config = crate::config::AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            cpu_threads: 1,
+            ..crate::config::AppConfig::default()
+        };
+        store.save(&config).unwrap();
+
+        let (runtime, probe) =
+            start_compute_only_test_runtime(&store, config.clone(), client.clone()).await;
+        assert!(!probe.workers_started.load(Ordering::Acquire));
+
+        let signal_number = match signal.as_str() {
+            "sigterm" => libc::SIGTERM,
+            #[cfg(target_os = "linux")]
+            "sighup" => libc::SIGHUP,
+            other => panic!("unsupported child runtime signal {other}"),
+        };
+        // The runtime has published its probe, so the shutdown handlers are
+        // already installed in this isolated child process.
+        assert_eq!(unsafe { libc::raise(signal_number) }, 0);
+        let result = timeout(Duration::from_secs(5), runtime)
+            .await
+            .expect("runtime should stop after an OS shutdown signal")
+            .expect("runtime task should join");
+        result.unwrap();
+        assert!(
+            store.read_transaction_journal().unwrap().is_none(),
+            "compute-only shutdown must not create signing state"
+        );
+
+        // Restart from the same state root. A completed shutdown must not leave
+        // a stale signal request or prevent a fresh runtime from starting.
+        let (runtime, probe) = start_compute_only_test_runtime(&store, config, client).await;
+        assert!(!probe.workers_started.load(Ordering::Acquire));
+        probe.stop_signal.request_stop();
+        let result = timeout(Duration::from_secs(5), runtime)
+            .await
+            .expect("restarted runtime should stop cleanly")
+            .expect("restarted runtime task should join");
+        result.unwrap();
+        assert!(store.read_transaction_journal().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_sigterm_closes_a_paid_session_without_signing() {
+        const CHILD: &str = "ASTATINE_TEST_RUNTIME_PAID_SIGNAL_CHILD";
+
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mining::tests::runtime_sigterm_closes_a_paid_session_without_signing",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child paid-runtime SIGTERM test failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                stdout.contains("Stopped autonomous Testnet mining"),
+                "the paid runtime must close its session gracefully: {stdout:?}"
+            );
+            assert!(
+                stdout.contains("Shutdown signal received: SIGTERM"),
+                "the paid runtime must report the delivered signal: {stdout:?}"
+            );
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let store = ConfigStore::at_root(temp.path().to_path_buf());
+        let signer = bip32::secp256k1::ecdsa::SigningKey::from_slice(&[0x22; 32]).unwrap();
+        let wallet = crate::wallet::signer_address(&signer);
+        let contract = Address::with_last_byte(0x81);
+        let token = Address::with_last_byte(0x82);
+        let server = BalanceRpcServer::start(vec![U256::from(2_000_000_000_000_000_000_u128)]);
+        let node_pins = (1..=9)
+            .map(|id| {
+                let address = if id == 1 {
+                    contract
+                } else {
+                    Address::with_last_byte(0x90 + id)
+                };
+                (id, address, B256::with_last_byte(id))
+            })
+            .collect::<Vec<_>>();
+        let mut client = NetworkClient::local_test_client_with_nodes(
+            server.url(),
+            &node_pins,
+            token,
+            B256::with_last_byte(0x84),
+            18,
+        )
+        .unwrap();
+        client.synthetic_snapshot = Some(ReadSnapshot {
+            block: test_block(1, 100),
+            native_balance: Some(U256::from(2_000_000_000_000_000_000_u128)),
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![NodeView {
+                id: 1,
+                address: contract,
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(eligible_state()),
+                error: None,
+            }],
+        });
+        let config = crate::config::AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            minimum_reserve_inj: "0.1".to_owned(),
+            per_session_spending_limit_inj: "1".to_owned(),
+            cpu_threads: 1,
+            ..crate::config::AppConfig::default()
+        };
+        store.save(&config).unwrap();
+
+        let (probe_sender, probe_receiver) = oneshot::channel();
+        let run_store = store.clone();
+        let run_config = config.clone();
+        let run_client = client.clone();
+        let runtime = tokio::spawn(async move {
+            super::run_with_client_test_options(
+                &run_store,
+                run_config,
+                MineArgs {
+                    device: DeviceChoice::Cpu,
+                    compute_only: false,
+                    new_session: true,
+                    threads: None,
+                    nodes: vec![1],
+                    send_rewards_to: None,
+                },
+                run_client,
+                Some(signer),
+                Some(probe_sender),
+                true,
+                super::RuntimeTestOptions {
+                    skip_workers: true,
+                    ..super::RuntimeTestOptions::default()
+                },
+            )
+            .await
+        });
+        let probe = match timeout(Duration::from_secs(5), probe_receiver).await {
+            Ok(Ok(probe)) => probe,
+            Ok(Err(error)) => panic!(
+                "paid runtime probe sender closed ({error}); runtime result: {:?}",
+                runtime.await
+            ),
+            Err(error) => panic!("paid runtime probe was not published: {error}"),
+        };
+        assert!(!probe.workers_started.load(Ordering::Acquire));
+
+        assert!(
+            server.requests() >= 1,
+            "the paid session must have revalidated confirmed balance"
+        );
+
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        let result = timeout(Duration::from_secs(5), runtime)
+            .await
+            .expect("paid runtime should stop after SIGTERM")
+            .expect("paid runtime task should join");
+        result.unwrap();
+
+        let after = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(after.closed);
+        assert!(after.session_id.is_some());
+        assert!(after.unresolved.is_empty());
+        assert_eq!(after.authorized_exposure_wei.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_startup_reconcile_closes_new_legacy_session_and_requires_restart_authorization()
+     {
+        let temp = tempdir().unwrap();
+        let store = ConfigStore::at_root(temp.path().to_path_buf());
+        let wallet = Address::with_last_byte(0x91);
+        let contract = Address::with_last_byte(0x92);
+        let token = Address::with_last_byte(0x93);
+        let node_pins = (1..=9)
+            .map(|id| {
+                let address = if id == 1 {
+                    contract
+                } else {
+                    Address::with_last_byte(0x90 + id)
+                };
+                (id, address, B256::with_last_byte(id))
+            })
+            .collect::<Vec<_>>();
+        let client = NetworkClient::local_test_client_with_nodes(
+            "http://127.0.0.1:1",
+            &node_pins,
+            token,
+            B256::with_last_byte(0x94),
+            18,
+        )
+        .unwrap();
+        let config = crate::config::AppConfig {
+            schema_version: 1,
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            cpu_threads: 1,
+            ..crate::config::AppConfig::default()
+        };
+        store.save(&config).unwrap();
+
+        super::run_with_client_test_options(
+            &store,
+            config.clone(),
+            MineArgs {
+                device: DeviceChoice::Cpu,
+                compute_only: false,
+                new_session: true,
+                threads: None,
+                nodes: vec![1],
+                send_rewards_to: None,
+            },
+            client,
+            None,
+            None,
+            true,
+            super::RuntimeTestOptions {
+                skip_workers: true,
+                pre_trigger_shutdown: true,
+                ..super::RuntimeTestOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(
+            snapshot.closed,
+            "the newly opened session must be closed on the early shutdown path"
+        );
+        assert!(snapshot.session_id.is_some());
+        assert!(snapshot.unresolved.is_empty());
+        assert_eq!(snapshot.authorized_exposure_wei.as_deref(), Some("0"));
+
+        let restarted = crate::transaction::TransactionManager::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(crate::history_telemetry::HistoryTelemetry::default()),
+            false,
+            false,
+        );
+        assert!(
+            restarted.is_err(),
+            "restart must require explicit new-session authorization for the closed session"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_wallet_unlock_closes_new_legacy_session_and_requires_restart_authorization()
+     {
+        let temp = tempdir().unwrap();
+        let store = ConfigStore::at_root(temp.path().to_path_buf());
+        let wallet = Address::with_last_byte(0xa1);
+        let token = Address::with_last_byte(0xa2);
+        let config = crate::config::AppConfig {
+            schema_version: 1,
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..crate::config::AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        let manager =
+            crate::transaction::TransactionManager::open(&store, &config, wallet, token).unwrap();
+        let mut lifecycle = super::RuntimeLifecycle {
+            transactions: Some(manager),
+            worker_guard: None,
+            observer: None,
+            dashboard: None,
+            finalized: false,
+        };
+        let interrupted = || -> anyhow::Result<bip32::secp256k1::ecdsa::SigningKey> {
+            Err(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "interrupted wallet prompt",
+            )))
+        };
+        let outcome = super::unlock_result(interrupted).unwrap();
+        assert!(matches!(outcome, super::UnlockOutcome::Cancelled));
+
+        let diagnostics = crate::diagnostics::DiagnosticBuffer::default();
+        let message = lifecycle
+            .finalize(None, false, false, false, &diagnostics)
+            .await
+            .unwrap();
+        assert!(
+            message.is_some_and(|message| message.contains("Stopped autonomous Testnet mining")),
+            "the finalizer must report a clean paid-session close"
+        );
+        let repeated = lifecycle
+            .finalize(None, false, false, false, &diagnostics)
+            .await
+            .unwrap();
+        assert!(
+            repeated.is_none(),
+            "repeated cleanup must be idempotent and must not create a new message or allowance"
+        );
+
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(
+            snapshot.closed,
+            "an interrupted unlock must close the newly opened session"
+        );
+        assert!(snapshot.session_id.is_some());
+        assert!(snapshot.unresolved.is_empty());
+        assert_eq!(snapshot.authorized_exposure_wei.as_deref(), Some("0"));
+
+        let restarted = crate::transaction::TransactionManager::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(crate::history_telemetry::HistoryTelemetry::default()),
+            false,
+            false,
+        );
+        assert!(
+            restarted.is_err(),
+            "restart must require explicit new-session authorization after an interrupted unlock"
+        );
+    }
+
+    fn legacy_paid_test_manager() -> (
+        tempfile::TempDir,
+        ConfigStore,
+        crate::config::AppConfig,
+        bip32::secp256k1::ecdsa::SigningKey,
+        Address,
+        Address,
+        crate::transaction::TransactionManager,
+    ) {
+        let temp = tempdir().unwrap();
+        let store = ConfigStore::at_root(temp.path().to_path_buf());
+        let signer = bip32::secp256k1::ecdsa::SigningKey::from_slice(&[0x33; 32]).unwrap();
+        let wallet = crate::wallet::signer_address(&signer);
+        let token = Address::with_last_byte(0xb2);
+        let config = crate::config::AppConfig {
+            schema_version: 1,
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..crate::config::AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        let manager =
+            crate::transaction::TransactionManager::open(&store, &config, wallet, token).unwrap();
+        (temp, store, config, signer, wallet, token, manager)
+    }
+
+    fn legacy_runtime_fixture() -> (
+        tempfile::TempDir,
+        ConfigStore,
+        crate::config::AppConfig,
+        NetworkClient,
+        bip32::secp256k1::ecdsa::SigningKey,
+        Address,
+        Address,
+    ) {
+        let temp = tempdir().unwrap();
+        let store = ConfigStore::at_root(temp.path().to_path_buf());
+        let signer = bip32::secp256k1::ecdsa::SigningKey::from_slice(&[0x44; 32]).unwrap();
+        let wallet = crate::wallet::signer_address(&signer);
+        let contract = Address::with_last_byte(0xc2);
+        let token = Address::with_last_byte(0xc3);
+        let node_pins = (1..=9)
+            .map(|id| {
+                let address = if id == 1 {
+                    contract
+                } else {
+                    Address::with_last_byte(0xd0 + id)
+                };
+                (id, address, B256::with_last_byte(id))
+            })
+            .collect::<Vec<_>>();
+        let mut client = NetworkClient::local_test_client_with_nodes(
+            "http://127.0.0.1:1",
+            &node_pins,
+            token,
+            B256::with_last_byte(0xc4),
+            18,
+        )
+        .unwrap();
+        client.synthetic_snapshot = Some(ReadSnapshot {
+            block: test_block(1, 100),
+            native_balance: Some(U256::from(1_000_000_000_000_000_000_u128)),
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![NodeView {
+                id: 1,
+                address: contract,
+                pin: ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(eligible_state()),
+                error: None,
+            }],
+        });
+        let config = crate::config::AppConfig {
+            schema_version: 1,
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            cpu_threads: 1,
+            ..crate::config::AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        (temp, store, config, client, signer, wallet, token)
+    }
+
+    #[tokio::test]
+    async fn finalizer_stops_gpu_worker_and_closes_session_on_cancel() {
+        let (_temp, store, config, _signer, wallet, token, manager) = legacy_paid_test_manager();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let mut lifecycle = super::RuntimeLifecycle {
+            transactions: Some(manager),
+            worker_guard: Some(super::MiningWorkers {
+                stop: Arc::clone(&stop),
+                workers: vec![worker],
+                has_gpu_controller: true,
+            }),
+            observer: None,
+            dashboard: None,
+            finalized: false,
+        };
+        let diagnostics = crate::diagnostics::DiagnosticBuffer::default();
+        let message = lifecycle
+            .finalize(None, false, false, false, &diagnostics)
+            .await
+            .unwrap();
+        assert!(
+            message.is_some_and(|message| message.contains("Stopped autonomous Testnet mining"))
+        );
+        assert!(
+            stop.load(Ordering::Acquire),
+            "the GPU worker stop flag must be set"
+        );
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(snapshot.closed);
+        assert!(snapshot.unresolved.is_empty());
+        assert_eq!(snapshot.authorized_exposure_wei.as_deref(), Some("0"));
+
+        let repeated = lifecycle
+            .finalize(None, false, false, false, &diagnostics)
+            .await
+            .unwrap();
+        assert!(repeated.is_none(), "repeated cleanup must be idempotent");
+        let restarted = crate::transaction::TransactionManager::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(crate::history_telemetry::HistoryTelemetry::default()),
+            false,
+            false,
+        );
+        assert!(restarted.is_err());
+    }
+
+    #[tokio::test]
+    async fn finalizer_stops_gpu_worker_and_preserves_original_error_on_failure() {
+        let (_temp, store, config, _signer, _wallet, _token, manager) = legacy_paid_test_manager();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let mut lifecycle = super::RuntimeLifecycle {
+            transactions: Some(manager),
+            worker_guard: Some(super::MiningWorkers {
+                stop: Arc::clone(&stop),
+                workers: vec![worker],
+                has_gpu_controller: true,
+            }),
+            observer: None,
+            dashboard: None,
+            finalized: false,
+        };
+        let diagnostics = crate::diagnostics::DiagnosticBuffer::default();
+        let finalize_result = lifecycle
+            .finalize(
+                Some("gpu startup failed"),
+                false,
+                false,
+                false,
+                &diagnostics,
+            )
+            .await;
+        let error = super::combine_runtime_results(
+            Err(anyhow::anyhow!("gpu startup failed")),
+            finalize_result,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("gpu startup failed"));
+        assert!(stop.load(Ordering::Acquire));
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(snapshot.closed);
+        assert!(snapshot.unresolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalizer_preserves_unresolved_legacy_liability_and_repeated_cleanup_is_idempotent() {
+        let (_temp, store, config, signer, _wallet, _token, mut manager) =
+            legacy_paid_test_manager();
+        let contract = Address::with_last_byte(0xb3);
+        let (hash, exposure) = manager
+            .inject_unresolved_liability_for_test(&signer, contract)
+            .unwrap();
+        let mut lifecycle = super::RuntimeLifecycle {
+            transactions: Some(manager),
+            worker_guard: None,
+            observer: None,
+            dashboard: None,
+            finalized: false,
+        };
+        let diagnostics = crate::diagnostics::DiagnosticBuffer::default();
+        let message = lifecycle
+            .finalize(None, false, false, false, &diagnostics)
+            .await
+            .unwrap();
+        assert!(
+            message.is_some_and(|message| message.contains("transaction exposure reserved")),
+            "unresolved legacy exposure must keep the session open"
+        );
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(!snapshot.closed);
+        assert_eq!(snapshot.unresolved.len(), 1);
+        assert_eq!(snapshot.unresolved[0].hash, format!("{hash:#x}"));
+        assert_eq!(
+            snapshot.pending_exposure_wei.as_deref(),
+            Some(exposure.to_string().as_str())
+        );
+        assert_eq!(
+            snapshot.authorized_exposure_wei.as_deref(),
+            Some(exposure.to_string().as_str())
+        );
+
+        let bytes_after_first = store.read_transaction_journal().unwrap().unwrap();
+        let repeated = lifecycle
+            .finalize(None, false, false, false, &diagnostics)
+            .await
+            .unwrap();
+        assert!(repeated.is_none());
+        let bytes_after_second = store.read_transaction_journal().unwrap().unwrap();
+        assert_eq!(
+            bytes_after_first, bytes_after_second,
+            "repeated cleanup must not rewrite, reset, refund, or create an allowance"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalizer_close_failure_before_rename_requires_restart_confirmation() {
+        let (_temp, store, config, _signer, _wallet, _token, manager) = legacy_paid_test_manager();
+        let session_id = manager.session_id_for_test().unwrap();
+        store
+            .fail_atomic_write_for_test(
+                store.transaction_journal_path_for_test().unwrap(),
+                crate::config::AtomicWriteFailPoint::BeforeRename,
+            )
+            .unwrap();
+        let mut lifecycle = super::RuntimeLifecycle {
+            transactions: Some(manager),
+            worker_guard: None,
+            observer: None,
+            dashboard: None,
+            finalized: false,
+        };
+        let diagnostics = crate::diagnostics::DiagnosticBuffer::default();
+        let error = lifecycle
+            .finalize(None, false, false, false, &diagnostics)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("close transaction spending session"),
+            "unexpected close-failure error: {error:#}"
+        );
+
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(
+            !snapshot.closed,
+            "a BeforeRename close failure must leave the durable journal open"
+        );
+        assert_eq!(snapshot.session_id.as_deref(), Some(session_id.as_str()));
+        assert!(snapshot.unresolved.is_empty());
+        assert_eq!(snapshot.authorized_exposure_wei.as_deref(), Some("0"));
+        assert!(
+            crate::commands::requires_open_legacy_session_confirmation(
+                false,
+                false,
+                crate::config::parse_inj_wei(&config.per_session_spending_limit_inj).unwrap(),
+                &snapshot,
+                false,
+            ),
+            "the next ordinary mine must require explicit confirmation before resuming the open session"
+        );
+
+        let bytes_after_failure = store.read_transaction_journal().unwrap().unwrap();
+        let repeated = lifecycle
+            .finalize(None, false, false, false, &diagnostics)
+            .await
+            .unwrap();
+        assert!(
+            repeated.is_none(),
+            "repeated cleanup must be idempotent after a failed close"
+        );
+        let bytes_after_repeat = store.read_transaction_journal().unwrap().unwrap();
+        assert_eq!(
+            bytes_after_failure, bytes_after_repeat,
+            "repeated cleanup must not reset, refund, or rewrite the open journal"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_dashboard_start_failure_closes_new_legacy_session() {
+        let (_temp, store, config, client, signer, wallet, token) = legacy_runtime_fixture();
+        let error = super::run_with_client_test_options(
+            &store,
+            config.clone(),
+            MineArgs {
+                device: DeviceChoice::Cpu,
+                compute_only: false,
+                new_session: true,
+                threads: None,
+                nodes: vec![1],
+                send_rewards_to: None,
+            },
+            client,
+            Some(signer),
+            None,
+            true,
+            super::RuntimeTestOptions {
+                skip_workers: true,
+                fail_dashboard_start: true,
+                ..super::RuntimeTestOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("dashboard"),
+            "unexpected dashboard-failure error: {error:#}"
+        );
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(snapshot.closed);
+        assert!(snapshot.session_id.is_some());
+        assert!(snapshot.unresolved.is_empty());
+        assert_eq!(snapshot.authorized_exposure_wei.as_deref(), Some("0"));
+        let restarted = crate::transaction::TransactionManager::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(crate::history_telemetry::HistoryTelemetry::default()),
+            false,
+            false,
+        );
+        assert!(restarted.is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_reconcile_failure_closes_new_legacy_session() {
+        let (_temp, store, config, client, signer, wallet, token) = legacy_runtime_fixture();
+        let error = super::run_with_client_test_options(
+            &store,
+            config.clone(),
+            MineArgs {
+                device: DeviceChoice::Cpu,
+                compute_only: false,
+                new_session: true,
+                threads: None,
+                nodes: vec![1],
+                send_rewards_to: None,
+            },
+            client,
+            Some(signer),
+            None,
+            true,
+            super::RuntimeTestOptions {
+                skip_workers: true,
+                fail_reconcile: true,
+                ..super::RuntimeTestOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("reconcile"));
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(snapshot.closed);
+        assert!(snapshot.session_id.is_some());
+        assert!(snapshot.unresolved.is_empty());
+        assert_eq!(snapshot.authorized_exposure_wei.as_deref(), Some("0"));
+        let restarted = crate::transaction::TransactionManager::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(crate::history_telemetry::HistoryTelemetry::default()),
+            false,
+            false,
+        );
+        assert!(restarted.is_err());
     }
 
     #[tokio::test]
@@ -11483,6 +12520,77 @@ mod tests {
                 .contains(AUTOMATIC_REWARD_FORWARDING_DISABLED)
         );
         assert!(store.read_transaction_journal().unwrap().is_none());
+    }
+
+    #[test]
+    fn reduced_limit_consent_defaults_to_no_on_eof_or_unrecognized_input() {
+        assert!(!super::consent_approved(""));
+        assert!(!super::consent_approved("\n"));
+        assert!(!super::consent_approved("n\n"));
+        assert!(!super::consent_approved("yes please"));
+        assert!(super::consent_approved("y\n"));
+        assert!(super::consent_approved("YES"));
+
+        assert!(!super::reduced_limit_consent_result(Ok(0), "").unwrap());
+        assert!(
+            !super::reduced_limit_consent_result(
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "interrupted by shutdown signal",
+                )),
+                "y\n",
+            )
+            .unwrap(),
+            "an interrupted consent read must not approve spending"
+        );
+        assert!(super::reduced_limit_consent_result(Ok(2), "y\n").unwrap());
+    }
+
+    #[test]
+    fn reduced_limit_consent_rejects_piped_yes_without_a_terminal() {
+        use std::io::Write;
+
+        const CHILD: &str = "ASTATINE_REDUCED_LIMIT_PIPED_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let error = super::prompt_reduced_run_limit(
+                Address::with_last_byte(0xa1),
+                U256::from(1_000_000_000_000_000_000_u128),
+                U256::from(2_000_000_000_000_000_000_u128),
+                U256::from(100_000_000_000_000_000_u128),
+                U256::ZERO,
+                U256::from(1_900_000_000_000_000_000_u128),
+                U256::from(1_000_000_000_000_000_000_u128),
+                None,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("interactive terminal"));
+            eprintln!("reduced-limit-piped-child-ran");
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mining::tests::reduced_limit_consent_rejects_piped_yes_without_a_terminal",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"yes\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "piped reduced-limit consent child failed: {stderr}"
+        );
+        assert!(
+            stderr.contains("reduced-limit-piped-child-ran"),
+            "the child branch must have executed: {stderr}"
+        );
     }
 
     #[test]

@@ -5,9 +5,7 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 use std::{
-    future::Future,
     io::{self, IsTerminal, Write},
-    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -18,8 +16,6 @@ use std::{
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(120);
 const PLAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-
-pub(crate) type CtrlCSignal = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
 
 struct ActiveStep {
     label: String,
@@ -195,7 +191,7 @@ impl StartupProgress {
     }
 
     pub(crate) fn cancel(&self) {
-        self.warn("Startup cancelled by Ctrl+C");
+        self.warn("Startup cancelled by shutdown signal");
         self.stop_ticker();
     }
 
@@ -471,22 +467,6 @@ fn progress_ticker(inner: std::sync::Weak<ProgressInner>) {
     }
 }
 
-pub(crate) async fn race_with_ctrl_c<F, T>(
-    future: F,
-    ctrl_c: &mut CtrlCSignal,
-) -> Result<Option<T>, io::Error>
-where
-    F: Future<Output = T>,
-{
-    tokio::select! {
-        result = future => Ok(Some(result)),
-        signal = ctrl_c.as_mut() => {
-            signal?;
-            Ok(None)
-        }
-    }
-}
-
 #[cfg(test)]
 fn progress_ticker_once(inner: &Arc<ProgressInner>) {
     let mut state = inner
@@ -516,7 +496,7 @@ fn progress_ticker_once(inner: &Arc<ProgressInner>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CtrlCSignal, PLAIN_HEARTBEAT_INTERVAL, StartupProgress, race_with_ctrl_c};
+    use super::{PLAIN_HEARTBEAT_INTERVAL, StartupProgress};
     use crate::mining::optional_history_profile;
     use std::{
         io::{self, Write},
@@ -713,23 +693,5 @@ mod tests {
             captured_output(&output)
                 .contains("Loading latest mining work stopped before completion")
         );
-    }
-
-    #[tokio::test]
-    async fn ctrl_c_cancels_a_pending_startup_operation() {
-        let mut ctrl_c: CtrlCSignal = Box::pin(async { Ok(()) });
-        let result = race_with_ctrl_c(std::future::pending::<()>(), &mut ctrl_c)
-            .await
-            .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn startup_operation_completes_before_ctrl_c() {
-        let mut ctrl_c: CtrlCSignal = Box::pin(std::future::pending());
-        let result = race_with_ctrl_c(async { 1439_u64 }, &mut ctrl_c)
-            .await
-            .unwrap();
-        assert_eq!(result, Some(1439));
     }
 }

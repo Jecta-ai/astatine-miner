@@ -293,6 +293,11 @@ impl ConfigStore {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn transaction_journal_path_for_test(&self) -> Result<PathBuf> {
+        self.transaction_journal_path()
+    }
+
     pub(crate) fn write_transaction_journal(&self, data: &[u8]) -> Result<()> {
         if data.is_empty() || data.len() as u64 > MAX_TRANSACTION_JOURNAL_BYTES {
             bail!("transaction journal is empty or exceeds its 8 MiB size limit");
@@ -1080,6 +1085,126 @@ mod tests {
     use alloy_primitives::U256;
     use std::{ffi::OsStr, path::PathBuf};
 
+    fn child_test_evidence(child: &std::process::Output) -> Result<(), String> {
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        if !child.status.success() {
+            return Err(format!(
+                "child process failed with {}\nstdout: {stdout}\nstderr: {stderr}",
+                child.status
+            ));
+        }
+        if !stdout.contains("running 1 test") {
+            return Err(format!(
+                "child did not execute exactly one test\nstdout: {stdout}\nstderr: {stderr}"
+            ));
+        }
+        if !stdout.contains("1 passed") {
+            return Err(format!(
+                "child did not report one passed test\nstdout: {stdout}\nstderr: {stderr}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn assert_child_executed_one_test(child: &std::process::Output, context: &str) {
+        if let Err(details) = child_test_evidence(child) {
+            panic!("{context}: {details}");
+        }
+    }
+
+    fn require_native_credential_store(value: Option<&OsStr>) -> bool {
+        value.is_some_and(|value| !value.is_empty())
+    }
+
+    #[test]
+    fn native_store_requirement_is_presence_of_a_nonempty_value() {
+        assert!(!require_native_credential_store(None));
+        assert!(!require_native_credential_store(Some(OsStr::new(""))));
+        assert!(require_native_credential_store(Some(OsStr::new("1"))));
+        assert!(require_native_credential_store(Some(OsStr::new("0"))));
+        assert!(require_native_credential_store(Some(OsStr::new("true"))));
+    }
+
+    #[test]
+    fn child_test_evidence_rejects_a_zero_test_exit() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::tests::definitely_not_a_real_test_name"])
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "the test harness must exit zero when it runs zero tests"
+        );
+        let error = child_test_evidence(&child)
+            .expect_err("a zero-test child must not satisfy the evidence guard");
+        assert!(
+            error.contains("did not execute exactly one test"),
+            "unexpected evidence error: {error}"
+        );
+    }
+
+    #[test]
+    fn child_test_evidence_accepts_a_single_test_run() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::tests::decimal_inj_conversion_is_exact"])
+            .output()
+            .unwrap();
+        assert_child_executed_one_test(&child, "single-test evidence");
+    }
+
+    #[test]
+    #[ignore = "child-harness smoke test; does not access a credential store"]
+    fn ignored_child_harness_smoke() {
+        if std::env::var_os("ASTATINE_IGNORED_CHILD_HARNESS_SMOKE").is_some() {
+            eprintln!("ignored-child-harness-smoke-ran");
+        }
+    }
+
+    #[test]
+    fn ignored_child_harness_smoke_runs_with_ignored_flag_without_keyring_access() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::ignored_child_harness_smoke",
+                "--nocapture",
+            ])
+            .env("ASTATINE_IGNORED_CHILD_HARNESS_SMOKE", "1")
+            .output()
+            .unwrap();
+        assert_child_executed_one_test(&child, "ignored child-harness smoke");
+        assert!(
+            String::from_utf8_lossy(&child.stderr).contains("ignored-child-harness-smoke-ran"),
+            "the ignored child harness must execute the test body, not zero tests: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn native_anchor_child_probe_fails_closed_without_parent_environment() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::native_anchor_child_reads_secret",
+            ])
+            .env_remove(NATIVE_ANCHOR_CHILD_ROOT_ENV)
+            .output()
+            .unwrap();
+        assert!(
+            !child.status.success(),
+            "the native anchor child probe must not silently pass without its parent environment"
+        );
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(
+            stdout.contains("requires ASTATINE_NATIVE_ANCHOR_CHILD_ROOT"),
+            "unexpected child probe output: stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+
     #[test]
     fn decimal_inj_conversion_is_exact() {
         assert_eq!(
@@ -1262,39 +1387,51 @@ transaction_confirmations = 2
         );
     }
 
+    const NATIVE_ANCHOR_TEST_SECRET: &[u8] = b"disposable-native-journal-anchor-test";
+    const NATIVE_ANCHOR_CHILD_ROOT_ENV: &str = "ASTATINE_NATIVE_ANCHOR_CHILD_ROOT";
+
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
+    #[ignore = "child probe; invoked by native_journal_anchor_persists_across_processes_and_is_root_scoped"]
+    fn native_anchor_child_reads_secret() {
+        let root = std::env::var_os(NATIVE_ANCHOR_CHILD_ROOT_ENV).expect(
+            "native anchor child probe requires ASTATINE_NATIVE_ANCHOR_CHILD_ROOT from its parent test",
+        );
+        let store = ConfigStore::at_root(PathBuf::from(root));
+        let secret = store
+            .read_journal_anchor_from_os_for_test()
+            .expect("child process could not read the disposable OS credential")
+            .expect("disposable OS credential was absent in the child process");
+        assert_eq!(&secret[..], NATIVE_ANCHOR_TEST_SECRET);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "child probe; invoked by native_journal_anchor_persists_across_processes_and_is_root_scoped"]
+    fn native_anchor_child_rejects_unavailable_store() {
+        let root = std::env::var_os(NATIVE_ANCHOR_CHILD_ROOT_ENV).expect(
+            "native anchor unavailable child probe requires ASTATINE_NATIVE_ANCHOR_CHILD_ROOT from its parent test",
+        );
+        let store = ConfigStore::at_root(PathBuf::from(root));
+        let error = store
+            .read_journal_anchor_from_os_for_test()
+            .expect_err("an unavailable Secret Service must fail closed, not look empty");
+        assert!(
+            !format!("{error:#}").is_empty(),
+            "an unavailable credential store must return a useful error"
+        );
+        assert!(
+            store
+                .write_journal_anchor_to_os_for_test(NATIVE_ANCHOR_TEST_SECRET)
+                .is_err(),
+            "an unavailable Secret Service must reject checkpoint writes"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    #[ignore = "requires a native OS credential store; run explicitly on a provider-equipped host"]
     fn native_journal_anchor_persists_across_processes_and_is_root_scoped() {
-        const CHILD_ROOT_ENV: &str = "ASTATINE_NATIVE_ANCHOR_TEST_ROOT";
-        const EXPECT_UNAVAILABLE_ENV: &str = "ASTATINE_NATIVE_ANCHOR_EXPECT_UNAVAILABLE";
-        const TEST_SECRET: &[u8] = b"disposable-native-journal-anchor-test";
-
-        if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
-            let store = ConfigStore::at_root(PathBuf::from(root));
-            if std::env::var_os(EXPECT_UNAVAILABLE_ENV).is_some() {
-                let error = store
-                    .read_journal_anchor_from_os_for_test()
-                    .expect_err("an unavailable Secret Service must fail closed, not look empty");
-                assert!(
-                    !format!("{error:#}").is_empty(),
-                    "an unavailable credential store must return a useful error"
-                );
-                assert!(
-                    store
-                        .write_journal_anchor_to_os_for_test(TEST_SECRET)
-                        .is_err(),
-                    "an unavailable Secret Service must reject checkpoint writes"
-                );
-                return;
-            }
-            let secret = store
-                .read_journal_anchor_from_os_for_test()
-                .expect("child process could not read the disposable OS credential")
-                .expect("disposable OS credential was absent in the child process");
-            assert_eq!(&secret[..], TEST_SECRET);
-            return;
-        }
-
         struct DeleteCredentialOnDrop(keyring::Entry);
         impl Drop for DeleteCredentialOnDrop {
             fn drop(&mut self) {
@@ -1312,38 +1449,59 @@ transaction_confirmations = 2
             "separate canonical data roots must use separate credential entries"
         );
 
+        // Any non-empty value is an explicit requirement. Unset or empty lets
+        // the test report an unavailable native store without failing, while a
+        // required store must fail on entry construction, read, or write.
+        let require_native = require_native_credential_store(
+            std::env::var_os("ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE").as_deref(),
+        );
+
         #[cfg(target_os = "linux")]
         {
             let unavailable_root = tempfile::tempdir().unwrap();
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--ignored",
                     "--exact",
-                    "config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped",
+                    "config::tests::native_anchor_child_rejects_unavailable_store",
                 ])
-                .env(CHILD_ROOT_ENV, unavailable_root.path())
-                .env(EXPECT_UNAVAILABLE_ENV, "1")
+                .env(NATIVE_ANCHOR_CHILD_ROOT_ENV, unavailable_root.path())
                 .env(
                     "DBUS_SESSION_BUS_ADDRESS",
                     "unix:path=/definitely-unavailable-astatine-test-bus",
                 )
                 .output()
                 .unwrap();
-            assert!(
-                child.status.success(),
-                "headless Secret Service access must fail closed: {}",
-                String::from_utf8_lossy(&child.stderr)
-            );
+            assert_child_executed_one_test(&child, "headless Secret Service fail-closed child");
         }
 
-        let credential = store_a.journal_anchor_entry().unwrap();
+        let credential = match store_a.journal_anchor_entry() {
+            Ok(credential) => credential,
+            Err(error) => {
+                let app_error = store_a.read_journal_anchor_from_os_for_test().expect_err(
+                    "entry construction failed but the platform read did not fail closed",
+                );
+                assert!(
+                    !format!("{app_error:#}").is_empty(),
+                    "OS credential-store access failures must propagate instead of falling back"
+                );
+                if require_native {
+                    panic!("required native credential store is unavailable: {error:#}");
+                }
+                eprintln!(
+                    "native credential store unavailable; production-equivalent reads failed closed: {error:#}"
+                );
+                return;
+            }
+        };
         let _cleanup = DeleteCredentialOnDrop(credential);
-        let require_native = std::env::var_os("ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE")
-            .is_some_and(|value| !value.is_empty());
 
         match _cleanup.0.get_secret() {
             Err(keyring::Error::NoEntry) => {}
             Err(error) => {
-                let app_error = store_a.read_journal_anchor_from_os_for_test().unwrap_err();
+                let app_error = store_a.read_journal_anchor_from_os_for_test().expect_err(
+                    "credential-store access failed but the platform read did not fail closed",
+                );
                 assert!(
                     !format!("{app_error:#}").is_empty(),
                     "OS credential-store access failures must propagate instead of falling back"
@@ -1364,9 +1522,11 @@ transaction_confirmations = 2
         eprintln!(
             "native credential store is available; checking persistent writes and data-root isolation"
         );
-        let secret = super::Zeroizing::new(TEST_SECRET.to_vec());
+        let secret = super::Zeroizing::new(NATIVE_ANCHOR_TEST_SECRET.to_vec());
         if let Err(error) = store_a.write_journal_anchor_to_os_for_test(&secret) {
-            let app_error = store_a.read_journal_anchor_from_os_for_test().unwrap_err();
+            let app_error = store_a.read_journal_anchor_from_os_for_test().expect_err(
+                "credential-store write failed but the platform read did not fail closed",
+            );
             assert!(
                 !format!("{app_error:#}").is_empty(),
                 "failed OS credential writes must propagate instead of falling back"
@@ -1387,7 +1547,7 @@ transaction_confirmations = 2
                 .read_journal_anchor_from_os_for_test()
                 .unwrap()
                 .unwrap()[..],
-            TEST_SECRET
+            NATIVE_ANCHOR_TEST_SECRET
         );
         assert!(
             store_b
@@ -1397,17 +1557,91 @@ transaction_confirmations = 2
         );
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
+                "--ignored",
                 "--exact",
-                "config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped",
+                "config::tests::native_anchor_child_reads_secret",
             ])
-            .env(CHILD_ROOT_ENV, root_a.path())
+            .env(NATIVE_ANCHOR_CHILD_ROOT_ENV, root_a.path())
+            .output()
+            .unwrap();
+        assert_child_executed_one_test(&child, "native credential-store restart child");
+    }
+
+    #[cfg(target_os = "linux")]
+    const LINUX_SECRET_SERVICE_CHILD_ROOT_ENV: &str = "ASTATINE_LINUX_SECRET_SERVICE_CHILD_ROOT";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "child probe; invoked by linux_secret_service_unavailable_fails_closed_without_native_keyring"]
+    fn linux_secret_service_unavailable_child_probe() {
+        let root = std::env::var_os(LINUX_SECRET_SERVICE_CHILD_ROOT_ENV).expect(
+            "Linux Secret Service child probe requires ASTATINE_LINUX_SECRET_SERVICE_CHILD_ROOT from its parent test",
+        );
+        let store = ConfigStore::at_root(PathBuf::from(root));
+        let read_error = store
+            .read_journal_anchor_from_os_for_test()
+            .expect_err("an unavailable Secret Service must fail closed, not look empty");
+        assert!(
+            !format!("{read_error:#}").is_empty(),
+            "an unavailable credential store must return a useful error"
+        );
+        assert!(
+            store
+                .write_journal_anchor_to_os_for_test(b"must-not-persist")
+                .is_err(),
+            "an unavailable Secret Service must reject checkpoint writes"
+        );
+        assert!(
+            store.read_transaction_journal().unwrap().is_none(),
+            "a failed inspection must not create or fall back to a plaintext journal"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_secret_service_child_probe_fails_closed_without_parent_environment() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::linux_secret_service_unavailable_child_probe",
+            ])
+            .env_remove(LINUX_SECRET_SERVICE_CHILD_ROOT_ENV)
             .output()
             .unwrap();
         assert!(
-            child.status.success(),
-            "OS credential did not persist across process restart: {}",
-            String::from_utf8_lossy(&child.stderr)
+            !child.status.success(),
+            "the Linux Secret Service child probe must not silently pass without its parent environment"
         );
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(
+            stdout.contains("requires ASTATINE_LINUX_SECRET_SERVICE_CHILD_ROOT"),
+            "unexpected child probe output: stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_secret_service_unavailable_fails_closed_without_native_keyring() {
+        let root = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::linux_secret_service_unavailable_child_probe",
+                "--nocapture",
+            ])
+            .env(LINUX_SECRET_SERVICE_CHILD_ROOT_ENV, root.path())
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/definitely-unavailable-astatine-test-bus",
+            )
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path())
+            .output()
+            .unwrap();
+        assert_child_executed_one_test(&child, "isolated Linux Secret Service failure child");
     }
 
     #[test]
