@@ -24,20 +24,8 @@ pub async fn dispatch(command: Command) -> Result<()> {
         Command::Init(args) => run_init(args).await,
         Command::Mine(args) => run_mine(args).await,
         Command::Recover => run_recover().await,
-        Command::Wallet(WalletCommand::Create) => {
-            let store = ConfigStore::system_default()?;
-            let mut config = store.load()?;
-            let _wallet_change_guard = ensure_standalone_wallet_change_allowed(&store, &config)?;
-            wallet::create_interactive(&store, &mut config)?;
-            Ok(())
-        }
-        Command::Wallet(WalletCommand::Import(args)) => {
-            let store = ConfigStore::system_default()?;
-            let mut config = store.load()?;
-            let _wallet_change_guard = ensure_standalone_wallet_change_allowed(&store, &config)?;
-            wallet::import_interactive(&store, &mut config, args)?;
-            Ok(())
-        }
+        Command::Wallet(WalletCommand::Create) => run_wallet_create().await,
+        Command::Wallet(WalletCommand::Import(args)) => run_wallet_import(args).await,
         Command::Wallet(WalletCommand::Address) => {
             let store = ConfigStore::system_default()?;
             let config = store.load()?;
@@ -110,12 +98,72 @@ pub async fn dispatch(command: Command) -> Result<()> {
     }
 }
 
+const INIT_PROMPT_CANCELLED_MESSAGE: &str = "Init cancelled while waiting for terminal input. Completed atomic steps remain in place, so a staged encrypted keystore may exist without being selected; nothing was deleted. Review the current configuration before rerunning.";
+
+fn is_terminal_prompt_cancelled(error: &anyhow::Error) -> bool {
+    crate::shutdown::is_prompt_shutdown(error)
+        || wallet::is_hidden_password_prompt_interrupted(error)
+}
+
+async fn run_wallet_create() -> Result<()> {
+    // Non-Unix prompts remain blocking and keep their pre-existing default
+    // cancellation behavior. Installing a Tokio Ctrl+C handler without a
+    // prompt reader that observes it could suppress the default cancellation
+    // without guaranteeing terminal restoration.
+    #[cfg(unix)]
+    let _shutdown = crate::shutdown::ShutdownSignal::new()
+        .context("install shutdown signal handlers for wallet creation")?;
+    if crate::shutdown::prompt_shutdown_requested() {
+        println!("Shutdown signal received before wallet creation; no wallet was stored.");
+        return Ok(());
+    }
+    let store = ConfigStore::system_default()?;
+    let mut config = store.load()?;
+    let _wallet_change_guard = ensure_standalone_wallet_change_allowed(&store, &config)?;
+    match wallet::create_interactive(&store, &mut config) {
+        Err(error) if is_terminal_prompt_cancelled(&error) => {
+            println!("Wallet creation cancelled by a terminal prompt; no new wallet was stored.");
+            Ok(())
+        }
+        result => result.map(|_| ()),
+    }
+}
+
+async fn run_wallet_import(args: crate::cli::ImportArgs) -> Result<()> {
+    #[cfg(unix)]
+    let _shutdown = crate::shutdown::ShutdownSignal::new()
+        .context("install shutdown signal handlers for wallet import")?;
+    if crate::shutdown::prompt_shutdown_requested() {
+        println!("Shutdown signal received before wallet import; no wallet was stored.");
+        return Ok(());
+    }
+    let store = ConfigStore::system_default()?;
+    let mut config = store.load()?;
+    let _wallet_change_guard = ensure_standalone_wallet_change_allowed(&store, &config)?;
+    match wallet::import_interactive(&store, &mut config, args) {
+        Err(error) if is_terminal_prompt_cancelled(&error) => {
+            println!("Wallet import cancelled by a terminal prompt; no new wallet was stored.");
+            Ok(())
+        }
+        result => result.map(|_| ()),
+    }
+}
+
 async fn run_init(args: InitArgs) -> Result<()> {
     let store = ConfigStore::system_default()?;
-    run_init_with_store(&store, args).await
+    match run_init_with_store(&store, args).await {
+        Err(error) if is_terminal_prompt_cancelled(&error) => {
+            println!("{INIT_PROMPT_CANCELLED_MESSAGE}");
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 async fn run_init_with_store(store: &ConfigStore, args: InitArgs) -> Result<()> {
+    #[cfg(unix)]
+    let _shutdown = crate::shutdown::ShutdownSignal::new()
+        .context("install shutdown signal handlers for init")?;
     let mut config = store.load()?;
     let initial_snapshot = TransactionJournal::inspect_session(store, &config)?;
     if let Some(pending) = initial_snapshot.pending_transition.as_ref() {
@@ -2182,7 +2230,10 @@ mod tests {
         );
 
         let error = ensure_standalone_wallet_change_allowed(&store, &previous).unwrap_err();
-        assert!(format!("{error:#}").contains("transition is pending"));
+        assert!(
+            format!("{error:#}").contains("transition is pending"),
+            "unexpected pending-transition error: {error:#}"
+        );
     }
 
     #[test]
@@ -2193,12 +2244,21 @@ mod tests {
         store.save(&config).unwrap();
         let guard = ensure_standalone_wallet_change_allowed(&store, &config).unwrap();
 
+        // The held-lock branch exercises the bounded retry and must still fail
+        // closed; the post-drop branch exercises reacquisition after release.
+        let error = match TransactionJournal::open(&store, &config, Address::with_last_byte(0xa3)) {
+            Ok(_) => panic!("a paid session must not begin while the wallet guard is held"),
+            Err(error) => error,
+        };
         assert!(
-            TransactionJournal::open(&store, &config, Address::with_last_byte(0xa3)).is_err(),
-            "a paid session must not begin between the wallet-change check and config persistence"
+            format!("{error:#}").contains("another astatine mining process"),
+            "a held journal lock must still fail closed after the bounded retry: {error:#}"
         );
         drop(guard);
-        assert!(TransactionJournal::open(&store, &config, Address::with_last_byte(0xa3)).is_ok());
+        if let Err(error) = TransactionJournal::open(&store, &config, Address::with_last_byte(0xa3))
+        {
+            panic!("transaction journal lock was not released after guard drop: {error:#}");
+        }
     }
 
     #[tokio::test]
@@ -2337,112 +2397,25 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    fn spawn_pty_test_child(
-        test_name: &str,
-        child_env: &str,
-        mode: &str,
-    ) -> (std::process::Child, std::fs::File) {
-        use std::os::unix::io::FromRawFd;
-
-        let mut master_fd = -1;
-        let mut slave_fd = -1;
-        // SAFETY: `openpty` writes two valid descriptors on success. No name,
-        // termios, or window-size overrides are supplied.
-        let result = unsafe {
-            libc::openpty(
-                &mut master_fd,
-                &mut slave_fd,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(result, 0, "openpty failed");
-        // SAFETY: the descriptors are uniquely owned by this function.
-        let master = unsafe { std::fs::File::from_raw_fd(master_fd) };
-        // SAFETY: the descriptors are uniquely owned by this function.
-        let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
-        let stdin = slave.try_clone().unwrap();
-        let stdout = slave.try_clone().unwrap();
-        let stderr = slave.try_clone().unwrap();
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test_name, "--nocapture"])
-            .env(child_env, "1")
-            .env("ASTATINE_PTY_MODE", mode)
-            .stdin(std::process::Stdio::from(stdin))
-            .stdout(std::process::Stdio::from(stdout))
-            .stderr(std::process::Stdio::from(stderr))
-            .spawn()
-            .unwrap();
-        drop(slave);
-        (child, master)
-    }
-
-    #[cfg(unix)]
-    fn read_pty_until(master: &mut std::fs::File, needle: &str, timeout: Duration) -> String {
-        use std::os::unix::io::AsRawFd;
-
-        let descriptor = master.as_raw_fd();
-        let deadline = std::time::Instant::now() + timeout;
-        let mut output = String::new();
-        while std::time::Instant::now() < deadline {
-            let mut poll = libc::pollfd {
-                fd: descriptor,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: one valid `pollfd` is supplied.
-            let ready = unsafe { libc::poll(&mut poll, 1, 100) };
-            if ready <= 0 {
-                continue;
-            }
-            let mut buffer = [0_u8; 4096];
-            // SAFETY: the buffer is valid for its full length.
-            let count = unsafe {
-                libc::read(
-                    descriptor,
-                    buffer.as_mut_ptr().cast::<libc::c_void>(),
-                    buffer.len(),
-                )
-            };
-            if count <= 0 {
-                break;
-            }
-            output.push_str(&String::from_utf8_lossy(&buffer[..count as usize]));
-            if output.contains(needle) {
-                break;
-            }
-        }
-        output
-    }
-
-    #[cfg(unix)]
-    fn wait_for_pty_child(
-        child: &mut std::process::Child,
-        timeout: Duration,
-    ) -> Option<std::process::ExitStatus> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                return Some(status);
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+    #[test]
+    fn init_prompt_cancelled_message_mentions_possible_staged_keystore() {
+        assert!(
+            super::INIT_PROMPT_CANCELLED_MESSAGE
+                .contains("staged encrypted keystore may exist without being selected")
+        );
+        assert!(!super::INIT_PROMPT_CANCELLED_MESSAGE.contains("did not store"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn signal_interrupts_blocking_terminal_prompt_on_a_disposable_pty() {
+    async fn signals_interrupt_blocking_terminal_prompts_on_a_disposable_controlling_pty() {
         const CHILD: &str = "ASTATINE_PTY_PROMPT_CHILD";
+        const MODE: &str = "ASTATINE_PTY_MODE";
         if std::env::var_os(CHILD).is_some() {
+            crate::test_support::attach_controlling_terminal();
+            let original_termios = crate::test_support::PtyChild::stdin_termios();
             let _shutdown = crate::shutdown::ShutdownSignal::new().unwrap();
-            let mode = std::env::var("ASTATINE_PTY_MODE").unwrap();
+            let mode = std::env::var(MODE).unwrap();
             match mode.as_str() {
                 "legacy" => {
                     let session = SessionJournalSnapshot {
@@ -2463,50 +2436,325 @@ mod tests {
                     let error = super::prompt_value("PTY prompt", "default").unwrap_err();
                     assert!(crate::shutdown::is_prompt_shutdown(&error));
                 }
+                "paid" => {
+                    let error = super::prompt_paid_consent("PTY paid consent?", false).unwrap_err();
+                    assert!(crate::shutdown::is_prompt_shutdown(&error));
+                }
                 other => panic!("unsupported PTY prompt mode {other}"),
             }
+            crate::test_support::PtyChild::assert_stdin_terminal_restored(&original_termios);
             eprintln!("pty-prompt-child-ran");
-            return;
+            std::process::exit(0);
         }
 
-        for mode in ["legacy", "value"] {
-            let (mut child, mut master) = spawn_pty_test_child(
-                "commands::tests::signal_interrupts_blocking_terminal_prompt_on_a_disposable_pty",
-                CHILD,
-                mode,
-            );
-            let needle = if mode == "legacy" {
-                "Resume the existing open spending session?"
-            } else {
-                "PTY prompt"
-            };
-            let output = read_pty_until(&mut master, needle, Duration::from_secs(5));
-            assert!(
-                output.contains("Session cap") || output.contains("PTY prompt"),
-                "child {mode} did not reach its prompt: {output:?}"
-            );
-            if mode == "legacy" {
+        #[allow(unused_mut)]
+        let mut signals = vec![("sigint", libc::SIGINT), ("sigterm", libc::SIGTERM)];
+        #[cfg(target_os = "linux")]
+        signals.push(("sighup", libc::SIGHUP));
+
+        for mode in ["legacy", "value", "paid"] {
+            for (signal_name, signal) in &signals {
+                let mut pty = crate::test_support::spawn_pty_test_child(
+                    "commands::tests::signals_interrupt_blocking_terminal_prompts_on_a_disposable_controlling_pty",
+                    &[(CHILD, "1"), (MODE, mode)],
+                );
+                let needle = match mode {
+                    "legacy" => "Resume the existing open spending session?",
+                    "value" => "PTY prompt",
+                    "paid" => "PTY paid consent?",
+                    _ => unreachable!("mode list is fixed"),
+                };
+                let output = pty.read_until(needle, Duration::from_secs(5));
                 assert!(
-                    output.contains("Remaining authorization")
-                        && output.contains("Unresolved transactions"),
-                    "legacy consent must display cap, authorized, remaining, and unresolved data: {output:?}"
+                    output.contains(needle),
+                    "child {mode}/{signal_name} did not reach its prompt: {output:?}"
+                );
+                if mode == "legacy" {
+                    assert!(
+                        output.contains("Remaining authorization")
+                            && output.contains("Unresolved transactions"),
+                        "legacy consent must display cap, authorized, remaining, and unresolved data: {output:?}"
+                    );
+                }
+                pty.signal(*signal);
+                let status = pty.wait_for_exit(Duration::from_secs(5));
+                let trailing = pty.drain_available(Duration::from_millis(100));
+                let status = status.unwrap_or_else(|| {
+                    panic!(
+                        "PTY child {mode}/{signal_name} did not exit after the signal: {output:?} {trailing:?}"
+                    )
+                });
+                assert!(
+                    status.success(),
+                    "PTY child {mode}/{signal_name} failed: {output:?} {trailing:?}"
+                );
+                assert!(
+                    trailing.contains("pty-prompt-child-ran"),
+                    "PTY child {mode}/{signal_name} did not run its test body: {trailing:?}"
                 );
             }
-            // SAFETY: `child.id()` is the live child PID.
-            let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-            assert_eq!(result, 0, "failed to signal PTY child");
-            let status = wait_for_pty_child(&mut child, Duration::from_secs(5));
-            let mut trailing = String::new();
-            if let Ok(mut file) = master.try_clone() {
-                let _ = file.read_to_string(&mut trailing);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standalone_wallet_import_command_restores_terminal_on_a_controlling_pty() {
+        const CHILD: &str = "ASTATINE_WALLET_COMMAND_PTY_CHILD";
+        const MODE: &str = "ASTATINE_WALLET_COMMAND_PTY_MODE";
+        const NEW_PASSWORD: &str = "new-strong-local-password";
+        const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        if std::env::var_os(CHILD).is_some() {
+            crate::test_support::attach_controlling_terminal();
+            let original_termios = crate::test_support::PtyChild::stdin_termios();
+            let mode = std::env::var(MODE).unwrap();
+            let store = ConfigStore::system_default().unwrap();
+            match mode.as_str() {
+                "import_signal" => {
+                    super::run_wallet_import(crate::cli::ImportArgs {
+                        keystore: None,
+                        derivation_path: "m/44'/60'/0'/0/0".to_owned(),
+                    })
+                    .await
+                    .unwrap();
+                    assert!(store.load().unwrap().wallet_address.is_none());
+                    assert!(!store.wallet_dir().exists());
+                }
+                "import_success" => {
+                    super::run_wallet_import(crate::cli::ImportArgs {
+                        keystore: None,
+                        derivation_path: "m/44'/60'/0'/0/0".to_owned(),
+                    })
+                    .await
+                    .unwrap();
+                    let address = crate::wallet::selected_address(&store.load().unwrap()).unwrap();
+                    assert!(store.keystore_path(address).exists());
+                }
+                other => panic!("unsupported wallet-command PTY mode {other}"),
             }
+            crate::test_support::PtyChild::assert_stdin_terminal_restored(&original_termios);
+            eprintln!("wallet-command-pty-child-ran");
+            // The test body has completed its assertions. Exit without running
+            // the harness teardown after a controlling-terminal signal probe.
+            std::process::exit(0);
+        }
+
+        #[allow(unused_mut)]
+        let mut signal_modes = vec![
+            ("import_signal", "sigint", libc::SIGINT),
+            ("import_signal", "sigterm", libc::SIGTERM),
+        ];
+        #[cfg(target_os = "linux")]
+        signal_modes.push(("import_signal", "sighup", libc::SIGHUP));
+        for (mode, signal_name, signal) in signal_modes {
+            let root = tempfile::tempdir().unwrap();
+            let mut pty = crate::test_support::spawn_pty_test_child(
+                "commands::tests::standalone_wallet_import_command_restores_terminal_on_a_controlling_pty",
+                &[
+                    (CHILD, "1"),
+                    (MODE, mode),
+                    ("HOME", root.path().to_str().unwrap()),
+                    ("XDG_CONFIG_HOME", root.path().to_str().unwrap()),
+                ],
+            );
+            let needle = "Recovery phrase (input hidden)";
+            let output = pty.read_until(needle, Duration::from_secs(5));
+            assert!(
+                output.contains(needle),
+                "wallet command {mode}/{signal_name} did not reach its prompt: {output:?}"
+            );
+            pty.signal(signal);
+            let status = pty.wait_for_exit(Duration::from_secs(5));
+            let trailing = pty.drain_available(Duration::from_millis(100));
             let status = status.unwrap_or_else(|| {
-                panic!("PTY child {mode} did not exit after SIGTERM: {output:?} {trailing:?}")
+                panic!(
+                    "wallet command {mode}/{signal_name} did not exit after the signal: {output:?} {trailing:?}"
+                )
             });
             assert!(
                 status.success(),
-                "PTY child {mode} failed: {output:?} {trailing:?}"
+                "wallet command {mode}/{signal_name} failed: {output:?} {trailing:?}"
             );
+            assert!(
+                trailing.contains("wallet-command-pty-child-ran"),
+                "wallet command {mode}/{signal_name} did not run its test body: {trailing:?}"
+            );
+            assert!(
+                !trailing.contains(NEW_PASSWORD) && !trailing.contains(TEST_PHRASE),
+                "hidden wallet command input must not be echoed: {trailing:?}"
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let mut pty = crate::test_support::spawn_pty_test_child(
+            "commands::tests::standalone_wallet_import_command_restores_terminal_on_a_controlling_pty",
+            &[
+                (CHILD, "1"),
+                (MODE, "import_success"),
+                ("HOME", root.path().to_str().unwrap()),
+                ("XDG_CONFIG_HOME", root.path().to_str().unwrap()),
+            ],
+        );
+        let output = pty.read_until("Recovery phrase (input hidden)", Duration::from_secs(5));
+        assert!(
+            output.contains("Recovery phrase (input hidden)"),
+            "wallet command import_success did not reach the phrase prompt: {output:?}"
+        );
+        pty.write_all(format!("{TEST_PHRASE}\n").as_bytes());
+        let output = pty.read_until("Optional BIP-39 passphrase", Duration::from_secs(5));
+        assert!(
+            output.contains("Optional BIP-39 passphrase"),
+            "wallet command import_success did not reach the passphrase prompt: {output:?}"
+        );
+        pty.write_all(b"\n");
+        let output = pty.read_until("Create keystore password", Duration::from_secs(5));
+        assert!(
+            output.contains("Create keystore password"),
+            "wallet command import_success did not reach the new password prompt: {output:?}"
+        );
+        pty.write_all(format!("{NEW_PASSWORD}\n").as_bytes());
+        let output = pty.read_until("Confirm keystore password", Duration::from_secs(5));
+        assert!(
+            output.contains("Confirm keystore password"),
+            "wallet command import_success did not reach confirmation: {output:?}"
+        );
+        pty.write_all(format!("{NEW_PASSWORD}\n").as_bytes());
+        let status = pty.wait_for_exit(Duration::from_secs(60));
+        let trailing = pty.drain_available(Duration::from_millis(100));
+        let status = status.unwrap_or_else(|| {
+            panic!("wallet command import_success did not finish: {output:?} {trailing:?}")
+        });
+        assert!(
+            status.success(),
+            "wallet command import_success failed: {output:?} {trailing:?}"
+        );
+        assert!(
+            trailing.contains("wallet-command-pty-child-ran"),
+            "wallet command import_success did not run its test body: {trailing:?}"
+        );
+        assert!(
+            !trailing.contains(NEW_PASSWORD) && !trailing.contains(TEST_PHRASE),
+            "hidden wallet command input must not be echoed: {trailing:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn init_terminal_prompts_restore_terminal_after_signals_on_a_controlling_pty() {
+        const CHILD: &str = "ASTATINE_INIT_PTY_CHILD";
+        const MODE: &str = "ASTATINE_INIT_PTY_MODE";
+
+        if std::env::var_os(CHILD).is_some() {
+            crate::test_support::attach_controlling_terminal();
+            let original_termios = crate::test_support::PtyChild::stdin_termios();
+            let mode = std::env::var(MODE).unwrap();
+            let store = ConfigStore::system_default().unwrap();
+            let staged_wallet = if mode == "staged_signal" {
+                let wallet = Address::with_last_byte(0xa7);
+                let config = AppConfig {
+                    wallet_address: Some(format!("{wallet:#x}")),
+                    ..AppConfig::default()
+                };
+                store.save(&config).unwrap();
+                store.prepare_wallet_dir().unwrap();
+                std::fs::write(store.keystore_path(wallet), dummy_v3_keystore(wallet)).unwrap();
+                Some(wallet)
+            } else {
+                None
+            };
+            let result = super::run_init(crate::cli::InitArgs {
+                network: Some(Network::Testnet),
+                threads: std::num::NonZeroUsize::new(1),
+                minimum_reserve_inj: Some("0.1".to_owned()),
+                spending_limit_inj: Some("1".to_owned()),
+                transaction_confirmations: Some(2),
+                rpc: Some("default".to_owned()),
+                per_run_sessions: true,
+            })
+            .await;
+            result.unwrap();
+            if let Some(wallet) = staged_wallet {
+                assert_eq!(
+                    store.load().unwrap().wallet_address.as_deref(),
+                    Some(format!("{wallet:#x}").as_str())
+                );
+                assert!(store.keystore_path(wallet).exists());
+            } else {
+                assert!(store.load().unwrap().wallet_address.is_none());
+                assert!(!store.wallet_dir().exists());
+            }
+            crate::test_support::PtyChild::assert_stdin_terminal_restored(&original_termios);
+            eprintln!("init-pty-child-ran-{mode}");
+            // The test body has completed its assertions. Exit without running
+            // the harness teardown after a controlling-terminal signal probe.
+            std::process::exit(0);
+        }
+
+        #[allow(unused_mut)]
+        let mut cases = vec![
+            ("choice_signal", "sigterm", libc::SIGTERM),
+            ("import_signal", "sigint", libc::SIGINT),
+            ("staged_signal", "sigterm", libc::SIGTERM),
+        ];
+        #[cfg(target_os = "linux")]
+        cases.push(("import_signal", "sighup", libc::SIGHUP));
+        for (mode, signal_name, signal) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let mut pty = crate::test_support::spawn_pty_test_child(
+                "commands::tests::init_terminal_prompts_restore_terminal_after_signals_on_a_controlling_pty",
+                &[
+                    (CHILD, "1"),
+                    (MODE, mode),
+                    ("HOME", root.path().to_str().unwrap()),
+                    ("XDG_CONFIG_HOME", root.path().to_str().unwrap()),
+                ],
+            );
+            let output = if mode == "staged_signal" {
+                let output = pty.read_until("Keep the selected wallet?", Duration::from_secs(5));
+                assert!(
+                    output.contains("Keep the selected wallet?"),
+                    "init {mode}/{signal_name} did not reach the staged wallet prompt: {output:?}"
+                );
+                output
+            } else {
+                let output = pty.read_until("Choose 1, 2, or 3", Duration::from_secs(5));
+                assert!(
+                    output.contains("Choose 1, 2, or 3"),
+                    "init {mode}/{signal_name} did not reach wallet setup: {output:?}"
+                );
+                if mode == "import_signal" {
+                    pty.write_all(b"2\n");
+                    let output =
+                        pty.read_until("Recovery phrase (input hidden)", Duration::from_secs(5));
+                    assert!(
+                        output.contains("Recovery phrase (input hidden)"),
+                        "init {mode}/{signal_name} did not reach the hidden phrase prompt: {output:?}"
+                    );
+                }
+                output
+            };
+            pty.signal(signal);
+            let status = pty.wait_for_exit(Duration::from_secs(5));
+            let trailing = pty.drain_available(Duration::from_millis(100));
+            let status = status.unwrap_or_else(|| {
+                panic!(
+                    "init {mode}/{signal_name} did not exit after the signal: {output:?} {trailing:?}"
+                )
+            });
+            assert!(
+                status.success(),
+                "init {mode}/{signal_name} failed: {output:?} {trailing:?}"
+            );
+            assert!(
+                trailing.contains(&format!("init-pty-child-ran-{mode}")),
+                "init {mode}/{signal_name} did not run its test body: {trailing:?}"
+            );
+            if mode == "staged_signal" {
+                assert!(
+                    trailing.contains("staged encrypted keystore may exist without being selected"),
+                    "init staged cancellation message must not claim no wallet exists: {trailing:?}"
+                );
+            }
         }
     }
 }

@@ -13,6 +13,8 @@ mod protocol;
 mod rpc;
 mod shutdown;
 mod startup;
+#[cfg(all(test, unix))]
+mod test_support;
 mod transaction;
 mod wallet;
 

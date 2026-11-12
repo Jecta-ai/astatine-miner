@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 use tempfile::{NamedTempFile, PersistError};
 use zeroize::Zeroizing;
@@ -28,6 +29,8 @@ const DEFAULT_TRANSACTION_CONFIRMATIONS: u8 = 2;
 const MAX_TRANSACTION_CONFIRMATIONS: u8 = 12;
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 const PER_RUN_CONFIG_SCHEMA_VERSION: u32 = 2;
+const JOURNAL_LOCK_RETRY_ATTEMPTS: u32 = 20;
+const JOURNAL_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 static TEST_JOURNAL_ANCHORS: std::sync::OnceLock<
@@ -610,12 +613,35 @@ impl ConfigStore {
                 bail!("transaction journal lock is a reparse point");
             }
         }
-        file.try_lock().with_context(|| {
-            format!(
-                "another astatine mining process already holds the transaction journal at {}",
-                path.display()
-            )
-        })?;
+        // A just-released journal lock can transiently report WouldBlock in
+        // parallel stress even when lsof shows no remaining holder fd. The
+        // exact cause is not established; a short-lived inherited fd or a
+        // lock-release visibility race remains possible. Retry briefly so a
+        // just-released lock is not misreported as contention. A genuinely
+        // held lock still fails closed after the bound.
+        let mut attempts = 0_u32;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock)
+                    if attempts < JOURNAL_LOCK_RETRY_ATTEMPTS =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(JOURNAL_LOCK_RETRY_INTERVAL);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(anyhow!(
+                        "another astatine mining process already holds the transaction journal at {}: lock acquisition failed because the operation would block",
+                        path.display()
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(anyhow::Error::new(error)).with_context(|| {
+                        format!("acquire the transaction journal lock at {}", path.display())
+                    });
+                }
+            }
+        }
         Ok(file)
     }
 
@@ -1708,5 +1734,93 @@ transaction_confirmations = 2
         let store = ConfigStore::at_root(linked_root);
         assert!(store.prepare_wallet_dir().is_err());
         assert!(!target.join("wallets").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_lock_retries_until_a_short_holder_releases() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(temporary.path().to_path_buf());
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_store = store.clone();
+        let holder = std::thread::spawn(move || {
+            let lock = holder_store.lock_transaction_journal().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(lock);
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            release_tx.send(()).unwrap();
+        });
+        let acquired = store.lock_transaction_journal();
+        releaser.join().unwrap();
+        holder.join().unwrap();
+        let acquired = acquired.expect("lock should be acquired after a short holder releases");
+        drop(acquired);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_lock_fails_closed_when_held_beyond_the_retry_bound() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(temporary.path().to_path_buf());
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder_store = store.clone();
+        let holder = std::thread::spawn(move || {
+            let lock = holder_store.lock_transaction_journal().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            drop(lock);
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let error = store.lock_transaction_journal().unwrap_err();
+        let elapsed = started.elapsed();
+        let minimum_retry_window = super::JOURNAL_LOCK_RETRY_INTERVAL
+            * (super::JOURNAL_LOCK_RETRY_ATTEMPTS.saturating_sub(2));
+        assert!(
+            elapsed >= minimum_retry_window,
+            "lock acquisition returned before the retry bound elapsed: {elapsed:?}"
+        );
+        let error_text = format!("{error:#}");
+        assert!(
+            error_text.contains("another astatine mining process")
+                && error_text.contains("operation would block"),
+            "a held journal lock must fail closed through the bounded retry: {error_text}"
+        );
+        holder.join().unwrap();
+        let acquired = store
+            .lock_transaction_journal()
+            .expect("lock should be acquirable after the holder releases");
+        drop(acquired);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_lock_fd_is_close_on_exec() {
+        use std::os::fd::AsRawFd;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(temporary.path().to_path_buf());
+        let lock = store.lock_transaction_journal().unwrap();
+        // SAFETY: `lock` owns a valid open descriptor.
+        let flags = unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_GETFD) };
+        assert!(
+            flags >= 0,
+            "F_GETFD failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "journal lock must not survive exec"
+        );
     }
 }

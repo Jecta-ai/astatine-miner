@@ -179,19 +179,34 @@ pub(crate) struct ShutdownRequest {
 
 impl Default for ShutdownRequest {
     fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+impl ShutdownRequest {
+    /// `register_for_prompts` must only be true for requests backed by an
+    /// installed OS signal handler. Bare signing-barrier requests used by tests
+    /// and internal callers must not be able to cancel an unrelated terminal
+    /// prompt in the same process.
+    fn new(register_for_prompts: bool) -> Self {
         let delivered = Arc::new(AtomicUsize::new(0));
-        ACTIVE_PROMPT_REQUESTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(Arc::downgrade(&delivered));
+        if register_for_prompts {
+            ACTIVE_PROMPT_REQUESTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(Arc::downgrade(&delivered));
+        }
         Self {
             delivered,
             signing: Arc::new(AtomicBool::new(false)),
         }
     }
-}
 
-impl ShutdownRequest {
+    #[cfg(test)]
+    pub(crate) fn registered_for_test() -> Self {
+        Self::new(true)
+    }
+
     pub(crate) fn is_requested(&self) -> bool {
         self.delivered.load(Ordering::SeqCst) != 0
     }
@@ -269,17 +284,43 @@ pub(crate) struct ShutdownSignal {
     sender: tokio::sync::watch::Sender<Option<ShutdownEvent>>,
 }
 
+#[cfg(test)]
+pub(crate) const PROMPT_SIGNAL_TEST_ENV: &str = "ASTATINE_TEST_PROMPT_SIGNAL";
+
 impl ShutdownSignal {
     pub(crate) fn new() -> io::Result<Self> {
+        // Production commands must register their request for prompt
+        // cancellation. Tests that run in the same process must not let one
+        // test's delivered flag cancel an unrelated test's prompt, so only
+        // disposable PTY child processes opt in explicitly.
+        #[cfg(test)]
+        let register_for_prompts = std::env::var_os(PROMPT_SIGNAL_TEST_ENV).is_some();
+        #[cfg(not(test))]
+        let register_for_prompts = true;
+        Self::new_impl(register_for_prompts)
+    }
+
+    fn new_impl(register_for_prompts: bool) -> io::Result<Self> {
         let (sender, receiver) = tokio::sync::watch::channel(None);
-        let request = ShutdownRequest::default();
-        // Create the async wake-up streams first, then add the synchronous
-        // signal-handler flags. A signal in this short registration window is
-        // queued by the async stream and the monitor records it; a signal after
-        // flag registration is visible synchronously to the signing barrier.
-        let streams = os_signal_streams()?;
+        let request = ShutdownRequest::new(register_for_prompts);
+        // Register the synchronous delivery flags first. Once this returns,
+        // every delivered signal is visible to the signing barrier and to
+        // blocking terminal prompts without waiting for the async monitor to
+        // be scheduled. The async streams only carry the reason event and wake
+        // the monitor; a signal between flag registration and stream creation
+        // is still observed through the synchronous flag.
         #[cfg(unix)]
-        let signal_ids = register_os_signal_flags(&request)?;
+        let mut signal_ids = register_os_signal_flags(&request)?;
+        let streams = match os_signal_streams() {
+            Ok(streams) => streams,
+            Err(error) => {
+                #[cfg(unix)]
+                for id in signal_ids.drain(..) {
+                    signal_hook::low_level::unregister(id);
+                }
+                return Err(error);
+            }
+        };
         let task = tokio::spawn(monitor_os_signals(request.clone(), sender.clone(), streams));
         Ok(Self {
             request,
@@ -298,7 +339,7 @@ impl ShutdownSignal {
         let (sender, receiver) = tokio::sync::watch::channel(None);
         let task = tokio::spawn(std::future::pending::<()>());
         Self {
-            request: ShutdownRequest::default(),
+            request: ShutdownRequest::new(false),
             receiver,
             task,
             #[cfg(unix)]
@@ -666,6 +707,17 @@ mod tests {
             .expect("OS signal should not report a monitor failure");
         assert_eq!(reason, expected);
         assert!(shutdown.is_requested());
+    }
+
+    #[test]
+    fn unregistered_signing_requests_do_not_cancel_terminal_prompts() {
+        let request = ShutdownRequest::default();
+        request.request_for_test();
+        assert!(request.is_requested());
+        assert!(
+            !super::prompt_shutdown_requested(),
+            "only requests backed by an installed OS handler may cancel a prompt"
+        );
     }
 
     #[test]
