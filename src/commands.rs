@@ -1711,11 +1711,12 @@ mod tests {
         transaction::{SessionJournalSnapshot, TransactionJournal, UnresolvedTransactionSummary},
     };
     use alloy_primitives::{Address, U256};
+    #[cfg(unix)]
+    use std::time::Duration;
     use std::{
         io::{Read, Write},
         net::TcpListener,
         thread::{self, JoinHandle},
-        time::Duration,
     };
 
     fn mock_chain_id_rpc(chain_id: &'static str) -> (String, JoinHandle<()>) {
