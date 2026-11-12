@@ -29,8 +29,10 @@ use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     io::{self, Write},
     num::NonZeroUsize,
+    pin::Pin,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -55,6 +57,11 @@ const PROOF_WAKE_CAPACITY: usize = 1;
 const WORK_EXPIRY_SAFETY_SECS: u64 = 2;
 const STALE_PREFLIGHT_RETRY: Duration = Duration::from_secs(1);
 const OBSERVER_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+// Once a submission has crossed the durable Prepared boundary, shutdown,
+// operator stop, or a terminal dashboard failure must not drop the future
+// before its single first-broadcast attempt can finish. This grace exceeds the
+// eight-second JSON-RPC client timeout plus margin.
+const PREPARED_BROADCAST_STOP_GRACE: Duration = Duration::from_secs(12);
 const MAX_PROOF_PREFLIGHT_RETRIES: u8 = 2;
 const MAX_PROOF_REFRESH_REQUESTS: u8 = 3;
 
@@ -1550,7 +1557,10 @@ pub(crate) async fn run_with_session_confirmation(
         for entry in &session.unresolved {
             eprintln!(
                 "  {} • node {:02} window {} • {}",
-                entry.hash, entry.node_id, entry.window_id, entry.status
+                crate::diagnostics::terminal_text(&entry.hash),
+                entry.node_id,
+                entry.window_id,
+                crate::diagnostics::terminal_text(&entry.status)
             );
         }
         bail!(
@@ -1908,6 +1918,40 @@ async fn run_with_client_test_options(
         test_options,
     )
     .await
+}
+
+/// A shutdown, operator stop, or terminal dashboard failure must not drop a
+/// submission that has already crossed the durable `Prepared` boundary before
+/// its single first-broadcast attempt concludes. Wait at most `grace` for that
+/// submission, returning early once the shared flag clears because the first
+/// broadcast outcome is durable; receipt confirmation may continue for much
+/// longer and does not need to delay shutdown. An unresolved liability is never
+/// cleared or relabelled here.
+async fn await_prepared_submission_with_grace<F>(
+    prepared_broadcast_pending: &AtomicBool,
+    mut submission: Pin<&mut F>,
+    grace: Duration,
+) -> Option<F::Output>
+where
+    F: Future,
+{
+    if !prepared_broadcast_pending.load(Ordering::Acquire) {
+        return None;
+    }
+    let deadline = time::Instant::now() + grace;
+    loop {
+        tokio::select! {
+            output = submission.as_mut() => return Some(output),
+            _ = time::sleep(Duration::from_millis(25)) => {
+                if !prepared_broadcast_pending.load(Ordering::Acquire) {
+                    return None;
+                }
+                if time::Instant::now() >= deadline {
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 fn combine_runtime_results(
@@ -2312,7 +2356,10 @@ async fn run_runtime(
             for entry in unresolved {
                 eprintln!(
                     "  {} • node {:02} window {} • {}",
-                    entry.hash, entry.node_id, entry.window_id, entry.status
+                    crate::diagnostics::terminal_text(&entry.hash),
+                    entry.node_id,
+                    entry.window_id,
+                    crate::diagnostics::terminal_text(&entry.status)
                 );
             }
             bail!(
@@ -3149,6 +3196,7 @@ async fn run_runtime(
                             && let (Some(manager), Some(signer)) =
                             (transactions.as_mut(), signer.as_ref())
                         {
+                            let finalization_prepared = manager.prepared_broadcast_pending();
                             let finalization = maybe_finalize_expired(
                                 &client,
                                 &selected,
@@ -3171,11 +3219,25 @@ async fn run_runtime(
                                             Ok(reason) => shutdown_reason = Some(reason),
                                             Err(error) => report_mining_warning(dashboard, format!("shutdown signal handler failed: {error}")),
                                         }
+                                        let _ = await_prepared_submission_with_grace(
+                                            &finalization_prepared,
+                                            finalization.as_mut(),
+                                            PREPARED_BROADCAST_STOP_GRACE,
+                                        )
+                                        .await;
                                         break None;
                                     }
                                     event = wait_for_dashboard_event(dashboard_signal.clone()) => {
                                         match event {
-                                            DashboardEventKind::StopRequested => break None,
+                                            DashboardEventKind::StopRequested => {
+                                                let _ = await_prepared_submission_with_grace(
+                                                    &finalization_prepared,
+                                                    finalization.as_mut(),
+                                                    PREPARED_BROADCAST_STOP_GRACE,
+                                                )
+                                                .await;
+                                                break None;
+                                            }
                                             DashboardEventKind::Failure(error)
                                                 if session_limit_reached.load(Ordering::Acquire) =>
                                             {
@@ -3192,6 +3254,12 @@ async fn run_runtime(
                                             }
                                             DashboardEventKind::Failure(error) => {
                                                 fatal_error = Some(anyhow!("dashboard failed: {error}"));
+                                                let _ = await_prepared_submission_with_grace(
+                                                    &finalization_prepared,
+                                                    finalization.as_mut(),
+                                                    PREPARED_BROADCAST_STOP_GRACE,
+                                                )
+                                                .await;
                                                 break None;
                                             }
                                         }
@@ -3639,6 +3707,7 @@ async fn run_runtime(
                     )),
                 );
                 proof_telemetry.record(proof.node_id, ProofMetric::PreflightStarted);
+                let prepared_broadcast_pending = manager.prepared_broadcast_pending();
                 let submission_result = {
                     let submission = manager.submit_proof(
                         &client,
@@ -3661,11 +3730,25 @@ async fn run_runtime(
                                     Ok(reason) => shutdown_reason = Some(reason),
                                     Err(error) => report_mining_warning(dashboard, format!("shutdown signal handler failed: {error}")),
                                 }
+                                let _ = await_prepared_submission_with_grace(
+                                    &prepared_broadcast_pending,
+                                    submission.as_mut(),
+                                    PREPARED_BROADCAST_STOP_GRACE,
+                                )
+                                .await;
                                 break None;
                             }
                             event = wait_for_dashboard_event(dashboard_signal.clone()) => {
                                 match event {
-                                    DashboardEventKind::StopRequested => break None,
+                                    DashboardEventKind::StopRequested => {
+                                        let _ = await_prepared_submission_with_grace(
+                                            &prepared_broadcast_pending,
+                                            submission.as_mut(),
+                                            PREPARED_BROADCAST_STOP_GRACE,
+                                        )
+                                        .await;
+                                        break None;
+                                    }
                                     DashboardEventKind::Failure(error)
                                         if session_limit_reached.load(Ordering::Acquire) =>
                                     {
@@ -3682,6 +3765,12 @@ async fn run_runtime(
                                     }
                                     DashboardEventKind::Failure(error) => {
                                         fatal_error = Some(anyhow!("dashboard failed: {error}"));
+                                        let _ = await_prepared_submission_with_grace(
+                                            &prepared_broadcast_pending,
+                                            submission.as_mut(),
+                                            PREPARED_BROADCAST_STOP_GRACE,
+                                        )
+                                        .await;
                                         break None;
                                     }
                                 }
@@ -6754,14 +6843,20 @@ fn prompt_reduced_run_limit(
     io::stdout()
         .flush()
         .context("flush reduced session limit prompt")?;
-    let mut answer = String::new();
-    let read_result = io::stdin().read_line(&mut answer);
+    let read_result = crate::commands::read_terminal_line();
     if let Some(startup) = startup {
         startup.resume_after_prompt("Rechecking balance and pending liabilities");
     }
-    reduced_limit_consent_result(read_result, &answer)
+    match read_result {
+        Ok(answer) => Ok(consent_approved(&answer)),
+        // A shutdown signal interrupts the blocking consent read. Treat it as
+        // a refusal so the runtime can take its normal graceful-stop path.
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
+        Err(error) => Err(error).context("read reduced session limit confirmation"),
+    }
 }
 
+#[cfg(test)]
 fn reduced_limit_consent_result(read_result: io::Result<usize>, answer: &str) -> Result<bool> {
     match read_result {
         Ok(_) => Ok(consent_approved(answer)),
@@ -12756,5 +12851,73 @@ mod tests {
 
         stop.store(true, Ordering::Release);
         worker.join().expect("worker should stop cleanly");
+    }
+    #[tokio::test]
+    async fn prepared_submission_grace_is_conditional_and_bounded() {
+        let pending = Arc::new(AtomicBool::new(false));
+
+        let not_prepared = std::future::ready(7_u8);
+        tokio::pin!(not_prepared);
+        assert_eq!(
+            super::await_prepared_submission_with_grace(
+                &pending,
+                not_prepared.as_mut(),
+                Duration::from_millis(50),
+            )
+            .await,
+            None,
+            "a submission still in preflight must not delay shutdown"
+        );
+
+        pending.store(true, Ordering::SeqCst);
+        let ready = std::future::ready(11_u8);
+        tokio::pin!(ready);
+        assert_eq!(
+            super::await_prepared_submission_with_grace(
+                &pending,
+                ready.as_mut(),
+                Duration::from_millis(50),
+            )
+            .await,
+            Some(11),
+            "a prepared submission that concludes inside the grace is retained"
+        );
+
+        let stuck = std::future::pending::<u8>();
+        tokio::pin!(stuck);
+        let started = Instant::now();
+        assert_eq!(
+            super::await_prepared_submission_with_grace(
+                &pending,
+                stuck.as_mut(),
+                Duration::from_millis(20),
+            )
+            .await,
+            None,
+            "a prepared submission that cannot conclude is dropped only after the bound"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(20));
+
+        let durable = Arc::new(AtomicBool::new(true));
+        let clear = Arc::clone(&durable);
+        let clearer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            clear.store(false, Ordering::SeqCst);
+        });
+        let still_pending = std::future::pending::<u8>();
+        tokio::pin!(still_pending);
+        let started = Instant::now();
+        assert_eq!(
+            super::await_prepared_submission_with_grace(
+                &durable,
+                still_pending.as_mut(),
+                Duration::from_secs(5),
+            )
+            .await,
+            None,
+            "a durable broadcast outcome must stop waiting before the full grace"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        clearer.await.unwrap();
     }
 }

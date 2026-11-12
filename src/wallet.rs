@@ -41,6 +41,22 @@ const NEW_KEYSTORE_SCRYPT_P: u32 = 1;
 
 type Aes128Ctr = Ctr128BE<Aes128>;
 
+/// Hidden input goes through `rpassword`'s `/dev/tty` raw-mode reader.
+///
+/// `rpassword` disables `ISIG`, reads a typed Ctrl-C as a byte, and raises
+/// SIGINT itself. Only commands that installed the application shutdown
+/// handler before prompting (`mine`) latch that signal and return
+/// `Interrupted`, allowing `Drop` to restore the terminal. `init` and
+/// standalone wallet commands have no application handler, so the default
+/// SIGINT disposition can terminate the process before terminal restoration;
+/// that is a known blocker. An external SIGTERM/SIGHUP delivered while this
+/// read is blocked is also not guaranteed to wake a `/dev/tty` read on a
+/// multi-threaded runtime. No detached reader thread or global `sigaction`
+/// mutation is used to claim otherwise. See the README for the full limitation.
+fn read_hidden_password(prompt: &str) -> io::Result<String> {
+    rpassword::prompt_password(prompt)
+}
+
 pub fn create_interactive(store: &ConfigStore, config: &mut AppConfig) -> Result<Address> {
     create_interactive_with_persistence(store, config, true)
 }
@@ -138,13 +154,11 @@ fn import_interactive_with_persistence(
         return import_keystore(store, config, &path, persist_config);
     }
 
-    let phrase = Zeroizing::new(rpassword::prompt_password(
-        "Recovery phrase (input hidden): ",
-    )?);
+    let phrase = Zeroizing::new(read_hidden_password("Recovery phrase (input hidden): ")?);
     if phrase.is_empty() {
         bail!("recovery phrase cannot be empty");
     }
-    let bip39_passphrase = Zeroizing::new(rpassword::prompt_password(
+    let bip39_passphrase = Zeroizing::new(read_hidden_password(
         "Optional BIP-39 passphrase (input hidden; empty if unused): ",
     )?);
     if bip39_passphrase.len() > MAX_PASSWORD_BYTES {
@@ -190,6 +204,13 @@ fn unlock_selected_interactive_inner(
     config: &AppConfig,
     progress: Option<&StartupProgress>,
 ) -> Result<SigningKey> {
+    if crate::shutdown::prompt_shutdown_requested() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "shutdown already latched before hidden wallet prompt",
+        )
+        .into());
+    }
     let address = selected_address(config)?;
     let keyfile = store.read_keystore(address)?;
     if validate_v3_keystore(&keyfile)? != address {
@@ -198,7 +219,7 @@ fn unlock_selected_interactive_inner(
     if let Some(progress) = progress {
         progress.pause_for_prompt("Unlock wallet");
     }
-    let password = Zeroizing::new(rpassword::prompt_password(
+    let password = Zeroizing::new(read_hidden_password(
         "Ethereum V3 keystore password (input hidden): ",
     )?);
     if let Some(progress) = progress {
@@ -343,7 +364,7 @@ fn import_keystore(
         source,
         persist_config,
         || {
-            Ok(Zeroizing::new(rpassword::prompt_password(
+            Ok(Zeroizing::new(read_hidden_password(
                 "Ethereum V3 keystore password (input hidden): ",
             )?))
         },
@@ -658,7 +679,7 @@ pub(crate) fn validate_v3_keystore(contents: &[u8]) -> Result<Address> {
 }
 
 fn prompt_new_password() -> Result<Zeroizing<String>> {
-    prompt_new_password_with(|prompt| rpassword::prompt_password(prompt))
+    prompt_new_password_with(read_hidden_password)
 }
 
 fn prompt_new_password_with<F>(mut prompt: F) -> Result<Zeroizing<String>>
@@ -1038,6 +1059,24 @@ mod tests {
         assert!(!super::is_password_prompt_interrupted(&anyhow::anyhow!(
             "bad password"
         )));
+    }
+
+    #[test]
+    fn latched_shutdown_skips_hidden_prompt_before_keystore_access() {
+        let temp = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(temp.path()));
+        let config = AppConfig {
+            wallet_address: Some(format!("{:#x}", Address::with_last_byte(0xa1))),
+            ..AppConfig::default()
+        };
+        let request = crate::shutdown::ShutdownRequest::default();
+        request.request_for_test();
+        let error = super::unlock_selected_interactive(&store, &config).unwrap_err();
+        assert!(
+            super::is_password_prompt_interrupted(&error),
+            "a latched shutdown must cancel before reading the keystore: {error:#}"
+        );
+        drop(request);
     }
 
     #[test]

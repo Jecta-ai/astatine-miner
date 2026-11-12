@@ -530,6 +530,18 @@ async fn run_init_with_store(store: &ConfigStore, args: InitArgs) -> Result<()> 
 }
 
 async fn run_mine(args: crate::cli::MineArgs) -> Result<()> {
+    match run_mine_inner(args).await {
+        Err(error) if crate::shutdown::is_prompt_shutdown(&error) => {
+            println!(
+                "Shutdown signal received while waiting for terminal input; no spending session or transaction was created or changed."
+            );
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+async fn run_mine_inner(args: crate::cli::MineArgs) -> Result<()> {
     // Install handlers before configuration, journal inspection, or any
     // interactive session prompt. A signal before this point still retains the
     // OS default disposition; CLI parsing/dispatch precedes this command.
@@ -775,7 +787,10 @@ async fn run_recover() -> Result<()> {
             for entry in &unresolved {
                 println!(
                     "  {} • node {:02} window {} • {}",
-                    entry.hash, entry.node_id, entry.window_id, entry.status
+                    crate::diagnostics::terminal_text(&entry.hash),
+                    entry.node_id,
+                    entry.window_id,
+                    crate::diagnostics::terminal_text(&entry.status)
                 );
             }
             last_status = unresolved;
@@ -926,18 +941,54 @@ pub(crate) fn requires_open_legacy_session_confirmation(
 fn prompt_resume_open_legacy_session_confirmation(
     session: &SessionJournalSnapshot,
 ) -> Result<bool> {
+    let cap = session
+        .limit_wei
+        .as_deref()
+        .context("legacy session has no spending cap")?;
+    let cap =
+        U256::from_str_radix(cap, 10).context("legacy session spending cap is not decimal wei")?;
     let authorized = session
         .authorized_exposure_wei
         .as_deref()
         .map(|value| {
             U256::from_str_radix(value, 10)
-                .map(|wei| format_token_units(wei, 18))
-                .unwrap_or_else(|_| value.to_owned())
+                .context("legacy session authorization counter is not decimal wei")
         })
-        .unwrap_or_else(|| "0".to_owned());
+        .transpose()?
+        .unwrap_or(U256::ZERO);
+    let remaining = cap.checked_sub(authorized).context(
+        "legacy session authorization counter exceeds its cap; refusing to resume an inconsistent session",
+    )?;
+    let unresolved_exposure = session
+        .pending_exposure_wei
+        .as_deref()
+        .map(|value| {
+            U256::from_str_radix(value, 10)
+                .context("legacy session unresolved exposure is not decimal wei")
+        })
+        .transpose()?
+        .unwrap_or(U256::ZERO);
+
     println!("An existing legacy spending session is open from a previous command.");
+    println!("Session cap: {} INJ", format_token_units(cap, 18));
     println!(
-        "It has already authorized up to {authorized} INJ; resuming it keeps the same remaining authorization and does not create a fresh allowance or refund prior authorization."
+        "Already authorized: {} INJ",
+        format_token_units(authorized, 18)
+    );
+    println!(
+        "Remaining authorization: {} INJ",
+        format_token_units(remaining, 18)
+    );
+    println!(
+        "Unresolved transactions: {} ({} INJ maximum exposure)",
+        session.unresolved.len(),
+        format_token_units(unresolved_exposure, 18)
+    );
+    if !session.unresolved.is_empty() {
+        print_unresolved_transactions(session);
+    }
+    println!(
+        "Resuming keeps the same remaining authorization; it does not create a fresh allowance or refund prior authorization."
     );
     prompt_paid_consent("Resume the existing open spending session?", false)
 }
@@ -1107,7 +1158,10 @@ fn print_unresolved_transactions(session: &SessionJournalSnapshot) {
     for entry in &session.unresolved {
         println!(
             "  {} • node {:02} window {} • {}",
-            entry.hash, entry.node_id, entry.window_id, entry.status
+            crate::diagnostics::terminal_text(&entry.hash),
+            entry.node_id,
+            entry.window_id,
+            crate::diagnostics::terminal_text(&entry.status)
         );
     }
 }
@@ -1448,13 +1502,125 @@ fn prompt_threads(current: usize) -> Result<usize> {
 fn prompt_value(prompt: &str, default: &str) -> Result<String> {
     print!("{prompt} [{default}]: ");
     io::stdout().flush().context("flush input prompt")?;
-    let mut value = String::new();
-    io::stdin().read_line(&mut value).context("read input")?;
+    let value = match read_terminal_line() {
+        Ok(value) => value,
+        Err(error)
+            if error.kind() == io::ErrorKind::Interrupted
+                && crate::shutdown::prompt_shutdown_requested() =>
+        {
+            return Err(crate::shutdown::prompt_shutdown_error());
+        }
+        Err(error) => return Err(error).context("read input"),
+    };
     let value = value.trim();
     Ok(if value.is_empty() {
         default.to_owned()
     } else {
         value.to_owned()
+    })
+}
+
+/// Read one terminal line without blocking indefinitely on a shutdown signal.
+///
+/// The read polls the descriptor in short slices and checks the synchronous
+/// shutdown delivery flags between slices. This works regardless of which
+/// runtime thread receives a process-directed signal; it does not mutate signal
+/// dispositions.
+pub(crate) fn read_terminal_line() -> io::Result<String> {
+    #[cfg(unix)]
+    {
+        read_unix_terminal_line()
+    }
+    #[cfg(not(unix))]
+    {
+        let mut value = String::new();
+        io::stdin().read_line(&mut value)?;
+        if crate::shutdown::prompt_shutdown_requested() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "terminal prompt cancelled by shutdown signal",
+            ));
+        }
+        Ok(value)
+    }
+}
+
+#[cfg(unix)]
+fn read_unix_terminal_line() -> io::Result<String> {
+    const MAX_PROMPT_BYTES: usize = 8_192;
+    let mut bytes = Vec::new();
+    loop {
+        if crate::shutdown::prompt_shutdown_requested() {
+            println!();
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "terminal prompt cancelled by shutdown signal",
+            ));
+        }
+        let mut descriptor = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` points to one valid `pollfd` and the timeout is
+        // a non-negative millisecond value.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 100) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            continue;
+        }
+        if descriptor.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "terminal input descriptor is invalid",
+            ));
+        }
+        let mut byte = [0_u8; 1];
+        // SAFETY: the destination buffer is one byte and the descriptor is the
+        // process standard input.
+        let count = unsafe {
+            libc::read(
+                libc::STDIN_FILENO,
+                byte.as_mut_ptr().cast::<libc::c_void>(),
+                1,
+            )
+        };
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if count == 0 || byte[0] == b'\n' {
+            break;
+        }
+        if bytes.len() >= MAX_PROMPT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "terminal input exceeds the supported prompt length",
+            ));
+        }
+        bytes.push(byte[0]);
+    }
+    if crate::shutdown::prompt_shutdown_requested() {
+        println!();
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "terminal prompt cancelled by shutdown signal",
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "terminal input is not valid UTF-8",
+        )
     })
 }
 
@@ -1549,6 +1715,7 @@ mod tests {
         io::{Read, Write},
         net::TcpListener,
         thread::{self, JoinHandle},
+        time::Duration,
     };
 
     fn mock_chain_id_rpc(chain_id: &'static str) -> (String, JoinHandle<()>) {
@@ -1678,6 +1845,38 @@ mod tests {
             current_limit,
             Some(Address::with_last_byte(0xa2))
         ));
+    }
+
+    #[test]
+    fn legacy_resume_prompt_fails_closed_on_malformed_or_overdrawn_counters() {
+        let base = SessionJournalSnapshot {
+            session_id: Some("legacy".to_owned()),
+            limit_wei: Some("1000000000000000000".to_owned()),
+            authorized_exposure_wei: Some("250000000000000000".to_owned()),
+            pending_exposure_wei: Some("0".to_owned()),
+            ..SessionJournalSnapshot::default()
+        };
+        let malformed = SessionJournalSnapshot {
+            authorized_exposure_wei: Some("not-decimal".to_owned()),
+            ..base.clone()
+        };
+        let error = super::prompt_resume_open_legacy_session_confirmation(&malformed).unwrap_err();
+        assert!(format!("{error:#}").contains("not decimal wei"));
+
+        let overdrawn = SessionJournalSnapshot {
+            authorized_exposure_wei: Some("2000000000000000000".to_owned()),
+            ..base.clone()
+        };
+        let error = super::prompt_resume_open_legacy_session_confirmation(&overdrawn).unwrap_err();
+        assert!(format!("{error:#}").contains("exceeds its cap"));
+
+        let malformed_exposure = SessionJournalSnapshot {
+            pending_exposure_wei: Some("not-decimal".to_owned()),
+            ..base
+        };
+        let error =
+            super::prompt_resume_open_legacy_session_confirmation(&malformed_exposure).unwrap_err();
+        assert!(format!("{error:#}").contains("not decimal wei"));
     }
 
     #[test]
@@ -1881,6 +2080,7 @@ mod tests {
             assert!(format!("{error:#}").contains("interactive terminal"));
             let session = SessionJournalSnapshot {
                 session_id: Some("open".to_owned()),
+                limit_wei: Some("1000000000000000000".to_owned()),
                 authorized_exposure_wei: Some("0".to_owned()),
                 ..SessionJournalSnapshot::default()
             };
@@ -2134,5 +2334,178 @@ mod tests {
             redact_rpc_url("https://rpc.example.org/"),
             "https://rpc.example.org/"
         );
+    }
+
+    #[cfg(unix)]
+    fn spawn_pty_test_child(
+        test_name: &str,
+        child_env: &str,
+        mode: &str,
+    ) -> (std::process::Child, std::fs::File) {
+        use std::os::unix::io::FromRawFd;
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        // SAFETY: `openpty` writes two valid descriptors on success. No name,
+        // termios, or window-size overrides are supplied.
+        let result = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(result, 0, "openpty failed");
+        // SAFETY: the descriptors are uniquely owned by this function.
+        let master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+        // SAFETY: the descriptors are uniquely owned by this function.
+        let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
+        let stdin = slave.try_clone().unwrap();
+        let stdout = slave.try_clone().unwrap();
+        let stderr = slave.try_clone().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture"])
+            .env(child_env, "1")
+            .env("ASTATINE_PTY_MODE", mode)
+            .stdin(std::process::Stdio::from(stdin))
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr))
+            .spawn()
+            .unwrap();
+        drop(slave);
+        (child, master)
+    }
+
+    #[cfg(unix)]
+    fn read_pty_until(master: &mut std::fs::File, needle: &str, timeout: Duration) -> String {
+        use std::os::unix::io::AsRawFd;
+
+        let descriptor = master.as_raw_fd();
+        let deadline = std::time::Instant::now() + timeout;
+        let mut output = String::new();
+        while std::time::Instant::now() < deadline {
+            let mut poll = libc::pollfd {
+                fd: descriptor,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid `pollfd` is supplied.
+            let ready = unsafe { libc::poll(&mut poll, 1, 100) };
+            if ready <= 0 {
+                continue;
+            }
+            let mut buffer = [0_u8; 4096];
+            // SAFETY: the buffer is valid for its full length.
+            let count = unsafe {
+                libc::read(
+                    descriptor,
+                    buffer.as_mut_ptr().cast::<libc::c_void>(),
+                    buffer.len(),
+                )
+            };
+            if count <= 0 {
+                break;
+            }
+            output.push_str(&String::from_utf8_lossy(&buffer[..count as usize]));
+            if output.contains(needle) {
+                break;
+            }
+        }
+        output
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pty_child(
+        child: &mut std::process::Child,
+        timeout: Duration,
+    ) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signal_interrupts_blocking_terminal_prompt_on_a_disposable_pty() {
+        const CHILD: &str = "ASTATINE_PTY_PROMPT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let _shutdown = crate::shutdown::ShutdownSignal::new().unwrap();
+            let mode = std::env::var("ASTATINE_PTY_MODE").unwrap();
+            match mode.as_str() {
+                "legacy" => {
+                    let session = SessionJournalSnapshot {
+                        session_id: Some("legacy-pty".to_owned()),
+                        wallet: Some(format!("{:#x}", Address::with_last_byte(0xa1))),
+                        limit_wei: Some("1000000000000000000".to_owned()),
+                        authorized_exposure_wei: Some("250000000000000000".to_owned()),
+                        pending_exposure_wei: Some("0".to_owned()),
+                        unresolved: Vec::new(),
+                        closed: false,
+                        ..SessionJournalSnapshot::default()
+                    };
+                    let error = super::prompt_resume_open_legacy_session_confirmation(&session)
+                        .unwrap_err();
+                    assert!(crate::shutdown::is_prompt_shutdown(&error));
+                }
+                "value" => {
+                    let error = super::prompt_value("PTY prompt", "default").unwrap_err();
+                    assert!(crate::shutdown::is_prompt_shutdown(&error));
+                }
+                other => panic!("unsupported PTY prompt mode {other}"),
+            }
+            eprintln!("pty-prompt-child-ran");
+            return;
+        }
+
+        for mode in ["legacy", "value"] {
+            let (mut child, mut master) = spawn_pty_test_child(
+                "commands::tests::signal_interrupts_blocking_terminal_prompt_on_a_disposable_pty",
+                CHILD,
+                mode,
+            );
+            let needle = if mode == "legacy" {
+                "Resume the existing open spending session?"
+            } else {
+                "PTY prompt"
+            };
+            let output = read_pty_until(&mut master, needle, Duration::from_secs(5));
+            assert!(
+                output.contains("Session cap") || output.contains("PTY prompt"),
+                "child {mode} did not reach its prompt: {output:?}"
+            );
+            if mode == "legacy" {
+                assert!(
+                    output.contains("Remaining authorization")
+                        && output.contains("Unresolved transactions"),
+                    "legacy consent must display cap, authorized, remaining, and unresolved data: {output:?}"
+                );
+            }
+            // SAFETY: `child.id()` is the live child PID.
+            let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            assert_eq!(result, 0, "failed to signal PTY child");
+            let status = wait_for_pty_child(&mut child, Duration::from_secs(5));
+            let mut trailing = String::new();
+            if let Ok(mut file) = master.try_clone() {
+                let _ = file.read_to_string(&mut trailing);
+            }
+            let status = status.unwrap_or_else(|| {
+                panic!("PTY child {mode} did not exit after SIGTERM: {output:?} {trailing:?}")
+            });
+            assert!(
+                status.success(),
+                "PTY child {mode} failed: {output:?} {trailing:?}"
+            );
+        }
     }
 }

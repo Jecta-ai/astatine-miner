@@ -25,7 +25,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -46,6 +49,14 @@ const ARCHIVE_AFTER_CONFIRMATIONS: u64 = 64;
 const MAX_FINALIZATION_ATTEMPTS_PER_WINDOW: usize = 2;
 const RECEIPT_WAIT: Duration = Duration::from_secs(90);
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+// Bound the raw-broadcast acknowledgement so a stalled RPC cannot hold the
+// mining runtime indefinitely. The HTTP client itself times out an individual
+// JSON-RPC request after eight seconds; this outer bound is a second line of
+// defence and stays above that client timeout so a client-reported in-flight
+// timeout normally reaches the broadcast error path as Unknown. If the outer
+// bound fires, the durable entry remains Prepared because whether a request
+// escaped cannot be established from that timeout alone.
+const BROADCAST_WAIT: Duration = Duration::from_secs(10);
 const REWARD_SCAN_JOBS_PER_BATCH: usize = 256;
 const REWARD_SCAN_CONCURRENCY: usize = 4;
 const REWARD_SCAN_BLOCK_RANGE: u64 = 10_000;
@@ -3312,8 +3323,25 @@ pub struct TransactionManager {
     session_limit_sink_notified: bool,
     session_limit_reached_sink: Option<SessionLimitReachedSink>,
     shutdown_request: Option<crate::shutdown::ShutdownRequest>,
+    prepared_broadcast_pending: Arc<AtomicBool>,
     #[cfg(test)]
     pre_sign_boundary_hook: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    post_prepare_boundary_hook: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    post_broadcast_boundary_hook: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    broadcast_wait_override: Option<Duration>,
+}
+
+/// Clears the shared "Prepared, first broadcast not yet concluded" flag on
+/// every exit path, including cancellation or unwind.
+struct PreparedBroadcastFlag(Arc<AtomicBool>);
+
+impl Drop for PreparedBroadcastFlag {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3366,6 +3394,20 @@ fn receipt_wait_timeout(hash: B256, last_error: Option<&str>) -> anyhow::Error {
             RECEIPT_WAIT.as_secs()
         ),
     }
+}
+
+/// True only when the HTTP client proves the request was never handed to a
+/// connection. Builder and connect failures are unsent; request timeouts,
+/// status errors, body-read failures, and RPC responses remain ambiguous or
+/// sent and are therefore classified as `Unknown` by the caller. In
+/// particular, reqwest's broad `is_request` predicate also covers timeouts and
+/// must not be treated as proof that nothing escaped.
+fn broadcast_error_is_definitely_unsent(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_builder() || error.is_connect())
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -3722,8 +3764,15 @@ impl TransactionManager {
             session_limit_sink_notified: false,
             session_limit_reached_sink: None,
             shutdown_request: None,
+            prepared_broadcast_pending: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             pre_sign_boundary_hook: None,
+            #[cfg(test)]
+            post_prepare_boundary_hook: None,
+            #[cfg(test)]
+            post_broadcast_boundary_hook: None,
+            #[cfg(test)]
+            broadcast_wait_override: None,
         })
     }
 
@@ -3731,9 +3780,31 @@ impl TransactionManager {
         self.shutdown_request = Some(request);
     }
 
+    /// Shared flag used by the mining coordinator to distinguish a submission
+    /// that has already crossed the durable Prepared boundary from one that is
+    /// still in preflight when shutdown is delivered.
+    pub(crate) fn prepared_broadcast_pending(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.prepared_broadcast_pending)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_pre_sign_boundary_hook(&mut self, hook: Box<dyn FnOnce() + Send>) {
         self.pre_sign_boundary_hook = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_post_prepare_boundary_hook(&mut self, hook: Box<dyn FnOnce() + Send>) {
+        self.post_prepare_boundary_hook = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_post_broadcast_boundary_hook(&mut self, hook: Box<dyn FnOnce() + Send>) {
+        self.post_broadcast_boundary_hook = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_broadcast_wait_override(&mut self, wait: Duration) {
+        self.broadcast_wait_override = Some(wait);
     }
 
     #[cfg(test)]
@@ -5417,6 +5488,10 @@ impl TransactionManager {
                 "transaction journal preparation failed after reserving maximum session exposure; no authorization is refunded",
             );
         }
+        let _prepared_broadcast_flag =
+            PreparedBroadcastFlag(Arc::clone(&self.prepared_broadcast_pending));
+        self.prepared_broadcast_pending
+            .store(true, Ordering::SeqCst);
         if action == TransactionAction::SubmitProof {
             self.current_process_proof_hashes.insert(signed.hash);
         }
@@ -5425,11 +5500,57 @@ impl TransactionManager {
             "transaction prepared node={node_id:02} window={window_id} action={action:?} hash={:#x} maximum_exposure_wei={maximum_exposure}",
             signed.hash
         ));
+        #[cfg(test)]
+        if let Some(hook) = self.post_prepare_boundary_hook.take() {
+            hook();
+        }
+        if self.shutdown_requested() {
+            // The durable Prepared entry is already an authorized, signed
+            // liability. Suppressing the first broadcast here would guarantee a
+            // never-sent Prepared transaction with no safe automatic resolution.
+            // Perform the bounded first-broadcast attempt instead; the result
+            // below is recorded accurately, and nothing is rebroadcast.
+            self.report_warning(format!(
+                "shutdown signal was delivered after transaction {:#x} became Prepared; performing the bounded first-broadcast attempt for this prepared transaction. If this process exits before the broadcast outcome is durable, the Prepared liability remains unresolved without sufficient RPC evidence; it is not blindly cleared, refunded, marked Unknown without evidence, or rebroadcast by this process. Read-only recovery may settle it or classify it Unknown when evidence supports that",
+                signed.hash
+            ));
+        }
+        #[cfg(test)]
+        let broadcast_wait = self.broadcast_wait_override.unwrap_or(BROADCAST_WAIT);
+        #[cfg(not(test))]
+        let broadcast_wait = BROADCAST_WAIT;
 
-        match client.broadcast_raw_transaction(&signed.raw).await {
+        let broadcast_result = match tokio::time::timeout(
+            broadcast_wait,
+            client.broadcast_raw_transaction(&signed.raw),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // No client result was observed. The request may or may not
+                // have reached the node; keep the durable Prepared entry
+                // rather than inventing an `Unknown` outcome for a send we
+                // cannot prove happened.
+                self.report_warning(format!(
+                    "transaction broadcast acknowledgement timed out node={node_id:02} window={window_id} action={action:?} hash={:#x}; the Prepared journal entry and maximum exposure remain reserved, and this transaction will not be resent",
+                    signed.hash
+                ));
+                return Err(anyhow!(
+                    "broadcast acknowledgement for {:#x} did not complete within {} seconds; the Prepared journal entry remains unresolved and will not be rebroadcast",
+                    signed.hash,
+                    broadcast_wait.as_secs()
+                ));
+            }
+        };
+        match broadcast_result {
             Ok(returned_hash) if returned_hash == signed.hash => {
                 self.journal
                     .set_broadcast_state(signed.hash, TransactionStatus::Broadcast)?;
+                #[cfg(test)]
+                if let Some(hook) = self.post_broadcast_boundary_hook.take() {
+                    hook();
+                }
                 if action == TransactionAction::SubmitProof {
                     self.record_proof_metric(node_id, ProofMetric::Broadcast);
                 }
@@ -5455,6 +5576,19 @@ impl TransactionManager {
                 );
             }
             Err(error) => {
+                if broadcast_error_is_definitely_unsent(&error) {
+                    // A connect/build failure proves no raw request escaped.
+                    // Keep the durable Prepared liability and do not claim an
+                    // Unknown outcome for an unsent transaction.
+                    self.report_warning(format!(
+                        "transaction broadcast request could not be sent node={node_id:02} window={window_id} action={action:?} hash={:#x}; the Prepared journal entry and maximum exposure remain reserved, and this transaction will not be retried automatically: {error:#}",
+                        signed.hash
+                    ));
+                    return Err(error.context(format!(
+                        "broadcast request for {:#x} was not sent; the Prepared journal entry remains unresolved and will not be retried automatically",
+                        signed.hash
+                    )));
+                }
                 self.journal
                     .set_broadcast_state(signed.hash, TransactionStatus::Unknown)?;
                 if action == TransactionAction::SubmitProof {
@@ -5471,6 +5605,11 @@ impl TransactionManager {
                 ));
             }
         }
+        // The first broadcast outcome is durable at this point (Broadcast on
+        // success; error paths returned above). Receipt confirmation may take
+        // longer than the shutdown grace and no longer needs to block it.
+        self.prepared_broadcast_pending
+            .store(false, Ordering::SeqCst);
         self.publish_dashboard_state();
 
         let deadline = Instant::now() + RECEIPT_WAIT;
@@ -12642,6 +12781,485 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broadcast_connect_failure_is_classified_unsent_not_unknown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = reqwest::Client::new()
+            .post(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            super::broadcast_error_is_definitely_unsent(&anyhow::Error::new(error)),
+            "a refused connection must be classified as unsent"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_timeout_preserves_prepared_without_unknown_or_rebroadcast() {
+        let fixture = submit_preflight_fixture();
+        fixture.client.delay_next_broadcast(Duration::from_secs(30));
+        let mut manager = TransactionManager::open(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+        )
+        .unwrap();
+        manager.set_broadcast_wait_override(Duration::from_secs(1));
+        let error = manager
+            .submit_proof(&fixture.client, &fixture.signer, fixture.submission.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("did not complete within"),
+            "unexpected bounded-broadcast error: {error:#}"
+        );
+
+        let bytes = fixture.store.read_transaction_journal().unwrap().unwrap();
+        let journal: super::JournalState = serde_json::from_slice(&bytes).unwrap();
+        assert!(journal.pending_authorization.is_none());
+        let entry = journal
+            .entries
+            .iter()
+            .find(|entry| entry.action == TransactionAction::SubmitProof)
+            .expect("the timed-out broadcast must remain journaled");
+        assert_eq!(
+            entry.status,
+            TransactionStatus::Prepared,
+            "an unacknowledged broadcast must not be relabelled Unknown"
+        );
+        assert_eq!(entry.nonce, 0);
+        let exposure = parse_decimal_wei(&entry.maximum_exposure_wei).unwrap();
+        assert_eq!(
+            journal
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some(exposure.to_string().as_str()),
+            "a broadcast timeout must never refund the charged authorization"
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "the delayed test hook must time out before a raw send"
+        );
+        drop(manager);
+
+        let mut restarted = TransactionManager::open_with_session_policy(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        )
+        .unwrap();
+        let unavailable = NetworkClient::local_test_client(
+            "http://127.0.0.1:1",
+            fixture.contract,
+            B256::with_last_byte(0xe8),
+            fixture.token,
+            B256::with_last_byte(0xe9),
+            18,
+        )
+        .unwrap();
+        let _ = restarted.reconcile(&unavailable).await;
+        let recovered = restarted.journal.entry(entry_hash(entry).unwrap()).unwrap();
+        assert_eq!(recovered.status, TransactionStatus::Prepared);
+        assert_eq!(recovered.nonce, 0);
+        assert_eq!(
+            restarted.journal.pending_exposure().unwrap(),
+            parse_decimal_wei(&entry.maximum_exposure_wei).unwrap()
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "restart reconciliation must not send a Prepared transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_acknowledgement_survives_cancellation_and_restart_never_rebroadcasts() {
+        let fixture = submit_preflight_fixture();
+        let mut manager = TransactionManager::open(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+        )
+        .unwrap();
+        let (broadcast_tx, broadcast_rx) = tokio::sync::oneshot::channel();
+        manager.set_post_broadcast_boundary_hook(Box::new(move || {
+            let _ = broadcast_tx.send(());
+        }));
+
+        let submit_client = fixture.client.clone();
+        let submit_signer = clone_signer(&fixture.signer);
+        let submission = fixture.submission.clone();
+        let submit_task = tokio::spawn(async move {
+            manager
+                .submit_proof(&submit_client, &submit_signer, submission)
+                .await
+        });
+        timeout(Duration::from_secs(5), broadcast_rx)
+            .await
+            .expect("submit should reach the acknowledged-broadcast boundary")
+            .expect("broadcast boundary notifier dropped");
+        submit_task.abort();
+        let _ = submit_task.await;
+
+        let bytes = fixture.store.read_transaction_journal().unwrap().unwrap();
+        let journal: super::JournalState = serde_json::from_slice(&bytes).unwrap();
+        assert!(journal.pending_authorization.is_none());
+        let entry = journal
+            .entries
+            .iter()
+            .find(|entry| entry.action == TransactionAction::SubmitProof)
+            .expect("the broadcast transaction must remain journaled");
+        assert_eq!(entry.status, TransactionStatus::Broadcast);
+        let exposure = parse_decimal_wei(&entry.maximum_exposure_wei).unwrap();
+        assert_eq!(
+            journal
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some(exposure.to_string().as_str())
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "the acknowledged broadcast must have been sent exactly once"
+        );
+
+        let mut restarted = TransactionManager::open_with_session_policy(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        )
+        .unwrap();
+        restarted.reconcile(&fixture.client).await.unwrap();
+        restarted.reconcile(&fixture.client).await.unwrap();
+        let recovered = restarted.journal.entry(entry_hash(entry).unwrap()).unwrap();
+        assert_eq!(recovered.status, TransactionStatus::Broadcast);
+        assert_eq!(
+            restarted.journal.pending_exposure().unwrap(),
+            exposure,
+            "restart must preserve the acknowledged transaction's maximum exposure"
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "restart must not resend an acknowledged transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_without_observation_preserves_all_transaction_stages_without_rebroadcast() {
+        for (index, status) in [
+            TransactionStatus::Prepared,
+            TransactionStatus::Broadcast,
+            TransactionStatus::Unknown,
+            TransactionStatus::Included,
+            TransactionStatus::MinedSuccess,
+            TransactionStatus::MinedReverted,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(PathBuf::from(root.path()));
+            let signer = recovery_signer();
+            let wallet = signer_address(&signer);
+            let contract = Address::with_last_byte(0xe1);
+            let token = Address::with_last_byte(0xe2);
+            let config = AppConfig {
+                wallet_address: Some(format!("{wallet:#x}")),
+                per_session_spending_limit_inj: "1".to_owned(),
+                ..AppConfig::default()
+            };
+            store.save(&config).unwrap();
+            let nonce = 30 + index as u64;
+            let window_id = 40 + index as u64;
+            let (_session_id, request, hash, exposure) = create_closed_run_with_status(
+                &store, &config, wallet, token, &signer, contract, nonce, window_id, status,
+            );
+            let before = TransactionJournal::inspect_session(&store, &config).unwrap();
+            let authorization_before = before.authorized_exposure_wei.clone();
+
+            // Reopen and explicitly attempt unavailable observation. The exact
+            // stage, nonce, maximum exposure, and charged authorization must
+            // survive; nothing in the restart/reconcile path may send a raw
+            // transaction.
+            let mut restarted = TransactionManager::open_for_read_only_recovery(
+                &store,
+                &config,
+                wallet,
+                token,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .unwrap();
+            let unavailable = NetworkClient::local_test_client(
+                "http://127.0.0.1:1",
+                contract,
+                B256::with_last_byte(0xef),
+                token,
+                B256::with_last_byte(0xf0),
+                18,
+            )
+            .unwrap();
+            let _ = restarted.reconcile(&unavailable).await;
+            let entry = restarted.journal.entry(hash).unwrap();
+            assert_eq!(entry.status, status, "case {status:?}");
+            assert_eq!(entry.nonce, request.nonce, "case {status:?}");
+            assert_eq!(
+                entry.maximum_exposure_wei,
+                exposure.to_string(),
+                "case {status:?}"
+            );
+            assert_eq!(
+                restarted.journal.pending_exposure().unwrap(),
+                if status.is_unresolved() {
+                    exposure
+                } else {
+                    U256::ZERO
+                },
+                "case {status:?}"
+            );
+            assert_eq!(
+                restarted
+                    .journal
+                    .state
+                    .active_session
+                    .as_ref()
+                    .unwrap()
+                    .authorized_exposure_wei
+                    .clone(),
+                authorization_before,
+                "case {status:?} must never refund authorization"
+            );
+            assert!(
+                restarted.journal.state.pending_authorization.is_none(),
+                "case {status:?}"
+            );
+            assert_eq!(
+                restarted.journal.unresolved_transactions().len(),
+                usize::from(status.is_unresolved()),
+                "case {status:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_prepare_attempts_one_in_flight_broadcast_then_preserves_unknown() {
+        let fixture = submit_preflight_fixture_with_send_delay(Duration::from_secs(9));
+        let mut manager = TransactionManager::open(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+        )
+        .unwrap();
+        let diagnostics = DiagnosticBuffer::default();
+        manager.set_diagnostics(diagnostics.clone());
+        let request = crate::shutdown::ShutdownRequest::default();
+        manager.set_shutdown_request(request.clone());
+        let prepared_broadcast_pending = manager.prepared_broadcast_pending();
+        let hook_pending = Arc::clone(&prepared_broadcast_pending);
+        manager.set_post_prepare_boundary_hook(Box::new(move || {
+            assert!(
+                hook_pending.load(Ordering::SeqCst),
+                "the shared flag must be visible after the durable Prepared write"
+            );
+            request.request_for_test();
+        }));
+
+        let error = manager
+            .submit_proof(&fixture.client, &fixture.signer, fixture.submission.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("broadcast outcome is unknown"),
+            "the real in-flight timeout must be classified as Unknown: {error:#}"
+        );
+        assert!(
+            !prepared_broadcast_pending.load(Ordering::SeqCst),
+            "the prepared-broadcast flag must clear after the attempt concludes"
+        );
+        let diagnostics = diagnostics.drain();
+        assert!(
+            diagnostics.iter().any(|message| {
+                message.contains("shutdown signal was delivered after transaction")
+                    && message.contains("bounded first-broadcast attempt")
+                    && message.contains("unresolved without sufficient RPC evidence")
+                    && message.contains("Read-only recovery may settle it or classify it Unknown")
+            }),
+            "the post-prepare shutdown diagnostic must scope the attempt and recovery evidence: {diagnostics:?}"
+        );
+
+        let bytes = fixture.store.read_transaction_journal().unwrap().unwrap();
+        let journal: super::JournalState = serde_json::from_slice(&bytes).unwrap();
+        assert!(journal.pending_authorization.is_none());
+        let entry = journal
+            .entries
+            .iter()
+            .find(|entry| entry.action == TransactionAction::SubmitProof)
+            .expect("the broadcast transaction must remain journaled");
+        assert_eq!(
+            entry.status,
+            TransactionStatus::Unknown,
+            "a real request received by the node but timed out by the client is Unknown"
+        );
+        assert_eq!(entry.nonce, 0);
+        let exposure = parse_decimal_wei(&entry.maximum_exposure_wei).unwrap();
+        assert!(exposure > U256::ZERO);
+        assert_eq!(
+            journal
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some(exposure.to_string().as_str()),
+            "the in-flight Unknown outcome must never refund authorization"
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "the server must have received the raw broadcast exactly once"
+        );
+        drop(manager);
+
+        // Restart and reconcile twice against the same absent-receipt server.
+        // The Unknown liability must survive and no second send may occur.
+        let mut restarted = TransactionManager::open_with_session_policy(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        )
+        .unwrap();
+        restarted.reconcile(&fixture.client).await.unwrap();
+        restarted.reconcile(&fixture.client).await.unwrap();
+        let recovered = restarted.journal.entry(entry_hash(entry).unwrap()).unwrap();
+        assert_eq!(recovered.status, TransactionStatus::Unknown);
+        assert_eq!(recovered.nonce, 0);
+        assert_eq!(
+            parse_decimal_wei(&recovered.maximum_exposure_wei).unwrap(),
+            exposure
+        );
+        assert_eq!(restarted.journal.pending_exposure().unwrap(), exposure);
+        assert_eq!(
+            restarted
+                .journal
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some(exposure.to_string().as_str())
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "reconcile must never resend an Unknown transaction"
+        );
+        drop(restarted);
+
+        // A second restart with an unavailable RPC must also preserve Unknown.
+        let mut restarted_again = TransactionManager::open_with_session_policy(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        )
+        .unwrap();
+        let unavailable = NetworkClient::local_test_client(
+            "http://127.0.0.1:1",
+            fixture.contract,
+            B256::with_last_byte(0xde),
+            fixture.token,
+            B256::with_last_byte(0xdf),
+            18,
+        )
+        .unwrap();
+        let _ = restarted_again.reconcile(&unavailable).await;
+        let recovered = restarted_again
+            .journal
+            .entry(entry_hash(entry).unwrap())
+            .unwrap();
+        assert_eq!(recovered.status, TransactionStatus::Unknown);
+        assert_eq!(
+            restarted_again.journal.pending_exposure().unwrap(),
+            exposure
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "an unavailable restart observation must not resend the transaction"
+        );
+    }
+
+    #[tokio::test]
     async fn shutdown_at_pre_sign_boundary_abandons_authorization_without_signing() {
         let fixture = submit_preflight_fixture();
         let mut manager = TransactionManager::open(
@@ -12961,7 +13579,10 @@ mod tests {
         (format!("http://{address}"), counts, stop_server, thread)
     }
 
-    fn submit_preflight_rpc_server(code: Vec<u8>) -> HistoryRpcServer {
+    fn submit_preflight_rpc_server(
+        code: Vec<u8>,
+        send_response_delay: Duration,
+    ) -> HistoryRpcServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -13012,7 +13633,15 @@ mod tests {
                     "eth_blockNumber" => serde_json::json!("0x1"),
                     "eth_getCode" => serde_json::json!(format!("0x{}", hex::encode(&code))),
                     "eth_sendRawTransaction" => {
-                        serde_json::Value::String(format!("{:#x}", B256::with_last_byte(0xdd)))
+                        let raw = request["params"][0]
+                            .as_str()
+                            .expect("raw transaction parameter");
+                        let raw =
+                            hex::decode(raw.trim_start_matches("0x")).expect("raw transaction hex");
+                        serde_json::Value::String(format!("{:#x}", keccak256(raw)))
+                    }
+                    "eth_getTransactionReceipt" | "eth_getTransactionByHash" => {
+                        serde_json::Value::Null
                     }
                     other => panic!("unexpected submit preflight RPC method {other}"),
                 };
@@ -13022,12 +13651,25 @@ mod tests {
                     "result": result,
                 })
                 .to_string();
-                write!(
+                if method == "eth_sendRawTransaction" && !send_response_delay.is_zero() {
+                    let deadline = Instant::now() + send_response_delay;
+                    let mut stopped = false;
+                    while Instant::now() < deadline {
+                        if server_stop.load(Ordering::Acquire) {
+                            stopped = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if stopped {
+                        break;
+                    }
+                }
+                let _ = write!(
                     stream,
                     "HTTP/1.1 200 response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
                     response.len()
-                )
-                .unwrap();
+                );
             }
         });
         (format!("http://{address}"), counts, stop_server, thread)
@@ -13058,6 +13700,12 @@ mod tests {
     }
 
     fn submit_preflight_fixture() -> SubmitPreflightFixture {
+        submit_preflight_fixture_with_send_delay(Duration::ZERO)
+    }
+
+    fn submit_preflight_fixture_with_send_delay(
+        send_response_delay: Duration,
+    ) -> SubmitPreflightFixture {
         let root = tempdir().unwrap();
         let store = ConfigStore::at_root(PathBuf::from(root.path()));
         let signer = test_signer();
@@ -13066,7 +13714,8 @@ mod tests {
         let token = Address::with_last_byte(0xd2);
         let code = b"submit-preflight-runtime-code".to_vec();
         let code_hash = keccak256(&code);
-        let (url, rpc_counts, stop_server, server) = submit_preflight_rpc_server(code);
+        let (url, rpc_counts, stop_server, server) =
+            submit_preflight_rpc_server(code, send_response_delay);
         let mut client = NetworkClient::local_test_client(
             &url,
             contract,
@@ -13334,6 +13983,67 @@ mod tests {
             .clone();
         manager.close_session().unwrap();
         drop(manager);
+        (session_id, request, hash, exposure)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_closed_run_with_status(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        ast_token: Address,
+        signer: &SigningKey,
+        contract: Address,
+        nonce: u64,
+        window_id: u64,
+        status: TransactionStatus,
+    ) -> (String, Eip1559Request, B256, U256) {
+        let (session_id, request, hash, exposure) = create_closed_broadcast_run(
+            store, config, wallet, ast_token, signer, contract, nonce, window_id,
+        );
+        let mut journal = TransactionJournal::open_for_read_only_recovery(
+            store,
+            config,
+            wallet,
+            Arc::new(HistoryTelemetry::default()),
+        )
+        .unwrap();
+        let entry = journal.entry_mut(hash).unwrap();
+        entry.status = status;
+        match status {
+            TransactionStatus::Prepared
+            | TransactionStatus::Broadcast
+            | TransactionStatus::Unknown => {
+                entry.receipt_verification = super::ReceiptVerification::Unverified;
+                entry.actual_cost_wei = None;
+                entry.last_known_cost_wei = None;
+                entry.outcome = None;
+                entry.receipt_block = None;
+                entry.receipt_block_hash = None;
+                entry.receipt_status = None;
+                entry.confirmations = 0;
+            }
+            TransactionStatus::Included => {
+                entry.receipt_verification = super::ReceiptVerification::TrustedRpcChecked;
+                entry.receipt_block = Some(20);
+                entry.receipt_block_hash = Some(format!("{:#x}", B256::with_last_byte(0x41)));
+                entry.receipt_status = Some(true);
+                entry.outcome = Some("window-finalized".to_owned());
+                entry.confirmations = 0;
+            }
+            TransactionStatus::MinedSuccess | TransactionStatus::MinedReverted => {
+                entry.receipt_verification = super::ReceiptVerification::TrustedRpcChecked;
+                entry.receipt_block = Some(20);
+                entry.receipt_block_hash = Some(format!("{:#x}", B256::with_last_byte(0x41)));
+                entry.receipt_status = Some(status == TransactionStatus::MinedSuccess);
+                entry.outcome = Some("window-finalized".to_owned());
+                entry.confirmations = u64::from(entry.confirmations_required);
+                entry.actual_cost_wei = Some("100000".to_owned());
+                entry.last_known_cost_wei = None;
+            }
+        }
+        journal.persist().unwrap();
+        drop(journal);
         (session_id, request, hash, exposure)
     }
 

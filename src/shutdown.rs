@@ -23,7 +23,7 @@ use std::{
     future::Future,
     io,
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -123,12 +123,72 @@ impl ShutdownReason {
     }
 }
 
+/// Live delivery flags used by synchronous terminal prompts. Signal handlers
+/// never touch this list; they only update the atomics owned by each request.
+/// Prompts consult it while they wait so a signal can cancel a polling read
+/// without mutating signal dispositions or using a detached reader thread.
+static ACTIVE_PROMPT_REQUESTS: Mutex<Vec<Weak<AtomicUsize>>> = Mutex::new(Vec::new());
+
+/// A blocking terminal prompt was cancelled because a shutdown signal was
+/// delivered. Callers that own a `ShutdownSignal` treat this as a clean stop;
+/// callers without one fail closed before mutating authorization state.
+#[derive(Debug)]
+pub(crate) struct PromptShutdown;
+
+impl std::fmt::Display for PromptShutdown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("terminal prompt cancelled by a shutdown signal")
+    }
+}
+
+impl std::error::Error for PromptShutdown {}
+
+pub(crate) fn prompt_shutdown_error() -> anyhow::Error {
+    anyhow::Error::new(PromptShutdown)
+}
+
+pub(crate) fn is_prompt_shutdown(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<PromptShutdown>().is_some())
+}
+
+/// True while any live shutdown request has observed a delivered signal.
+pub(crate) fn prompt_shutdown_requested() -> bool {
+    let mut active = ACTIVE_PROMPT_REQUESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut requested = false;
+    active.retain(|weak| {
+        let Some(delivered) = weak.upgrade() else {
+            return false;
+        };
+        requested |= delivered.load(Ordering::SeqCst) != 0;
+        true
+    });
+    requested
+}
+
 /// Synchronous delivery flag and the signing-permit state shared with the
 /// transaction manager.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct ShutdownRequest {
     delivered: Arc<AtomicUsize>,
     signing: Arc<AtomicBool>,
+}
+
+impl Default for ShutdownRequest {
+    fn default() -> Self {
+        let delivered = Arc::new(AtomicUsize::new(0));
+        ACTIVE_PROMPT_REQUESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Arc::downgrade(&delivered));
+        Self {
+            delivered,
+            signing: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl ShutdownRequest {
@@ -136,10 +196,14 @@ impl ShutdownRequest {
         self.delivered.load(Ordering::SeqCst) != 0
     }
 
+    /// The first signal reason latched by `mark_delivered`. Later signals do
+    /// not replace it; they only keep the shutdown state latched.
     pub(crate) fn reason(&self) -> Option<ShutdownReason> {
         ShutdownReason::from_code(self.delivered.load(Ordering::SeqCst))
     }
 
+    /// Latch the first delivered signal reason. Later signals observe the
+    /// already-nonzero flag and do not replace the reason reported to callers.
     fn mark_delivered(&self, reason: ShutdownReason) {
         let _ =
             self.delivered
@@ -333,7 +397,16 @@ fn register_os_signal_flags(request: &ShutdownRequest) -> io::Result<Vec<signal_
 
     let mut ids = Vec::with_capacity(signals.len());
     for (signal, code) in signals {
-        match signal_hook::flag::register_usize(*signal, Arc::clone(&request.delivered), *code) {
+        let delivered = Arc::clone(&request.delivered);
+        let code = *code;
+        // SAFETY: the handler only performs a lock-free atomic compare-exchange,
+        // which is async-signal-safe. It latches the first delivered signal so
+        // later signals cannot replace the reason reported to the operator.
+        match unsafe {
+            signal_hook::low_level::register(*signal, move || {
+                let _ = delivered.compare_exchange(0, code, Ordering::SeqCst, Ordering::SeqCst);
+            })
+        } {
             Ok(id) => ids.push(id),
             Err(error) => {
                 for id in ids.drain(..) {
@@ -403,12 +476,14 @@ fn signal_reason(received: Option<()>, reason: ShutdownReason) -> io::Result<Shu
     })
 }
 
+/// A named unit type keeps the shared registration path free of a `()` local,
+/// which Clippy rejects as `let_unit_value` on Windows.
 #[cfg(not(unix))]
-type OsSignalStreams = ();
+struct OsSignalStreams;
 
 #[cfg(not(unix))]
 fn os_signal_streams() -> io::Result<OsSignalStreams> {
-    Ok(())
+    Ok(OsSignalStreams)
 }
 
 #[cfg(not(unix))]
@@ -501,6 +576,16 @@ mod tests {
         waiter.join().unwrap();
         assert!(request.is_requested());
         request.request_for_test();
+        assert!(request.is_requested());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_delivered_signal_reason_is_latched() {
+        let request = ShutdownRequest::default();
+        request.mark_delivered(ShutdownReason::Terminate);
+        request.mark_delivered(ShutdownReason::Interrupt);
+        assert_eq!(request.reason(), Some(ShutdownReason::Terminate));
         assert!(request.is_requested());
     }
 
