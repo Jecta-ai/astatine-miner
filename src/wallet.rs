@@ -1333,7 +1333,9 @@ mod tests {
     use bip39::{Language, Mnemonic};
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha256;
-    use std::{io, path::PathBuf, str::FromStr, time::Duration};
+    #[cfg(unix)]
+    use std::time::Duration;
+    use std::{io, path::PathBuf, str::FromStr};
     use tempfile::tempdir;
     use zeroize::Zeroizing;
 
@@ -1677,6 +1679,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn hidden_prompt_cancellation_without_controlling_terminal_stays_cancellation() {
         const CHILD: &str = "ASTATINE_WALLET_NO_TTY_CHILD";
