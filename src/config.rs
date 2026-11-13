@@ -1129,8 +1129,10 @@ mod tests {
     use alloy_primitives::U256;
     use std::{ffi::OsStr, path::PathBuf};
 
+    #[cfg(unix)]
     struct JournalLockRetryHookGuard;
 
+    #[cfg(unix)]
     impl Drop for JournalLockRetryHookGuard {
         fn drop(&mut self) {
             super::JOURNAL_LOCK_RETRY_TEST_HOOK.with(|hook| {
@@ -1139,6 +1141,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn install_journal_lock_retry_hook(hook: impl FnMut() + 'static) -> JournalLockRetryHookGuard {
         super::JOURNAL_LOCK_RETRY_TEST_HOOK.with(|slot| {
             assert!(

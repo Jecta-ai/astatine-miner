@@ -67,8 +67,10 @@ fn require_disposable_missing_mode() {
 
 fn test_config() -> (AppConfig, Address) {
     let wallet = Address::from_str(TEST_WALLET).expect("test wallet address is valid");
-    let mut config = AppConfig::default();
-    config.wallet_address = Some(TEST_WALLET.to_owned());
+    let config = AppConfig {
+        wallet_address: Some(TEST_WALLET.to_owned()),
+        ..AppConfig::default()
+    };
     (config, wallet)
 }
 
