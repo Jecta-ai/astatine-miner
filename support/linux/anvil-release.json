@@ -1,0 +1,28 @@
+{
+  "schema": "astatine-external-binary-release/v1",
+  "tool": "anvil",
+  "upstream_repository": "https://github.com/foundry-rs/foundry",
+  "release_tag": "v1.9.0",
+  "source_commit": "6056c5845d34205a83cf7108042adb137325c9df",
+  "published_utc": "2026-11-02T21:28:02Z",
+  "platform": "linux-amd64",
+  "asset": "foundry_v1.9.0_linux_amd64.tar.gz",
+  "asset_url": "https://github.com/foundry-rs/foundry/releases/download/v1.9.0/foundry_v1.9.0_linux_amd64.tar.gz",
+  "sha256": "8d17599b42e3139f1a9c171be3798c4ed8e743ae17b84cc3435e57bf2a51ae99",
+  "sha256_url": "https://github.com/foundry-rs/foundry/releases/download/v1.9.0/foundry_v1.9.0_linux_amd64.sha256",
+  "attestation_url": "https://github.com/foundry-rs/foundry/attestations/62819811",
+  "runtime_scope": "Test-only local loopback Anvil. The miner does not link, load, or ship this binary.",
+  "verification": {
+    "enforced": [
+      "Archive bytes are downloaded over HTTPS from the pinned upstream release asset URL.",
+      "The SHA-256 digest is pinned in this inventory and recomputed after download before extraction.",
+      "The extracted binary must be an x86-64 ELF executable, must report the pinned Anvil version, and must report the pinned upstream source commit in its version banner.",
+      "The workflow runs Anvil only on 127.0.0.1 with a loopback RPC fixture and no public RPC endpoint."
+    ],
+    "not_enforced": [
+      "The upstream Sigstore attestation and any GPG signature are recorded but not verified by the workflow.",
+      "This inventory does not independently audit the upstream Foundry source tree."
+    ]
+  },
+  "asset_bytes": 118268939
+}

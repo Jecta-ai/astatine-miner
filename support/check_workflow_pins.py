@@ -12,7 +12,14 @@ USES = re.compile(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)")
 IMMUTABLE_SHA = re.compile(r"[0-9a-f]{40}\Z")
 PRIVILEGED_WORKFLOW_PATTERNS = (
     ("GitHub secrets context", re.compile(r"\bsecrets\b", re.IGNORECASE)),
+    ("write-all permission", re.compile(r"(?mi)^\s*permissions\s*:\s*write-all\b")),
     ("contents write permission", re.compile(r"\bcontents\s*:\s*write\b", re.IGNORECASE)),
+    (
+        "write permission",
+        re.compile(
+            r"(?mi)^\s*(?:actions|attestations|checks|contents|deployments|discussions|id-token|issues|packages|pages|pull-requests|repository-projects|security-events|statuses)\s*:\s*write\b"
+        ),
+    ),
     (
         "signing environment",
         re.compile(r"\benvironment\s*:\s*['\"]?testnet-release-signing\b", re.IGNORECASE),
@@ -66,6 +73,9 @@ def self_test() -> None:
         "env: TESTNET_RELEASE_SIGNING_KEY: ${{ secrets.TESTNET_RELEASE_SIGNING_KEY }}",
         "permissions: contents: write",
         "permissions: contents : write",
+        "permissions: write-all",
+        "permissions:\n  id-token: write",
+        "permissions:\n  packages: write",
         "env: ${{ toJSON(secrets) }}",
         "environment: testnet-release-signing",
         "environment: testnet-release-publish",
