@@ -60,6 +60,20 @@ static TEST_ATOMIC_WRITE_FAILURES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, AtomicWriteFailPoint>>,
 > = std::sync::OnceLock::new();
 
+#[cfg(all(test, unix))]
+static TEST_ATOMIC_WRITE_PAUSE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, unix))]
+pub(crate) fn pause_atomic_write_before_rename_for_test(path: PathBuf, ready: PathBuf) {
+    TEST_ATOMIC_WRITE_PAUSE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path, ready);
+}
+
 #[cfg(test)]
 static TEST_ARCHIVE_TAMPER_POINTS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, ArchiveTamperPoint>>,
@@ -1045,6 +1059,18 @@ fn atomic_write(path: &Path, data: &[u8], replace: bool) -> Result<()> {
         .context("flush staged file")?;
     #[cfg(test)]
     fail_atomic_write_if_requested(path, AtomicWriteFailPoint::BeforeRename)?;
+    #[cfg(all(test, unix))]
+    if let Some(ready) = TEST_ATOMIC_WRITE_PAUSE
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| anyhow!("test atomic-write pause mutex was poisoned"))?
+        .remove(path)
+    {
+        fs::write(ready, b"staged file synced; rename not started")?;
+        loop {
+            std::thread::park();
+        }
+    }
     if replace {
         persist_replace(temporary, path)?;
     } else {

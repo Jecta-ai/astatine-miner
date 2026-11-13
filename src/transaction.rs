@@ -17506,6 +17506,69 @@ mod tests {
         assert!(store.read_transaction_journal().unwrap().is_none());
     }
 
+    #[test]
+    fn zero_cap_preserves_unresolved_liability_without_new_authorization() {
+        for status in [TransactionStatus::Prepared, TransactionStatus::Broadcast] {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(root.path().to_path_buf());
+            let signer = recovery_signer();
+            let wallet = signer_address(&signer);
+            let previous = AppConfig {
+                per_session_spending_limit_inj: "1".to_owned(),
+                ..AppConfig::default()
+            };
+            let (_, request, hash, exposure) = create_closed_run_with_status(
+                &store,
+                &previous,
+                wallet,
+                Address::with_last_byte(0x92),
+                &signer,
+                Address::with_last_byte(0x91),
+                70,
+                80,
+                status,
+            );
+            let before = store.read_transaction_journal().unwrap().unwrap();
+            let zero = AppConfig {
+                per_session_spending_limit_inj: "0".to_owned(),
+                ..previous
+            };
+            let mut journal = TransactionJournal::open(&store, &zero, wallet).unwrap();
+            assert!(journal.has_unresolved());
+            assert_eq!(journal.entry(hash).unwrap().status, status);
+            assert_eq!(journal.pending_exposure().unwrap(), exposure);
+            assert_eq!(journal.unresolved_transactions().len(), 1);
+            let intent = TransactionIntent {
+                contract: request.to,
+                node_id: 1,
+                window_id: 81,
+                action: TransactionAction::FinalizeWindow,
+                proof: None,
+                reward_destination: None,
+                forwarding: None,
+            };
+            let refusal = journal
+                .authorize_exposure(&request, &intent, U256::ZERO, U256::ZERO, U256::MAX)
+                .unwrap_err();
+            assert!(
+                format!("{refusal:#}").contains("earlier transaction has unresolved broadcast"),
+                "the unresolved liability must block another authorization: {refusal:#}"
+            );
+            drop(journal);
+            assert_eq!(store.read_transaction_journal().unwrap().unwrap(), before);
+
+            let recovery = TransactionJournal::open_for_read_only_recovery(
+                &store,
+                &zero,
+                wallet,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .unwrap();
+            assert_eq!(recovery.pending_exposure().unwrap(), exposure);
+            assert_eq!(recovery.entry(hash).unwrap().status, status);
+        }
+    }
+
     #[cfg(unix)]
     const JOURNAL_SIGKILL_CHILD_ROOT_ENV: &str = "ASTATINE_JOURNAL_SIGKILL_CHILD_ROOT";
 
@@ -17537,6 +17600,91 @@ mod tests {
                 let _ = self.0.kill();
                 let _ = self.0.wait();
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child probe; invoked by sigkill_during_staged_journal_write_preserves_prior_state"]
+    fn journal_staged_write_child() {
+        let root = PathBuf::from(std::env::var_os(JOURNAL_SIGKILL_CHILD_ROOT_ENV).unwrap());
+        let store = ConfigStore::at_root(root.clone());
+        let _lock = store.lock_transaction_journal().unwrap();
+        let path = store.transaction_journal_path_for_test().unwrap();
+        let mut replacement = store.read_transaction_journal().unwrap().unwrap();
+        replacement.push(b' ');
+        crate::config::pause_atomic_write_before_rename_for_test(
+            path,
+            root.join("staged-journal-write-ready"),
+        );
+        store.write_transaction_journal(&replacement).unwrap();
+        panic!("staged-write child must be killed at the injected pre-rename boundary");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigkill_during_staged_journal_write_preserves_prior_state() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for status in [TransactionStatus::Prepared, TransactionStatus::Broadcast] {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(root.path().to_path_buf());
+            let signer = recovery_signer();
+            let wallet = signer_address(&signer);
+            let config = AppConfig {
+                per_session_spending_limit_inj: "1".to_owned(),
+                ..AppConfig::default()
+            };
+            let (_, _, hash, exposure) = create_closed_run_with_status(
+                &store,
+                &config,
+                wallet,
+                Address::with_last_byte(0x92),
+                &signer,
+                Address::with_last_byte(0x91),
+                70,
+                80,
+                status,
+            );
+            let before = store.read_transaction_journal().unwrap().unwrap();
+            let ready = root.path().join("staged-journal-write-ready");
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "transaction::tests::journal_staged_write_child",
+                ])
+                .env(JOURNAL_SIGKILL_CHILD_ROOT_ENV, root.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut child = JournalSigkillChild(child);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !ready.exists() {
+                if let Some(exit) = child.0.try_wait().unwrap() {
+                    panic!("journal writer exited before the staged-write boundary: {exit}");
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "journal writer did not reach the boundary"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(store.read_transaction_journal().unwrap().unwrap(), before);
+            child.0.kill().unwrap();
+            assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+            assert_eq!(store.read_transaction_journal().unwrap().unwrap(), before);
+            let recovery = TransactionJournal::open_for_read_only_recovery(
+                &store,
+                &config,
+                wallet,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .unwrap();
+            assert_eq!(recovery.entry(hash).unwrap().status, status);
+            assert_eq!(recovery.pending_exposure().unwrap(), exposure);
         }
     }
 

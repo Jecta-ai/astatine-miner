@@ -229,9 +229,11 @@ jobs:
             "config::tests::journal_lock_retries_until_a_short_holder_releases"
             "config::tests::journal_lock_fails_closed_when_held_beyond_the_retry_bound"
             "transaction::tests::zero_limit_opens_read_only_while_mainnet_cannot_open_a_journal"
+            "transaction::tests::zero_cap_preserves_unresolved_liability_without_new_authorization"
             "transaction::tests::maximum_exposure_and_minimum_reserve_are_enforced_before_journaling"
             "transaction::tests::journal_and_checkpoint_crash_boundaries_never_authorize_an_unpersisted_signature"
             "transaction::tests::journal_sigkill_releases_lock_and_restart_preserves_unresolved_states"
+            "transaction::tests::sigkill_during_staged_journal_write_preserves_prior_state"
             "commands::tests::matching_existing_session_cap_does_not_reset_allowance_after_config_repair"
             "transaction::tests::copied_data_root_cannot_fork_a_session_checkpoint_or_spending_cap"
           )
