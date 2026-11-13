@@ -2015,11 +2015,8 @@ transaction_confirmations = 2
             }
         }
         let _cleanup = DeleteSyntheticEntry(store.journal_anchor_entry().ok());
-        match store.read_journal_anchor_from_os_for_test() {
-            Ok(Some(_)) => {
-                panic!("a locked or unavailable Secret Service exposed a checkpoint secret")
-            }
-            Ok(None) | Err(_) => {}
+        if let Ok(Some(_)) = store.read_journal_anchor_from_os_for_test() {
+            panic!("a locked or unavailable Secret Service exposed a checkpoint secret")
         }
         let write_error = store
             .write_journal_anchor_to_os_for_test(b"must-not-persist")

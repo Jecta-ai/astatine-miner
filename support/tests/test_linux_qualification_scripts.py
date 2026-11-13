@@ -58,6 +58,13 @@ class SshLoopbackScriptInvariantTests(unittest.TestCase):
         self.assertIn('[[ "$created_user" == "true" ]]', cleanup_block)
         self.assertIn("userdel -r", cleanup_block)
 
+    def test_authorized_keys_are_reachable_without_traversing_runner_home(self) -> None:
+        self.assertIn('auth_dir="$(mktemp -d /tmp/astatine-ssh-auth.XXXXXX)"', self.script)
+        self.assertIn('chmod 755 "$auth_dir"', self.script)
+        self.assertIn("AuthorizedKeysFile $auth_dir/authorized_keys", self.script)
+        self.assertIn('chmod 700 "$work"', self.script)
+        self.assertNotIn("AuthorizedKeysFile $work/authorized_keys", self.script)
+
     def test_uses_random_username_and_fixed_trusted_sshd(self) -> None:
         self.assertIn('smoke_user="astatine-ssh-$(python3', self.script)
         self.assertIn('SSHD="/usr/sbin/sshd"', self.script)

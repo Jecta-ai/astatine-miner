@@ -36,6 +36,10 @@ attest, create releases, or contact a public RPC endpoint.
   checkpoint **write** to fail and verifies that no transaction journal is
   created. It also rejects any secret returned from a locked or unavailable
   provider.
+- The SSH smoke places only the public `authorized_keys` in a separate
+  0755 `/tmp` directory because GitHub's `RUNNER_TEMP` can sit beneath a
+  non-traversable `/home/runner`; private keys, host keys, logs, and the sshd
+  configuration remain in a 0700 work directory.
 - The SSH job creates a disposable local user with a random password marker
   (password authentication is disabled), generates host and user keys under
   `RUNNER_TEMP`, uses a custom `sshd` configuration bound to `127.0.0.1` on an
