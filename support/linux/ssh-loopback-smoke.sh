@@ -17,7 +17,7 @@ if [[ "${GITHUB_ACTIONS:-}" != "true" && "${ASTATINE_ALLOW_SSH_SMOKE:-}" != "1" 
     printf 'ssh-loopback: refusing to create a disposable system user outside a disposable CI runner; set ASTATINE_ALLOW_SSH_SMOKE=1 to override\n' >&2
     exit 1
 fi
-for tool in ssh ssh-keygen sudo python3 useradd userdel chpasswd passwd timeout; do
+for tool in ssh ssh-keygen sudo python3 useradd userdel chpasswd passwd timeout ss; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         printf 'ssh-loopback: required tool is missing: %s\n' "$tool" >&2
         exit 1
@@ -235,3 +235,23 @@ if ! grep -q 'ssh-loopback-pty-ok' <<<"$output"; then
 fi
 
 printf 'ssh-loopback: PTY and /dev/tty verified over a loopback-only disposable sshd\n'
+
+# Exercise the actual application without accessing a wallet or network. Only
+# the compiled executable is made accessible to the disposable target user.
+app="${ASTATINE_SSH_TEST_BINARY:?set ASTATINE_SSH_TEST_BINARY to the compiled test executable}"
+if [[ ! -f "$app" || ! -x "$app" ]]; then
+    printf 'ssh-loopback: application executable is unavailable\n' >&2
+    exit 1
+fi
+cp "$app" "$auth_dir/astatine"
+chmod 755 "$auth_dir/astatine"
+for allocation in -T -tt; do
+    output="$(timeout --signal=TERM --kill-after=5s 30s \
+        ssh "$allocation" "${ssh_options[@]}" "$target_user@127.0.0.1" \
+        "$auth_dir/astatine --help" </dev/null)"
+    if ! grep -q 'Usage:' <<<"$output"; then
+        printf 'ssh-loopback: application help failed with allocation %s\n' "$allocation" >&2
+        exit 1
+    fi
+done
+printf 'ssh-loopback: application help succeeded with and without SSH PTY allocation\n'

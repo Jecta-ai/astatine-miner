@@ -33,6 +33,12 @@ const JOURNAL_LOCK_RETRY_ATTEMPTS: u32 = 20;
 const JOURNAL_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
+std::thread_local! {
+    static JOURNAL_LOCK_RETRY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
 static TEST_JOURNAL_ANCHORS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Zeroizing<Vec<u8>>>>,
 > = std::sync::OnceLock::new();
@@ -633,6 +639,12 @@ impl ConfigStore {
                     if attempts < JOURNAL_LOCK_RETRY_ATTEMPTS =>
                 {
                     attempts += 1;
+                    #[cfg(test)]
+                    JOURNAL_LOCK_RETRY_TEST_HOOK.with(|hook| {
+                        if let Some(hook) = hook.borrow_mut().as_mut() {
+                            hook();
+                        }
+                    });
                     std::thread::sleep(JOURNAL_LOCK_RETRY_INTERVAL);
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
@@ -1116,6 +1128,26 @@ mod tests {
     use crate::cli::Network;
     use alloy_primitives::U256;
     use std::{ffi::OsStr, path::PathBuf};
+
+    struct JournalLockRetryHookGuard;
+
+    impl Drop for JournalLockRetryHookGuard {
+        fn drop(&mut self) {
+            super::JOURNAL_LOCK_RETRY_TEST_HOOK.with(|hook| {
+                hook.borrow_mut().take();
+            });
+        }
+    }
+
+    fn install_journal_lock_retry_hook(hook: impl FnMut() + 'static) -> JournalLockRetryHookGuard {
+        super::JOURNAL_LOCK_RETRY_TEST_HOOK.with(|slot| {
+            assert!(
+                slot.borrow_mut().replace(Box::new(hook)).is_none(),
+                "journal lock retry hooks cannot be nested"
+            );
+        });
+        JournalLockRetryHookGuard
+    }
 
     fn child_test_evidence(child: &std::process::Output) -> Result<(), String> {
         let stdout = String::from_utf8_lossy(&child.stdout);
@@ -2143,22 +2175,36 @@ transaction_confirmations = 2
         let store = ConfigStore::at_root(temporary.path().to_path_buf());
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
         let holder_store = store.clone();
         let holder = std::thread::spawn(move || {
             let lock = holder_store.lock_transaction_journal().unwrap();
             locked_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             drop(lock);
+            released_tx.send(()).unwrap();
         });
         locked_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            release_tx.send(()).unwrap();
+        let retry_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let observed_retries = std::sync::Arc::clone(&retry_count);
+        let _retry_hook = install_journal_lock_retry_hook(move || {
+            let retry = observed_retries.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if retry == 1 {
+                release_tx.send(()).unwrap();
+                released_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("holder must release the lock before the next attempt");
+            }
         });
         let acquired = store.lock_transaction_journal();
-        releaser.join().unwrap();
+        drop(_retry_hook);
+        assert!(
+            (1..=super::JOURNAL_LOCK_RETRY_ATTEMPTS)
+                .contains(&retry_count.load(std::sync::atomic::Ordering::SeqCst)),
+            "a short holder must be released on the first retry and acquired within the bound"
+        );
         holder.join().unwrap();
         let acquired = acquired.expect("lock should be acquired after a short holder releases");
         drop(acquired);
@@ -2181,17 +2227,20 @@ transaction_confirmations = 2
         locked_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
-        let started = std::time::Instant::now();
+        let retry_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let observed_retries = std::sync::Arc::clone(&retry_count);
+        let _retry_hook = install_journal_lock_retry_hook(move || {
+            observed_retries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
         let error = store.lock_transaction_journal().unwrap_err();
-        let elapsed = started.elapsed();
+        drop(_retry_hook);
+        assert_eq!(
+            retry_count.load(std::sync::atomic::Ordering::SeqCst),
+            super::JOURNAL_LOCK_RETRY_ATTEMPTS,
+            "the lock must make exactly the configured number of retry attempts"
+        );
         let _ = release_tx.send(());
         holder.join().unwrap();
-        let minimum_retry_window = super::JOURNAL_LOCK_RETRY_INTERVAL
-            * (super::JOURNAL_LOCK_RETRY_ATTEMPTS.saturating_sub(2));
-        assert!(
-            elapsed >= minimum_retry_window,
-            "lock acquisition returned before the retry bound elapsed: {elapsed:?}"
-        );
         let error_text = format!("{error:#}");
         assert!(
             error_text.contains("another astatine mining process")

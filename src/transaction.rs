@@ -17484,6 +17484,7 @@ mod tests {
         let root = tempdir().unwrap();
         let store = ConfigStore::at_root(PathBuf::from(root.path()));
         let wallet = Address::with_last_byte(0x99);
+        assert!(store.read_transaction_journal().unwrap().is_none());
         let readonly_config = AppConfig {
             per_session_spending_limit_inj: "0".to_owned(),
             ..AppConfig::default()
@@ -17492,12 +17493,152 @@ mod tests {
         assert!(readonly.state.active_session.is_none());
         assert!(!readonly.has_unresolved());
         drop(readonly);
+        assert!(
+            store.read_transaction_journal().unwrap().is_none(),
+            "opening with a zero cap must not create or mutate a transaction journal"
+        );
         let mainnet_config = AppConfig {
             network: Network::Mainnet,
             per_session_spending_limit_inj: "1".to_owned(),
             ..AppConfig::default()
         };
         assert!(TransactionJournal::open(&store, &mainnet_config, wallet).is_err());
+        assert!(store.read_transaction_journal().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    const JOURNAL_SIGKILL_CHILD_ROOT_ENV: &str = "ASTATINE_JOURNAL_SIGKILL_CHILD_ROOT";
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child probe; invoked by journal_sigkill_releases_lock_and_restart_preserves_unresolved_states"]
+    fn journal_sigkill_lock_holder_child() {
+        let root = std::env::var_os(JOURNAL_SIGKILL_CHILD_ROOT_ENV)
+            .expect("SIGKILL lock-holder child requires its private test root");
+        let store = ConfigStore::at_root(PathBuf::from(&root));
+        let _lock = store.lock_transaction_journal().unwrap();
+        std::fs::write(
+            PathBuf::from(root).join("journal-lock-holder-ready"),
+            b"lock acquired",
+        )
+        .unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(unix)]
+    struct JournalSigkillChild(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for JournalSigkillChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_sigkill_releases_lock_and_restart_preserves_unresolved_states() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for (index, status) in [TransactionStatus::Prepared, TransactionStatus::Broadcast]
+            .into_iter()
+            .enumerate()
+        {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(PathBuf::from(root.path()));
+            let signer = recovery_signer();
+            let wallet = signer_address(&signer);
+            let contract = Address::with_last_byte(0x91);
+            let token = Address::with_last_byte(0x92);
+            let config = AppConfig {
+                per_session_spending_limit_inj: "1".to_owned(),
+                ..AppConfig::default()
+            };
+            let nonce = 70 + index as u64;
+            let window_id = 80 + index as u64;
+            let (_, request, hash, exposure) = create_closed_run_with_status(
+                &store, &config, wallet, token, &signer, contract, nonce, window_id, status,
+            );
+            let durable_before_kill = store.read_transaction_journal().unwrap().unwrap();
+            let ready_path = root.path().join("journal-lock-holder-ready");
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "transaction::tests::journal_sigkill_lock_holder_child",
+                    "--nocapture",
+                ])
+                .env(JOURNAL_SIGKILL_CHILD_ROOT_ENV, root.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn a disposable journal-lock holder");
+            let mut child = JournalSigkillChild(child);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !ready_path.exists() {
+                if let Some(exit) = child.0.try_wait().unwrap() {
+                    panic!("journal lock-holder child exited before acquiring its lock: {exit}");
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "journal lock-holder child did not acquire the lock before the deadline"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            let contention = store
+                .lock_transaction_journal()
+                .expect_err("the live child must hold the transaction journal lock");
+            let contention = format!("{contention:#}");
+            assert!(
+                contention.contains("another astatine mining process")
+                    && contention.contains("operation would block"),
+                "expected bounded lock contention before SIGKILL, got: {contention}"
+            );
+
+            // SAFETY: the child is confirmed alive by the ready marker written
+            // only after it acquired the journal lock.
+            assert_eq!(
+                unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGKILL) },
+                0,
+                "SIGKILL the journal lock-holder: {}",
+                std::io::Error::last_os_error()
+            );
+            let exit = child.0.wait().unwrap();
+            assert_eq!(
+                exit.signal(),
+                Some(libc::SIGKILL),
+                "the journal lock-holder must exit from SIGKILL"
+            );
+
+            assert_eq!(
+                store.read_transaction_journal().unwrap().unwrap(),
+                durable_before_kill,
+                "killing a lock holder must not alter already-durable journal bytes"
+            );
+            let restarted = TransactionJournal::open_for_read_only_recovery(
+                &store,
+                &config,
+                wallet,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .expect("restart must reacquire the lock and authenticate the durable journal");
+            let recovered = restarted.entry(hash).unwrap();
+            assert_eq!(recovered.status, status);
+            assert_eq!(recovered.nonce, request.nonce);
+            assert_eq!(
+                parse_decimal_wei(&recovered.maximum_exposure_wei).unwrap(),
+                exposure
+            );
+            assert_eq!(restarted.pending_exposure().unwrap(), exposure);
+            assert_eq!(restarted.unresolved_transactions().len(), 1);
+        }
     }
 
     #[test]

@@ -2,8 +2,9 @@
 #
 # This workflow is intentionally separate from ci.yml. It uses a private D-Bus
 # session, a disposable Secret Service keyring, disposable SSH keys, and a
-# pinned local-loopback Anvil binary. It never reads repository credentials, never
-# contacts a public RPC endpoint, and never publishes, signs, or releases.
+# pinned local-loopback Anvil binary. It does not read repository credentials,
+# contact a public RPC endpoint, publish, or perform release signing. Anvil tests
+# sign synthetic transactions only for the local loopback chain.
 name: Linux native qualification
 
 on:
@@ -94,10 +95,13 @@ jobs:
             dbus gnome-keyring libglib2.0-bin
           dpkg-query -W -f='${Package} ${Version}\n' dbus gnome-keyring libglib2.0-bin
       - name: Compile the test harness without executing it
-        run: cargo test --locked --bin astatine --no-run
+        run: |
+          cargo test --locked --bin astatine --no-run
+          cargo build --locked --bin astatine
       - name: Run the isolated Secret Service matrix
         env:
           ASTATINE_QUALIFICATION_MODE: ${{ matrix.mode }}
+          ASTATINE_PHASE_B_APP_BINARY: ${{ github.workspace }}/target/debug/astatine
           CARGO_NET_OFFLINE: "true"
         run: |
           set -euo pipefail
@@ -148,6 +152,11 @@ jobs:
           case "$ASTATINE_QUALIFICATION_MODE" in
             provider)
               run_ignored_test "config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped"
+              run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_authenticated_journal_restarts_across_processes"
+              run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_production_recover_authenticates_journal_after_restart"
+              run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_missing_checkpoint_fails_closed_after_restart"
+              run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_corrupt_checkpoint_fails_closed_after_restart"
+              run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_interrupted_init_transition_recovers_across_processes"
               ;;
             locked)
               run_ignored_test "config::tests::linux_secret_service_untrusted_on_ambient_bus_fails_closed"
@@ -155,6 +164,7 @@ jobs:
             missing)
               run_regular_test "config::tests::linux_secret_service_unavailable_fails_closed_without_native_keyring"
               run_ignored_test "config::tests::linux_secret_service_untrusted_on_ambient_bus_fails_closed"
+              run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_absence_has_no_default_collection_and_fails_closed"
               ;;
             *)
               printf 'unsupported qualification mode: %s\n' "$ASTATINE_QUALIFICATION_MODE" >&2
@@ -216,10 +226,12 @@ jobs:
             "wallet::tests::hidden_wallet_prompts_restore_terminal_on_a_controlling_pty"
             "shutdown::tests::supported_os_signals_resolve_the_shutdown_signal"
             "config::tests::journal_lock_excludes_a_second_process"
+            "config::tests::journal_lock_retries_until_a_short_holder_releases"
             "config::tests::journal_lock_fails_closed_when_held_beyond_the_retry_bound"
             "transaction::tests::zero_limit_opens_read_only_while_mainnet_cannot_open_a_journal"
             "transaction::tests::maximum_exposure_and_minimum_reserve_are_enforced_before_journaling"
             "transaction::tests::journal_and_checkpoint_crash_boundaries_never_authorize_an_unpersisted_signature"
+            "transaction::tests::journal_sigkill_releases_lock_and_restart_preserves_unresolved_states"
             "commands::tests::matching_existing_session_cap_does_not_reset_allowance_after_config_repair"
             "transaction::tests::copied_data_root_cannot_fork_a_session_checkpoint_or_spending_cap"
           )
@@ -339,7 +351,7 @@ jobs:
     needs: workflow-safety
     name: SSH loopback PTY smoke
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
         with:
@@ -369,9 +381,19 @@ jobs:
             fi
           }
           trap cleanup_policy EXIT
-          sudo apt-get install -y --no-install-recommends openssh-server openssh-client
+          sudo apt-get install -y --no-install-recommends openssh-server openssh-client iproute2
           cleanup_policy
           trap - EXIT
           dpkg-query -W -f='${Package} ${Version}\n' openssh-server openssh-client
-      - name: Verify loopback-only SSH PTY allocation
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.1 --profile minimal
+          test "$(rustc --version | awk '{print $2}')" = "1.94.1"
+          test "$(rustc -vV | awk '$1 == "host:" {print $2}')" = "x86_64-unknown-linux-gnu"
+      - name: Build application for SSH smoke
+        run: cargo build --locked --bin astatine
+      - name: Verify loopback-only SSH application and PTY allocation
+        env:
+          ASTATINE_SSH_TEST_BINARY: target/debug/astatine
         run: bash support/linux/ssh-loopback-smoke.sh

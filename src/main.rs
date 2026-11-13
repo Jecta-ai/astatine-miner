@@ -7,6 +7,8 @@ mod deployment;
 mod diagnostics;
 mod gpu;
 mod history_telemetry;
+#[cfg(all(test, target_os = "linux"))]
+mod linux_secret_service_phase_b_tests;
 mod mining;
 mod proof_telemetry;
 mod protocol;
