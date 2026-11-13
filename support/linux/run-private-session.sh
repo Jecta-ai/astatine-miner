@@ -5,6 +5,8 @@
 #   provider  Start an unlocked disposable GNOME Keyring (Secret Service).
 #   locked    Create it unlocked, stop the daemon, restart without the password,
 #             and verify the default collection is genuinely locked.
+#   no-default Start GNOME Keyring without unlocking a fresh HOME; require a
+#             live service owner and ReadAlias default to return /.
 #   missing   Start no provider on a private bus with no service activation.
 #
 # The script never prints or exports the disposable keyring password. It creates
@@ -13,7 +15,7 @@ set -euo pipefail
 umask 077
 
 usage() {
-    printf 'usage: %s {provider|locked|missing} -- COMMAND [ARGS...]\n' "$0" >&2
+    printf 'usage: %s {provider|locked|no-default|missing} -- COMMAND [ARGS...]\n' "$0" >&2
     exit 2
 }
 
@@ -31,7 +33,7 @@ if [[ $# -eq 0 ]]; then
 fi
 
 case "$mode" in
-    provider|locked|missing) ;;
+    provider|locked|no-default|missing) ;;
     *)
         usage
         ;;
@@ -231,6 +233,24 @@ start_keyring_locked() {
     fi
 }
 
+start_keyring_no_default() {
+    # HOME and XDG paths were created empty by this harness. Starting the
+    # secrets component without --unlock leaves it running without creating a
+    # default collection; verify that fact over D-Bus before the test command
+    # is allowed to exercise the native credential-store client.
+    gnome-keyring-daemon --components=secrets --foreground \
+        >/dev/null 2>"$work/keyring.log" &
+    keyring_pid="$!"
+    if ! wait_for_secret_service; then
+        printf 'linux-qualification: org.freedesktop.secrets did not appear in no-default mode\n' >&2
+        return 1
+    fi
+    if ! kill -0 "$keyring_pid" 2>/dev/null; then
+        printf 'linux-qualification: the no-default keyring exited during startup\n' >&2
+        return 1
+    fi
+}
+
 stop_keyring() {
     if [[ -z "$keyring_pid" ]]; then
         return 0
@@ -288,6 +308,20 @@ case "$mode" in
         fi
         unset ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE
         printf 'linux-qualification: provider=locked default_collection=%s\n' "$default_path"
+        ;;
+    no-default)
+        start_keyring_no_default
+        if ! secret_service_owned; then
+            printf 'linux-qualification: no-default mode requires a running Secret Service owner\n' >&2
+            exit 1
+        fi
+        default_path="$(default_collection_path)"
+        if [[ "$default_path" != "/" ]]; then
+            printf 'linux-qualification: expected ReadAlias default to return / in no-default mode (got %s)\n' "${default_path:-<empty>}" >&2
+            exit 1
+        fi
+        unset ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE
+        printf 'linux-qualification: provider=present default_collection=%s\n' "$default_path"
         ;;
     missing)
         if secret_service_owned; then

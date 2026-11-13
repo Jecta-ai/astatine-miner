@@ -67,7 +67,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [provider, locked, missing]
+        mode: [provider, locked, no-default, missing]
     env:
       CARGO_TARGET_DIR: target
     steps:
@@ -159,6 +159,9 @@ jobs:
               run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_interrupted_init_transition_recovers_across_processes"
               ;;
             locked)
+              run_ignored_test "config::tests::linux_secret_service_untrusted_on_ambient_bus_fails_closed"
+              ;;
+            no-default)
               run_ignored_test "config::tests::linux_secret_service_untrusted_on_ambient_bus_fails_closed"
               ;;
             missing)

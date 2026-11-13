@@ -98,19 +98,27 @@ python3 -m unittest discover -s support/tests -p 'test_*.py'
 
 ## Honest limits
 
-- The GitHub-hosted workflow has not been executed by this source tree until the
-  branch is pushed or opened as a pull request. Local validation used Linux
-  containers and the native macOS test suite; it is not a substitute for a
-  hosted-runner run.
-- The SSH loopback job verifies transport and PTY behavior only. Wallet prompts
-  over SSH, including host-side terminal recording and SSH server policy, remain
-  **NOT TESTED** here.
+- GitHub-hosted results apply only to the exact commit tested. Local validation
+  using Linux containers or macOS is not a substitute for a hosted-runner run.
+- The SSH loopback job verifies transport and PTY allocation only. Actual SSH
+  client disconnect and resize, and wallet prompts over SSH, including host-side
+  terminal recording and SSH server policy, remain **NOT TESTED** here.
 - The Foundry Sigstore attestation, the upstream `.sha256` asset fetch, and GPG
   signatures are recorded but **NOT VERIFIED** by the workflow; only the pinned
   digest and version-banner commit are enforced.
 - The locked probe verifies fail-closed behavior on a headless private bus. It
   does not represent a desktop keyring that can display an interactive unlock
   prompt.
+- The `no-default` mode tests a running Secret Service with no default
+  collection separately from an absent provider. Consult the hosted workflow
+  result for the exact commit before treating that case as qualified.
+- The production `recover` restart test authenticates a journal created by the
+  test harness with its checkpoint copied into the native provider. It does not
+  establish production creation of a journal and checkpoint followed by a
+  restart against that provider.
+- Anvil lifecycle coverage does not establish interruption at the actual
+  preparation or broadcast boundary followed by process restart; separate
+  synthetic RPC tests cover shutdown and recovery behavior at those boundaries.
 - Physical GPU mining, Windows credential storage, macOS Keychain behavior, the
   real bundled Testnet deployment, paid mining, public RPC endpoints, releases,
   signing, and deployment remain outside this qualification.

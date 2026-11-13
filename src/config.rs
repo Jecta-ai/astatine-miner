@@ -1289,53 +1289,79 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn gdbus_output(arguments: &[&str]) -> String {
-        let output = std::process::Command::new("gdbus")
+        let output = std::process::Command::new("timeout")
+            .args(["--signal=TERM", "--kill-after=1s", "3s", "gdbus"])
             .args(arguments)
             .output()
-            .expect("Linux qualification requires gdbus");
+            .expect("Linux qualification requires timeout and gdbus");
         assert!(
             output.status.success(),
-            "gdbus failed: {:?}",
+            "gdbus failed or exceeded its 3-second bound: {:?}",
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
     #[cfg(target_os = "linux")]
+    fn secret_service_has_owner() -> bool {
+        gdbus_output(&[
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.DBus",
+            "--object-path",
+            "/org/freedesktop/DBus",
+            "--method",
+            "org.freedesktop.DBus.NameHasOwner",
+            "org.freedesktop.secrets",
+        ])
+        .trim()
+            == "(true,)"
+    }
+
+    #[cfg(target_os = "linux")]
+    fn default_secret_service_alias_path() -> Option<String> {
+        let alias = gdbus_output(&[
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.secrets",
+            "--object-path",
+            "/org/freedesktop/secrets",
+            "--method",
+            "org.freedesktop.Secret.Service.ReadAlias",
+            "default",
+        ]);
+        alias
+            .split("objectpath '")
+            .nth(1)
+            .and_then(|value| value.split('\'').next())
+            .map(str::to_owned)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_no_default_secret_service_state() {
+        assert!(
+            secret_service_has_owner(),
+            "no-default mode requires an owned Secret Service immediately around native store access"
+        );
+        assert_eq!(
+            default_secret_service_alias_path().as_deref(),
+            Some("/"),
+            "no-default mode requires ReadAlias default to return / immediately around native store access"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     fn assert_ambient_secret_service_qualification_state() {
         let mode = ambient_secret_service_qualification_mode();
-        let owned = || {
-            gdbus_output(&[
-                "call",
-                "--session",
-                "--dest",
-                "org.freedesktop.DBus",
-                "--object-path",
-                "/org/freedesktop/DBus",
-                "--method",
-                "org.freedesktop.DBus.NameHasOwner",
-                "org.freedesktop.secrets",
-            ])
-            .contains("true")
-        };
         match mode.as_str() {
             "locked" => {
-                assert!(owned(), "locked mode requires an owned Secret Service");
-                let alias = gdbus_output(&[
-                    "call",
-                    "--session",
-                    "--dest",
-                    "org.freedesktop.secrets",
-                    "--object-path",
-                    "/org/freedesktop/secrets",
-                    "--method",
-                    "org.freedesktop.Secret.Service.ReadAlias",
-                    "default",
-                ]);
-                let path = alias
-                    .split("objectpath '")
-                    .nth(1)
-                    .and_then(|value| value.split('\'').next())
+                assert!(
+                    secret_service_has_owner(),
+                    "locked mode requires an owned Secret Service"
+                );
+                let path = default_secret_service_alias_path()
                     .filter(|value| !value.is_empty())
                     .expect("locked mode requires a default Secret Service collection");
                 let locked = gdbus_output(&[
@@ -1344,7 +1370,7 @@ mod tests {
                     "--dest",
                     "org.freedesktop.secrets",
                     "--object-path",
-                    path,
+                    &path,
                     "--method",
                     "org.freedesktop.DBus.Properties.Get",
                     "org.freedesktop.Secret.Collection",
@@ -1355,9 +1381,10 @@ mod tests {
                     "locked mode requires the default collection to report Locked=true: {locked:?}"
                 );
             }
+            "no-default" => assert_no_default_secret_service_state(),
             "missing" => {
                 assert!(
-                    !owned(),
+                    !secret_service_has_owner(),
                     "missing mode must not have an owned Secret Service"
                 );
             }
@@ -1725,11 +1752,11 @@ transaction_confirmations = 2
     fn ambient_secret_service_qualification_mode() -> String {
         require_disposable_credential_store();
         let mode = std::env::var("ASTATINE_QUALIFICATION_MODE").expect(
-            "ambient Secret Service qualification requires ASTATINE_QUALIFICATION_MODE=locked or missing",
+            "ambient Secret Service qualification requires ASTATINE_QUALIFICATION_MODE=locked, no-default, or missing",
         );
         assert!(
-            mode == "locked" || mode == "missing",
-            "ambient Secret Service qualification only permits locked or missing mode, got {mode:?}"
+            mode == "locked" || mode == "no-default" || mode == "missing",
+            "ambient Secret Service qualification only permits locked, no-default, or missing mode, got {mode:?}"
         );
         mode
     }
@@ -2017,7 +2044,7 @@ transaction_confirmations = 2
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn untrusted_store_child_requires_locked_or_missing_mode() {
+    fn untrusted_store_child_rejects_unlocked_provider_mode() {
         let root = tempfile::tempdir().unwrap();
         let child = guard_child_output(
             "config::tests::linux_secret_service_untrusted_child_probe",
@@ -2028,7 +2055,7 @@ transaction_confirmations = 2
         );
         assert_guard_failure(
             &child,
-            "only permits locked or missing",
+            "only permits locked, no-default, or missing",
             "untrusted child in provider mode",
         );
     }
@@ -2065,7 +2092,7 @@ transaction_confirmations = 2
         let root = std::env::var_os(LINUX_SECRET_SERVICE_CHILD_ROOT_ENV).expect(
             "Linux Secret Service untrusted child probe requires ASTATINE_LINUX_SECRET_SERVICE_CHILD_ROOT from its parent test",
         );
-        ambient_secret_service_qualification_mode();
+        let no_default_mode = ambient_secret_service_qualification_mode() == "no-default";
         let store = ConfigStore::at_root(PathBuf::from(root));
         struct DeleteSyntheticEntry(Option<keyring::Entry>);
         impl Drop for DeleteSyntheticEntry {
@@ -2075,14 +2102,32 @@ transaction_confirmations = 2
                 }
             }
         }
-        let _cleanup = DeleteSyntheticEntry(store.journal_anchor_entry().ok());
-        if let Ok(Some(_)) = store.read_journal_anchor_from_os_for_test() {
-            panic!("a locked or unavailable Secret Service exposed a checkpoint secret")
+        // No-default mode has a disposable HOME that the outer harness removes;
+        // avoid an extra native delete operation outside the read/write probes.
+        let _cleanup =
+            (!no_default_mode).then(|| DeleteSyntheticEntry(store.journal_anchor_entry().ok()));
+        if no_default_mode {
+            assert_no_default_secret_service_state();
         }
-        let write_error = store
-            .write_journal_anchor_to_os_for_test(b"must-not-persist")
-            .expect_err("a locked or unavailable Secret Service must reject checkpoint writes");
-        drop(_cleanup);
+        let read_result = store.read_journal_anchor_from_os_for_test();
+        if no_default_mode {
+            assert_no_default_secret_service_state();
+        }
+        if let Ok(Some(_)) = read_result {
+            panic!(
+                "a locked, no-default, or unavailable Secret Service exposed a checkpoint secret"
+            )
+        }
+        if no_default_mode {
+            assert_no_default_secret_service_state();
+        }
+        let write_result = store.write_journal_anchor_to_os_for_test(b"must-not-persist");
+        if no_default_mode {
+            assert_no_default_secret_service_state();
+        }
+        let write_error = write_result.expect_err(
+            "a locked, no-default, or unavailable Secret Service must reject checkpoint writes",
+        );
         assert!(
             !format!("{write_error:#}").is_empty(),
             "a rejected checkpoint write must return a useful error"
@@ -2096,7 +2141,7 @@ transaction_confirmations = 2
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires a private ambient D-Bus fixture without an unlocked Secret Service; run only from Linux qualification"]
+    #[ignore = "requires a private ambient D-Bus fixture with a locked provider, no default collection, or no provider; run only from Linux qualification"]
     fn linux_secret_service_untrusted_on_ambient_bus_fails_closed() {
         assert_ambient_secret_service_qualification_state();
         let root = tempfile::tempdir().unwrap();
