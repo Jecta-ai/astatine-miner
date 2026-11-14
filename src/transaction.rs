@@ -25207,10 +25207,9 @@ mod tests {
                         Ok((client, _)) => {
                             if let Err(failure) =
                                 forward_counted_anvil_rpc(client, target, &thread_count)
+                                && let Ok(mut first_error) = thread_error.lock()
                             {
-                                if let Ok(mut first_error) = thread_error.lock() {
-                                    first_error.get_or_insert_with(|| failure.to_string());
-                                }
+                                first_error.get_or_insert_with(|| failure.to_string());
                             }
                         }
                         Err(failure) if failure.kind() == std::io::ErrorKind::WouldBlock => {
@@ -25322,11 +25321,11 @@ mod tests {
         let mut total_len = None;
         let mut chunk = [0_u8; 8192];
         loop {
-            if let Some(total_len) = total_len {
-                if bytes.len() >= total_len {
-                    bytes.truncate(total_len);
-                    return Ok((bytes, header_end.unwrap()));
-                }
+            if let Some(total_len) = total_len
+                && bytes.len() >= total_len
+            {
+                bytes.truncate(total_len);
+                return Ok((bytes, header_end.unwrap()));
             }
             if bytes.len() >= MAX_MESSAGE_BYTES {
                 return Err(std::io::Error::new(
