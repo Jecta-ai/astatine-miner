@@ -182,6 +182,41 @@ class FixtureProvenanceTests(unittest.TestCase):
         ):
             VERIFIER.verify(self.root)
 
+    def test_notice_checklist_cannot_be_emptied(self) -> None:
+        inventory = self.inventory()
+        inventory["rights_review"]["notice_checklist"]["items"] = []
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "notice_checklist items must not be empty"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_blocked_publication_requires_an_open_blocking_item(self) -> None:
+        inventory = self.inventory()
+        for item in inventory["rights_review"]["notice_checklist"]["items"]:
+            item["blocking"] = False
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError,
+            "publication is BLOCKED but no blocking notice-checklist item is open",
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_synthetic_receipt_shape_is_pinned(self) -> None:
+        receipt_rel = Path("tests/fixtures/synthetic-injective-virtual-receipt.json")
+        path = self.root / receipt_rel
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["logs"] = [log for log in document["logs"] if not log.get("virtual")]
+        data = (json.dumps(document, indent=2) + "\n").encode()
+        path.write_bytes(data)
+        inventory = self.inventory()
+        self.update_fixture_entry(inventory, receipt_rel, data)
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "synthetic receipt log count changed"
+        ):
+            VERIFIER.verify(self.root)
+
     def test_fixture_identity_substitution_fails(self) -> None:
         inventory = self.inventory()
         inventory["fixtures"][3]["path"] = "tests/fixtures/AstatineMiner.json"

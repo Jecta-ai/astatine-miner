@@ -7759,6 +7759,12 @@ mod tests {
         SigningKey::from_slice(&[0x11; 32]).unwrap()
     }
 
+    fn local_rpc_client() -> reqwest::Client {
+        crate::rpc::local_test_http_client_builder()
+            .build()
+            .expect("create proxy-free local test RPC client")
+    }
+
     fn test_request() -> Eip1559Request {
         Eip1559Request {
             chain_id: 1439,
@@ -12785,7 +12791,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let error = reqwest::Client::new()
+        let error = local_rpc_client()
             .post(format!("http://{address}"))
             .send()
             .await
@@ -17593,6 +17599,26 @@ mod tests {
     #[cfg(unix)]
     struct JournalSigkillChild(std::process::Child);
 
+    #[cfg(all(unix, target_os = "linux"))]
+    impl JournalSigkillChild {
+        fn wait_with_output(&mut self) -> std::io::Result<std::process::Output> {
+            let status = self.0.wait()?;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(mut pipe) = self.0.stdout.take() {
+                pipe.read_to_end(&mut stdout)?;
+            }
+            if let Some(mut pipe) = self.0.stderr.take() {
+                pipe.read_to_end(&mut stderr)?;
+            }
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+    }
+
     #[cfg(unix)]
     impl Drop for JournalSigkillChild {
         fn drop(&mut self) {
@@ -18302,7 +18328,7 @@ mod tests {
             .expect("Anvil must be installed for the local EVM lifecycle test");
         let _process_guard = AnvilGuard(&mut process);
         let endpoint = format!("http://127.0.0.1:{port}");
-        let client = reqwest::Client::new();
+        let client = local_rpc_client();
         wait_for_anvil(&client, &endpoint).await;
 
         let signer = test_signer();
@@ -18635,7 +18661,7 @@ mod tests {
             .expect("Anvil must be installed for the compute-only recovery regression");
         let _process_guard = AnvilGuard(&mut process);
         let endpoint = format!("http://127.0.0.1:{port}");
-        let rpc = reqwest::Client::new();
+        let rpc = local_rpc_client();
         wait_for_anvil(&rpc, &endpoint).await;
 
         let signer = test_signer();
@@ -18971,7 +18997,7 @@ mod tests {
                 .expect("Anvil is required for genesis activation lifecycle tests");
             let _process_guard = AnvilGuard(&mut process);
             let endpoint = format!("http://127.0.0.1:{port}");
-            let rpc = reqwest::Client::new();
+            let rpc = local_rpc_client();
             wait_for_anvil(&rpc, &endpoint).await;
 
             let accounts =
@@ -20019,7 +20045,7 @@ mod tests {
                 .expect("Anvil is required for the paid session-limit lifecycle regression");
             let _process_guard = AnvilGuard(&mut process);
             let endpoint = format!("http://127.0.0.1:{port}");
-            let rpc = reqwest::Client::new();
+            let rpc = local_rpc_client();
             wait_for_anvil(&rpc, &endpoint).await;
 
             let signer = test_signer();
@@ -20681,7 +20707,7 @@ mod tests {
                 .expect("Anvil is required for the session-limit terminal regression");
             let _process_guard = AnvilGuard(&mut process);
             let endpoint = format!("http://127.0.0.1:{port}");
-            let rpc = reqwest::Client::new();
+            let rpc = local_rpc_client();
             wait_for_anvil(&rpc, &endpoint).await;
 
             let signer = test_signer();
@@ -21440,7 +21466,7 @@ mod tests {
                 .expect("Anvil is required for the autonomous local lifecycle test");
             let _process_guard = AnvilGuard(&mut process);
             let endpoint = format!("http://127.0.0.1:{port}");
-            let rpc = reqwest::Client::new();
+            let rpc = local_rpc_client();
             wait_for_anvil(&rpc, &endpoint).await;
 
             let signer = test_signer();
@@ -22512,7 +22538,7 @@ mod tests {
             .expect("Anvil must be installed for the verified session reward lifecycle test");
         let _process_guard = AnvilGuard(&mut process);
         let endpoint = format!("http://127.0.0.1:{port}");
-        let rpc = reqwest::Client::new();
+        let rpc = local_rpc_client();
         wait_for_anvil(&rpc, &endpoint).await;
 
         let signer = test_signer();
@@ -23611,7 +23637,7 @@ mod tests {
                 .expect("Anvil must be installed for the high-difficulty worker test");
             let _process_guard = AnvilGuard(&mut process);
             let endpoint = format!("http://127.0.0.1:{port}");
-            let rpc = reqwest::Client::new();
+            let rpc = local_rpc_client();
             wait_for_anvil(&rpc, &endpoint).await;
 
             let signer = test_signer();
@@ -24053,7 +24079,7 @@ mod tests {
             .expect("Anvil must be installed for the local EVM lifecycle test");
         let _process_guard = AnvilGuard(&mut process);
         let endpoint = format!("http://127.0.0.1:{port}");
-        let client = reqwest::Client::new();
+        let client = local_rpc_client();
         wait_for_anvil(&client, &endpoint).await;
 
         let signer = test_signer();
@@ -25123,6 +25149,777 @@ mod tests {
             finalization_entry.nonce,
             "reorg recovery must reserve exposure without rebroadcasting"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANVIL_ROOT_ENV: &str = "ASTATINE_NATIVE_ANVIL_ROOT";
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANVIL_RPC_ENV: &str = "ASTATINE_NATIVE_ANVIL_RPC";
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANVIL_MINER_ENV: &str = "ASTATINE_NATIVE_ANVIL_MINER";
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANVIL_TOKEN_ENV: &str = "ASTATINE_NATIVE_ANVIL_TOKEN";
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANVIL_READY_ENV: &str = "ASTATINE_NATIVE_ANVIL_READY";
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANVIL_CHILD_TEST: &str =
+        "transaction::tests::linux_native_provider_anvil_broadcast_worker";
+
+    #[cfg(target_os = "linux")]
+    struct NativeJournalAnchorCleanup(ConfigStore);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for NativeJournalAnchorCleanup {
+        fn drop(&mut self) {
+            if self.0.delete_native_journal_anchor_for_test().is_err() {
+                // The surrounding private-session harness also destroys the
+                // disposable keyring, but make per-root cleanup best-effort
+                // even while unwinding from a failed assertion.
+                eprintln!("failed to remove disposable native journal checkpoint");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct AnvilRpcBoundary {
+        endpoint: String,
+        raw_send_count: Arc<std::sync::atomic::AtomicUsize>,
+        error: Arc<Mutex<Option<String>>>,
+        stop: Arc<AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl AnvilRpcBoundary {
+        fn start(target: std::net::SocketAddr) -> std::io::Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            listener.set_nonblocking(true)?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let raw_send_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let error = Arc::new(Mutex::new(None));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_count = Arc::clone(&raw_send_count);
+            let thread_error = Arc::clone(&error);
+            let thread_stop = Arc::clone(&stop);
+            let server = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((client, _)) => {
+                            if let Err(failure) =
+                                forward_counted_anvil_rpc(client, target, &thread_count)
+                            {
+                                if let Ok(mut first_error) = thread_error.lock() {
+                                    first_error.get_or_insert_with(|| failure.to_string());
+                                }
+                            }
+                        }
+                        Err(failure) if failure.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(failure) => {
+                            if let Ok(mut first_error) = thread_error.lock() {
+                                first_error.get_or_insert_with(|| failure.to_string());
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+            Ok(Self {
+                endpoint,
+                raw_send_count,
+                error,
+                stop,
+                server: Some(server),
+            })
+        }
+
+        fn raw_send_count(&self) -> usize {
+            self.raw_send_count.load(Ordering::SeqCst)
+        }
+
+        fn assert_healthy(&self) {
+            if let Some(error) = self.error.lock().unwrap().as_ref() {
+                panic!("local Anvil RPC counting proxy failed: {error}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for AnvilRpcBoundary {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn forward_counted_anvil_rpc(
+        mut client: TcpStream,
+        target: std::net::SocketAddr,
+        raw_send_count: &std::sync::atomic::AtomicUsize,
+    ) -> std::io::Result<()> {
+        use std::io::ErrorKind;
+
+        client.set_read_timeout(Some(Duration::from_secs(15)))?;
+        client.set_write_timeout(Some(Duration::from_secs(15)))?;
+        let (request, header_end) = read_rpc_http_message(&mut client)?;
+        let body = &request[header_end..];
+        let value: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+        let raw_sends = count_raw_send_methods(&value);
+        if raw_sends != 0 {
+            raw_send_count.fetch_add(raw_sends, Ordering::SeqCst);
+        }
+
+        let header = std::str::from_utf8(&request[..header_end - 4])
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+        let mut forwarded = Vec::with_capacity(request.len() + 64);
+        for line in header.split("\r\n") {
+            let name = line.split_once(':').map(|(name, _)| name.trim());
+            if name.is_some_and(|name| {
+                name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("host")
+            }) {
+                continue;
+            }
+            forwarded.extend_from_slice(line.as_bytes());
+            forwarded.extend_from_slice(b"\r\n");
+        }
+        forwarded
+            .extend_from_slice(format!("Host: {target}\r\nConnection: close\r\n\r\n").as_bytes());
+        forwarded.extend_from_slice(body);
+
+        let mut upstream = TcpStream::connect(target)?;
+        upstream.set_read_timeout(Some(Duration::from_secs(15)))?;
+        upstream.set_write_timeout(Some(Duration::from_secs(15)))?;
+        upstream.write_all(&forwarded)?;
+        let (response, _) = read_rpc_http_message(&mut upstream)?;
+        client.write_all(&response)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn count_raw_send_methods(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Object(object) => usize::from(
+                object.get("method").and_then(serde_json::Value::as_str)
+                    == Some("eth_sendRawTransaction"),
+            ),
+            serde_json::Value::Array(values) => values.iter().map(count_raw_send_methods).sum(),
+            _ => 0,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_rpc_http_message(stream: &mut TcpStream) -> std::io::Result<(Vec<u8>, usize)> {
+        use std::io::ErrorKind;
+
+        const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        let mut header_end = None;
+        let mut total_len = None;
+        let mut chunk = [0_u8; 8192];
+        loop {
+            if let Some(total_len) = total_len {
+                if bytes.len() >= total_len {
+                    bytes.truncate(total_len);
+                    return Ok((bytes, header_end.unwrap()));
+                }
+            }
+            if bytes.len() >= MAX_MESSAGE_BYTES {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "local RPC HTTP message exceeded its size limit",
+                ));
+            }
+            let read = stream.read(&mut chunk)?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "local RPC HTTP message ended early",
+                ));
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            if header_end.is_none() {
+                if let Some(separator) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let end = separator + 4;
+                    let header = std::str::from_utf8(&bytes[..separator])
+                        .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+                    let mut content_length = None;
+                    for line in header.split("\r\n").skip(1) {
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                                && !value.trim().eq_ignore_ascii_case("identity")
+                            {
+                                return Err(std::io::Error::new(
+                                    ErrorKind::InvalidData,
+                                    "chunked local RPC HTTP messages are unsupported",
+                                ));
+                            }
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                if content_length.is_some() {
+                                    return Err(std::io::Error::new(
+                                        ErrorKind::InvalidData,
+                                        "duplicate local RPC Content-Length header",
+                                    ));
+                                }
+                                content_length =
+                                    Some(value.trim().parse::<usize>().map_err(|error| {
+                                        std::io::Error::new(ErrorKind::InvalidData, error)
+                                    })?);
+                            }
+                        }
+                    }
+                    let content_length = content_length.ok_or_else(|| {
+                        std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "local RPC HTTP message has no Content-Length",
+                        )
+                    })?;
+                    let expected = end.checked_add(content_length).ok_or_else(|| {
+                        std::io::Error::new(ErrorKind::InvalidData, "HTTP length overflow")
+                    })?;
+                    if expected > MAX_MESSAGE_BYTES {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "local RPC HTTP message exceeded its size limit",
+                        ));
+                    }
+                    header_end = Some(end);
+                    total_len = Some(expected);
+                } else if bytes.len() > 64 * 1024 {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "local RPC HTTP headers exceeded their size limit",
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires pinned Anvil and the private unlocked Secret Service qualification session"]
+    async fn linux_native_provider_anvil_broadcast_survives_fresh_process_sigkill() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // This constructor checks the private D-Bus socket, HOME/XDG/TMPDIR
+        // layout, owner/mode of the directories, unlocked provider state, and
+        // the explicit required-provider marker before any credential access.
+        let root = tempdir().expect("create disposable native-journal root");
+        let store =
+            ConfigStore::at_root_with_native_journal_anchor_for_test(root.path().to_path_buf())
+                .expect("open the isolated native-checkpoint test store");
+        let _anchor_cleanup = NativeJournalAnchorCleanup(store.clone());
+
+        let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = port_listener.local_addr().unwrap().port();
+        drop(port_listener);
+        let mut anvil = Command::new("anvil")
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--chain-id",
+                "1439",
+                "--accounts",
+                "3",
+                "--silent",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("pinned Anvil must be installed for native-checkpoint crash qualification");
+        let _anvil_guard = AnvilGuard(&mut anvil);
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let rpc = local_rpc_client();
+        wait_for_anvil(&rpc, &endpoint).await;
+
+        let signer = recovery_signer();
+        let wallet = signer_address(&signer);
+        let unlocked_accounts =
+            rpc_request_local(&rpc, &endpoint, "eth_accounts", serde_json::json!([]))
+                .await
+                .unwrap();
+        let deployment_wallet = Address::from_str(unlocked_accounts[0].as_str().unwrap()).unwrap();
+        let balance = U256::from(1_000_u64) * U256::from(10_u8).pow(U256::from(18));
+        rpc_request_local(
+            &rpc,
+            &endpoint,
+            "anvil_setBalance",
+            serde_json::json!([format!("{wallet:#x}"), format!("{balance:#x}")]),
+        )
+        .await
+        .unwrap();
+
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        prepare_local_test_contracts(&fixtures);
+        let token_artifact = read_artifact(&fixtures.join("MockAST.json"));
+        let miner_artifact = read_artifact(&fixtures.join("AstatineMiner.json"));
+        let token_decimals = 9_u8;
+        let token_unit = U256::from(10_u8).pow(U256::from(token_decimals));
+        let allocation = U256::from(1_000_u64) * token_unit;
+        let reward = U256::from(100_u64) * token_unit;
+        let mut token_init = artifact_bytecode(&token_artifact);
+        let miner_bytecode = artifact_bytecode(&miner_artifact);
+        token_init.extend_from_slice(&abi_uint8_word(token_decimals));
+        let token = deploy_unlocked(&rpc, &endpoint, deployment_wallet, &token_init).await;
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(token),
+            &LocalMockAST::mintCall {
+                account: deployment_wallet,
+                amount: allocation,
+            }
+            .abi_encode(),
+            U256::ZERO,
+        )
+        .await;
+        let miner = deploy_local_miner(LocalMinerDeployment {
+            client: &rpc,
+            endpoint: &endpoint,
+            deployment_wallet,
+            token,
+            token_decimals,
+            allocation,
+            reward,
+            miner_bytecode: &miner_bytecode,
+            initial_target: U256::MAX,
+            retarget_interval: 3,
+            window_secs: 3_600,
+        })
+        .await;
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(token),
+            &LocalMockAST::approveCall {
+                spender: miner,
+                amount: allocation,
+            }
+            .abi_encode(),
+            U256::ZERO,
+        )
+        .await;
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &LocalAstatineMiner::fundASTCall { amount: allocation }.abi_encode(),
+            U256::ZERO,
+        )
+        .await;
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &LocalAstatineMiner::activateGenesisCall {
+                initialSeed: B256::with_last_byte(0x7a),
+            }
+            .abi_encode(),
+            U256::ZERO,
+        )
+        .await;
+
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            transaction_confirmations: 1,
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        drop(
+            TransactionJournal::open(&store, &config, wallet)
+                .expect("create the authenticated journal and native checkpoint"),
+        );
+        assert!(
+            store
+                .read_journal_anchor()
+                .expect("read the real native checkpoint")
+                .is_some(),
+            "the test must create a checkpoint in the isolated Secret Service"
+        );
+
+        let rpc_boundary = AnvilRpcBoundary::start(format!("127.0.0.1:{port}").parse().unwrap())
+            .expect("start the loopback RPC boundary that counts raw transaction sends");
+        let network = NetworkClient::local_test_client(
+            &rpc_boundary.endpoint,
+            miner,
+            local_code_hash(&rpc, &endpoint, miner).await,
+            token,
+            local_code_hash(&rpc, &endpoint, token).await,
+            token_decimals,
+        )
+        .unwrap();
+        let nonce_before_broadcast = local_pending_nonce(&rpc, &endpoint, wallet).await;
+        rpc_request_local(
+            &rpc,
+            &endpoint,
+            "anvil_setAutomine",
+            serde_json::json!([false]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rpc_boundary.raw_send_count(), 0);
+
+        let ready = root.path().join("native-anvil-broadcast-ready");
+        let mut child = JournalSigkillChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    NATIVE_ANVIL_CHILD_TEST,
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(NATIVE_ANVIL_ROOT_ENV, root.path())
+                .env(NATIVE_ANVIL_RPC_ENV, &rpc_boundary.endpoint)
+                .env(NATIVE_ANVIL_MINER_ENV, format!("{miner:#x}"))
+                .env(NATIVE_ANVIL_TOKEN_ENV, format!("{token:#x}"))
+                .env(NATIVE_ANVIL_READY_ENV, &ready)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn the fresh transaction-manager process"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ready.exists() {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "native Anvil worker exited before durable broadcast ({status}): stdout={:?} stderr={:?}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            if Instant::now() >= deadline {
+                child.0.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "native Anvil worker did not durably broadcast before timeout: stdout={:?} stderr={:?}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let hash_text = std::fs::read_to_string(&ready).unwrap();
+        let transaction_hash = B256::from_str(hash_text.trim()).unwrap();
+        rpc_boundary.assert_healthy();
+        assert_eq!(
+            rpc_boundary.raw_send_count(),
+            1,
+            "the proof must cross the local RPC boundary exactly once before the crash"
+        );
+        let journal_before_kill = store.read_transaction_journal().unwrap().unwrap();
+        let state: super::JournalState = serde_json::from_slice(&journal_before_kill).unwrap();
+        let broadcast = state
+            .entries
+            .iter()
+            .find(|entry| entry.transaction_hash == format!("{transaction_hash:#x}"))
+            .expect("the worker's transaction must be in this same journal");
+        assert_eq!(broadcast.status, TransactionStatus::Broadcast);
+        assert_eq!(broadcast.nonce, nonce_before_broadcast);
+        let active_session = state
+            .active_session
+            .as_ref()
+            .expect("proof journal must retain its active spending session");
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .filter(|entry| entry.session_id == active_session.id)
+                .count(),
+            1,
+            "the test session should authorize only this proof transaction"
+        );
+        let session_authorized_before_recovery = parse_decimal_wei(
+            active_session
+                .authorized_exposure_wei
+                .as_deref()
+                .expect("the durable active session must record its authorization total"),
+        )
+        .unwrap();
+        let proof_maximum_exposure = parse_decimal_wei(&broadcast.maximum_exposure_wei).unwrap();
+        let spending_cap = parse_inj_wei(&config.per_session_spending_limit_inj).unwrap();
+        assert_eq!(session_authorized_before_recovery, proof_maximum_exposure);
+        assert_eq!(spending_cap, U256::from(10_u8).pow(U256::from(18)));
+        assert!(
+            session_authorized_before_recovery <= spending_cap,
+            "the durable proof authorization must remain within the configured 1 INJ cap"
+        );
+        let checkpoint_before_kill = store
+            .read_journal_anchor()
+            .unwrap()
+            .expect("fresh process must have persisted its native checkpoint");
+        let checkpoint_revision = u64::from_be_bytes(
+            checkpoint_before_kill[4..12]
+                .try_into()
+                .expect("checkpoint revision has the expected width"),
+        );
+        assert_eq!(
+            state.integrity.as_ref().unwrap().revision,
+            checkpoint_revision,
+            "the same journal and real Secret Service checkpoint must agree before SIGKILL"
+        );
+        assert!(network.transaction_known(transaction_hash).await.unwrap());
+        assert!(
+            network
+                .transaction_receipt(transaction_hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "the transaction must remain pending on Anvil at the crash boundary"
+        );
+        assert_eq!(
+            local_pending_nonce(&rpc, &endpoint, wallet).await,
+            nonce_before_broadcast + 1,
+            "Anvil must have exactly the one pending transaction before the crash"
+        );
+        assert_eq!(rpc_boundary.raw_send_count(), 1);
+
+        if let Some(status) = child.0.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "native Anvil worker exited after its ready marker ({status}): stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        child.0.kill().unwrap();
+        assert_eq!(
+            child.0.wait().unwrap().signal(),
+            Some(libc::SIGKILL),
+            "the transaction-manager worker must be terminated by SIGKILL"
+        );
+        assert_eq!(
+            store.read_transaction_journal().unwrap().unwrap(),
+            journal_before_kill,
+            "killing the worker must preserve the exact same journal bytes"
+        );
+        assert_eq!(
+            store.read_journal_anchor().unwrap().unwrap(),
+            checkpoint_before_kill,
+            "killing the worker must preserve the native checkpoint"
+        );
+
+        let mut recovered = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        recovered.reconcile(&network).await.unwrap();
+        assert_eq!(
+            recovered.journal.session_authorized_total().unwrap(),
+            session_authorized_before_recovery,
+            "fresh-process recovery must preserve the durable session authorization total"
+        );
+        assert!(
+            recovered.journal.session_authorized_total().unwrap() <= spending_cap,
+            "recovered session authorization must remain within the 1 INJ cap"
+        );
+        let pending = recovered
+            .journal
+            .state
+            .entries
+            .iter()
+            .find(|entry| entry.transaction_hash == format!("{transaction_hash:#x}"))
+            .expect("restart must recover the same broadcast entry");
+        assert_eq!(pending.status, TransactionStatus::Broadcast);
+        assert!(recovered.journal.pending_exposure().unwrap() > U256::ZERO);
+        assert_eq!(
+            local_pending_nonce(&rpc, &endpoint, wallet).await,
+            nonce_before_broadcast + 1,
+            "recovery must observe, not rebroadcast, the pending Anvil transaction"
+        );
+        rpc_boundary.assert_healthy();
+        assert_eq!(
+            rpc_boundary.raw_send_count(),
+            1,
+            "restart reconciliation must issue zero additional eth_sendRawTransaction calls"
+        );
+
+        rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+            .await
+            .unwrap();
+        recovered.reconcile(&network).await.unwrap();
+        recovered.reconcile(&network).await.unwrap();
+        let settled = recovered
+            .journal
+            .state
+            .entries
+            .iter()
+            .find(|entry| entry.transaction_hash == format!("{transaction_hash:#x}"))
+            .unwrap();
+        assert_eq!(settled.status, TransactionStatus::MinedSuccess);
+        assert_eq!(settled.outcome.as_deref(), Some("candidate-updated"));
+        assert_eq!(
+            local_pending_nonce(&rpc, &endpoint, wallet).await,
+            nonce_before_broadcast + 1,
+            "the mined transaction must not have been duplicated after restart"
+        );
+        assert_eq!(
+            recovered.journal.session_authorized_total().unwrap(),
+            session_authorized_before_recovery,
+            "mining and reconciliation must not refund or increase session authorization"
+        );
+        assert_eq!(
+            rpc_boundary.raw_send_count(),
+            1,
+            "the proof must remain a single raw transaction through settlement"
+        );
+        drop(recovered);
+
+        store
+            .delete_native_journal_anchor_for_test()
+            .expect("delete the disposable native checkpoint before the private session ends");
+        assert!(
+            store.read_journal_anchor().unwrap().is_none(),
+            "explicit native-checkpoint cleanup must leave no root-scoped entry"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "child probe; invoked by linux_native_provider_anvil_broadcast_survives_fresh_process_sigkill"]
+    async fn linux_native_provider_anvil_broadcast_worker() {
+        let root = PathBuf::from(
+            std::env::var_os(NATIVE_ANVIL_ROOT_ENV)
+                .expect("native Anvil worker requires its parent-provided root"),
+        );
+        let endpoint = std::env::var(NATIVE_ANVIL_RPC_ENV)
+            .expect("native Anvil worker requires its parent-provided loopback RPC");
+        let parsed = reqwest::Url::parse(&endpoint).expect("worker RPC URL must parse");
+        assert!(
+            parsed.scheme() == "http"
+                && parsed.host_str().is_some_and(|host| {
+                    host == "127.0.0.1" || host == "::1" || host == "localhost"
+                })
+                && parsed.username().is_empty()
+                && parsed.password().is_none(),
+            "worker RPC must be an unauthenticated local-loopback URL"
+        );
+        let miner = Address::from_str(
+            &std::env::var(NATIVE_ANVIL_MINER_ENV)
+                .expect("native Anvil worker requires its parent-provided miner"),
+        )
+        .unwrap();
+        let token = Address::from_str(
+            &std::env::var(NATIVE_ANVIL_TOKEN_ENV)
+                .expect("native Anvil worker requires its parent-provided token"),
+        )
+        .unwrap();
+        let ready = PathBuf::from(
+            std::env::var_os(NATIVE_ANVIL_READY_ENV)
+                .expect("native Anvil worker requires its parent-provided ready path"),
+        );
+
+        // No in-memory checkpoint bridge is used: this fresh process constructs
+        // its own test store, authenticates from the isolated native provider,
+        // and writes the very same root-scoped journal/checkpoint pair.
+        let store = ConfigStore::at_root_with_native_journal_anchor_for_test(root)
+            .expect("worker must prove it inherited the isolated unlocked provider");
+        let config = store
+            .load()
+            .expect("load parent-created miner configuration");
+        let signer = recovery_signer();
+        let wallet = signer_address(&signer);
+        let expected_wallet = format!("{wallet:#x}");
+        assert_eq!(
+            config.wallet_address.as_deref(),
+            Some(expected_wallet.as_str())
+        );
+        let rpc = local_rpc_client();
+        let token_decimals = 9_u8;
+        let network = NetworkClient::local_test_client(
+            &endpoint,
+            miner,
+            local_code_hash(&rpc, &endpoint, miner).await,
+            token,
+            local_code_hash(&rpc, &endpoint, token).await,
+            token_decimals,
+        )
+        .unwrap();
+        let work_bytes = local_call(
+            &rpc,
+            &endpoint,
+            miner,
+            &AstatineMinerRead::workCall {}.abi_encode(),
+        )
+        .await;
+        type WorkReturn = (
+            bool,
+            bool,
+            u64,
+            u64,
+            u64,
+            B256,
+            B256,
+            U256,
+            U256,
+            U256,
+            u32,
+            U256,
+        );
+        let work = <WorkReturn as SolValue>::abi_decode_validate(&work_bytes).unwrap();
+        let header = b"native-provider-fresh-process-crash";
+        let context = WorkContext {
+            chain_id: 1439,
+            contract: miner,
+            window_id: work.2,
+            seed: work.5,
+            miner: wallet,
+            header: header.to_vec(),
+        };
+        let hasher = WorkHasher::new(&context).unwrap();
+        let (nonce, work_hash) = (0..10_000_u128)
+            .find_map(|nonce| {
+                let hash = hasher.hash(nonce);
+                meets_target(hash, work.7).then_some((nonce, hash))
+            })
+            .expect("the local Anvil work target must have a valid test proof");
+        let submission = ProofSubmission {
+            contract: miner,
+            node_id: 1,
+            window_id: work.2,
+            nonce,
+            header: header.to_vec(),
+            work_hash,
+        };
+        let manager = TransactionManager::open(&store, &config, wallet, token)
+            .expect("open the same authenticated journal in a fresh process");
+        let submit_task = tokio::spawn(async move {
+            let mut manager = manager;
+            manager.submit_proof(&network, &signer, submission).await
+        });
+        let broadcast = wait_for_journal_entry(
+            &store,
+            TransactionAction::SubmitProof,
+            TransactionStatus::Broadcast,
+        )
+        .await;
+        let ready_staged = ready.with_extension("staged");
+        std::fs::write(
+            &ready_staged,
+            format!("{:#x}", entry_hash(&broadcast).unwrap()),
+        )
+        .expect("stage the parent signal after the authenticated broadcast is durable");
+        std::fs::rename(&ready_staged, &ready)
+            .expect("atomically signal the parent after durable broadcast");
+        loop {
+            assert!(
+                !submit_task.is_finished(),
+                "Anvil unexpectedly mined the transaction before the parent crash point"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
     }
 
     struct AnvilGuard<'a>(&'a mut Child);

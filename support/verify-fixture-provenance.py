@@ -39,9 +39,9 @@ EXPECTED_FIXTURE_IDENTITIES = {
         "AstatineGenesisCoordinator",
     ),
     "tests/fixtures/MockAST.json": ("FIX-03", "contract_creation_bytecode", "MockAST"),
-    "tests/fixtures/injective-testnet-virtual-receipt.json": (
+    "tests/fixtures/synthetic-injective-virtual-receipt.json": (
         "FIX-04",
-        "public_chain_receipt",
+        "synthetic_rpc_receipt",
         None,
     ),
 }
@@ -256,7 +256,7 @@ def validate_fixture_entry(entry: object, index: int) -> None:
     validate_relative_path(entry["path"], f"{label} path")
     require(entry["path"] in EXPECTED_FIXTURE_PATHS, f"{label} path is not an expected fixture: {entry['path']}")
     kind = require_string(entry["kind"], f"{label} kind")
-    require(kind in {"contract_creation_bytecode", "public_chain_receipt"}, f"{label} kind is unknown: {kind}")
+    require(kind in {"contract_creation_bytecode", "synthetic_rpc_receipt"}, f"{label} kind is unknown: {kind}")
     require_string(entry["source_origin"], f"{label} source_origin")
     require_string(entry["contract"], f"{label} contract", allow_none=True)
     require_string(entry["source_commit"], f"{label} source_commit", allow_none=True)
@@ -370,10 +370,19 @@ def verify_fixture(root: Path, entry: dict) -> None:
             document.get("compiler") == entry["compiler"],
             f"{relative} compiler declaration changed",
         )
-    elif entry["kind"] == "public_chain_receipt":
+    elif entry["kind"] == "synthetic_rpc_receipt":
         require("source_commit" not in document, f"{relative} must not gain a source pin")
         require(document.get("transactionHash", "").startswith("0x"), "receipt transaction hash is missing")
         require(document.get("blockNumber", "").startswith("0x"), "receipt block number is missing")
+        logs = document.get("logs")
+        require(isinstance(logs, list), f"{relative} receipt logs must be a list")
+        require(len(logs) == 8, f"{relative} synthetic receipt log count changed")
+        virtual = [log for log in logs if isinstance(log, dict) and log.get("virtual") is True]
+        require(len(virtual) == 5, f"{relative} synthetic virtual-log count changed")
+        require(
+            len(virtual) < len(logs),
+            f"{relative} synthetic receipt must retain EVM event logs",
+        )
     else:
         raise VerificationError(f"unknown fixture kind: {entry['kind']}")
 
@@ -491,6 +500,7 @@ def verify_inventory(root: Path) -> dict:
             "rights_holder_authority",
             "owner_attestation",
             "notice_applicability",
+            "notice_checklist",
             "publication_decision",
             "not_inferred",
         ),
@@ -526,6 +536,34 @@ def verify_inventory(root: Path) -> dict:
     )
     require(rights["notice_applicability"] == "UNRESOLVED", "NOTICE status must remain honest")
     require(rights["publication_decision"].startswith("BLOCKED"), "publication must remain blocked")
+
+    checklist = require_object(rights["notice_checklist"], "rights_review notice_checklist")
+    require_fields(checklist, ("status", "scope", "items"), "rights_review notice_checklist")
+    require_string(checklist["status"], "notice_checklist status")
+    require_string(checklist["scope"], "notice_checklist scope")
+    require(checklist["status"].startswith("OPEN"), "notice checklist must stay open while publication is blocked")
+    items = require_list(checklist["items"], "notice_checklist items")
+    require(items, "notice_checklist items must not be empty")
+    item_ids = []
+    blocking_open = 0
+    for index, item in enumerate(items):
+        label = f"notice_checklist items[{index}]"
+        item = require_object(item, label)
+        require_fields(item, ("id", "action", "owner", "status", "blocking", "evidence"), label)
+        item_ids.append(require_string(item["id"], f"{label} id"))
+        require_string(item["action"], f"{label} action")
+        require_string(item["owner"], f"{label} owner")
+        item_status = require_string(item["status"], f"{label} status")
+        require(item_status in {"OPEN", "DONE"}, f"{label} status is unknown: {item_status}")
+        blocking = require_bool(item["blocking"], f"{label} blocking")
+        require_string(item["evidence"], f"{label} evidence")
+        if blocking and item_status == "OPEN":
+            blocking_open += 1
+    require(len(set(item_ids)) == len(item_ids), "notice_checklist contains duplicate ids")
+    require(
+        blocking_open > 0,
+        "publication is BLOCKED but no blocking notice-checklist item is open",
+    )
 
     scrub = require_object(inventory.get("scrub_policy"), "scrub_policy")
     require_fields(
@@ -590,6 +628,8 @@ def verify_inventory(root: Path) -> dict:
         "owner_attestation_status": attestation["status"],
         "owner_attestation_independent_verification": attestation["independent_verification"],
         "notice_applicability": rights["notice_applicability"],
+        "notice_checklist_items_checked": len(items),
+        "notice_checklist_blocking_open": blocking_open,
         "publication_decision": rights["publication_decision"],
         "status": "PASS",
     }

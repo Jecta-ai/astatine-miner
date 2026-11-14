@@ -219,10 +219,291 @@ fn default_transaction_confirmations() -> u8 {
     DEFAULT_TRANSACTION_CONFIRMATIONS
 }
 
+/// Validate the same private Linux qualification boundary enforced by
+/// `support/linux/qualify-production-journal.py`, then optionally require the
+/// unlocked provider used by authenticated restart tests. This is compiled only
+/// into Linux test binaries; no environment switch is present in production.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn validate_private_native_test_context(
+    root: Option<&Path>,
+    require_provider: bool,
+) -> Result<()> {
+    use std::{
+        os::unix::fs::MetadataExt,
+        process::{Command, Stdio},
+    };
+
+    const QUALIFICATION_MODE: &str = "ASTATINE_QUALIFICATION_MODE";
+    if env::var("ASTATINE_DISPOSABLE_CREDENTIAL_STORE").as_deref() != Ok("1") {
+        bail!("refusing native credential access without the disposable-store marker");
+    }
+    let mode = env::var(QUALIFICATION_MODE)
+        .context("refusing native credential access without qualification mode")?;
+    if !matches!(
+        mode.as_str(),
+        "provider" | "locked" | "no-default" | "missing"
+    ) {
+        bail!("refusing native credential access in an unsupported qualification mode");
+    }
+    if mode == "provider"
+        && env::var("ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE").as_deref() != Ok("1")
+    {
+        bail!("native provider mode requires the exact required-provider marker");
+    }
+    if require_provider && mode != "provider" {
+        bail!("native journal tests require the explicitly required provider mode");
+    }
+    if mode != "provider" && env::var_os("ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE").is_some() {
+        bail!("refusing an unexpected native-provider requirement outside provider mode");
+    }
+
+    for variable in [
+        "DBUS_STARTER_ADDRESS",
+        "DBUS_STARTER_BUS_TYPE",
+        "DBUS_SESSION_BUS_PID",
+        "GNOME_KEYRING_CONTROL",
+        "GNOME_KEYRING_PID",
+        "SSH_AUTH_SOCK",
+    ] {
+        if env::var_os(variable).is_some() {
+            bail!("refusing native credential access with ambient session-service state");
+        }
+    }
+
+    let tmp = env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .context("refusing native credential access without private TMPDIR")?;
+    if !tmp.is_absolute() || tmp.parent().is_none() {
+        bail!("refusing native credential access with an invalid private TMPDIR");
+    }
+    let work_root = tmp.parent().expect("validated TMPDIR parent");
+    if !work_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("astatine-linux-qualification."))
+    {
+        bail!("refusing native credential access outside the private qualification layout");
+    }
+    ensure_private_test_directory(work_root)?;
+    ensure_private_test_directory(&work_root.join("home"))?;
+    ensure_private_test_directory(&work_root.join("home/.config"))?;
+    ensure_private_test_directory(&work_root.join("home/.local"))?;
+    ensure_private_test_directory(&work_root.join("home/.local/share"))?;
+    ensure_private_test_directory(&work_root.join("home/.cache"))?;
+    ensure_private_test_directory(&work_root.join("runtime"))?;
+    ensure_private_test_directory(&work_root.join("tmp"))?;
+    ensure_private_test_directory(&work_root.join("bus"))?;
+    if fs::canonicalize(work_root).ok().as_deref() != Some(work_root)
+        || fs::canonicalize(&tmp).ok().as_deref() != Some(tmp.as_path())
+        || tmp != work_root.join("tmp")
+    {
+        bail!("refusing native credential access through a non-canonical private layout");
+    }
+
+    for variable in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_RUNTIME_DIR",
+    ] {
+        let directory = env::var_os(variable)
+            .map(PathBuf::from)
+            .with_context(|| format!("refusing native credential access without {variable}"))?;
+        if !directory.is_absolute() {
+            bail!("refusing native credential access with a relative private directory");
+        }
+        ensure_private_test_directory(&directory)?;
+        let canonical =
+            fs::canonicalize(&directory).context("inspect private qualification directory")?;
+        if canonical != directory || !canonical.starts_with(work_root) {
+            bail!("refusing native credential access outside the private qualification root");
+        }
+    }
+
+    if let Some(root) = root {
+        let canonical_root =
+            fs::canonicalize(root).context("inspect isolated native-checkpoint data root")?;
+        if canonical_root == tmp || !canonical_root.starts_with(&tmp) {
+            bail!("refusing native checkpoint outside the private temporary directory");
+        }
+        ensure_private_test_directory(&canonical_root)?;
+    }
+
+    let bus_dir = work_root.join("bus");
+    let bus_address = env::var("DBUS_SESSION_BUS_ADDRESS")
+        .context("refusing native credential access without the private D-Bus address")?;
+    let socket = private_dbus_socket_path(&bus_address, &bus_dir)?;
+    let socket_metadata =
+        fs::symlink_metadata(&socket).context("inspect private qualification D-Bus socket")?;
+    use std::os::unix::fs::FileTypeExt;
+    if !socket_metadata.file_type().is_socket()
+        || socket_metadata.uid() != unsafe { libc::geteuid() }
+        || fs::canonicalize(&socket).ok().as_deref() != Some(socket.as_path())
+    {
+        bail!("refusing native credential access through a non-private D-Bus socket");
+    }
+
+    let call_gdbus = |arguments: &[&str]| -> Result<String> {
+        let output = Command::new("gdbus")
+            .args(["call", "--session"])
+            .args(arguments)
+            .stdin(Stdio::null())
+            .output()
+            .context("query the private qualification Secret Service")?;
+        if !output.status.success() {
+            bail!("private qualification Secret Service query failed");
+        }
+        String::from_utf8(output.stdout)
+            .context("private qualification Secret Service returned non-UTF-8 output")
+    };
+    let owner = call_gdbus(&[
+        "--dest",
+        "org.freedesktop.DBus",
+        "--object-path",
+        "/org/freedesktop/DBus",
+        "--method",
+        "org.freedesktop.DBus.NameHasOwner",
+        "org.freedesktop.secrets",
+    ])?;
+    let owns_service = owner.trim() == "(true,)";
+    let has_service = owns_service;
+    if (mode == "missing" && has_service) || (mode != "missing" && !has_service) {
+        bail!("private D-Bus Secret Service state does not match qualification mode");
+    }
+    if mode != "missing" {
+        let alias = call_gdbus(&[
+            "--dest",
+            "org.freedesktop.secrets",
+            "--object-path",
+            "/org/freedesktop/secrets",
+            "--method",
+            "org.freedesktop.Secret.Service.ReadAlias",
+            "default",
+        ])?;
+        let collection = alias
+            .split_once("objectpath '")
+            .and_then(|(_, value)| value.split_once('\''))
+            .map(|(path, _)| path)
+            .context("private Secret Service returned no default collection")?;
+        if mode == "no-default" {
+            if collection != "/" {
+                bail!("private Secret Service unexpectedly has a default collection");
+            }
+        } else {
+            if !collection.starts_with("/org/freedesktop/secrets/collection/") {
+                bail!("private Secret Service returned an invalid default collection");
+            }
+            let locked = call_gdbus(&[
+                "--dest",
+                "org.freedesktop.secrets",
+                "--object-path",
+                collection,
+                "--method",
+                "org.freedesktop.DBus.Properties.Get",
+                "org.freedesktop.Secret.Collection",
+                "Locked",
+            ])?;
+            let is_locked = locked.contains("true");
+            if (mode == "provider" && is_locked) || (mode == "locked" && !is_locked) {
+                bail!("private Secret Service lock state does not match qualification mode");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn ensure_private_test_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path).context("inspect private qualification directory")?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o700
+    {
+        bail!("refusing native credential access through a non-private directory");
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn private_dbus_socket_path(address: &str, bus_dir: &Path) -> Result<PathBuf> {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let mut transports = address.split(';');
+    let transport = transports
+        .next()
+        .context("private D-Bus address is empty")?;
+    if transports.next().is_some() {
+        bail!("refusing a multi-transport D-Bus address");
+    }
+    let (kind, parameters) = transport
+        .split_once(':')
+        .context("private D-Bus address is malformed")?;
+    if kind != "unix" {
+        bail!("refusing a non-Unix qualification D-Bus transport");
+    }
+    let mut socket_path = None;
+    let mut has_guid = false;
+    for parameter in parameters.split(',') {
+        let (name, value) = parameter
+            .split_once('=')
+            .context("private D-Bus address parameter is malformed")?;
+        match name {
+            "path" if socket_path.is_none() => {
+                let bytes = value.as_bytes();
+                let mut decoded = Vec::with_capacity(bytes.len());
+                let mut index = 0;
+                while index < bytes.len() {
+                    if bytes[index] == b'%' {
+                        if index + 2 >= bytes.len() {
+                            bail!("private D-Bus socket path has invalid escaping");
+                        }
+                        let high = (bytes[index + 1] as char).to_digit(16);
+                        let low = (bytes[index + 2] as char).to_digit(16);
+                        let (Some(high), Some(low)) = (high, low) else {
+                            bail!("private D-Bus socket path has invalid escaping");
+                        };
+                        decoded.push(((high << 4) | low) as u8);
+                        index += 3;
+                    } else {
+                        decoded.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+                socket_path = Some(PathBuf::from(OsString::from_vec(decoded)));
+            }
+            "guid" if !has_guid => {
+                if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    bail!("private D-Bus GUID is malformed");
+                }
+                has_guid = true;
+            }
+            _ => bail!("refusing an unsupported private D-Bus address parameter"),
+        }
+    }
+    let socket = socket_path.context("private D-Bus address has no socket path")?;
+    if !has_guid {
+        bail!("private D-Bus address has no GUID");
+    }
+    if !socket.is_absolute()
+        || socket
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || socket.parent() != Some(bus_dir)
+    {
+        bail!("refusing a D-Bus socket outside the private qualification bus directory");
+    }
+    Ok(socket)
+}
+
 #[derive(Clone, Debug)]
 pub struct ConfigStore {
     root: PathBuf,
     anchor_scope: Arc<OnceLock<std::result::Result<String, String>>>,
+    #[cfg(all(test, target_os = "linux"))]
+    native_anchor_for_test: bool,
 }
 
 impl ConfigStore {
@@ -230,6 +511,8 @@ impl ConfigStore {
         Ok(Self {
             root: system_config_dir()?,
             anchor_scope: Arc::new(OnceLock::new()),
+            #[cfg(all(test, target_os = "linux"))]
+            native_anchor_for_test: false,
         })
     }
 
@@ -238,7 +521,25 @@ impl ConfigStore {
         Self {
             root,
             anchor_scope: Arc::new(OnceLock::new()),
+            #[cfg(target_os = "linux")]
+            native_anchor_for_test: false,
         }
+    }
+
+    /// Use the real Linux Secret Service checkpoint for an isolated test root.
+    ///
+    /// This path exists only in the test binary. It requires the private
+    /// qualification-session layout and an unlocked provider before enabling
+    /// native checkpoint reads or writes; marker variables by themselves are
+    /// not accepted as evidence of isolation.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn at_root_with_native_journal_anchor_for_test(root: PathBuf) -> Result<Self> {
+        validate_private_native_test_context(Some(&root), true)?;
+        Ok(Self {
+            root,
+            anchor_scope: Arc::new(OnceLock::new()),
+            native_anchor_for_test: true,
+        })
     }
 
     pub fn wallet_dir(&self) -> PathBuf {
@@ -332,6 +633,11 @@ impl ConfigStore {
     pub(crate) fn read_journal_anchor(&self) -> Result<Option<Zeroizing<Vec<u8>>>> {
         #[cfg(test)]
         {
+            #[cfg(target_os = "linux")]
+            if self.native_anchor_for_test {
+                validate_private_native_test_context(Some(&self.root), true)?;
+                return self.read_journal_anchor_from_platform();
+            }
             let account = self.journal_anchor_account()?;
             return Ok(TEST_JOURNAL_ANCHORS
                 .get_or_init(Default::default)
@@ -358,28 +664,32 @@ impl ConfigStore {
         }
     }
 
-    #[cfg(all(
-        test,
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
-    ))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn read_journal_anchor_from_os_for_test(
         &self,
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        #[cfg(target_os = "linux")]
+        validate_private_native_test_context(Some(&self.root), false)?;
         self.read_journal_anchor_from_platform()
     }
 
-    #[cfg(all(
-        test,
-        any(target_os = "linux", target_os = "macos", target_os = "windows")
-    ))]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn write_journal_anchor_to_os_for_test(&self, data: &[u8]) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        validate_private_native_test_context(Some(&self.root), false)?;
         self.journal_anchor_entry()?
             .set_secret(data)
             .map_err(anyhow::Error::new)
             .context("write the transaction authorization checkpoint to the OS credential store")
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(any(
+        all(test, target_os = "linux"),
+        all(
+            not(test),
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
+        )
+    ))]
     fn read_journal_anchor_from_platform(&self) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let entry = self.journal_anchor_entry()?;
         match entry.get_secret() {
@@ -394,6 +704,17 @@ impl ConfigStore {
     pub(crate) fn write_journal_anchor(&self, data: &[u8]) -> Result<()> {
         #[cfg(test)]
         {
+            #[cfg(target_os = "linux")]
+            if self.native_anchor_for_test {
+                validate_private_native_test_context(Some(&self.root), true)?;
+                return self
+                    .journal_anchor_entry()?
+                    .set_secret(data)
+                    .map_err(anyhow::Error::new)
+                    .context(
+                        "write the transaction authorization checkpoint to the OS credential store",
+                    );
+            }
             let account = self.journal_anchor_account()?;
             let failure = {
                 let mut failures = TEST_JOURNAL_ANCHOR_WRITE_FAILURES
@@ -463,6 +784,17 @@ impl ConfigStore {
             .map_err(|_| anyhow!("test journal-anchor failure mutex was poisoned"))?
             .remove(&account);
         Ok(())
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn delete_native_journal_anchor_for_test(&self) -> Result<()> {
+        validate_private_native_test_context(Some(&self.root), true)?;
+        match self.journal_anchor_entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => {
+                Err(anyhow!(error)).context("delete the disposable native journal checkpoint")
+            }
+        }
     }
 
     #[cfg(test)]
@@ -540,8 +872,16 @@ impl ConfigStore {
             .map_err(anyhow::Error::msg)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(any(
+        all(test, target_os = "linux"),
+        all(
+            not(test),
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
+        )
+    ))]
     fn journal_anchor_entry(&self) -> Result<keyring::Entry> {
+        #[cfg(all(test, target_os = "linux"))]
+        validate_private_native_test_context(Some(&self.root), false)?;
         keyring::Entry::new(
             "ai.jecta.astatine.transaction-journal",
             &self.journal_anchor_account()?,
@@ -1341,6 +1681,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn assert_no_default_secret_service_state() {
+        super::validate_private_native_test_context(None, false).expect(
+            "no-default Secret Service probes require the verified private qualification session",
+        );
         assert!(
             secret_service_has_owner(),
             "no-default mode requires an owned Secret Service immediately around native store access"
@@ -1396,7 +1739,35 @@ mod tests {
         value.is_some_and(|value| !value.is_empty())
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(unix)]
+    #[test]
+    fn private_dbus_address_parser_accepts_only_the_qualification_socket() {
+        let bus_dir = PathBuf::from("/private/session bus");
+        let address = format!(
+            "unix:path=/private/session%20bus/dbus-test,guid={}",
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            super::private_dbus_socket_path(&address, &bus_dir).unwrap(),
+            bus_dir.join("dbus-test")
+        );
+
+        for address in [
+            "tcp:host=localhost,port=1234,guid=0123456789abcdef0123456789abcdef",
+            "unix:path=/tmp/not-private,guid=0123456789abcdef0123456789abcdef",
+            "unix:path=/private/session%2F..%2Fbus/dbus-test,guid=0123456789abcdef0123456789abcdef",
+            "unix:path=/private/session%Q0bus/dbus-test,guid=0123456789abcdef0123456789abcdef",
+            "unix:path=/private/session%20bus/dbus-test",
+            "unix:path=/private/session%20bus/dbus-test,guid=0123456789abcdef0123456789abcdef;unix:path=/private/session%20bus/other,guid=0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(
+                super::private_dbus_socket_path(address, &bus_dir).is_err(),
+                "accepted non-private D-Bus address {address:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn native_persistence_parent_requires_provider_mode_before_store_access() {
         let root = tempfile::tempdir().unwrap();
@@ -1714,6 +2085,7 @@ transaction_confirmations = 2
         );
     }
 
+    #[cfg(target_os = "linux")]
     const NATIVE_ANCHOR_TEST_SECRET: &[u8] = b"disposable-native-journal-anchor-test";
     const NATIVE_ANCHOR_CHILD_ROOT_ENV: &str = "ASTATINE_NATIVE_ANCHOR_CHILD_ROOT";
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -1758,6 +2130,9 @@ transaction_confirmations = 2
             mode == "locked" || mode == "no-default" || mode == "missing",
             "ambient Secret Service qualification only permits locked, no-default, or missing mode, got {mode:?}"
         );
+        super::validate_private_native_test_context(None, false).expect(
+            "ambient Secret Service probes require the verified private qualification session",
+        );
         mode
     }
 
@@ -1765,16 +2140,21 @@ transaction_confirmations = 2
     #[test]
     #[ignore = "child probe; invoked by native_journal_anchor_persists_across_processes_and_is_root_scoped"]
     fn native_anchor_child_reads_secret() {
-        let root = std::env::var_os(NATIVE_ANCHOR_CHILD_ROOT_ENV).expect(
+        let _root = std::env::var_os(NATIVE_ANCHOR_CHILD_ROOT_ENV).expect(
             "native anchor child probe requires ASTATINE_NATIVE_ANCHOR_CHILD_ROOT from its parent test",
         );
         require_disposable_provider_mode();
-        let store = ConfigStore::at_root(PathBuf::from(root));
-        let secret = store
-            .read_journal_anchor_from_os_for_test()
-            .expect("child process could not read the disposable OS credential")
-            .expect("disposable OS credential was absent in the child process");
-        assert_eq!(&secret[..], NATIVE_ANCHOR_TEST_SECRET);
+        #[cfg(not(target_os = "linux"))]
+        panic!("native anchor restart qualification is unqualified outside Linux");
+        #[cfg(target_os = "linux")]
+        {
+            let store = ConfigStore::at_root(PathBuf::from(_root));
+            let secret = store
+                .read_journal_anchor_from_os_for_test()
+                .expect("child process could not read the disposable OS credential")
+                .expect("disposable OS credential was absent in the child process");
+            assert_eq!(&secret[..], NATIVE_ANCHOR_TEST_SECRET);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1801,20 +2181,25 @@ transaction_confirmations = 2
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires a native OS credential store; run explicitly on a provider-equipped host"]
+    #[ignore = "Linux-only isolated Secret Service qualification; macOS/Windows native stores remain unqualified"]
     fn native_journal_anchor_persists_across_processes_and_is_root_scoped() {
         require_disposable_provider_mode();
-        struct DeleteCredentialOnDrop(keyring::Entry);
+        struct DeleteCredentialOnDrop(ConfigStore);
         impl Drop for DeleteCredentialOnDrop {
             fn drop(&mut self) {
-                let _ = self.0.delete_credential();
+                let _ = self.0.delete_native_journal_anchor_for_test();
             }
         }
 
         let root_a = tempfile::tempdir().unwrap();
         let root_b = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            super::validate_private_native_test_context(Some(root_a.path()), true).unwrap();
+            super::validate_private_native_test_context(Some(root_b.path()), true).unwrap();
+        }
         let store_a = ConfigStore::at_root(root_a.path().to_path_buf());
         let store_b = ConfigStore::at_root(root_b.path().to_path_buf());
         assert_ne!(
@@ -1870,9 +2255,9 @@ transaction_confirmations = 2
                 return;
             }
         };
-        let _cleanup = DeleteCredentialOnDrop(credential);
+        let _cleanup = DeleteCredentialOnDrop(store_a.clone());
 
-        match _cleanup.0.get_secret() {
+        match credential.get_secret() {
             Err(keyring::Error::NoEntry) => {}
             Err(error) => {
                 let app_error = store_a.read_journal_anchor_from_os_for_test().expect_err(
@@ -2062,6 +2447,44 @@ transaction_confirmations = 2
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn untrusted_store_child_rejects_markers_without_private_session_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::linux_secret_service_untrusted_child_probe",
+                "--nocapture",
+            ])
+            .env(LINUX_SECRET_SERVICE_CHILD_ROOT_ENV, root.path())
+            .env(DISPOSABLE_CREDENTIAL_STORE_ENV, "1")
+            .env("ASTATINE_QUALIFICATION_MODE", "missing")
+            .env("TMPDIR", root.path())
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path())
+            .env("XDG_DATA_HOME", root.path())
+            .env("XDG_CACHE_HOME", root.path())
+            .env("XDG_RUNTIME_DIR", root.path())
+            .env("PATH", root.path())
+            .env_remove("ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("DBUS_STARTER_ADDRESS")
+            .env_remove("DBUS_STARTER_BUS_TYPE")
+            .env_remove("DBUS_SESSION_BUS_PID")
+            .env_remove("GNOME_KEYRING_CONTROL")
+            .env_remove("GNOME_KEYRING_PID")
+            .env_remove("SSH_AUTH_SOCK")
+            .output()
+            .unwrap();
+        assert_guard_failure(
+            &child,
+            "outside the private qualification layout",
+            "untrusted child with markers but no private qualification layout",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn linux_secret_service_unavailable_fails_closed_without_native_keyring() {
         let root = tempfile::tempdir().unwrap();
         let child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -2094,18 +2517,8 @@ transaction_confirmations = 2
         );
         let no_default_mode = ambient_secret_service_qualification_mode() == "no-default";
         let store = ConfigStore::at_root(PathBuf::from(root));
-        struct DeleteSyntheticEntry(Option<keyring::Entry>);
-        impl Drop for DeleteSyntheticEntry {
-            fn drop(&mut self) {
-                if let Some(entry) = self.0.take() {
-                    let _ = entry.delete_credential();
-                }
-            }
-        }
-        // No-default mode has a disposable HOME that the outer harness removes;
-        // avoid an extra native delete operation outside the read/write probes.
-        let _cleanup =
-            (!no_default_mode).then(|| DeleteSyntheticEntry(store.journal_anchor_entry().ok()));
+        // The private-session harness removes its disposable HOME and keyring;
+        // do not issue an unguarded best-effort native delete during Drop.
         if no_default_mode {
             assert_no_default_secret_service_state();
         }
@@ -2158,9 +2571,7 @@ transaction_confirmations = 2
             .env(
                 "ASTATINE_QUALIFICATION_MODE",
                 std::env::var("ASTATINE_QUALIFICATION_MODE").unwrap(),
-            )
-            .env("HOME", root.path())
-            .env("XDG_CONFIG_HOME", root.path());
+            );
         let child = run_child_with_timeout(
             command,
             std::time::Duration::from_secs(15),

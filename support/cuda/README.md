@@ -28,7 +28,7 @@ When a driver call returns an error or a backend operation panics, the mining co
 
 ## Hardware validation
 
-Physical CUDA mining and runtime testing have been performed on Linux x86_64 with an NVIDIA RTX 3070. macOS physical mining testing has been performed separately on Apple Silicon M4 using Metal.
+Physical CUDA mining and runtime testing have been performed on Linux x86_64 with an NVIDIA RTX 3070. macOS physical mining testing has been performed separately on Apple Silicon M4 using Metal. `GPU_EVIDENCE.md` records the exact local artifacts, their attribution limits, and a reproducible capture procedure; the recorded run is historical evidence for one host, not release qualification of the current commit.
 
 Physical mining tests have been performed on Linux and macOS, including NVIDIA CUDA mining on Linux and Apple Metal mining on macOS. Physical mining and GPU runtime testing have not yet been performed on Windows. Windows builds and automated CI tests have passed, but Windows GPU functionality remains physically unverified.
 

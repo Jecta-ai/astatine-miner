@@ -35,6 +35,11 @@ const MAX_LOG_QUERY_RANGE: u64 = 10_000;
 const ABI_PROBE_NONCE: u128 = u128::MAX - 7;
 const GENESIS_PROBE_CONCURRENCY: usize = 3;
 
+#[cfg(test)]
+pub(crate) fn local_test_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().no_proxy()
+}
+
 fn rpc_network_label(network: crate::cli::Network) -> &'static str {
     match network {
         crate::cli::Network::Testnet => "Testnet",
@@ -1438,7 +1443,7 @@ impl NetworkClient {
         let endpoint = RpcEndpoint {
             name: "primary".to_owned(),
             url: Url::parse(url).context("parse local Anvil URL")?,
-            client: reqwest::Client::builder()
+            client: local_test_http_client_builder()
                 .timeout(RPC_TIMEOUT)
                 .build()
                 .context("create local Anvil RPC client")?,
@@ -3395,6 +3400,7 @@ mod tests {
             name: name.to_owned(),
             url: Url::parse(&format!("http://{address}")).unwrap(),
             client: reqwest::Client::builder()
+                .no_proxy()
                 .timeout(Duration::from_secs(3))
                 .build()
                 .unwrap(),
@@ -3410,9 +3416,100 @@ mod tests {
             name: name.to_owned(),
             url: Url::parse(&format!("http://{address}")).unwrap(),
             client: reqwest::Client::builder()
+                .no_proxy()
                 .timeout(Duration::from_secs(1))
                 .build()
                 .unwrap(),
+        }
+    }
+
+    const LOCAL_CLIENT_PROXY_TEST_URL_ENV: &str = "ASTATINE_LOCAL_CLIENT_PROXY_TEST_URL";
+
+    #[test]
+    fn local_test_client_ignores_environment_proxies() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            for _ in 0..2 {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "proxy-free local test client did not reach its loopback endpoint"
+                            );
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept local proxy test request: {error}"),
+                    }
+                };
+                read_http_request(&mut stream);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                )
+                .unwrap();
+            }
+        });
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "rpc::tests::local_test_client_proxy_environment_child",
+                "--nocapture",
+            ])
+            .env(LOCAL_CLIENT_PROXY_TEST_URL_ENV, format!("http://{address}"))
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "http://127.0.0.1:1")
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env_remove("http_proxy")
+            .env_remove("all_proxy")
+            .env_remove("https_proxy")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .output()
+            .unwrap();
+        server.join().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "local test client honored the bogus proxy: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed")
+                || stderr.contains("test result: ok. 1 passed"),
+            "proxy child did not execute exactly one passing test: stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "child probe; invoked by local_test_client_ignores_environment_proxies"]
+    async fn local_test_client_proxy_environment_child() {
+        let endpoint = std::env::var(LOCAL_CLIENT_PROXY_TEST_URL_ENV)
+            .expect("proxy test child requires its parent-provided loopback endpoint");
+        let network = NetworkClient::local_test_client(
+            &endpoint,
+            Address::with_last_byte(0x11),
+            B256::with_last_byte(0x12),
+            Address::with_last_byte(0x13),
+            B256::with_last_byte(0x14),
+            18,
+        )
+        .unwrap();
+        let direct_rpc_client = super::local_test_http_client_builder().build().unwrap();
+        let primary = network.primary_endpoint().unwrap();
+        for client in [primary.client.clone(), direct_rpc_client] {
+            let response = client
+                .get(primary.url.clone())
+                .send()
+                .await
+                .expect("local test RPC clients must bypass environment proxy settings");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.text().await.unwrap(), "ok");
         }
     }
 
@@ -3583,6 +3680,7 @@ mod tests {
             name: "delayed-primary".to_owned(),
             url: Url::parse(&format!("http://{address}")).unwrap(),
             client: reqwest::Client::builder()
+                .no_proxy()
                 .timeout(Duration::from_secs(1))
                 .build()
                 .unwrap(),
@@ -3828,20 +3926,23 @@ mod tests {
 
     #[test]
     fn injective_virtual_logs_do_not_invalidate_signed_transaction_inclusion() {
+        // Synthetic receipt shaped after an Injective Testnet receipt: three
+        // EVM event logs plus five virtual Cosmos logs. Transaction-specific
+        // values are synthetic; protocol constants are retained.
         let receipt_json: ReceiptJson = serde_json::from_str(include_str!(
-            "../tests/fixtures/injective-testnet-virtual-receipt.json"
+            "../tests/fixtures/synthetic-injective-virtual-receipt.json"
         ))
         .unwrap();
         let receipt = TransactionReceipt::try_from(receipt_json).unwrap();
 
         assert_eq!(
             format!("{:#x}", receipt.transaction_hash),
-            "0x0bb5c1a62950464c0e27a7e6ba525ad9305be3064f6977ac67b80206f2211dfe"
+            "0x1111111111111111111111111111111111111111111111111111111111111111"
         );
-        assert_eq!(receipt.block_number, 0x8ba197e);
+        assert_eq!(receipt.block_number, 42);
         assert_eq!(
             format!("{:#x}", receipt.block_hash),
-            "0xf23693cb504671f46be1f0e4b4e975fcbabce37460e9f84f29ef8a666a6c4989"
+            "0x2222222222222222222222222222222222222222222222222222222222222222"
         );
         assert!(receipt.status);
         assert_eq!(receipt.logs.len(), 8);

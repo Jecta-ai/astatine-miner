@@ -50,6 +50,8 @@ fn require_disposable_provider() {
         Ok("1"),
         "the native provider must be an explicit test requirement"
     );
+    crate::config::validate_private_native_test_context(None, true)
+        .expect("Phase B native-provider tests require the verified private Linux session");
 }
 
 fn require_disposable_missing_mode() {
@@ -63,6 +65,8 @@ fn require_disposable_missing_mode() {
         Ok("missing"),
         "this qualification requires the isolated no-provider mode"
     );
+    crate::config::validate_private_native_test_context(None, false)
+        .expect("Phase B missing-provider tests require the verified private Linux session");
 }
 
 fn test_config() -> (AppConfig, Address) {
@@ -103,23 +107,16 @@ fn checkpoint_from_test_backend(store: &ConfigStore) -> Zeroizing<Vec<u8>> {
 }
 
 fn native_anchor_cleanup(root: &Path) -> NativeAnchorCleanup {
-    use sha2::{Digest, Sha256};
-    use std::os::unix::ffi::OsStrExt;
-
-    let canonical = std::fs::canonicalize(root).expect("canonicalize disposable data root");
-    let account = alloy_primitives::hex::encode(Sha256::digest(canonical.as_os_str().as_bytes()));
-    let entry = keyring::Entry::new("ai.jecta.astatine.transaction-journal", &account)
-        .expect("construct the disposable native credential entry");
-    NativeAnchorCleanup(entry)
+    NativeAnchorCleanup(ConfigStore::at_root(root.to_path_buf()))
 }
 
-struct NativeAnchorCleanup(keyring::Entry);
+struct NativeAnchorCleanup(ConfigStore);
 
 impl Drop for NativeAnchorCleanup {
     fn drop(&mut self) {
-        // The surrounding private-session harness owns the disposable keyring;
-        // delete this root-scoped entry as an additional cleanup boundary.
-        let _ = self.0.delete_credential();
+        // This method revalidates the private provider context and root before
+        // touching the disposable keyring. The harness removes it on failure.
+        let _ = self.0.delete_native_journal_anchor_for_test();
     }
 }
 
@@ -262,7 +259,7 @@ fn linux_secret_service_production_recover_authenticates_journal_after_restart()
     }
     _cleanup
         .0
-        .delete_credential()
+        .delete_native_journal_anchor_for_test()
         .expect("delete the disposable native checkpoint");
     let missing = recover();
     assert!(

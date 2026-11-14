@@ -116,7 +116,7 @@ The wgpu backends target Metal on macOS, Direct3D 12 or Vulkan on Windows, and V
 
 Physical mining tests have been performed on Linux and macOS, including NVIDIA CUDA mining on Linux and Apple Metal mining on macOS. Physical mining and GPU runtime testing have not yet been performed on Windows. Windows builds and automated CI tests have passed, but Windows GPU functionality remains physically unverified.
 
-Those are historical reports, not platform qualification of a current release. macOS GPU behavior has been reported as satisfactory; raw GPU and paid-transaction acceptance logs are not attached here. The documented archive target is macOS ARM64 only; Linux and Windows require separate native release acceptance.
+Those are historical reports, not platform qualification of a current release. macOS GPU behavior has been reported as satisfactory; raw GPU and paid-transaction acceptance logs are not attached here. The documented archive target is macOS ARM64 only; Linux and Windows require separate native release acceptance. `support/cuda/GPU_EVIDENCE.md` records the surviving CUDA artifact attribution, its build-provenance gaps, and the exact capture procedure required before a physical result can be tied to a release commit.
 
 | Platform / GPU | Preferred backend | Recorded validation |
 |---|---|---|

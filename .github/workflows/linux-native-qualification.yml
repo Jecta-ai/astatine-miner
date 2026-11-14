@@ -55,6 +55,9 @@ jobs:
           for script in support/linux/*.sh; do
             bash -n "$script"
           done
+          for script in support/linux/*.py; do
+            python3 -m py_compile "$script"
+          done
           python3 -m json.tool support/linux/anvil-release.json >/dev/null
           python3 support/verify-fixture-provenance.py
           python3 -m unittest discover -s support/tests -p 'test_*.py'
@@ -122,7 +125,7 @@ jobs:
               printf 'qualification test failed: %s\n' "$test" >&2
               return "$status"
             fi
-            if ! grep -q 'test result: ok. 1 passed' <<<"$output"; then
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<<"$output"; then
               printf 'qualification test did not execute exactly one passing test: %s\n' "$test" >&2
               return 1
             fi
@@ -143,7 +146,7 @@ jobs:
               printf 'qualification test failed: %s\n' "$test" >&2
               return "$status"
             fi
-            if ! grep -q 'test result: ok. 1 passed' <<<"$output"; then
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<<"$output"; then
               printf 'qualification test did not execute exactly one passing test: %s\n' "$test" >&2
               return 1
             fi
@@ -174,6 +177,58 @@ jobs:
               exit 1
               ;;
           esac
+
+  production-journal:
+    needs: workflow-safety
+    name: Production journal and native checkpoint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify Ubuntu 24.04 x86_64 runner
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          test "${ID:-}" = "ubuntu"
+          test "${VERSION_ID:-}" = "24.04"
+          test "$(uname -m)" = "x86_64"
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.1 --profile minimal
+          test "$(rustc --version | awk '{print $2}')" = "1.94.1"
+          test "$(rustc -vV | awk '$1 == "host:" {print $2}')" = "x86_64-unknown-linux-gnu"
+      - name: Install isolated Secret Service dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dbus gnome-keyring libglib2.0-bin
+          dpkg-query -W -f='${Package} ${Version}\n' dbus gnome-keyring libglib2.0-bin
+      - name: Build the production binary
+        run: cargo build --locked --bin astatine
+      - name: Run the production-created journal and checkpoint qualification
+        run: |
+          set -euo pipefail
+          status=0
+          output=$(bash support/linux/run-private-session.sh provider -- \
+            python3 support/linux/qualify-production-journal.py target/debug/astatine 2>&1) || status=$?
+          printf '%s\n' "$output"
+          test "$status" -eq 0 || exit "$status"
+          for marker in \
+            'production-init=ok' \
+            'production-recover=ok' \
+            'production-recover-second-process=ok' \
+            'data-root-scope=fail-closed' \
+            'interrupted-init-prompt=recoverable' \
+            'unavailable-provider=fail-closed' \
+            'root-mode=700 config-mode=600 journal-mode=600 keystore-mode=600' \
+            'checkpoint=native-present'
+          do
+            grep -qxF "$marker" <<<"$output"
+          done
 
   signals-pty:
     needs: workflow-safety
@@ -252,7 +307,7 @@ jobs:
               printf 'qualification test failed: %s\n' "$test" >&2
               exit "$status"
             fi
-            if ! grep -q 'test result: ok. 1 passed' <<<"$output"; then
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<<"$output"; then
               printf 'qualification test did not execute exactly one passing test: %s\n' "$test" >&2
               exit 1
             fi
@@ -288,7 +343,8 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ca-certificates curl file python3
+          sudo apt-get install -y --no-install-recommends ca-certificates curl file python3 \
+            dbus gnome-keyring libglib2.0-bin
       - name: Install pinned Anvil binary and verify provenance
         run: |
           set -euo pipefail
@@ -339,12 +395,29 @@ jobs:
               printf 'Anvil qualification test failed: %s\n' "$test" >&2
               exit "$status"
             fi
-            if ! grep -q 'test result: ok. 1 passed' <<<"$output"; then
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<<"$output"; then
               printf 'Anvil qualification test did not execute exactly one passing test: %s\n' "$test" >&2
               exit 1
             fi
             printf '::endgroup::\n'
           done
+      - name: Verify native checkpoint and Anvil crash recovery
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export PATH="$RUNNER_TEMP/astatine-foundry/bin:$PATH"
+          status=0
+          output=$(ASTATINE_QUALIFICATION_TIMEOUT_SECONDS=300 \
+            bash support/linux/run-private-session.sh provider -- \
+            cargo test --locked --bin astatine -- --ignored --exact \
+              transaction::tests::linux_native_provider_anvil_broadcast_survives_fresh_process_sigkill \
+              --nocapture --test-threads=1 2>&1) || status=$?
+          printf '%s\n' "$output"
+          test "$status" -eq 0 || exit "$status"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<<"$output"
       - name: Stop any leftover local Anvil process
         if: always()
         run: |
@@ -386,10 +459,11 @@ jobs:
             fi
           }
           trap cleanup_policy EXIT
-          sudo apt-get install -y --no-install-recommends openssh-server openssh-client iproute2
+          sudo apt-get install -y --no-install-recommends openssh-server openssh-client iproute2 \
+            dbus gnome-keyring libglib2.0-bin
           cleanup_policy
           trap - EXIT
-          dpkg-query -W -f='${Package} ${Version}\n' openssh-server openssh-client
+          dpkg-query -W -f='${Package} ${Version}\n' openssh-server openssh-client dbus gnome-keyring libglib2.0-bin
       - name: Install pinned Rust toolchain
         run: |
           set -euo pipefail
@@ -402,3 +476,7 @@ jobs:
         env:
           ASTATINE_SSH_TEST_BINARY: target/debug/astatine
         run: bash support/linux/ssh-loopback-smoke.sh
+      - name: Verify SSH application lifecycle
+        run: |
+          set -euo pipefail
+          python3 support/linux/ssh-application-lifecycle.py target/debug/astatine
