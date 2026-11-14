@@ -1440,11 +1440,50 @@ impl NetworkClient {
         token_runtime_hash: B256,
         token_decimals: u8,
     ) -> Result<Self> {
+        Self::local_test_client_with_nodes_and_rpc_timeout(
+            url,
+            miners,
+            token,
+            token_runtime_hash,
+            token_decimals,
+            RPC_TIMEOUT,
+        )
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn local_test_client_with_rpc_timeout(
+        url: &str,
+        miner: Address,
+        miner_runtime_hash: B256,
+        token: Address,
+        token_runtime_hash: B256,
+        token_decimals: u8,
+        rpc_timeout: Duration,
+    ) -> Result<Self> {
+        Self::local_test_client_with_nodes_and_rpc_timeout(
+            url,
+            &[(1, miner, miner_runtime_hash)],
+            token,
+            token_runtime_hash,
+            token_decimals,
+            rpc_timeout,
+        )
+    }
+
+    #[cfg(test)]
+    fn local_test_client_with_nodes_and_rpc_timeout(
+        url: &str,
+        miners: &[(u8, Address, B256)],
+        token: Address,
+        token_runtime_hash: B256,
+        token_decimals: u8,
+        rpc_timeout: Duration,
+    ) -> Result<Self> {
         let endpoint = RpcEndpoint {
             name: "primary".to_owned(),
             url: Url::parse(url).context("parse local Anvil URL")?,
             client: local_test_http_client_builder()
-                .timeout(RPC_TIMEOUT)
+                .timeout(rpc_timeout)
                 .build()
                 .context("create local Anvil RPC client")?,
         };

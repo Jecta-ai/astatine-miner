@@ -480,3 +480,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 support/linux/ssh-application-lifecycle.py target/debug/astatine
+      - name: Verify production wallet import over SSH
+        run: |
+          set -euo pipefail
+          python3 support/linux/qualify-ssh-wallet-import.py target/debug/astatine

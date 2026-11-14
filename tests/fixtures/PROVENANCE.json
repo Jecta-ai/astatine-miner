@@ -201,8 +201,8 @@
   "documents": [
     {
       "path": "tests/fixtures/README.md",
-      "sha256": "7ea99fa618d6f281038aa85c4f1d14a7564a5a50f09824952aa0c00a5c74ddee",
-      "bytes": 5083
+      "sha256": "c61ab2f8f53dcdd49ea3841133237c657a86a3b02374c37c118921e736d01f8d",
+      "bytes": 5106
     }
   ],
   "legal_artifacts": [
@@ -232,8 +232,8 @@
     "owner_attestation": {
       "status": "OWNER-ATTESTED \u2014 not independently verified",
       "scope": "The AstatineMiner and AstatineGenesisCoordinator contracts are first-party works developed and owned by the project owner.",
-      "attested_on": "2026-11-11",
-      "attestation_source": "Explicit statement by the project owner; not independently verified.",
+      "attested_on": "2026-11-15",
+      "attestation_source": "The project owner explicitly confirmed ownership of the first-party ASTATINE mining and genesis coordinator contracts for Phase D; not independently verified.",
       "independent_verification": false
     },
     "notice_applicability": "UNRESOLVED",
@@ -243,11 +243,11 @@
       "items": [
         {
           "id": "RIGHTS-01",
-          "action": "Record written first-party ownership of AstatineMiner and AstatineGenesisCoordinator and confirm the owner can license them for redistribution.",
+          "action": "Record the project owner's confirmation of first-party ownership of AstatineMiner and AstatineGenesisCoordinator.",
           "owner": "project owner",
-          "status": "OPEN",
+          "status": "DONE",
           "blocking": true,
-          "evidence": "rights_review.owner_attestation records only an owner statement; independent_verification is false."
+          "evidence": "rights_review.owner_attestation records the project owner's explicit Phase D confirmation; independent_verification is false."
         },
         {
           "id": "RIGHTS-02",

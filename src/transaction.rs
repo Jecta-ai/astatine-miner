@@ -7765,6 +7765,14 @@ mod tests {
             .expect("create proxy-free local test RPC client")
     }
 
+    #[cfg(target_os = "linux")]
+    fn local_rpc_client_with_timeout(timeout: Duration) -> reqwest::Client {
+        crate::rpc::local_test_http_client_builder()
+            .timeout(timeout)
+            .build()
+            .expect("create proxy-free local test RPC client with a bounded timeout")
+    }
+
     fn test_request() -> Eip1559Request {
         Eip1559Request {
             chain_id: 1439,
@@ -25184,6 +25192,8 @@ mod tests {
     struct AnvilRpcBoundary {
         endpoint: String,
         raw_send_count: Arc<std::sync::atomic::AtomicUsize>,
+        hold_raw_send_ack: Arc<AtomicBool>,
+        raw_send_ack_waiting: Arc<AtomicBool>,
         error: Arc<Mutex<Option<String>>>,
         stop: Arc<AtomicBool>,
         server: Option<std::thread::JoinHandle<()>>,
@@ -25196,18 +25206,26 @@ mod tests {
             listener.set_nonblocking(true)?;
             let endpoint = format!("http://{}", listener.local_addr()?);
             let raw_send_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let hold_raw_send_ack = Arc::new(AtomicBool::new(false));
+            let raw_send_ack_waiting = Arc::new(AtomicBool::new(false));
             let error = Arc::new(Mutex::new(None));
             let stop = Arc::new(AtomicBool::new(false));
             let thread_count = Arc::clone(&raw_send_count);
+            let thread_hold_ack = Arc::clone(&hold_raw_send_ack);
+            let thread_ack_waiting = Arc::clone(&raw_send_ack_waiting);
             let thread_error = Arc::clone(&error);
             let thread_stop = Arc::clone(&stop);
             let server = std::thread::spawn(move || {
                 while !thread_stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((client, _)) => {
-                            if let Err(failure) =
-                                forward_counted_anvil_rpc(client, target, &thread_count)
-                                && let Ok(mut first_error) = thread_error.lock()
+                            if let Err(failure) = forward_counted_anvil_rpc(
+                                client,
+                                target,
+                                &thread_count,
+                                &thread_hold_ack,
+                                &thread_ack_waiting,
+                            ) && let Ok(mut first_error) = thread_error.lock()
                             {
                                 first_error.get_or_insert_with(|| failure.to_string());
                             }
@@ -25227,6 +25245,8 @@ mod tests {
             Ok(Self {
                 endpoint,
                 raw_send_count,
+                hold_raw_send_ack,
+                raw_send_ack_waiting,
                 error,
                 stop,
                 server: Some(server),
@@ -25235,6 +25255,19 @@ mod tests {
 
         fn raw_send_count(&self) -> usize {
             self.raw_send_count.load(Ordering::SeqCst)
+        }
+
+        fn hold_next_raw_send_acknowledgement(&self) {
+            self.raw_send_ack_waiting.store(false, Ordering::SeqCst);
+            self.hold_raw_send_ack.store(true, Ordering::SeqCst);
+        }
+
+        fn raw_send_acknowledgement_is_held(&self) -> bool {
+            self.raw_send_ack_waiting.load(Ordering::Acquire)
+        }
+
+        fn release_raw_send_acknowledgement(&self) {
+            self.hold_raw_send_ack.store(false, Ordering::Release);
         }
 
         fn assert_healthy(&self) {
@@ -25247,6 +25280,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     impl Drop for AnvilRpcBoundary {
         fn drop(&mut self) {
+            self.hold_raw_send_ack.store(false, Ordering::Release);
             self.stop.store(true, Ordering::Release);
             if let Some(server) = self.server.take() {
                 let _ = server.join();
@@ -25259,6 +25293,8 @@ mod tests {
         mut client: TcpStream,
         target: std::net::SocketAddr,
         raw_send_count: &std::sync::atomic::AtomicUsize,
+        hold_raw_send_ack: &AtomicBool,
+        raw_send_ack_waiting: &AtomicBool,
     ) -> std::io::Result<()> {
         use std::io::ErrorKind;
 
@@ -25295,8 +25331,31 @@ mod tests {
         upstream.set_write_timeout(Some(Duration::from_secs(15)))?;
         upstream.write_all(&forwarded)?;
         let (response, _) = read_rpc_http_message(&mut upstream)?;
-        client.write_all(&response)?;
-        Ok(())
+        let acknowledgement_withheld = raw_sends != 0 && hold_raw_send_ack.load(Ordering::Acquire);
+        if acknowledgement_withheld {
+            raw_send_ack_waiting.store(true, Ordering::Release);
+            while hold_raw_send_ack.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            raw_send_ack_waiting.store(false, Ordering::Release);
+        }
+        match client.write_all(&response) {
+            Ok(()) => Ok(()),
+            Err(failure)
+                if acknowledgement_withheld
+                    && matches!(
+                        failure.kind(),
+                        ErrorKind::BrokenPipe
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::NotConnected
+                    ) =>
+            {
+                // A peer killed at the explicitly gated acknowledgement
+                // boundary has already closed its side of this socket.
+                Ok(())
+            }
+            Err(failure) => Err(failure),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -25403,6 +25462,7 @@ mod tests {
     #[ignore = "requires pinned Anvil and the private unlocked Secret Service qualification session"]
     async fn linux_native_provider_anvil_broadcast_survives_fresh_process_sigkill() {
         use std::os::unix::process::ExitStatusExt;
+        use subtle::ConstantTimeEq;
 
         // This constructor checks the private D-Bus socket, HOME/XDG/TMPDIR
         // layout, owner/mode of the directories, unlocked provider state, and
@@ -25585,6 +25645,7 @@ mod tests {
                 .env(NATIVE_ANVIL_MINER_ENV, format!("{miner:#x}"))
                 .env(NATIVE_ANVIL_TOKEN_ENV, format!("{token:#x}"))
                 .env(NATIVE_ANVIL_READY_ENV, &ready)
+                .env_remove(NATIVE_ANVIL_STAGE_ENV)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -25707,9 +25768,13 @@ mod tests {
             journal_before_kill,
             "killing the worker must preserve the exact same journal bytes"
         );
-        assert_eq!(
-            store.read_journal_anchor().unwrap().unwrap(),
-            checkpoint_before_kill,
+        let checkpoint_after_kill = store.read_journal_anchor().unwrap().unwrap();
+        assert!(
+            bool::from(
+                checkpoint_after_kill
+                    .as_slice()
+                    .ct_eq(checkpoint_before_kill.as_slice())
+            ),
             "killing the worker must preserve the native checkpoint"
         );
 
@@ -25776,6 +25841,23 @@ mod tests {
         );
         drop(recovered);
 
+        exercise_native_anvil_prepare_and_unacknowledged_sigkill_cases(
+            NativeAnvilCrashTestContext {
+                setup: NativeAnvilCrashTestSetup {
+                    rpc: &rpc,
+                    direct_endpoint: &endpoint,
+                    deployment_wallet,
+                    token,
+                    token_decimals,
+                    allocation,
+                    reward,
+                    miner_bytecode: &miner_bytecode,
+                },
+                rpc_boundary: &rpc_boundary,
+            },
+        )
+        .await;
+
         store
             .delete_native_journal_anchor_for_test()
             .expect("delete the disposable native checkpoint before the private session ends");
@@ -25819,6 +25901,8 @@ mod tests {
             std::env::var_os(NATIVE_ANVIL_READY_ENV)
                 .expect("native Anvil worker requires its parent-provided ready path"),
         );
+        let stage =
+            std::env::var(NATIVE_ANVIL_STAGE_ENV).unwrap_or_else(|_| "after-broadcast".to_owned());
 
         // No in-memory checkpoint bridge is used: this fresh process constructs
         // its own test store, authenticates from the isolated native provider,
@@ -25837,87 +25921,70 @@ mod tests {
         );
         let rpc = local_rpc_client();
         let token_decimals = 9_u8;
-        let network = NetworkClient::local_test_client(
+        let network = NetworkClient::local_test_client_with_rpc_timeout(
             &endpoint,
             miner,
             local_code_hash(&rpc, &endpoint, miner).await,
             token,
             local_code_hash(&rpc, &endpoint, token).await,
             token_decimals,
+            NATIVE_ANVIL_WORKER_RPC_TIMEOUT,
         )
         .unwrap();
-        let work_bytes = local_call(
-            &rpc,
-            &endpoint,
-            miner,
-            &AstatineMinerRead::workCall {}.abi_encode(),
-        )
-        .await;
-        type WorkReturn = (
-            bool,
-            bool,
-            u64,
-            u64,
-            u64,
-            B256,
-            B256,
-            U256,
-            U256,
-            U256,
-            u32,
-            U256,
-        );
-        let work = <WorkReturn as SolValue>::abi_decode_validate(&work_bytes).unwrap();
-        let header = b"native-provider-fresh-process-crash";
-        let context = WorkContext {
-            chain_id: 1439,
-            contract: miner,
-            window_id: work.2,
-            seed: work.5,
-            miner: wallet,
-            header: header.to_vec(),
-        };
-        let hasher = WorkHasher::new(&context).unwrap();
-        let (nonce, work_hash) = (0..10_000_u128)
-            .find_map(|nonce| {
-                let hash = hasher.hash(nonce);
-                meets_target(hash, work.7).then_some((nonce, hash))
-            })
-            .expect("the local Anvil work target must have a valid test proof");
-        let submission = ProofSubmission {
-            contract: miner,
-            node_id: 1,
-            window_id: work.2,
-            nonce,
-            header: header.to_vec(),
-            work_hash,
-        };
-        let manager = TransactionManager::open(&store, &config, wallet, token)
+        let submission = local_native_anvil_proof_submission(&rpc, &endpoint, miner, wallet).await;
+        let mut manager = TransactionManager::open(&store, &config, wallet, token)
             .expect("open the same authenticated journal in a fresh process");
+        if stage == "after-prepare" {
+            let prepare_ready = ready.clone();
+            manager.set_post_prepare_boundary_hook(Box::new(move || {
+                let staged = prepare_ready.with_extension("staged");
+                std::fs::write(&staged, b"prepared boundary reached")
+                    .expect("signal the parent after durable preparation");
+                std::fs::rename(&staged, &prepare_ready)
+                    .expect("atomically signal the durable prepared boundary");
+                loop {
+                    std::thread::park_timeout(Duration::from_secs(1));
+                }
+            }));
+        } else if stage == "await-broadcast-ack" {
+            manager.set_broadcast_wait_override(NATIVE_ANVIL_WORKER_BROADCAST_WAIT);
+        }
         let submit_task = tokio::spawn(async move {
             let mut manager = manager;
             manager.submit_proof(&network, &signer, submission).await
         });
-        let broadcast = wait_for_journal_entry(
-            &store,
-            TransactionAction::SubmitProof,
-            TransactionStatus::Broadcast,
-        )
-        .await;
-        let ready_staged = ready.with_extension("staged");
-        std::fs::write(
-            &ready_staged,
-            format!("{:#x}", entry_hash(&broadcast).unwrap()),
-        )
-        .expect("stage the parent signal after the authenticated broadcast is durable");
-        std::fs::rename(&ready_staged, &ready)
-            .expect("atomically signal the parent after durable broadcast");
-        loop {
-            assert!(
-                !submit_task.is_finished(),
-                "Anvil unexpectedly mined the transaction before the parent crash point"
-            );
-            sleep(Duration::from_millis(100)).await;
+        match stage.as_str() {
+            "after-broadcast" => {
+                let broadcast = wait_for_journal_entry(
+                    &store,
+                    TransactionAction::SubmitProof,
+                    TransactionStatus::Broadcast,
+                )
+                .await;
+                let ready_staged = ready.with_extension("staged");
+                std::fs::write(
+                    &ready_staged,
+                    format!("{:#x}", entry_hash(&broadcast).unwrap()),
+                )
+                .expect("stage the parent signal after the authenticated broadcast is durable");
+                std::fs::rename(&ready_staged, &ready)
+                    .expect("atomically signal the parent after durable broadcast");
+                loop {
+                    assert!(
+                        !submit_task.is_finished(),
+                        "Anvil unexpectedly mined the transaction before the parent crash point"
+                    );
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+            "after-prepare" | "await-broadcast-ack" => loop {
+                assert!(
+                    !submit_task.is_finished(),
+                    "the worker exited before the parent crash boundary"
+                );
+                sleep(Duration::from_millis(100)).await;
+            },
+            other => panic!("unsupported native Anvil worker stage {other:?}"),
         }
     }
 
@@ -26994,4 +27061,7 @@ mod tests {
         word[31] = value;
         word
     }
+
+    #[cfg(target_os = "linux")]
+    include!("linux_native_anvil_crash_tests.rs");
 }

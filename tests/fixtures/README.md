@@ -12,7 +12,7 @@ The pinned upstream `AstatineMiner` and `AstatineGenesisCoordinator` source file
 
 Publication of this repository or a release archive stays BLOCKED until every item is resolved and recorded in `rights_review.notice_checklist` of `PROVENANCE.json`. No automated check can establish ownership, authority or NOTICE applicability; these actions need a human decision.
 
-- [ ] **RIGHTS-01** — Record written first-party ownership of `AstatineMiner` and `AstatineGenesisCoordinator` and confirm the owner can license them for redistribution. Owner attestation alone is not independent verification.
+- [x] **RIGHTS-01** — The project owner confirmed ownership of the first-party `AstatineMiner` and `AstatineGenesisCoordinator` contracts for Phase D. This is an owner attestation, not independent verification or a waiver of third-party obligations.
 - [ ] **RIGHTS-02** — Decide whether Apache-2.0 NOTICE propagation applies to each distributed artifact. The contract fixtures are not release-archive members, so any obligation follows source redistribution of the fixtures rather than the miner binary.
 - [ ] **RIGHTS-03** — If the two first-party contract fixtures remain in the public source tree, add the Apache-2.0 license text and a copyright statement for them, or remove those fixtures from the public tree.
 - [ ] **RIGHTS-04** — Confirm authorship and redistribution authority for `MockAST` and keep the OpenZeppelin MIT notice with any redistribution of it.

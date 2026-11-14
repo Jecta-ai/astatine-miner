@@ -15,8 +15,8 @@ attest, create releases, or contact a public RPC endpoint.
 | `secret-service` (`missing`) | Private D-Bus session with no service activation and no provider. The unavailable-bus test and the ambient-bus child probe must both fail closed. |
 | `production-journal` | The production executable's interactive `init` creates a v10 authenticated journal and its native Secret Service checkpoint; two fresh production `recover` processes authenticate them; a copied data root fails closed without its own checkpoint; `SIGKILL` at a real init prompt remains recoverable; an unavailable provider fails closed without changing the journal. |
 | `signals-pty` | Linux `SIGHUP`, `SIGINT`, and `SIGTERM` cancellation and terminal restoration on disposable controlling PTYs; init, wallet import, wallet creation/import/unlock prompts; cross-process journal-lock contention; zero-cap read-only behavior; maximum-exposure/reserve, checkpoint-crash, and copied-data-root guards. |
-| `anvil-lifecycle` | Pinned Anvil archive and source-commit verification; offline fixture provenance; local-loopback lifecycle and a test-only native-checkpoint SIGKILL/restart after broadcast. Consult the hosted run for results on the exact commit. |
-| `ssh-loopback` | Ephemeral loopback-only `sshd` and disposable keys; verifies PTY allocation and runs the production application through a real SSH disconnect, reconnect and native-checkpoint recovery. Resize evidence is limited to local PTY resize and application responsiveness, not remote window-size propagation. |
+| `anvil-lifecycle` | Pinned Anvil and test-only native-checkpoint SIGKILL/restart after preparation, while an accepted broadcast acknowledgement is withheld, and after broadcast. Consult the hosted run for results on the exact commit. |
+| `ssh-loopback` | Ephemeral loopback-only `sshd` and disposable keys; exercises production initialization, encrypted-keystore import, real SSH disconnect, reconnect and native-checkpoint recovery. Resize evidence is limited to local PTY resize and application responsiveness, not remote window-size propagation. |
 
 ## Isolation and secret handling
 
@@ -73,12 +73,13 @@ configured.
 
 ## Unqualified: production prepare/broadcast interruption (P2)
 
-The test-only native-provider Anvil harness now exercises SIGKILL after a
-broadcast and authenticates the same journal in a fresh test process. It counts
-raw sends at a loopback boundary and checks authorization and exposure. It is
-not the production CLI and does not establish termination between preparation
-and broadcast acknowledgement, or zero-cap recovery after an actual process
-kill. The remaining production-path blockers are architectural:
+The test-only native-provider Anvil harness exercises SIGKILL after preparation,
+after Anvil accepts a broadcast while its acknowledgement is withheld, and
+after broadcast. Fresh test processes authenticate the same journal; a local
+proxy counts raw sends, and the test checks nonce, authorization, exposure and
+zero-cap refusal. This exercises real transaction code with a test-only local
+deployment, not the production CLI; consult hosted results for the exact commit.
+The remaining production-path limitation is architectural:
 
 - The production CLI always loads the embedded Testnet manifest
   (`src/deployment.rs:115-124`), requires the selected RPC to report the
@@ -90,11 +91,12 @@ kill. The remaining production-path blockers are architectural:
 - Under `cfg(test)`, journal-anchor reads and writes use a process-local map
   (`src/config.rs:332-342` and `src/config.rs:394-428`); the production
   `not(test)` branches use the native OS credential store. Explicit test-only
-  helpers can also access that store. A fresh test process therefore
-  cannot authenticate a checkpoint written by another test process without the
-  explicit bridge used by `src/linux_secret_service_phase_b_tests.rs:196-212`.
+  helpers can also access that store. The Anvil crash fixture explicitly opts
+  into the isolated native backend and does not use the separate bridge in
+  `src/linux_secret_service_phase_b_tests.rs`.
 
-What the existing tests do prove, all without a fresh terminated process:
+Other existing component tests do not themselves establish the fresh-process
+native-provider scenario:
 
 | Test | Boundary |
 | --- | --- |
@@ -111,10 +113,9 @@ What the existing tests do prove, all without a fresh terminated process:
 No complete, safe production-CLI procedure is established with the current repository.
 Do not fork a public endpoint, run paid mining, change the pinned production
 manifest, or manually modify an authenticated journal to simulate this test.
-Qualification requires a separately reviewed, isolated local deployment and a
-way to observe and interrupt the actual boundary while retaining the native
-checkpoint across processes. Until those prerequisites exist, P2 remains
-**BLOCKED**, not passed.
+The test-only isolated deployment does not establish that the production CLI
+can run the same interruption scenario against its pinned deployment. Do not
+claim production-CLI end-to-end coverage from the test-only fixture.
 
 The following component checks are reproducible on disposable Linux x86_64;
 they do not prove the combined process-kill scenario:
@@ -200,9 +201,9 @@ python3 -m unittest discover -s support/tests -p 'test_*.py'
   interrupts the process inside an atomic journal write; the interrupted-init
   check kills at a real user-visible consent prompt before the write.
 - The native-provider Anvil crash test is a test-only path, not the production
-  CLI. It exercises a post-broadcast kill; the prepare-to-broadcast crash window
-  and zero-cap recovery following an actual process kill remain **NOT TESTED**.
-  The production CLI cannot target arbitrary local deployments.
+  CLI. The production CLI cannot target arbitrary local deployments. Container
+  restart with a persistent provider and manual credential unlock remains
+  **NOT TESTED** by this workflow.
 - Physical GPU mining, Windows credential storage, macOS Keychain behavior, the
   real bundled Testnet deployment, paid mining, public RPC endpoints, releases,
   signing, and deployment remain outside this qualification.
