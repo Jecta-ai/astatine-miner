@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 use tempfile::{NamedTempFile, PersistError};
 use zeroize::Zeroizing;
@@ -28,6 +29,14 @@ const DEFAULT_TRANSACTION_CONFIRMATIONS: u8 = 2;
 const MAX_TRANSACTION_CONFIRMATIONS: u8 = 12;
 const LEGACY_CONFIG_SCHEMA_VERSION: u32 = 1;
 const PER_RUN_CONFIG_SCHEMA_VERSION: u32 = 2;
+const JOURNAL_LOCK_RETRY_ATTEMPTS: u32 = 20;
+const JOURNAL_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+#[cfg(test)]
+std::thread_local! {
+    static JOURNAL_LOCK_RETRY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 static TEST_JOURNAL_ANCHORS: std::sync::OnceLock<
@@ -50,6 +59,20 @@ struct TestJournalAnchorWriteFailure {
 static TEST_ATOMIC_WRITE_FAILURES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, AtomicWriteFailPoint>>,
 > = std::sync::OnceLock::new();
+
+#[cfg(all(test, unix))]
+static TEST_ATOMIC_WRITE_PAUSE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, PathBuf>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, unix))]
+pub(crate) fn pause_atomic_write_before_rename_for_test(path: PathBuf, ready: PathBuf) {
+    TEST_ATOMIC_WRITE_PAUSE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(path, ready);
+}
 
 #[cfg(test)]
 static TEST_ARCHIVE_TAMPER_POINTS: std::sync::OnceLock<
@@ -196,10 +219,291 @@ fn default_transaction_confirmations() -> u8 {
     DEFAULT_TRANSACTION_CONFIRMATIONS
 }
 
+/// Validate the same private Linux qualification boundary enforced by
+/// `support/linux/qualify-production-journal.py`, then optionally require the
+/// unlocked provider used by authenticated restart tests. This is compiled only
+/// into Linux test binaries; no environment switch is present in production.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn validate_private_native_test_context(
+    root: Option<&Path>,
+    require_provider: bool,
+) -> Result<()> {
+    use std::{
+        os::unix::fs::MetadataExt,
+        process::{Command, Stdio},
+    };
+
+    const QUALIFICATION_MODE: &str = "ASTATINE_QUALIFICATION_MODE";
+    if env::var("ASTATINE_DISPOSABLE_CREDENTIAL_STORE").as_deref() != Ok("1") {
+        bail!("refusing native credential access without the disposable-store marker");
+    }
+    let mode = env::var(QUALIFICATION_MODE)
+        .context("refusing native credential access without qualification mode")?;
+    if !matches!(
+        mode.as_str(),
+        "provider" | "locked" | "no-default" | "missing"
+    ) {
+        bail!("refusing native credential access in an unsupported qualification mode");
+    }
+    if mode == "provider"
+        && env::var("ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE").as_deref() != Ok("1")
+    {
+        bail!("native provider mode requires the exact required-provider marker");
+    }
+    if require_provider && mode != "provider" {
+        bail!("native journal tests require the explicitly required provider mode");
+    }
+    if mode != "provider" && env::var_os("ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE").is_some() {
+        bail!("refusing an unexpected native-provider requirement outside provider mode");
+    }
+
+    for variable in [
+        "DBUS_STARTER_ADDRESS",
+        "DBUS_STARTER_BUS_TYPE",
+        "DBUS_SESSION_BUS_PID",
+        "GNOME_KEYRING_CONTROL",
+        "GNOME_KEYRING_PID",
+        "SSH_AUTH_SOCK",
+    ] {
+        if env::var_os(variable).is_some() {
+            bail!("refusing native credential access with ambient session-service state");
+        }
+    }
+
+    let tmp = env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .context("refusing native credential access without private TMPDIR")?;
+    if !tmp.is_absolute() || tmp.parent().is_none() {
+        bail!("refusing native credential access with an invalid private TMPDIR");
+    }
+    let work_root = tmp.parent().expect("validated TMPDIR parent");
+    if !work_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("astatine-linux-qualification."))
+    {
+        bail!("refusing native credential access outside the private qualification layout");
+    }
+    ensure_private_test_directory(work_root)?;
+    ensure_private_test_directory(&work_root.join("home"))?;
+    ensure_private_test_directory(&work_root.join("home/.config"))?;
+    ensure_private_test_directory(&work_root.join("home/.local"))?;
+    ensure_private_test_directory(&work_root.join("home/.local/share"))?;
+    ensure_private_test_directory(&work_root.join("home/.cache"))?;
+    ensure_private_test_directory(&work_root.join("runtime"))?;
+    ensure_private_test_directory(&work_root.join("tmp"))?;
+    ensure_private_test_directory(&work_root.join("bus"))?;
+    if fs::canonicalize(work_root).ok().as_deref() != Some(work_root)
+        || fs::canonicalize(&tmp).ok().as_deref() != Some(tmp.as_path())
+        || tmp != work_root.join("tmp")
+    {
+        bail!("refusing native credential access through a non-canonical private layout");
+    }
+
+    for variable in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_RUNTIME_DIR",
+    ] {
+        let directory = env::var_os(variable)
+            .map(PathBuf::from)
+            .with_context(|| format!("refusing native credential access without {variable}"))?;
+        if !directory.is_absolute() {
+            bail!("refusing native credential access with a relative private directory");
+        }
+        ensure_private_test_directory(&directory)?;
+        let canonical =
+            fs::canonicalize(&directory).context("inspect private qualification directory")?;
+        if canonical != directory || !canonical.starts_with(work_root) {
+            bail!("refusing native credential access outside the private qualification root");
+        }
+    }
+
+    if let Some(root) = root {
+        let canonical_root =
+            fs::canonicalize(root).context("inspect isolated native-checkpoint data root")?;
+        if canonical_root == tmp || !canonical_root.starts_with(&tmp) {
+            bail!("refusing native checkpoint outside the private temporary directory");
+        }
+        ensure_private_test_directory(&canonical_root)?;
+    }
+
+    let bus_dir = work_root.join("bus");
+    let bus_address = env::var("DBUS_SESSION_BUS_ADDRESS")
+        .context("refusing native credential access without the private D-Bus address")?;
+    let socket = private_dbus_socket_path(&bus_address, &bus_dir)?;
+    let socket_metadata =
+        fs::symlink_metadata(&socket).context("inspect private qualification D-Bus socket")?;
+    use std::os::unix::fs::FileTypeExt;
+    if !socket_metadata.file_type().is_socket()
+        || socket_metadata.uid() != unsafe { libc::geteuid() }
+        || fs::canonicalize(&socket).ok().as_deref() != Some(socket.as_path())
+    {
+        bail!("refusing native credential access through a non-private D-Bus socket");
+    }
+
+    let call_gdbus = |arguments: &[&str]| -> Result<String> {
+        let output = Command::new("gdbus")
+            .args(["call", "--session"])
+            .args(arguments)
+            .stdin(Stdio::null())
+            .output()
+            .context("query the private qualification Secret Service")?;
+        if !output.status.success() {
+            bail!("private qualification Secret Service query failed");
+        }
+        String::from_utf8(output.stdout)
+            .context("private qualification Secret Service returned non-UTF-8 output")
+    };
+    let owner = call_gdbus(&[
+        "--dest",
+        "org.freedesktop.DBus",
+        "--object-path",
+        "/org/freedesktop/DBus",
+        "--method",
+        "org.freedesktop.DBus.NameHasOwner",
+        "org.freedesktop.secrets",
+    ])?;
+    let owns_service = owner.trim() == "(true,)";
+    let has_service = owns_service;
+    if (mode == "missing" && has_service) || (mode != "missing" && !has_service) {
+        bail!("private D-Bus Secret Service state does not match qualification mode");
+    }
+    if mode != "missing" {
+        let alias = call_gdbus(&[
+            "--dest",
+            "org.freedesktop.secrets",
+            "--object-path",
+            "/org/freedesktop/secrets",
+            "--method",
+            "org.freedesktop.Secret.Service.ReadAlias",
+            "default",
+        ])?;
+        let collection = alias
+            .split_once("objectpath '")
+            .and_then(|(_, value)| value.split_once('\''))
+            .map(|(path, _)| path)
+            .context("private Secret Service returned no default collection")?;
+        if mode == "no-default" {
+            if collection != "/" {
+                bail!("private Secret Service unexpectedly has a default collection");
+            }
+        } else {
+            if !collection.starts_with("/org/freedesktop/secrets/collection/") {
+                bail!("private Secret Service returned an invalid default collection");
+            }
+            let locked = call_gdbus(&[
+                "--dest",
+                "org.freedesktop.secrets",
+                "--object-path",
+                collection,
+                "--method",
+                "org.freedesktop.DBus.Properties.Get",
+                "org.freedesktop.Secret.Collection",
+                "Locked",
+            ])?;
+            let is_locked = locked.contains("true");
+            if (mode == "provider" && is_locked) || (mode == "locked" && !is_locked) {
+                bail!("private Secret Service lock state does not match qualification mode");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn ensure_private_test_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path).context("inspect private qualification directory")?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o700
+    {
+        bail!("refusing native credential access through a non-private directory");
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn private_dbus_socket_path(address: &str, bus_dir: &Path) -> Result<PathBuf> {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let mut transports = address.split(';');
+    let transport = transports
+        .next()
+        .context("private D-Bus address is empty")?;
+    if transports.next().is_some() {
+        bail!("refusing a multi-transport D-Bus address");
+    }
+    let (kind, parameters) = transport
+        .split_once(':')
+        .context("private D-Bus address is malformed")?;
+    if kind != "unix" {
+        bail!("refusing a non-Unix qualification D-Bus transport");
+    }
+    let mut socket_path = None;
+    let mut has_guid = false;
+    for parameter in parameters.split(',') {
+        let (name, value) = parameter
+            .split_once('=')
+            .context("private D-Bus address parameter is malformed")?;
+        match name {
+            "path" if socket_path.is_none() => {
+                let bytes = value.as_bytes();
+                let mut decoded = Vec::with_capacity(bytes.len());
+                let mut index = 0;
+                while index < bytes.len() {
+                    if bytes[index] == b'%' {
+                        if index + 2 >= bytes.len() {
+                            bail!("private D-Bus socket path has invalid escaping");
+                        }
+                        let high = (bytes[index + 1] as char).to_digit(16);
+                        let low = (bytes[index + 2] as char).to_digit(16);
+                        let (Some(high), Some(low)) = (high, low) else {
+                            bail!("private D-Bus socket path has invalid escaping");
+                        };
+                        decoded.push(((high << 4) | low) as u8);
+                        index += 3;
+                    } else {
+                        decoded.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+                socket_path = Some(PathBuf::from(OsString::from_vec(decoded)));
+            }
+            "guid" if !has_guid => {
+                if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    bail!("private D-Bus GUID is malformed");
+                }
+                has_guid = true;
+            }
+            _ => bail!("refusing an unsupported private D-Bus address parameter"),
+        }
+    }
+    let socket = socket_path.context("private D-Bus address has no socket path")?;
+    if !has_guid {
+        bail!("private D-Bus address has no GUID");
+    }
+    if !socket.is_absolute()
+        || socket
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        || socket.parent() != Some(bus_dir)
+    {
+        bail!("refusing a D-Bus socket outside the private qualification bus directory");
+    }
+    Ok(socket)
+}
+
 #[derive(Clone, Debug)]
 pub struct ConfigStore {
     root: PathBuf,
     anchor_scope: Arc<OnceLock<std::result::Result<String, String>>>,
+    #[cfg(all(test, target_os = "linux"))]
+    native_anchor_for_test: bool,
 }
 
 impl ConfigStore {
@@ -207,6 +511,8 @@ impl ConfigStore {
         Ok(Self {
             root: system_config_dir()?,
             anchor_scope: Arc::new(OnceLock::new()),
+            #[cfg(all(test, target_os = "linux"))]
+            native_anchor_for_test: false,
         })
     }
 
@@ -215,7 +521,25 @@ impl ConfigStore {
         Self {
             root,
             anchor_scope: Arc::new(OnceLock::new()),
+            #[cfg(target_os = "linux")]
+            native_anchor_for_test: false,
         }
+    }
+
+    /// Use the real Linux Secret Service checkpoint for an isolated test root.
+    ///
+    /// This path exists only in the test binary. It requires the private
+    /// qualification-session layout and an unlocked provider before enabling
+    /// native checkpoint reads or writes; marker variables by themselves are
+    /// not accepted as evidence of isolation.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn at_root_with_native_journal_anchor_for_test(root: PathBuf) -> Result<Self> {
+        validate_private_native_test_context(Some(&root), true)?;
+        Ok(Self {
+            root,
+            anchor_scope: Arc::new(OnceLock::new()),
+            native_anchor_for_test: true,
+        })
     }
 
     pub fn wallet_dir(&self) -> PathBuf {
@@ -293,6 +617,11 @@ impl ConfigStore {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn transaction_journal_path_for_test(&self) -> Result<PathBuf> {
+        self.transaction_journal_path()
+    }
+
     pub(crate) fn write_transaction_journal(&self, data: &[u8]) -> Result<()> {
         if data.is_empty() || data.len() as u64 > MAX_TRANSACTION_JOURNAL_BYTES {
             bail!("transaction journal is empty or exceeds its 8 MiB size limit");
@@ -304,6 +633,11 @@ impl ConfigStore {
     pub(crate) fn read_journal_anchor(&self) -> Result<Option<Zeroizing<Vec<u8>>>> {
         #[cfg(test)]
         {
+            #[cfg(target_os = "linux")]
+            if self.native_anchor_for_test {
+                validate_private_native_test_context(Some(&self.root), true)?;
+                return self.read_journal_anchor_from_platform();
+            }
             let account = self.journal_anchor_account()?;
             return Ok(TEST_JOURNAL_ANCHORS
                 .get_or_init(Default::default)
@@ -330,22 +664,32 @@ impl ConfigStore {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn read_journal_anchor_from_os_for_test(
         &self,
     ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        #[cfg(target_os = "linux")]
+        validate_private_native_test_context(Some(&self.root), false)?;
         self.read_journal_anchor_from_platform()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn write_journal_anchor_to_os_for_test(&self, data: &[u8]) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        validate_private_native_test_context(Some(&self.root), false)?;
         self.journal_anchor_entry()?
             .set_secret(data)
             .map_err(anyhow::Error::new)
             .context("write the transaction authorization checkpoint to the OS credential store")
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(any(
+        all(test, target_os = "linux"),
+        all(
+            not(test),
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
+        )
+    ))]
     fn read_journal_anchor_from_platform(&self) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let entry = self.journal_anchor_entry()?;
         match entry.get_secret() {
@@ -360,6 +704,17 @@ impl ConfigStore {
     pub(crate) fn write_journal_anchor(&self, data: &[u8]) -> Result<()> {
         #[cfg(test)]
         {
+            #[cfg(target_os = "linux")]
+            if self.native_anchor_for_test {
+                validate_private_native_test_context(Some(&self.root), true)?;
+                return self
+                    .journal_anchor_entry()?
+                    .set_secret(data)
+                    .map_err(anyhow::Error::new)
+                    .context(
+                        "write the transaction authorization checkpoint to the OS credential store",
+                    );
+            }
             let account = self.journal_anchor_account()?;
             let failure = {
                 let mut failures = TEST_JOURNAL_ANCHOR_WRITE_FAILURES
@@ -429,6 +784,17 @@ impl ConfigStore {
             .map_err(|_| anyhow!("test journal-anchor failure mutex was poisoned"))?
             .remove(&account);
         Ok(())
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn delete_native_journal_anchor_for_test(&self) -> Result<()> {
+        validate_private_native_test_context(Some(&self.root), true)?;
+        match self.journal_anchor_entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => {
+                Err(anyhow!(error)).context("delete the disposable native journal checkpoint")
+            }
+        }
     }
 
     #[cfg(test)]
@@ -506,8 +872,16 @@ impl ConfigStore {
             .map_err(anyhow::Error::msg)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(any(
+        all(test, target_os = "linux"),
+        all(
+            not(test),
+            any(target_os = "linux", target_os = "macos", target_os = "windows")
+        )
+    ))]
     fn journal_anchor_entry(&self) -> Result<keyring::Entry> {
+        #[cfg(all(test, target_os = "linux"))]
+        validate_private_native_test_context(Some(&self.root), false)?;
         keyring::Entry::new(
             "ai.jecta.astatine.transaction-journal",
             &self.journal_anchor_account()?,
@@ -605,12 +979,41 @@ impl ConfigStore {
                 bail!("transaction journal lock is a reparse point");
             }
         }
-        file.try_lock().with_context(|| {
-            format!(
-                "another astatine mining process already holds the transaction journal at {}",
-                path.display()
-            )
-        })?;
+        // A just-released journal lock can transiently report WouldBlock in
+        // parallel stress even when lsof shows no remaining holder fd. The
+        // exact cause is not established; a short-lived inherited fd or a
+        // lock-release visibility race remains possible. Retry briefly so a
+        // just-released lock is not misreported as contention. A genuinely
+        // held lock still fails closed after the bound.
+        let mut attempts = 0_u32;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock)
+                    if attempts < JOURNAL_LOCK_RETRY_ATTEMPTS =>
+                {
+                    attempts += 1;
+                    #[cfg(test)]
+                    JOURNAL_LOCK_RETRY_TEST_HOOK.with(|hook| {
+                        if let Some(hook) = hook.borrow_mut().as_mut() {
+                            hook();
+                        }
+                    });
+                    std::thread::sleep(JOURNAL_LOCK_RETRY_INTERVAL);
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(anyhow!(
+                        "another astatine mining process already holds the transaction journal at {}: lock acquisition failed because the operation would block",
+                        path.display()
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(anyhow::Error::new(error)).with_context(|| {
+                        format!("acquire the transaction journal lock at {}", path.display())
+                    });
+                }
+            }
+        }
         Ok(file)
     }
 
@@ -996,6 +1399,18 @@ fn atomic_write(path: &Path, data: &[u8], replace: bool) -> Result<()> {
         .context("flush staged file")?;
     #[cfg(test)]
     fail_atomic_write_if_requested(path, AtomicWriteFailPoint::BeforeRename)?;
+    #[cfg(all(test, unix))]
+    if let Some(ready) = TEST_ATOMIC_WRITE_PAUSE
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| anyhow!("test atomic-write pause mutex was poisoned"))?
+        .remove(path)
+    {
+        fs::write(ready, b"staged file synced; rename not started")?;
+        loop {
+            std::thread::park();
+        }
+    }
     if replace {
         persist_replace(temporary, path)?;
     } else {
@@ -1079,6 +1494,414 @@ mod tests {
     use crate::cli::Network;
     use alloy_primitives::U256;
     use std::{ffi::OsStr, path::PathBuf};
+
+    #[cfg(unix)]
+    struct JournalLockRetryHookGuard;
+
+    #[cfg(unix)]
+    impl Drop for JournalLockRetryHookGuard {
+        fn drop(&mut self) {
+            super::JOURNAL_LOCK_RETRY_TEST_HOOK.with(|hook| {
+                hook.borrow_mut().take();
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    fn install_journal_lock_retry_hook(hook: impl FnMut() + 'static) -> JournalLockRetryHookGuard {
+        super::JOURNAL_LOCK_RETRY_TEST_HOOK.with(|slot| {
+            assert!(
+                slot.borrow_mut().replace(Box::new(hook)).is_none(),
+                "journal lock retry hooks cannot be nested"
+            );
+        });
+        JournalLockRetryHookGuard
+    }
+
+    fn child_test_evidence(child: &std::process::Output) -> Result<(), String> {
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        if !child.status.success() {
+            return Err(format!(
+                "child process failed with {}\nstdout: {stdout}\nstderr: {stderr}",
+                child.status
+            ));
+        }
+        if !stdout.contains("running 1 test") {
+            return Err(format!(
+                "child did not execute exactly one test\nstdout: {stdout}\nstderr: {stderr}"
+            ));
+        }
+        if !stdout.contains("1 passed") {
+            return Err(format!(
+                "child did not report one passed test\nstdout: {stdout}\nstderr: {stderr}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn assert_child_executed_one_test(child: &std::process::Output, context: &str) {
+        if let Err(details) = child_test_evidence(child) {
+            panic!("{context}: {details}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_child_with_timeout(
+        mut command: std::process::Command,
+        timeout: std::time::Duration,
+        context: &str,
+    ) -> std::process::Output {
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "{context} did not finish within {timeout:?}; stdout={:?} stderr={:?}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.wait_with_output().unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn guard_child_output(
+        test_name: &str,
+        root_env: &str,
+        root: &std::path::Path,
+        marker: Option<&str>,
+        mode: Option<&str>,
+    ) -> std::process::Output {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--ignored", "--exact", test_name, "--nocapture"])
+            .env(root_env, root)
+            .env("HOME", root)
+            .env("XDG_CONFIG_HOME", root)
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/definitely-unavailable-astatine-test-bus",
+            );
+        match marker {
+            Some(value) => {
+                command.env(DISPOSABLE_CREDENTIAL_STORE_ENV, value);
+            }
+            None => {
+                command.env_remove(DISPOSABLE_CREDENTIAL_STORE_ENV);
+            }
+        }
+        match mode {
+            Some(value) => {
+                command.env("ASTATINE_QUALIFICATION_MODE", value);
+            }
+            None => {
+                command.env_remove("ASTATINE_QUALIFICATION_MODE");
+            }
+        }
+        command.output().unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn assert_guard_failure(child: &std::process::Output, expected: &str, context: &str) {
+        assert!(
+            !child.status.success(),
+            "{context}: child unexpectedly succeeded; stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{context}: missing guard message {expected:?}; stderr={stderr:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn gdbus_output(arguments: &[&str]) -> String {
+        let output = std::process::Command::new("timeout")
+            .args(["--signal=TERM", "--kill-after=1s", "3s", "gdbus"])
+            .args(arguments)
+            .output()
+            .expect("Linux qualification requires timeout and gdbus");
+        assert!(
+            output.status.success(),
+            "gdbus failed or exceeded its 3-second bound: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn secret_service_has_owner() -> bool {
+        gdbus_output(&[
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.DBus",
+            "--object-path",
+            "/org/freedesktop/DBus",
+            "--method",
+            "org.freedesktop.DBus.NameHasOwner",
+            "org.freedesktop.secrets",
+        ])
+        .trim()
+            == "(true,)"
+    }
+
+    #[cfg(target_os = "linux")]
+    fn default_secret_service_alias_path() -> Option<String> {
+        let alias = gdbus_output(&[
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.secrets",
+            "--object-path",
+            "/org/freedesktop/secrets",
+            "--method",
+            "org.freedesktop.Secret.Service.ReadAlias",
+            "default",
+        ]);
+        alias
+            .split("objectpath '")
+            .nth(1)
+            .and_then(|value| value.split('\'').next())
+            .map(str::to_owned)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_no_default_secret_service_state() {
+        super::validate_private_native_test_context(None, false).expect(
+            "no-default Secret Service probes require the verified private qualification session",
+        );
+        assert!(
+            secret_service_has_owner(),
+            "no-default mode requires an owned Secret Service immediately around native store access"
+        );
+        assert_eq!(
+            default_secret_service_alias_path().as_deref(),
+            Some("/"),
+            "no-default mode requires ReadAlias default to return / immediately around native store access"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_ambient_secret_service_qualification_state() {
+        let mode = ambient_secret_service_qualification_mode();
+        match mode.as_str() {
+            "locked" => {
+                assert!(
+                    secret_service_has_owner(),
+                    "locked mode requires an owned Secret Service"
+                );
+                let path = default_secret_service_alias_path()
+                    .filter(|value| !value.is_empty())
+                    .expect("locked mode requires a default Secret Service collection");
+                let locked = gdbus_output(&[
+                    "call",
+                    "--session",
+                    "--dest",
+                    "org.freedesktop.secrets",
+                    "--object-path",
+                    &path,
+                    "--method",
+                    "org.freedesktop.DBus.Properties.Get",
+                    "org.freedesktop.Secret.Collection",
+                    "Locked",
+                ]);
+                assert!(
+                    locked.contains("true"),
+                    "locked mode requires the default collection to report Locked=true: {locked:?}"
+                );
+            }
+            "no-default" => assert_no_default_secret_service_state(),
+            "missing" => {
+                assert!(
+                    !secret_service_has_owner(),
+                    "missing mode must not have an owned Secret Service"
+                );
+            }
+            other => panic!("unsupported ambient Secret Service mode: {other}"),
+        }
+    }
+
+    fn require_native_credential_store(value: Option<&OsStr>) -> bool {
+        value.is_some_and(|value| !value.is_empty())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dbus_address_parser_accepts_only_the_qualification_socket() {
+        let bus_dir = PathBuf::from("/private/session bus");
+        let address = format!(
+            "unix:path=/private/session%20bus/dbus-test,guid={}",
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            super::private_dbus_socket_path(&address, &bus_dir).unwrap(),
+            bus_dir.join("dbus-test")
+        );
+
+        for address in [
+            "tcp:host=localhost,port=1234,guid=0123456789abcdef0123456789abcdef",
+            "unix:path=/tmp/not-private,guid=0123456789abcdef0123456789abcdef",
+            "unix:path=/private/session%2F..%2Fbus/dbus-test,guid=0123456789abcdef0123456789abcdef",
+            "unix:path=/private/session%Q0bus/dbus-test,guid=0123456789abcdef0123456789abcdef",
+            "unix:path=/private/session%20bus/dbus-test",
+            "unix:path=/private/session%20bus/dbus-test,guid=0123456789abcdef0123456789abcdef;unix:path=/private/session%20bus/other,guid=0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(
+                super::private_dbus_socket_path(address, &bus_dir).is_err(),
+                "accepted non-private D-Bus address {address:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_persistence_parent_requires_provider_mode_before_store_access() {
+        let root = tempfile::tempdir().unwrap();
+        let child = guard_child_output(
+            "config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped",
+            NATIVE_ANCHOR_CHILD_ROOT_ENV,
+            root.path(),
+            Some("1"),
+            Some("missing"),
+        );
+        assert_guard_failure(
+            &child,
+            "require ASTATINE_QUALIFICATION_MODE=provider",
+            "native persistence parent in missing mode",
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn native_anchor_child_requires_exact_marker_and_provider_mode_before_store_access() {
+        let root = tempfile::tempdir().unwrap();
+        let marker_zero = guard_child_output(
+            "config::tests::native_anchor_child_reads_secret",
+            NATIVE_ANCHOR_CHILD_ROOT_ENV,
+            root.path(),
+            Some("0"),
+            Some("provider"),
+        );
+        assert_guard_failure(
+            &marker_zero,
+            "without ASTATINE_DISPOSABLE_CREDENTIAL_STORE=1",
+            "native child with marker 0",
+        );
+        let wrong_mode = guard_child_output(
+            "config::tests::native_anchor_child_reads_secret",
+            NATIVE_ANCHOR_CHILD_ROOT_ENV,
+            root.path(),
+            Some("1"),
+            Some("missing"),
+        );
+        assert_guard_failure(
+            &wrong_mode,
+            "require ASTATINE_QUALIFICATION_MODE=provider",
+            "native child in missing mode",
+        );
+    }
+
+    #[test]
+    fn native_store_requirement_is_presence_of_a_nonempty_value() {
+        assert!(!require_native_credential_store(None));
+        assert!(!require_native_credential_store(Some(OsStr::new(""))));
+        assert!(require_native_credential_store(Some(OsStr::new("1"))));
+        assert!(require_native_credential_store(Some(OsStr::new("0"))));
+        assert!(require_native_credential_store(Some(OsStr::new("true"))));
+    }
+
+    #[test]
+    fn child_test_evidence_rejects_a_zero_test_exit() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::tests::definitely_not_a_real_test_name"])
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "the test harness must exit zero when it runs zero tests"
+        );
+        let error = child_test_evidence(&child)
+            .expect_err("a zero-test child must not satisfy the evidence guard");
+        assert!(
+            error.contains("did not execute exactly one test"),
+            "unexpected evidence error: {error}"
+        );
+    }
+
+    #[test]
+    fn child_test_evidence_accepts_a_single_test_run() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "config::tests::decimal_inj_conversion_is_exact"])
+            .output()
+            .unwrap();
+        assert_child_executed_one_test(&child, "single-test evidence");
+    }
+
+    #[test]
+    #[ignore = "child-harness smoke test; does not access a credential store"]
+    fn ignored_child_harness_smoke() {
+        if std::env::var_os("ASTATINE_IGNORED_CHILD_HARNESS_SMOKE").is_some() {
+            eprintln!("ignored-child-harness-smoke-ran");
+        }
+    }
+
+    #[test]
+    fn ignored_child_harness_smoke_runs_with_ignored_flag_without_keyring_access() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::ignored_child_harness_smoke",
+                "--nocapture",
+            ])
+            .env("ASTATINE_IGNORED_CHILD_HARNESS_SMOKE", "1")
+            .output()
+            .unwrap();
+        assert_child_executed_one_test(&child, "ignored child-harness smoke");
+        assert!(
+            String::from_utf8_lossy(&child.stderr).contains("ignored-child-harness-smoke-ran"),
+            "the ignored child harness must execute the test body, not zero tests: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn native_anchor_child_probe_fails_closed_without_parent_environment() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::native_anchor_child_reads_secret",
+            ])
+            .env_remove(NATIVE_ANCHOR_CHILD_ROOT_ENV)
+            .output()
+            .unwrap();
+        assert!(
+            !child.status.success(),
+            "the native anchor child probe must not silently pass without its parent environment"
+        );
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(
+            stdout.contains("requires ASTATINE_NATIVE_ANCHOR_CHILD_ROOT"),
+            "unexpected child probe output: stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
 
     #[test]
     fn decimal_inj_conversion_is_exact() {
@@ -1262,48 +2085,121 @@ transaction_confirmations = 2
         );
     }
 
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANCHOR_TEST_SECRET: &[u8] = b"disposable-native-journal-anchor-test";
+    const NATIVE_ANCHOR_CHILD_ROOT_ENV: &str = "ASTATINE_NATIVE_ANCHOR_CHILD_ROOT";
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    const DISPOSABLE_CREDENTIAL_STORE_ENV: &str = "ASTATINE_DISPOSABLE_CREDENTIAL_STORE";
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn require_disposable_credential_store() {
+        assert_eq!(
+            std::env::var(DISPOSABLE_CREDENTIAL_STORE_ENV).as_deref(),
+            Ok("1"),
+            "refusing to access a native credential store without {DISPOSABLE_CREDENTIAL_STORE_ENV}=1; run through support/linux/run-private-session.sh or set the marker only for a disposable store"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn require_disposable_provider_mode() {
+        require_disposable_credential_store();
+        assert_eq!(
+            std::env::var("ASTATINE_QUALIFICATION_MODE").as_deref(),
+            Ok("provider"),
+            "native credential-store tests require ASTATINE_QUALIFICATION_MODE=provider"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn require_disposable_missing_mode() {
+        require_disposable_credential_store();
+        assert_eq!(
+            std::env::var("ASTATINE_QUALIFICATION_MODE").as_deref(),
+            Ok("missing"),
+            "unavailable Secret Service tests require ASTATINE_QUALIFICATION_MODE=missing"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ambient_secret_service_qualification_mode() -> String {
+        require_disposable_credential_store();
+        let mode = std::env::var("ASTATINE_QUALIFICATION_MODE").expect(
+            "ambient Secret Service qualification requires ASTATINE_QUALIFICATION_MODE=locked, no-default, or missing",
+        );
+        assert!(
+            mode == "locked" || mode == "no-default" || mode == "missing",
+            "ambient Secret Service qualification only permits locked, no-default, or missing mode, got {mode:?}"
+        );
+        super::validate_private_native_test_context(None, false).expect(
+            "ambient Secret Service probes require the verified private qualification session",
+        );
+        mode
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
-    fn native_journal_anchor_persists_across_processes_and_is_root_scoped() {
-        const CHILD_ROOT_ENV: &str = "ASTATINE_NATIVE_ANCHOR_TEST_ROOT";
-        const EXPECT_UNAVAILABLE_ENV: &str = "ASTATINE_NATIVE_ANCHOR_EXPECT_UNAVAILABLE";
-        const TEST_SECRET: &[u8] = b"disposable-native-journal-anchor-test";
-
-        if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
-            let store = ConfigStore::at_root(PathBuf::from(root));
-            if std::env::var_os(EXPECT_UNAVAILABLE_ENV).is_some() {
-                let error = store
-                    .read_journal_anchor_from_os_for_test()
-                    .expect_err("an unavailable Secret Service must fail closed, not look empty");
-                assert!(
-                    !format!("{error:#}").is_empty(),
-                    "an unavailable credential store must return a useful error"
-                );
-                assert!(
-                    store
-                        .write_journal_anchor_to_os_for_test(TEST_SECRET)
-                        .is_err(),
-                    "an unavailable Secret Service must reject checkpoint writes"
-                );
-                return;
-            }
+    #[ignore = "child probe; invoked by native_journal_anchor_persists_across_processes_and_is_root_scoped"]
+    fn native_anchor_child_reads_secret() {
+        let _root = std::env::var_os(NATIVE_ANCHOR_CHILD_ROOT_ENV).expect(
+            "native anchor child probe requires ASTATINE_NATIVE_ANCHOR_CHILD_ROOT from its parent test",
+        );
+        require_disposable_provider_mode();
+        #[cfg(not(target_os = "linux"))]
+        panic!("native anchor restart qualification is unqualified outside Linux");
+        #[cfg(target_os = "linux")]
+        {
+            let store = ConfigStore::at_root(PathBuf::from(_root));
             let secret = store
                 .read_journal_anchor_from_os_for_test()
                 .expect("child process could not read the disposable OS credential")
                 .expect("disposable OS credential was absent in the child process");
-            assert_eq!(&secret[..], TEST_SECRET);
-            return;
+            assert_eq!(&secret[..], NATIVE_ANCHOR_TEST_SECRET);
         }
+    }
 
-        struct DeleteCredentialOnDrop(keyring::Entry);
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "child probe; invoked by native_journal_anchor_persists_across_processes_and_is_root_scoped"]
+    fn native_anchor_child_rejects_unavailable_store() {
+        let root = std::env::var_os(NATIVE_ANCHOR_CHILD_ROOT_ENV).expect(
+            "native anchor unavailable child probe requires ASTATINE_NATIVE_ANCHOR_CHILD_ROOT from its parent test",
+        );
+        require_disposable_missing_mode();
+        let store = ConfigStore::at_root(PathBuf::from(root));
+        let error = store
+            .read_journal_anchor_from_os_for_test()
+            .expect_err("an unavailable Secret Service must fail closed, not look empty");
+        assert!(
+            !format!("{error:#}").is_empty(),
+            "an unavailable credential store must return a useful error"
+        );
+        assert!(
+            store
+                .write_journal_anchor_to_os_for_test(NATIVE_ANCHOR_TEST_SECRET)
+                .is_err(),
+            "an unavailable Secret Service must reject checkpoint writes"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "Linux-only isolated Secret Service qualification; macOS/Windows native stores remain unqualified"]
+    fn native_journal_anchor_persists_across_processes_and_is_root_scoped() {
+        require_disposable_provider_mode();
+        struct DeleteCredentialOnDrop(ConfigStore);
         impl Drop for DeleteCredentialOnDrop {
             fn drop(&mut self) {
-                let _ = self.0.delete_credential();
+                let _ = self.0.delete_native_journal_anchor_for_test();
             }
         }
 
         let root_a = tempfile::tempdir().unwrap();
         let root_b = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            super::validate_private_native_test_context(Some(root_a.path()), true).unwrap();
+            super::validate_private_native_test_context(Some(root_b.path()), true).unwrap();
+        }
         let store_a = ConfigStore::at_root(root_a.path().to_path_buf());
         let store_b = ConfigStore::at_root(root_b.path().to_path_buf());
         assert_ne!(
@@ -1312,38 +2208,61 @@ transaction_confirmations = 2
             "separate canonical data roots must use separate credential entries"
         );
 
+        // Any non-empty value is an explicit requirement. Unset or empty lets
+        // the test report an unavailable native store without failing, while a
+        // required store must fail on entry construction, read, or write.
+        let require_native = require_native_credential_store(
+            std::env::var_os("ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE").as_deref(),
+        );
+
         #[cfg(target_os = "linux")]
         {
             let unavailable_root = tempfile::tempdir().unwrap();
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
+                    "--ignored",
                     "--exact",
-                    "config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped",
+                    "config::tests::native_anchor_child_rejects_unavailable_store",
                 ])
-                .env(CHILD_ROOT_ENV, unavailable_root.path())
-                .env(EXPECT_UNAVAILABLE_ENV, "1")
+                .env(NATIVE_ANCHOR_CHILD_ROOT_ENV, unavailable_root.path())
+                .env(DISPOSABLE_CREDENTIAL_STORE_ENV, "1")
+                .env("ASTATINE_QUALIFICATION_MODE", "missing")
                 .env(
                     "DBUS_SESSION_BUS_ADDRESS",
                     "unix:path=/definitely-unavailable-astatine-test-bus",
                 )
                 .output()
                 .unwrap();
-            assert!(
-                child.status.success(),
-                "headless Secret Service access must fail closed: {}",
-                String::from_utf8_lossy(&child.stderr)
-            );
+            assert_child_executed_one_test(&child, "headless Secret Service fail-closed child");
         }
 
-        let credential = store_a.journal_anchor_entry().unwrap();
-        let _cleanup = DeleteCredentialOnDrop(credential);
-        let require_native = std::env::var_os("ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE")
-            .is_some_and(|value| !value.is_empty());
+        let credential = match store_a.journal_anchor_entry() {
+            Ok(credential) => credential,
+            Err(error) => {
+                let app_error = store_a.read_journal_anchor_from_os_for_test().expect_err(
+                    "entry construction failed but the platform read did not fail closed",
+                );
+                assert!(
+                    !format!("{app_error:#}").is_empty(),
+                    "OS credential-store access failures must propagate instead of falling back"
+                );
+                if require_native {
+                    panic!("required native credential store is unavailable: {error:#}");
+                }
+                eprintln!(
+                    "native credential store unavailable; production-equivalent reads failed closed: {error:#}"
+                );
+                return;
+            }
+        };
+        let _cleanup = DeleteCredentialOnDrop(store_a.clone());
 
-        match _cleanup.0.get_secret() {
+        match credential.get_secret() {
             Err(keyring::Error::NoEntry) => {}
             Err(error) => {
-                let app_error = store_a.read_journal_anchor_from_os_for_test().unwrap_err();
+                let app_error = store_a.read_journal_anchor_from_os_for_test().expect_err(
+                    "credential-store access failed but the platform read did not fail closed",
+                );
                 assert!(
                     !format!("{app_error:#}").is_empty(),
                     "OS credential-store access failures must propagate instead of falling back"
@@ -1364,9 +2283,11 @@ transaction_confirmations = 2
         eprintln!(
             "native credential store is available; checking persistent writes and data-root isolation"
         );
-        let secret = super::Zeroizing::new(TEST_SECRET.to_vec());
+        let secret = super::Zeroizing::new(NATIVE_ANCHOR_TEST_SECRET.to_vec());
         if let Err(error) = store_a.write_journal_anchor_to_os_for_test(&secret) {
-            let app_error = store_a.read_journal_anchor_from_os_for_test().unwrap_err();
+            let app_error = store_a.read_journal_anchor_from_os_for_test().expect_err(
+                "credential-store write failed but the platform read did not fail closed",
+            );
             assert!(
                 !format!("{app_error:#}").is_empty(),
                 "failed OS credential writes must propagate instead of falling back"
@@ -1387,7 +2308,7 @@ transaction_confirmations = 2
                 .read_journal_anchor_from_os_for_test()
                 .unwrap()
                 .unwrap()[..],
-            TEST_SECRET
+            NATIVE_ANCHOR_TEST_SECRET
         );
         assert!(
             store_b
@@ -1397,15 +2318,271 @@ transaction_confirmations = 2
         );
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
+                "--ignored",
                 "--exact",
-                "config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped",
+                "config::tests::native_anchor_child_reads_secret",
             ])
-            .env(CHILD_ROOT_ENV, root_a.path())
+            .env(NATIVE_ANCHOR_CHILD_ROOT_ENV, root_a.path())
+            .env(DISPOSABLE_CREDENTIAL_STORE_ENV, "1")
+            .env("ASTATINE_QUALIFICATION_MODE", "provider")
+            .output()
+            .unwrap();
+        assert_child_executed_one_test(&child, "native credential-store restart child");
+    }
+
+    #[cfg(target_os = "linux")]
+    const LINUX_SECRET_SERVICE_CHILD_ROOT_ENV: &str = "ASTATINE_LINUX_SECRET_SERVICE_CHILD_ROOT";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "child probe; invoked by linux_secret_service_unavailable_fails_closed_without_native_keyring"]
+    fn linux_secret_service_unavailable_child_probe() {
+        let root = std::env::var_os(LINUX_SECRET_SERVICE_CHILD_ROOT_ENV).expect(
+            "Linux Secret Service child probe requires ASTATINE_LINUX_SECRET_SERVICE_CHILD_ROOT from its parent test",
+        );
+        require_disposable_missing_mode();
+        let store = ConfigStore::at_root(PathBuf::from(root));
+        let read_error = store
+            .read_journal_anchor_from_os_for_test()
+            .expect_err("an unavailable Secret Service must fail closed, not look empty");
+        assert!(
+            !format!("{read_error:#}").is_empty(),
+            "an unavailable credential store must return a useful error"
+        );
+        assert!(
+            store
+                .write_journal_anchor_to_os_for_test(b"must-not-persist")
+                .is_err(),
+            "an unavailable Secret Service must reject checkpoint writes"
+        );
+        assert!(
+            store.read_transaction_journal().unwrap().is_none(),
+            "a failed inspection must not create or fall back to a plaintext journal"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_secret_service_child_probe_fails_closed_without_parent_environment() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::linux_secret_service_unavailable_child_probe",
+            ])
+            .env_remove(LINUX_SECRET_SERVICE_CHILD_ROOT_ENV)
             .output()
             .unwrap();
         assert!(
-            child.status.success(),
-            "OS credential did not persist across process restart: {}",
+            !child.status.success(),
+            "the Linux Secret Service child probe must not silently pass without its parent environment"
+        );
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(
+            stdout.contains("requires ASTATINE_LINUX_SECRET_SERVICE_CHILD_ROOT"),
+            "unexpected child probe output: stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unavailable_store_children_require_exact_marker_and_missing_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let native_wrong_mode = guard_child_output(
+            "config::tests::native_anchor_child_rejects_unavailable_store",
+            NATIVE_ANCHOR_CHILD_ROOT_ENV,
+            root.path(),
+            Some("1"),
+            Some("provider"),
+        );
+        assert_guard_failure(
+            &native_wrong_mode,
+            "require ASTATINE_QUALIFICATION_MODE=missing",
+            "native unavailable child in provider mode",
+        );
+        let linux_marker_zero = guard_child_output(
+            "config::tests::linux_secret_service_unavailable_child_probe",
+            LINUX_SECRET_SERVICE_CHILD_ROOT_ENV,
+            root.path(),
+            Some("0"),
+            Some("missing"),
+        );
+        assert_guard_failure(
+            &linux_marker_zero,
+            "without ASTATINE_DISPOSABLE_CREDENTIAL_STORE=1",
+            "Linux unavailable child with marker 0",
+        );
+        let linux_wrong_mode = guard_child_output(
+            "config::tests::linux_secret_service_unavailable_child_probe",
+            LINUX_SECRET_SERVICE_CHILD_ROOT_ENV,
+            root.path(),
+            Some("1"),
+            Some("provider"),
+        );
+        assert_guard_failure(
+            &linux_wrong_mode,
+            "require ASTATINE_QUALIFICATION_MODE=missing",
+            "Linux unavailable child in provider mode",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn untrusted_store_child_rejects_unlocked_provider_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let child = guard_child_output(
+            "config::tests::linux_secret_service_untrusted_child_probe",
+            LINUX_SECRET_SERVICE_CHILD_ROOT_ENV,
+            root.path(),
+            Some("1"),
+            Some("provider"),
+        );
+        assert_guard_failure(
+            &child,
+            "only permits locked, no-default, or missing",
+            "untrusted child in provider mode",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn untrusted_store_child_rejects_markers_without_private_session_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::linux_secret_service_untrusted_child_probe",
+                "--nocapture",
+            ])
+            .env(LINUX_SECRET_SERVICE_CHILD_ROOT_ENV, root.path())
+            .env(DISPOSABLE_CREDENTIAL_STORE_ENV, "1")
+            .env("ASTATINE_QUALIFICATION_MODE", "missing")
+            .env("TMPDIR", root.path())
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path())
+            .env("XDG_DATA_HOME", root.path())
+            .env("XDG_CACHE_HOME", root.path())
+            .env("XDG_RUNTIME_DIR", root.path())
+            .env("PATH", root.path())
+            .env_remove("ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("DBUS_STARTER_ADDRESS")
+            .env_remove("DBUS_STARTER_BUS_TYPE")
+            .env_remove("DBUS_SESSION_BUS_PID")
+            .env_remove("GNOME_KEYRING_CONTROL")
+            .env_remove("GNOME_KEYRING_PID")
+            .env_remove("SSH_AUTH_SOCK")
+            .output()
+            .unwrap();
+        assert_guard_failure(
+            &child,
+            "outside the private qualification layout",
+            "untrusted child with markers but no private qualification layout",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_secret_service_unavailable_fails_closed_without_native_keyring() {
+        let root = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::linux_secret_service_unavailable_child_probe",
+                "--nocapture",
+            ])
+            .env(LINUX_SECRET_SERVICE_CHILD_ROOT_ENV, root.path())
+            .env(DISPOSABLE_CREDENTIAL_STORE_ENV, "1")
+            .env("ASTATINE_QUALIFICATION_MODE", "missing")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/definitely-unavailable-astatine-test-bus",
+            )
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path())
+            .output()
+            .unwrap();
+        assert_child_executed_one_test(&child, "isolated Linux Secret Service failure child");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "child probe; invoked by linux_secret_service_untrusted_on_ambient_bus_fails_closed"]
+    fn linux_secret_service_untrusted_child_probe() {
+        let root = std::env::var_os(LINUX_SECRET_SERVICE_CHILD_ROOT_ENV).expect(
+            "Linux Secret Service untrusted child probe requires ASTATINE_LINUX_SECRET_SERVICE_CHILD_ROOT from its parent test",
+        );
+        let no_default_mode = ambient_secret_service_qualification_mode() == "no-default";
+        let store = ConfigStore::at_root(PathBuf::from(root));
+        // The private-session harness removes its disposable HOME and keyring;
+        // do not issue an unguarded best-effort native delete during Drop.
+        if no_default_mode {
+            assert_no_default_secret_service_state();
+        }
+        let read_result = store.read_journal_anchor_from_os_for_test();
+        if no_default_mode {
+            assert_no_default_secret_service_state();
+        }
+        if let Ok(Some(_)) = read_result {
+            panic!(
+                "a locked, no-default, or unavailable Secret Service exposed a checkpoint secret"
+            )
+        }
+        if no_default_mode {
+            assert_no_default_secret_service_state();
+        }
+        let write_result = store.write_journal_anchor_to_os_for_test(b"must-not-persist");
+        if no_default_mode {
+            assert_no_default_secret_service_state();
+        }
+        let write_error = write_result.expect_err(
+            "a locked, no-default, or unavailable Secret Service must reject checkpoint writes",
+        );
+        assert!(
+            !format!("{write_error:#}").is_empty(),
+            "a rejected checkpoint write must return a useful error"
+        );
+        assert!(
+            store.read_transaction_journal().unwrap().is_none(),
+            "a rejected checkpoint write must not create a plaintext transaction journal"
+        );
+        eprintln!("linux-secret-service-untrusted-child-fail-closed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a private ambient D-Bus fixture with a locked provider, no default collection, or no provider; run only from Linux qualification"]
+    fn linux_secret_service_untrusted_on_ambient_bus_fails_closed() {
+        assert_ambient_secret_service_qualification_state();
+        let root = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::linux_secret_service_untrusted_child_probe",
+                "--nocapture",
+            ])
+            .env(LINUX_SECRET_SERVICE_CHILD_ROOT_ENV, root.path())
+            .env(DISPOSABLE_CREDENTIAL_STORE_ENV, "1")
+            .env(
+                "ASTATINE_QUALIFICATION_MODE",
+                std::env::var("ASTATINE_QUALIFICATION_MODE").unwrap(),
+            );
+        let child = run_child_with_timeout(
+            command,
+            std::time::Duration::from_secs(15),
+            "ambient-bus Secret Service fail-closed child",
+        );
+        assert_child_executed_one_test(&child, "ambient-bus Secret Service fail-closed child");
+        assert!(
+            String::from_utf8_lossy(&child.stderr)
+                .contains("linux-secret-service-untrusted-child-fail-closed"),
+            "the child must execute the fail-closed assertions: stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&child.stdout),
             String::from_utf8_lossy(&child.stderr)
         );
     }
@@ -1474,5 +2651,171 @@ transaction_confirmations = 2
         let store = ConfigStore::at_root(linked_root);
         assert!(store.prepare_wallet_dir().is_err());
         assert!(!target.join("wallets").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_lock_retries_until_a_short_holder_releases() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(temporary.path().to_path_buf());
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let holder_store = store.clone();
+        let holder = std::thread::spawn(move || {
+            let lock = holder_store.lock_transaction_journal().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(lock);
+            released_tx.send(()).unwrap();
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let retry_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let observed_retries = std::sync::Arc::clone(&retry_count);
+        let _retry_hook = install_journal_lock_retry_hook(move || {
+            let retry = observed_retries.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if retry == 1 {
+                release_tx.send(()).unwrap();
+                released_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("holder must release the lock before the next attempt");
+            }
+        });
+        let acquired = store.lock_transaction_journal();
+        drop(_retry_hook);
+        assert!(
+            (1..=super::JOURNAL_LOCK_RETRY_ATTEMPTS)
+                .contains(&retry_count.load(std::sync::atomic::Ordering::SeqCst)),
+            "a short holder must be released on the first retry and acquired within the bound"
+        );
+        holder.join().unwrap();
+        let acquired = acquired.expect("lock should be acquired after a short holder releases");
+        drop(acquired);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_lock_fails_closed_when_held_beyond_the_retry_bound() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(temporary.path().to_path_buf());
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_store = store.clone();
+        let holder = std::thread::spawn(move || {
+            let lock = holder_store.lock_transaction_journal().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+            drop(lock);
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let retry_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let observed_retries = std::sync::Arc::clone(&retry_count);
+        let _retry_hook = install_journal_lock_retry_hook(move || {
+            observed_retries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let error = store.lock_transaction_journal().unwrap_err();
+        drop(_retry_hook);
+        assert_eq!(
+            retry_count.load(std::sync::atomic::Ordering::SeqCst),
+            super::JOURNAL_LOCK_RETRY_ATTEMPTS,
+            "the lock must make exactly the configured number of retry attempts"
+        );
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        let error_text = format!("{error:#}");
+        assert!(
+            error_text.contains("another astatine mining process")
+                && error_text.contains("operation would block"),
+            "a held journal lock must fail closed through the bounded retry: {error_text}"
+        );
+        let acquired = store
+            .lock_transaction_journal()
+            .expect("lock should be acquirable after the holder releases");
+        drop(acquired);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_lock_fd_is_close_on_exec() {
+        use std::os::fd::AsRawFd;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(temporary.path().to_path_buf());
+        let lock = store.lock_transaction_journal().unwrap();
+        // SAFETY: `lock` owns a valid open descriptor.
+        let flags = unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_GETFD) };
+        assert!(
+            flags >= 0,
+            "F_GETFD failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "journal lock must not survive exec"
+        );
+    }
+
+    #[cfg(unix)]
+    const JOURNAL_LOCK_CHILD_ROOT_ENV: &str = "ASTATINE_JOURNAL_LOCK_CHILD_ROOT";
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child probe; invoked by journal_lock_excludes_a_second_process"]
+    fn journal_lock_child_observes_contention() {
+        let root = std::env::var_os(JOURNAL_LOCK_CHILD_ROOT_ENV).expect(
+            "journal lock child probe requires ASTATINE_JOURNAL_LOCK_CHILD_ROOT from its parent test",
+        );
+        let store = ConfigStore::at_root(PathBuf::from(root));
+        let error = store
+            .lock_transaction_journal()
+            .expect_err("a second process must not acquire a lock held by the parent process");
+        let error_text = format!("{error:#}");
+        assert!(
+            error_text.contains("another astatine mining process")
+                && error_text.contains("operation would block"),
+            "a cross-process held journal lock must fail closed through the bounded retry: {error_text}"
+        );
+        eprintln!("journal-lock-child-observed-contention");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_lock_excludes_a_second_process() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(temporary.path().to_path_buf());
+        let lock = store.lock_transaction_journal().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "config::tests::journal_lock_child_observes_contention",
+                "--nocapture",
+            ])
+            .env(JOURNAL_LOCK_CHILD_ROOT_ENV, temporary.path());
+        let child = run_child_with_timeout(
+            command,
+            std::time::Duration::from_secs(15),
+            "cross-process journal lock contention child",
+        );
+        assert_child_executed_one_test(&child, "cross-process journal lock contention");
+        assert!(
+            String::from_utf8_lossy(&child.stderr)
+                .contains("journal-lock-child-observed-contention"),
+            "the child process must execute the contention assertion: stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        drop(lock);
+        drop(
+            store
+                .lock_transaction_journal()
+                .expect("the parent must reacquire the lock after releasing it"),
+        );
     }
 }

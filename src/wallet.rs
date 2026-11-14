@@ -19,6 +19,8 @@ use rand::{RngCore, thread_rng};
 use scrypt::{Params as ScryptParams, scrypt};
 use serde_json::Value;
 use sha2::Sha256;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
     fs,
     io::{self, IsTerminal, Write},
@@ -26,6 +28,8 @@ use std::{
     str::FromStr,
 };
 use subtle::ConstantTimeEq;
+#[cfg(unix)]
+use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 const DEFAULT_DERIVATION_PATH: &str = "m/44'/60'/0'/0/0";
@@ -40,6 +44,551 @@ const NEW_KEYSTORE_SCRYPT_R: u32 = 8;
 const NEW_KEYSTORE_SCRYPT_P: u32 = 1;
 
 type Aes128Ctr = Ctr128BE<Aes128>;
+
+#[cfg(unix)]
+const MAX_HIDDEN_INPUT_BYTES: usize = 16 * 1024;
+
+#[cfg(all(test, unix))]
+static TEST_TERMINAL_FLUSH_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(test, unix))]
+pub(crate) fn fail_next_terminal_flush_for_test() {
+    TEST_TERMINAL_FLUSH_FAILURE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(all(test, unix))]
+fn take_terminal_flush_failure() -> bool {
+    TEST_TERMINAL_FLUSH_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Read a hidden line from the controlling terminal on Unix.
+///
+/// `rpassword` reads `/dev/tty` with a blocking one-byte read. `signal-hook`
+/// installs handlers with `SA_RESTART`, so an external SIGTERM/SIGHUP would
+/// not wake that read, and a typed Ctrl-C under the default disposition can
+/// terminate the process before its raw-mode guard runs. This reader keeps the
+/// same `/dev/tty`, no-echo, `ISIG`-disabled contract but uses nonblocking
+/// reads with bounded waits and consults the synchronous shutdown flags between
+/// attempts. All terminal mutation is owned by one RAII guard on the calling
+/// thread; no reader thread and no additional `sigaction` are introduced.
+#[cfg(unix)]
+fn read_hidden_password(prompt: &str) -> io::Result<String> {
+    ensure_prompt_not_shutdown()?;
+    let mut terminal = HiddenTerminal::open()?;
+    if let Err(error) = terminal
+        .write_all(prompt.as_bytes())
+        .and_then(|()| terminal.flush())
+    {
+        return Err(terminal.restore_after(error, RestoreInput::Flush));
+    }
+
+    let mut password = HiddenInputBuffer::new();
+    loop {
+        let character = match terminal.read_character() {
+            Ok(character) => character,
+            Err(error) => return Err(terminal.restore_after(error, RestoreInput::Flush)),
+        };
+        match character {
+            '\n' | '\r' => {
+                if let Err(error) = terminal.write_all(b"\n").and_then(|()| terminal.flush()) {
+                    return Err(terminal.restore_after(error, RestoreInput::Flush));
+                }
+                if crate::shutdown::prompt_shutdown_requested() {
+                    let _ = terminal.flush_pending_input();
+                    return Err(terminal.restore_after(interrupted_prompt(), RestoreInput::Flush));
+                }
+                terminal.restore_required(RestoreInput::Keep)?;
+                if crate::shutdown::prompt_shutdown_requested() {
+                    return Err(terminal.cancel_after_restore());
+                }
+                let mut value = Zeroizing::new(password.into_string()?);
+                if crate::shutdown::prompt_shutdown_requested() {
+                    let error = terminal.cancel_after_restore();
+                    value.zeroize();
+                    return Err(error);
+                }
+                return Ok(std::mem::take(&mut *value));
+            }
+            '\u{7f}' | '\u{8}' => password.pop(),
+            '\u{15}' => password.clear(),
+            '\u{17}' => password.clear_to_last_space(),
+            '\u{3}' => {
+                let _ = terminal.write_all(b"\n");
+                let _ = terminal.flush();
+                return Err(terminal.restore_after(interrupted_prompt(), RestoreInput::Flush));
+            }
+            '\u{4}' => {
+                if password.is_empty() {
+                    return Err(terminal.restore_after(
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected end of file"),
+                        RestoreInput::Flush,
+                    ));
+                }
+            }
+            '\u{1b}' => {
+                let next = match terminal.read_character() {
+                    Ok(next) => next,
+                    Err(error) => return Err(terminal.restore_after(error, RestoreInput::Flush)),
+                };
+                if next == '[' || next == 'O' {
+                    loop {
+                        let character = match terminal.read_character() {
+                            Ok(character) => character,
+                            Err(error) => {
+                                return Err(terminal.restore_after(error, RestoreInput::Flush));
+                            }
+                        };
+                        if ('\u{40}'..='\u{7e}').contains(&character) {
+                            break;
+                        }
+                    }
+                }
+            }
+            character if !character.is_control() => {
+                if let Err(error) = password.push(character) {
+                    return Err(terminal.restore_after(error, RestoreInput::Flush));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Windows keeps the upstream `rpassword` console reader. This change is scoped
+/// to the Unix controlling-terminal signal path.
+#[cfg(not(unix))]
+fn read_hidden_password(prompt: &str) -> io::Result<String> {
+    ensure_prompt_not_shutdown()?;
+    rpassword::prompt_password(prompt)
+}
+
+#[derive(Debug)]
+struct HiddenPromptCancelled;
+
+impl std::fmt::Display for HiddenPromptCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("hidden terminal prompt cancelled")
+    }
+}
+
+impl std::error::Error for HiddenPromptCancelled {}
+
+fn interrupted_prompt() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, HiddenPromptCancelled)
+}
+
+fn ensure_prompt_not_shutdown() -> io::Result<()> {
+    if !crate::shutdown::prompt_shutdown_requested() {
+        return Ok(());
+    }
+    // A prompt may have completed just before a signal latched. Discard any
+    // queued terminal input before returning the cancellation so extra secret
+    // bytes cannot reach the restored shell.
+    #[cfg(unix)]
+    if let Err(error) = flush_pending_terminal_input() {
+        return Err(io::Error::other(format!(
+            "flush terminal input after cancelled hidden prompt failed: {error}"
+        )));
+    }
+    Err(interrupted_prompt())
+}
+
+#[cfg(unix)]
+fn flush_pending_terminal_input() -> io::Result<()> {
+    let input = match fs::OpenOptions::new().read(true).open("/dev/tty") {
+        Ok(input) => input,
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENXIO) | Some(libc::ENODEV) | Some(libc::ENOTTY) | Some(libc::ENOENT)
+            ) =>
+        {
+            // No controlling terminal means there is no shell input queue to
+            // leak into. Treat the flush as vacuously complete.
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    #[cfg(test)]
+    if take_terminal_flush_failure() {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    let attributes = terminal_attributes(input.as_raw_fd())?;
+    // Reapply the current attributes with TCSAFLUSH. This discards queued
+    // input even when the prompt already restored the terminal with TCSANOW.
+    if let Err(error) = set_terminal_attributes(input.as_raw_fd(), libc::TCSAFLUSH, &attributes) {
+        let _ = tcflush_input(input.as_raw_fd());
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn tcflush_input(descriptor: libc::c_int) -> io::Result<()> {
+    loop {
+        // SAFETY: `descriptor` is an open terminal descriptor.
+        if unsafe { libc::tcflush(descriptor, libc::TCIFLUSH) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum RestoreInput {
+    Keep,
+    Flush,
+}
+
+#[cfg(unix)]
+impl RestoreInput {
+    fn action(self) -> libc::c_int {
+        match self {
+            Self::Keep => libc::TCSANOW,
+            Self::Flush => libc::TCSAFLUSH,
+        }
+    }
+}
+
+#[cfg(unix)]
+struct HiddenTerminal {
+    input: fs::File,
+    output: fs::File,
+    original: libc::termios,
+    restored: bool,
+}
+
+#[cfg(unix)]
+impl HiddenTerminal {
+    fn open() -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let input = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open("/dev/tty")?;
+        let output = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open("/dev/tty")?;
+        let descriptor = input.as_raw_fd();
+        let original = terminal_attributes(descriptor)?;
+        // Construct the restoration guard before changing the terminal. If
+        // entering raw mode fails after a partial change, Drop still attempts
+        // restoration.
+        let mut terminal = Self {
+            input,
+            output,
+            original,
+            restored: false,
+        };
+        terminal.enter_raw()?;
+        Ok(terminal)
+    }
+
+    fn enter_raw(&mut self) -> io::Result<()> {
+        let mut raw = self.original;
+        raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ECHONL | libc::ISIG);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        set_terminal_attributes(self.input.as_raw_fd(), libc::TCSANOW, &raw)
+    }
+
+    fn restore(&mut self, input: RestoreInput) -> io::Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        set_terminal_attributes(self.input.as_raw_fd(), input.action(), &self.original)?;
+        self.restored = true;
+        Ok(())
+    }
+
+    fn restore_required(&mut self, input: RestoreInput) -> io::Result<()> {
+        self.restore(input).map_err(|error| {
+            io::Error::other(format!(
+                "restore terminal after hidden prompt failed: {error}"
+            ))
+        })
+    }
+
+    fn restore_after(&mut self, error: io::Error, input: RestoreInput) -> io::Error {
+        match self.restore(input) {
+            Ok(()) => error,
+            Err(restore_error) => io::Error::other(format!(
+                "restore terminal after hidden prompt failed: {restore_error}; original prompt error: {error}"
+            )),
+        }
+    }
+
+    fn flush_pending_input(&self) -> io::Result<()> {
+        tcflush_input(self.input.as_raw_fd())
+    }
+
+    /// Force TCSAFLUSH even after the prompt restored with TCSANOW. This is
+    /// used when a shutdown becomes visible only after normal restoration, so
+    /// queued input cannot reach the shell. A failure leaves `restored` false
+    /// so Drop retries TCSAFLUSH.
+    fn cancel_after_restore(&mut self) -> io::Error {
+        match self.force_flush_restore() {
+            Ok(()) => interrupted_prompt(),
+            Err(error) => {
+                let _ = self.flush_pending_input();
+                io::Error::other(format!(
+                    "flush terminal input after hidden prompt failed: {error}"
+                ))
+            }
+        }
+    }
+
+    fn force_flush_restore(&mut self) -> io::Result<()> {
+        self.restored = false;
+        #[cfg(test)]
+        if take_terminal_flush_failure() {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        set_terminal_attributes(self.input.as_raw_fd(), libc::TCSAFLUSH, &self.original)?;
+        self.restored = true;
+        Ok(())
+    }
+
+    fn read_character(&mut self) -> io::Result<char> {
+        let first = self.read_byte()?;
+        if first < 0x80 {
+            return Ok(first as char);
+        }
+        let width = match first {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => return Ok('\u{fffd}'),
+        };
+        let mut bytes = [0_u8; 4];
+        bytes[0] = first;
+        for byte in bytes.iter_mut().take(width).skip(1) {
+            *byte = self.read_byte()?;
+        }
+        let character = std::str::from_utf8(&bytes[..width])
+            .ok()
+            .and_then(|value| value.chars().next())
+            .unwrap_or('\u{fffd}');
+        bytes.fill(0);
+        Ok(character)
+    }
+
+    fn read_byte(&mut self) -> io::Result<u8> {
+        loop {
+            if crate::shutdown::prompt_shutdown_requested() {
+                let _ = self.write_all(b"\n");
+                let _ = self.flush();
+                return Err(interrupted_prompt());
+            }
+            let mut byte = [0_u8; 1];
+            // SAFETY: the destination is one byte and the descriptor is the
+            // owned nonblocking `/dev/tty` input file.
+            let count = unsafe {
+                libc::read(
+                    self.input.as_raw_fd(),
+                    byte.as_mut_ptr().cast::<libc::c_void>(),
+                    1,
+                )
+            };
+            if count < 0 {
+                let error = io::Error::last_os_error();
+                match error.kind() {
+                    io::ErrorKind::Interrupted => continue,
+                    io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                    _ => return Err(error),
+                }
+            }
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected end of file",
+                ));
+            }
+            let value = byte[0];
+            byte.fill(0);
+            return Ok(value);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl io::Write for HiddenTerminal {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut written = 0;
+        while written < bytes.len() {
+            match self.output.write(&bytes[written..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "terminal output accepted no bytes",
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if crate::shutdown::prompt_shutdown_requested() {
+                        return Err(interrupted_prompt());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HiddenTerminal {
+    fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
+        // A panic or an unhandled early return must not leave queued secret
+        // bytes available to the restored shell.
+        let _ = set_terminal_attributes(self.input.as_raw_fd(), libc::TCSAFLUSH, &self.original);
+    }
+}
+
+#[cfg(unix)]
+struct HiddenInputBuffer {
+    bytes: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl HiddenInputBuffer {
+    fn new() -> Self {
+        Self {
+            // Reserve the full bound up front so pushes never reallocate and
+            // free an unzeroized previous buffer.
+            bytes: Vec::with_capacity(MAX_HIDDEN_INPUT_BYTES),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn push(&mut self, character: char) -> io::Result<()> {
+        let mut encoded_bytes = [0_u8; 4];
+        let encoded = character.encode_utf8(&mut encoded_bytes);
+        let length = encoded.len();
+        if self.bytes.len().saturating_add(length) > MAX_HIDDEN_INPUT_BYTES {
+            encoded_bytes.fill(0);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "hidden terminal input exceeds the supported length",
+            ));
+        }
+        self.bytes.extend_from_slice(&encoded_bytes[..length]);
+        encoded_bytes.fill(0);
+        Ok(())
+    }
+
+    fn pop(&mut self) {
+        let Some(character) = self.text().chars().next_back() else {
+            return;
+        };
+        let new_len = self.bytes.len() - character.len_utf8();
+        self.zero_from(new_len);
+        self.bytes.truncate(new_len);
+    }
+
+    fn clear(&mut self) {
+        self.zero_from(0);
+        self.bytes.clear();
+    }
+
+    fn clear_to_last_space(&mut self) {
+        let trimmed = self.text().trim_end();
+        let new_len = trimmed.rfind(' ').map(|position| position + 1).unwrap_or(0);
+        self.zero_from(new_len);
+        self.bytes.truncate(new_len);
+    }
+
+    fn into_string(mut self) -> io::Result<String> {
+        let bytes = std::mem::take(&mut self.bytes);
+        match String::from_utf8(bytes) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let mut bytes = error.into_bytes();
+                bytes.fill(0);
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "hidden terminal input is not valid UTF-8",
+                ))
+            }
+        }
+    }
+
+    fn text(&self) -> &str {
+        std::str::from_utf8(&self.bytes).expect("hidden input is valid UTF-8")
+    }
+
+    fn zero_from(&mut self, start: usize) {
+        self.bytes[start..].fill(0);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HiddenInputBuffer {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+    }
+}
+
+#[cfg(unix)]
+fn terminal_attributes(descriptor: libc::c_int) -> io::Result<libc::termios> {
+    let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    loop {
+        // SAFETY: `attributes` is a valid destination and `descriptor` is an
+        // open terminal descriptor.
+        if unsafe { libc::tcgetattr(descriptor, attributes.as_mut_ptr()) } == 0 {
+            // SAFETY: `tcgetattr` succeeded and initialized the structure.
+            return Ok(unsafe { attributes.assume_init() });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+#[cfg(unix)]
+fn set_terminal_attributes(
+    descriptor: libc::c_int,
+    action: libc::c_int,
+    attributes: &libc::termios,
+) -> io::Result<()> {
+    loop {
+        // SAFETY: `attributes` points to a valid termios structure and
+        // `descriptor` is an open terminal descriptor.
+        if unsafe { libc::tcsetattr(descriptor, action, attributes) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+}
 
 pub fn create_interactive(store: &ConfigStore, config: &mut AppConfig) -> Result<Address> {
     create_interactive_with_persistence(store, config, true)
@@ -71,6 +620,7 @@ fn create_interactive_with_persistence(
 }
 
 fn disclose_and_confirm_recovery_phrase(phrase: &str) -> Result<()> {
+    ensure_prompt_not_shutdown()?;
     println!("Recovery phrase — write it down and keep it offline. It will not be stored:");
     println!("\n{}\n", phrase);
     confirm_backup()
@@ -97,16 +647,20 @@ where
             "wallet creation requires an interactive terminal; refusing to generate or display a recovery phrase when stdin or stdout is redirected or unavailable. Run wallet initialization directly in a private terminal on a trusted machine"
         );
     }
+    ensure_prompt_not_shutdown()?;
     eprintln!(
         "Security warning: an interactive terminal is not a privacy guarantee. SSH sessions, terminal logging, screen capture, or a compromised host can still record the recovery phrase; create it only on a trusted, non-recorded machine."
     );
 
     let mnemonic = generate_mnemonic()?;
     let phrase = Zeroizing::new(mnemonic.to_string());
+    ensure_prompt_not_shutdown()?;
     disclose_and_confirm(phrase.as_str())?;
+    ensure_prompt_not_shutdown()?;
 
     let signer = derive_signer(phrase.as_str(), "", DEFAULT_DERIVATION_PATH)?;
     let password = prompt_new_password()?;
+    ensure_prompt_not_shutdown()?;
     let address = store_signer(store, config, &signer, password.as_bytes(), persist_config)?;
     println!("Encrypted Ethereum V3 wallet created: {address:#x}");
     Ok(address)
@@ -134,17 +688,16 @@ fn import_interactive_with_persistence(
     args: ImportArgs,
     persist_config: bool,
 ) -> Result<Address> {
+    ensure_prompt_not_shutdown()?;
     if let Some(path) = args.keystore {
         return import_keystore(store, config, &path, persist_config);
     }
 
-    let phrase = Zeroizing::new(rpassword::prompt_password(
-        "Recovery phrase (input hidden): ",
-    )?);
+    let phrase = Zeroizing::new(read_hidden_password("Recovery phrase (input hidden): ")?);
     if phrase.is_empty() {
         bail!("recovery phrase cannot be empty");
     }
-    let bip39_passphrase = Zeroizing::new(rpassword::prompt_password(
+    let bip39_passphrase = Zeroizing::new(read_hidden_password(
         "Optional BIP-39 passphrase (input hidden; empty if unused): ",
     )?);
     if bip39_passphrase.len() > MAX_PASSWORD_BYTES {
@@ -157,6 +710,7 @@ fn import_interactive_with_persistence(
         &args.derivation_path,
     )?;
     let password = prompt_new_password()?;
+    ensure_prompt_not_shutdown()?;
     let address = store_signer(store, config, &signer, password.as_bytes(), persist_config)?;
     println!("Encrypted Ethereum V3 wallet imported: {address:#x}");
     Ok(address)
@@ -190,6 +744,13 @@ fn unlock_selected_interactive_inner(
     config: &AppConfig,
     progress: Option<&StartupProgress>,
 ) -> Result<SigningKey> {
+    if crate::shutdown::prompt_shutdown_requested() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "shutdown already latched before hidden wallet prompt",
+        )
+        .into());
+    }
     let address = selected_address(config)?;
     let keyfile = store.read_keystore(address)?;
     if validate_v3_keystore(&keyfile)? != address {
@@ -198,9 +759,10 @@ fn unlock_selected_interactive_inner(
     if let Some(progress) = progress {
         progress.pause_for_prompt("Unlock wallet");
     }
-    let password = Zeroizing::new(rpassword::prompt_password(
+    let password = Zeroizing::new(read_hidden_password(
         "Ethereum V3 keystore password (input hidden): ",
     )?);
+    ensure_prompt_not_shutdown()?;
     if let Some(progress) = progress {
         progress.resume_after_prompt("Decrypting Ethereum V3 keystore");
     }
@@ -210,6 +772,7 @@ fn unlock_selected_interactive_inner(
     if signer_address(&signer) != address {
         bail!("decrypted private key does not match the selected wallet address");
     }
+    ensure_prompt_not_shutdown()?;
     Ok(signer)
 }
 
@@ -343,7 +906,7 @@ fn import_keystore(
         source,
         persist_config,
         || {
-            Ok(Zeroizing::new(rpassword::prompt_password(
+            Ok(Zeroizing::new(read_hidden_password(
                 "Ethereum V3 keystore password (input hidden): ",
             )?))
         },
@@ -363,6 +926,7 @@ where
     F: FnOnce() -> Result<Zeroizing<String>>,
     G: FnOnce() -> Result<Zeroizing<String>>,
 {
+    ensure_prompt_not_shutdown()?;
     let contents = read_regular_limited(source, MAX_KEYSTORE_BYTES, false)
         .context("read external Ethereum V3 keyfile")?;
     if contents.is_empty() {
@@ -371,6 +935,7 @@ where
     let embedded_address = validate_v3_keystore(&contents)?;
 
     let password = read_source_password()?;
+    ensure_prompt_not_shutdown()?;
     validate_import_password(&password)?;
     let private_key = decrypt_v3_keystore(&contents, password.as_bytes())?;
     let signer = SigningKey::from_slice(private_key.as_slice())
@@ -381,6 +946,7 @@ where
     }
 
     let new_password = read_new_password()?;
+    ensure_prompt_not_shutdown()?;
     validate_new_password(&new_password)?;
     let address = store_signer(
         store,
@@ -658,7 +1224,7 @@ pub(crate) fn validate_v3_keystore(contents: &[u8]) -> Result<Address> {
 }
 
 fn prompt_new_password() -> Result<Zeroizing<String>> {
-    prompt_new_password_with(|prompt| rpassword::prompt_password(prompt))
+    prompt_new_password_with(read_hidden_password)
 }
 
 fn prompt_new_password_with<F>(mut prompt: F) -> Result<Zeroizing<String>>
@@ -685,6 +1251,21 @@ pub(crate) fn is_password_prompt_interrupted(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<io::Error>()
         .is_some_and(|error| error.kind() == io::ErrorKind::Interrupted)
+}
+
+/// Narrow command-level check: only an interruption produced by this module's
+/// hidden prompt reader is treated as a clean cancellation. Unrelated
+/// `Interrupted` I/O errors must remain errors rather than being reported as a
+/// cancelled wallet operation.
+pub(crate) fn is_hidden_password_prompt_interrupted(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            error.kind() == io::ErrorKind::Interrupted
+                && error
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<HiddenPromptCancelled>())
+        })
+    })
 }
 
 fn validate_new_password(password: &str) -> Result<()> {
@@ -717,10 +1298,17 @@ fn confirm_backup() -> Result<()> {
     io::stdout()
         .flush()
         .context("flush recovery phrase confirmation prompt")?;
-    let mut confirmation = String::new();
-    io::stdin()
-        .read_line(&mut confirmation)
-        .context("read recovery phrase confirmation")?;
+    let confirmation = match crate::commands::read_terminal_line() {
+        Ok(confirmation) => confirmation,
+        Err(error)
+            if error.kind() == io::ErrorKind::Interrupted
+                && crate::shutdown::prompt_shutdown_requested() =>
+        {
+            let _ = ensure_prompt_not_shutdown();
+            return Err(crate::shutdown::prompt_shutdown_error());
+        }
+        Err(error) => return Err(error).context("read recovery phrase confirmation"),
+    };
     if confirmation.trim() != "BACKED UP" {
         bail!("wallet creation cancelled; no wallet was stored");
     }
@@ -745,6 +1333,8 @@ mod tests {
     use bip39::{Language, Mnemonic};
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha256;
+    #[cfg(unix)]
+    use std::time::Duration;
     use std::{io, path::PathBuf, str::FromStr};
     use tempfile::tempdir;
     use zeroize::Zeroizing;
@@ -1038,6 +1628,145 @@ mod tests {
         assert!(!super::is_password_prompt_interrupted(&anyhow::anyhow!(
             "bad password"
         )));
+        assert!(super::is_hidden_password_prompt_interrupted(
+            &anyhow::Error::new(super::interrupted_prompt())
+        ));
+        assert!(
+            !super::is_hidden_password_prompt_interrupted(&error),
+            "unrelated Interrupted I/O must not be reported as a hidden-prompt cancellation"
+        );
+    }
+
+    #[test]
+    fn latched_shutdown_skips_hidden_prompt_before_keystore_access() {
+        const CHILD: &str = "ASTATINE_WALLET_LATCHED_SHUTDOWN_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let temp = tempdir().unwrap();
+            let store = ConfigStore::at_root(PathBuf::from(temp.path()));
+            let config = AppConfig {
+                wallet_address: Some(format!("{:#x}", Address::with_last_byte(0xa1))),
+                ..AppConfig::default()
+            };
+            let request = crate::shutdown::ShutdownRequest::registered_for_test();
+            request.request_for_test();
+            let error = super::unlock_selected_interactive(&store, &config).unwrap_err();
+            assert!(
+                super::is_password_prompt_interrupted(&error),
+                "a latched shutdown must cancel before reading the keystore: {error:#}"
+            );
+            drop(request);
+            eprintln!("latched-shutdown-child-ran");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "wallet::tests::latched_shutdown_skips_hidden_prompt_before_keystore_access",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "latched-shutdown child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("latched-shutdown-child-ran"),
+            "latched-shutdown child did not run its test body: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_prompt_cancellation_without_controlling_terminal_stays_cancellation() {
+        const CHILD: &str = "ASTATINE_WALLET_NO_TTY_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Detach from any controlling terminal inherited from the test
+            // runner. A cancellation with no terminal has no shell queue to
+            // leak into and must remain a clean Interrupted result.
+            assert_ne!(unsafe { libc::setsid() }, -1);
+            let request = crate::shutdown::ShutdownRequest::registered_for_test();
+            request.request_for_test();
+            let error =
+                anyhow::Error::new(super::read_hidden_password("unused prompt: ").unwrap_err());
+            assert!(super::is_password_prompt_interrupted(&error), "{error:#}");
+            drop(request);
+            eprintln!("no-tty-child-ran");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "wallet::tests::hidden_prompt_cancellation_without_controlling_terminal_stays_cancellation",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "no-tty child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no-tty-child-ran"),
+            "no-tty child did not run its test body: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn wallet_creation_does_not_disclose_phrase_after_shutdown_latches_during_generation() {
+        const CHILD: &str = "ASTATINE_WALLET_DISCLOSURE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let temp = tempdir().unwrap();
+            let store = ConfigStore::at_root(PathBuf::from(temp.path()));
+            let mut config = AppConfig::default();
+            let request = crate::shutdown::ShutdownRequest::registered_for_test();
+            let error = super::create_interactive_with_secret_terminal(
+                &store,
+                &mut config,
+                true,
+                true,
+                || {
+                    request.request_for_test();
+                    Ok(Mnemonic::parse_in(Language::English, TEST_PHRASE).unwrap())
+                },
+                |_| panic!("recovery phrase must not be disclosed after shutdown latches"),
+            )
+            .unwrap_err();
+            assert!(super::is_password_prompt_interrupted(&error), "{error:#}");
+            assert_eq!(config, AppConfig::default());
+            assert!(!store.wallet_dir().exists());
+
+            let error = super::disclose_and_confirm_recovery_phrase(TEST_PHRASE).unwrap_err();
+            assert!(super::is_password_prompt_interrupted(&error), "{error:#}");
+            drop(request);
+            eprintln!("wallet-disclosure-child-ran");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "wallet::tests::wallet_creation_does_not_disclose_phrase_after_shutdown_latches_during_generation",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "wallet-disclosure child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("wallet-disclosure-child-ran"),
+            "wallet-disclosure child did not run its test body: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -1546,6 +2275,362 @@ mod tests {
         let orphan = std::fs::read(&destination).unwrap();
         assert_eq!(validate_v3_keystore(&orphan).unwrap(), address);
         assert!(decrypt_v3_keystore(&orphan, NEW_LOCAL_PASSWORD.as_bytes()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hidden_wallet_prompts_restore_terminal_on_a_controlling_pty() {
+        const CHILD: &str = "ASTATINE_WALLET_PTY_CHILD";
+        const MODE: &str = "ASTATINE_WALLET_PTY_MODE";
+
+        if std::env::var_os(CHILD).is_some() {
+            crate::test_support::attach_controlling_terminal();
+            let original_termios = crate::test_support::PtyChild::stdin_termios();
+            let _shutdown = crate::shutdown::ShutdownSignal::new().unwrap();
+            let mode = std::env::var(MODE).unwrap();
+            let temp = tempdir().unwrap();
+            let store = ConfigStore::at_root(PathBuf::from(temp.path()));
+            let mut config = AppConfig::default();
+            match mode.as_str() {
+                "create_password_signal" | "create_confirm_signal" => {
+                    let error = super::create_interactive_with_secret_terminal(
+                        &store,
+                        &mut config,
+                        true,
+                        true,
+                        || Ok(Mnemonic::parse_in(Language::English, TEST_PHRASE).unwrap()),
+                        |_| Ok(()),
+                    )
+                    .unwrap_err();
+                    assert!(super::is_password_prompt_interrupted(&error), "{error:#}");
+                    assert_eq!(config, AppConfig::default());
+                    assert!(!store.wallet_dir().exists());
+                }
+                "create_success" => {
+                    let address = super::create_interactive_with_secret_terminal(
+                        &store,
+                        &mut config,
+                        true,
+                        true,
+                        || Ok(Mnemonic::parse_in(Language::English, TEST_PHRASE).unwrap()),
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        config.wallet_address.as_deref(),
+                        Some(format!("{address:#x}").as_str())
+                    );
+                    assert!(store.keystore_path(address).exists());
+                }
+                "import_source_signal" | "import_new_signal" | "import_confirm_signal" => {
+                    let signer = derive_signer(TEST_PHRASE, "", DEFAULT_DERIVATION_PATH).unwrap();
+                    let source = external_weak_keyfile(temp.path(), &signer);
+                    let original = std::fs::read(&source).unwrap();
+                    let error =
+                        super::import_keystore(&store, &mut config, &source, true).unwrap_err();
+                    assert!(super::is_password_prompt_interrupted(&error), "{error:#}");
+                    assert_eq!(config, AppConfig::default());
+                    assert!(!store.wallet_dir().exists());
+                    assert_eq!(std::fs::read(&source).unwrap(), original);
+                }
+                "import_success" => {
+                    let signer = derive_signer(TEST_PHRASE, "", DEFAULT_DERIVATION_PATH).unwrap();
+                    let address = signer_address(&signer);
+                    let source = external_weak_keyfile(temp.path(), &signer);
+                    let original = std::fs::read(&source).unwrap();
+                    let imported =
+                        super::import_keystore(&store, &mut config, &source, true).unwrap();
+                    assert_eq!(imported, address);
+                    assert_eq!(
+                        config.wallet_address.as_deref(),
+                        Some(format!("{address:#x}").as_str())
+                    );
+                    assert_eq!(std::fs::read(&source).unwrap(), original);
+                    assert!(store.keystore_path(address).exists());
+                }
+                "unlock_signal" | "unlock_success" => {
+                    let signer = derive_signer(TEST_PHRASE, "", DEFAULT_DERIVATION_PATH).unwrap();
+                    let address = signer_address(&signer);
+                    store.prepare_wallet_dir().unwrap();
+                    std::fs::write(
+                        store.keystore_path(address),
+                        weak_pbkdf2_keyfile(&signer, TEST_PASSWORD, address),
+                    )
+                    .unwrap();
+                    config.wallet_address = Some(format!("{address:#x}"));
+                    match super::unlock_selected_interactive(&store, &config) {
+                        Ok(unlocked) => {
+                            assert_eq!(mode, "unlock_success");
+                            assert_eq!(signer_address(&unlocked), address);
+                        }
+                        Err(error) => {
+                            assert_eq!(mode, "unlock_signal");
+                            assert!(super::is_password_prompt_interrupted(&error), "{error:#}");
+                        }
+                    }
+                    assert!(store.keystore_path(address).exists());
+                }
+                "queued_secret_signal" => {
+                    let error = super::create_interactive_with_secret_terminal(
+                        &store,
+                        &mut config,
+                        true,
+                        true,
+                        || Ok(Mnemonic::parse_in(Language::English, TEST_PHRASE).unwrap()),
+                        |_| Ok(()),
+                    )
+                    .unwrap_err();
+                    assert!(super::is_password_prompt_interrupted(&error), "{error:#}");
+                    assert_eq!(config, AppConfig::default());
+                    assert!(!store.wallet_dir().exists());
+                    let mut pending: libc::c_int = 0;
+                    // SAFETY: `pending` is a valid destination and standard
+                    // input is the PTY slave.
+                    assert_eq!(
+                        unsafe {
+                            libc::ioctl(
+                                libc::STDIN_FILENO,
+                                libc::FIONREAD as libc::c_ulong,
+                                &mut pending,
+                            )
+                        },
+                        0,
+                        "FIONREAD on the child terminal failed: {}",
+                        io::Error::last_os_error()
+                    );
+                    assert_eq!(
+                        pending, 0,
+                        "cancelled hidden prompt must flush queued terminal input"
+                    );
+                }
+                "preserve_input_success" => {
+                    let password = super::read_hidden_password("Preserve input prompt: ").unwrap();
+                    assert_eq!(password, NEW_LOCAL_PASSWORD);
+                    let mut next = String::new();
+                    std::io::stdin().read_line(&mut next).unwrap();
+                    assert_eq!(next.trim_end(), "queued-next-input");
+                }
+                "flush_failure_after_restore" => {
+                    let mut terminal = super::HiddenTerminal::open().unwrap();
+                    terminal
+                        .restore_required(super::RestoreInput::Keep)
+                        .unwrap();
+                    super::fail_next_terminal_flush_for_test();
+                    let error = terminal.cancel_after_restore();
+                    assert!(
+                        format!("{error}")
+                            .contains("flush terminal input after hidden prompt failed"),
+                        "{error}"
+                    );
+                    drop(terminal);
+                }
+                "flush_failure_before_prompt" => {
+                    let request = crate::shutdown::ShutdownRequest::registered_for_test();
+                    request.request_for_test();
+                    super::fail_next_terminal_flush_for_test();
+                    let error = super::read_hidden_password("unused prompt: ").unwrap_err();
+                    assert!(
+                        format!("{error}").contains("flush terminal input"),
+                        "{error}"
+                    );
+                    drop(request);
+                }
+                other => panic!("unsupported wallet PTY mode {other}"),
+            }
+            crate::test_support::PtyChild::assert_stdin_terminal_restored(&original_termios);
+            eprintln!("wallet-pty-child-ran-{mode}");
+            // The test body has completed its assertions. Exit without running
+            // the harness teardown after a controlling-terminal signal probe.
+            std::process::exit(0);
+        }
+
+        fn spawn(mode: &str) -> crate::test_support::PtyChild {
+            crate::test_support::spawn_pty_test_child(
+                "wallet::tests::hidden_wallet_prompts_restore_terminal_on_a_controlling_pty",
+                &[(CHILD, "1"), (MODE, mode)],
+            )
+        }
+
+        fn finish(mut pty: crate::test_support::PtyChild, mode: &str) {
+            let status = pty.wait_for_exit(Duration::from_secs(60));
+            let trailing = pty.drain_available(Duration::from_millis(100));
+            let status =
+                status.unwrap_or_else(|| panic!("wallet PTY {mode} did not finish: {trailing:?}"));
+            assert!(status.success(), "wallet PTY {mode} failed: {trailing:?}");
+            assert!(
+                trailing.contains(&format!("wallet-pty-child-ran-{mode}")),
+                "wallet PTY {mode} did not run its test body: {trailing:?}"
+            );
+            assert!(
+                !trailing.contains(TEST_PASSWORD)
+                    && !trailing.contains(NEW_LOCAL_PASSWORD)
+                    && !trailing.contains(TEST_PHRASE),
+                "hidden wallet input must not be echoed: {trailing:?}"
+            );
+        }
+
+        #[allow(unused_mut)]
+        let mut create_signals = vec![
+            ("sigint", Some(libc::SIGINT)),
+            ("sigterm", Some(libc::SIGTERM)),
+            ("ctrlc", None),
+        ];
+        #[cfg(target_os = "linux")]
+        create_signals.push(("sighup", Some(libc::SIGHUP)));
+        for (signal_name, signal) in create_signals {
+            let mut pty = spawn("create_password_signal");
+            let output = pty.read_until("Create keystore password", Duration::from_secs(5));
+            assert!(
+                output.contains("Create keystore password"),
+                "create password {signal_name} did not reach its prompt: {output:?}"
+            );
+            if let Some(signal) = signal {
+                pty.signal(signal);
+            } else {
+                pty.write_all(b"\x03");
+            }
+            finish(pty, "create_password_signal");
+        }
+
+        let mut pty = spawn("create_confirm_signal");
+        pty.read_until("Create keystore password", Duration::from_secs(5));
+        pty.write_all(format!("{NEW_LOCAL_PASSWORD}\n").as_bytes());
+        let output = pty.read_until("Confirm keystore password", Duration::from_secs(5));
+        assert!(
+            output.contains("Confirm keystore password"),
+            "create confirmation did not reach its prompt: {output:?}"
+        );
+        pty.signal(libc::SIGTERM);
+        finish(pty, "create_confirm_signal");
+
+        let mut pty = spawn("import_source_signal");
+        let output = pty.read_until("Ethereum V3 keystore password", Duration::from_secs(5));
+        assert!(
+            output.contains("Ethereum V3 keystore password"),
+            "import source did not reach its prompt: {output:?}"
+        );
+        pty.signal(libc::SIGINT);
+        finish(pty, "import_source_signal");
+
+        let mut pty = spawn("import_new_signal");
+        pty.read_until("Ethereum V3 keystore password", Duration::from_secs(5));
+        pty.write_all(format!("{TEST_PASSWORD}\n").as_bytes());
+        let output = pty.read_until("Create keystore password", Duration::from_secs(5));
+        assert!(
+            output.contains("Create keystore password"),
+            "import new password did not reach its prompt: {output:?}"
+        );
+        #[cfg(target_os = "linux")]
+        pty.signal(libc::SIGHUP);
+        #[cfg(not(target_os = "linux"))]
+        pty.signal(libc::SIGTERM);
+        finish(pty, "import_new_signal");
+
+        let mut pty = spawn("import_confirm_signal");
+        pty.read_until("Ethereum V3 keystore password", Duration::from_secs(5));
+        pty.write_all(format!("{TEST_PASSWORD}\n").as_bytes());
+        pty.read_until("Create keystore password", Duration::from_secs(5));
+        pty.write_all(format!("{NEW_LOCAL_PASSWORD}\n").as_bytes());
+        let output = pty.read_until("Confirm keystore password", Duration::from_secs(5));
+        assert!(
+            output.contains("Confirm keystore password"),
+            "import confirmation did not reach its prompt: {output:?}"
+        );
+        pty.write_all(b"\x03");
+        finish(pty, "import_confirm_signal");
+
+        let mut pty = spawn("unlock_signal");
+        let output = pty.read_until("Ethereum V3 keystore password", Duration::from_secs(5));
+        assert!(
+            output.contains("Ethereum V3 keystore password"),
+            "unlock did not reach its prompt: {output:?}"
+        );
+        pty.signal(libc::SIGTERM);
+        finish(pty, "unlock_signal");
+
+        let mut pty = spawn("create_success");
+        pty.read_until("Create keystore password", Duration::from_secs(5));
+        pty.write_all(format!("{NEW_LOCAL_PASSWORD}\n").as_bytes());
+        pty.read_until("Confirm keystore password", Duration::from_secs(5));
+        pty.write_all(format!("{NEW_LOCAL_PASSWORD}\n").as_bytes());
+        finish(pty, "create_success");
+
+        let mut pty = spawn("import_success");
+        pty.read_until("Ethereum V3 keystore password", Duration::from_secs(5));
+        pty.write_all(format!("{TEST_PASSWORD}\n").as_bytes());
+        pty.read_until("Create keystore password", Duration::from_secs(5));
+        pty.write_all(format!("{NEW_LOCAL_PASSWORD}\n").as_bytes());
+        pty.read_until("Confirm keystore password", Duration::from_secs(5));
+        pty.write_all(format!("{NEW_LOCAL_PASSWORD}\n").as_bytes());
+        finish(pty, "import_success");
+
+        let mut pty = spawn("unlock_success");
+        pty.read_until("Ethereum V3 keystore password", Duration::from_secs(5));
+        pty.write_all(format!("{TEST_PASSWORD}\n").as_bytes());
+        finish(pty, "unlock_success");
+
+        let mut pty = spawn("queued_secret_signal");
+        let output = pty.read_until("Create keystore password", Duration::from_secs(5));
+        assert!(
+            output.contains("Create keystore password"),
+            "queued-secret prompt was not reached: {output:?}"
+        );
+        pty.write_all(b"queued-secret-value");
+        pty.signal(libc::SIGTERM);
+        pty.write_all(b"\n");
+        let status = pty.wait_for_exit(Duration::from_secs(5));
+        let trailing = pty.drain_available(Duration::from_millis(100));
+        let status =
+            status.unwrap_or_else(|| panic!("queued-secret PTY did not finish: {trailing:?}"));
+        assert!(status.success(), "queued-secret PTY failed: {trailing:?}");
+        assert!(
+            trailing.contains("wallet-pty-child-ran-queued_secret_signal"),
+            "queued-secret child did not run its test body: {trailing:?}"
+        );
+        assert!(
+            !trailing.contains("queued-secret-value"),
+            "queued secret must not be echoed after cancellation: {trailing:?}"
+        );
+
+        let mut pty = spawn("preserve_input_success");
+        let output = pty.read_until("Preserve input prompt", Duration::from_secs(5));
+        assert!(
+            output.contains("Preserve input prompt"),
+            "preserve-input prompt was not reached: {output:?}"
+        );
+        pty.write_all(format!("{NEW_LOCAL_PASSWORD}\nqueued-next-input\n").as_bytes());
+        let status = pty.wait_for_exit(Duration::from_secs(5));
+        let trailing = pty.drain_available(Duration::from_millis(100));
+        let status =
+            status.unwrap_or_else(|| panic!("preserve-input PTY did not finish: {trailing:?}"));
+        assert!(status.success(), "preserve-input PTY failed: {trailing:?}");
+        assert!(
+            trailing.contains("wallet-pty-child-ran-preserve_input_success"),
+            "preserve-input child did not run its test body: {trailing:?}"
+        );
+        assert!(
+            !trailing.contains(NEW_LOCAL_PASSWORD),
+            "hidden password must not be echoed: {trailing:?}"
+        );
+
+        for mode in ["flush_failure_after_restore", "flush_failure_before_prompt"] {
+            let mut pty = spawn(mode);
+            let status = pty.wait_for_exit(Duration::from_secs(5));
+            let trailing = pty.drain_available(Duration::from_millis(100));
+            let status =
+                status.unwrap_or_else(|| panic!("wallet PTY {mode} did not finish: {trailing:?}"));
+            assert!(status.success(), "wallet PTY {mode} failed: {trailing:?}");
+            assert!(
+                trailing.contains(&format!("wallet-pty-child-ran-{mode}")),
+                "wallet PTY {mode} did not run its test body: {trailing:?}"
+            );
+            assert!(
+                !trailing.contains(TEST_PASSWORD)
+                    && !trailing.contains(NEW_LOCAL_PASSWORD)
+                    && !trailing.contains(TEST_PHRASE),
+                "fault-injection path must not echo secrets: {trailing:?}"
+            );
+        }
     }
 
     #[test]

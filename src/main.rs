@@ -7,11 +7,16 @@ mod deployment;
 mod diagnostics;
 mod gpu;
 mod history_telemetry;
+#[cfg(all(test, target_os = "linux"))]
+mod linux_secret_service_phase_b_tests;
 mod mining;
 mod proof_telemetry;
 mod protocol;
 mod rpc;
+mod shutdown;
 mod startup;
+#[cfg(all(test, unix))]
+mod test_support;
 mod transaction;
 mod wallet;
 

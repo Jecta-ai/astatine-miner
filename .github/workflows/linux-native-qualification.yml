@@ -1,0 +1,482 @@
+# Phase B Linux native qualification on Ubuntu 24.04 x86_64.
+#
+# This workflow is intentionally separate from ci.yml. It uses a private D-Bus
+# session, a disposable Secret Service keyring, disposable SSH keys, and a
+# pinned local-loopback Anvil binary. It does not read repository credentials,
+# contact a public RPC endpoint, publish, or perform release signing. Anvil tests
+# sign synthetic transactions only for the local loopback chain.
+name: Linux native qualification
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    # The feature-branch entry is temporary Phase B evidence; remove it after merge.
+    branches: [main, feature/linux-readiness-phase-a]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-native-qualification-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTUP_TOOLCHAIN: "1.94.1"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  workflow-safety:
+    name: Workflow and fixture policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify Ubuntu 24.04 x86_64 runner
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          test "${ID:-}" = "ubuntu"
+          test "${VERSION_ID:-}" = "24.04"
+          test "$(uname -m)" = "x86_64"
+      - name: Check immutable action pins and release authority isolation
+        run: python3 support/check_workflow_pins.py
+      - name: Check qualification shell scripts and release inventory syntax
+        run: |
+          set -euo pipefail
+          for script in support/linux/*.sh; do
+            bash -n "$script"
+          done
+          for script in support/linux/*.py; do
+            python3 -m py_compile "$script"
+          done
+          python3 -m json.tool support/linux/anvil-release.json >/dev/null
+          python3 support/verify-fixture-provenance.py
+          python3 -m unittest discover -s support/tests -p 'test_*.py'
+
+  secret-service:
+    needs: workflow-safety
+    name: Linux Secret Service (${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [provider, locked, no-default, missing]
+    env:
+      CARGO_TARGET_DIR: target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify Ubuntu 24.04 x86_64 runner
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          test "${ID:-}" = "ubuntu"
+          test "${VERSION_ID:-}" = "24.04"
+          test "$(uname -m)" = "x86_64"
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.1 --profile minimal
+          test "$(rustc --version | awk '{print $2}')" = "1.94.1"
+          test "$(rustc -vV | awk '$1 == "host:" {print $2}')" = "x86_64-unknown-linux-gnu"
+      - name: Install isolated Secret Service dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dbus gnome-keyring libglib2.0-bin
+          dpkg-query -W -f='${Package} ${Version}\n' dbus gnome-keyring libglib2.0-bin
+      - name: Compile the test harness without executing it
+        run: |
+          cargo test --locked --bin astatine --no-run
+          cargo build --locked --bin astatine
+      - name: Run the isolated Secret Service matrix
+        env:
+          ASTATINE_QUALIFICATION_MODE: ${{ matrix.mode }}
+          ASTATINE_PHASE_B_APP_BINARY: ${{ github.workspace }}/target/debug/astatine
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          run_ignored_test() {
+            local test="$1"
+            local output status
+            printf '::group::%s\n' "$test"
+            set +e
+            output=$(ASTATINE_QUALIFICATION_TIMEOUT_SECONDS=300 \
+              bash support/linux/run-private-session.sh "$ASTATINE_QUALIFICATION_MODE" -- \
+              cargo test --locked --bin astatine -- --ignored --exact "$test" --nocapture --test-threads=1 2>&1)
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [[ $status -ne 0 ]]; then
+              printf 'qualification test failed: %s\n' "$test" >&2
+              return "$status"
+            fi
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<<"$output"; then
+              printf 'qualification test did not execute exactly one passing test: %s\n' "$test" >&2
+              return 1
+            fi
+            printf '::endgroup::\n'
+          }
+          run_regular_test() {
+            local test="$1"
+            local output status
+            printf '::group::%s\n' "$test"
+            set +e
+            output=$(ASTATINE_QUALIFICATION_TIMEOUT_SECONDS=300 \
+              bash support/linux/run-private-session.sh "$ASTATINE_QUALIFICATION_MODE" -- \
+              cargo test --locked --bin astatine -- --exact "$test" --nocapture --test-threads=1 2>&1)
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [[ $status -ne 0 ]]; then
+              printf 'qualification test failed: %s\n' "$test" >&2
+              return "$status"
+            fi
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<<"$output"; then
+              printf 'qualification test did not execute exactly one passing test: %s\n' "$test" >&2
+              return 1
+            fi
+            printf '::endgroup::\n'
+          }
+          case "$ASTATINE_QUALIFICATION_MODE" in
+            provider)
+              run_ignored_test "config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped"
+              run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_authenticated_journal_restarts_across_processes"
+              run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_production_recover_authenticates_journal_after_restart"
+              run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_missing_checkpoint_fails_closed_after_restart"
+              run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_corrupt_checkpoint_fails_closed_after_restart"
+              run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_interrupted_init_transition_recovers_across_processes"
+              ;;
+            locked)
+              run_ignored_test "config::tests::linux_secret_service_untrusted_on_ambient_bus_fails_closed"
+              ;;
+            no-default)
+              run_ignored_test "config::tests::linux_secret_service_untrusted_on_ambient_bus_fails_closed"
+              ;;
+            missing)
+              run_regular_test "config::tests::linux_secret_service_unavailable_fails_closed_without_native_keyring"
+              run_ignored_test "config::tests::linux_secret_service_untrusted_on_ambient_bus_fails_closed"
+              run_ignored_test "linux_secret_service_phase_b_tests::linux_secret_service_absence_has_no_default_collection_and_fails_closed"
+              ;;
+            *)
+              printf 'unsupported qualification mode: %s\n' "$ASTATINE_QUALIFICATION_MODE" >&2
+              exit 1
+              ;;
+          esac
+
+  production-journal:
+    needs: workflow-safety
+    name: Production journal and native checkpoint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify Ubuntu 24.04 x86_64 runner
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          test "${ID:-}" = "ubuntu"
+          test "${VERSION_ID:-}" = "24.04"
+          test "$(uname -m)" = "x86_64"
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.1 --profile minimal
+          test "$(rustc --version | awk '{print $2}')" = "1.94.1"
+          test "$(rustc -vV | awk '$1 == "host:" {print $2}')" = "x86_64-unknown-linux-gnu"
+      - name: Install isolated Secret Service dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dbus gnome-keyring libglib2.0-bin
+          dpkg-query -W -f='${Package} ${Version}\n' dbus gnome-keyring libglib2.0-bin
+      - name: Build the production binary
+        run: cargo build --locked --bin astatine
+      - name: Run the production-created journal and checkpoint qualification
+        run: |
+          set -euo pipefail
+          status=0
+          output=$(bash support/linux/run-private-session.sh provider -- \
+            python3 support/linux/qualify-production-journal.py target/debug/astatine 2>&1) || status=$?
+          printf '%s\n' "$output"
+          test "$status" -eq 0 || exit "$status"
+          for marker in \
+            'production-init=ok' \
+            'production-recover=ok' \
+            'production-recover-second-process=ok' \
+            'data-root-scope=fail-closed' \
+            'interrupted-init-prompt=recoverable' \
+            'unavailable-provider=fail-closed' \
+            'root-mode=700 config-mode=600 journal-mode=600 keystore-mode=600' \
+            'checkpoint=native-present'
+          do
+            grep -qxF "$marker" <<<"$output"
+          done
+
+  signals-pty:
+    needs: workflow-safety
+    name: Linux signals, PTYs, journal, and spending guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify Ubuntu 24.04 x86_64 runner
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          test "${ID:-}" = "ubuntu"
+          test "${VERSION_ID:-}" = "24.04"
+          test "$(uname -m)" = "x86_64"
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.1 --profile minimal
+          test "$(rustc --version | awk '{print $2}')" = "1.94.1"
+          test "$(rustc -vV | awk '$1 == "host:" {print $2}')" = "x86_64-unknown-linux-gnu"
+      - name: Compile the test harness without executing it
+        run: cargo test --locked --bin astatine --no-run
+      - name: Run focused native Linux terminal and spending tests
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          real_home="$HOME"
+          export CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}"
+          test_home="$RUNNER_TEMP/astatine-phase-b-signals-home"
+          mkdir -p "$test_home" "$test_home/runtime"
+          chmod 700 "$test_home" "$test_home/runtime"
+          export HOME="$test_home"
+          export XDG_CONFIG_HOME="$test_home/.config"
+          export XDG_DATA_HOME="$test_home/.local/share"
+          export XDG_CACHE_HOME="$test_home/.cache"
+          export XDG_RUNTIME_DIR="$test_home/runtime"
+          mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNNER_TEMP/astatine-phase-b-no-secret-service"
+          unset ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE
+          unset ASTATINE_E2E_DEVICE
+          unset ASTATINE_E2E_GPU_NODE_SET
+          tests=(
+            "commands::tests::signals_interrupt_blocking_terminal_prompts_on_a_disposable_controlling_pty"
+            "commands::tests::init_terminal_prompts_restore_terminal_after_signals_on_a_controlling_pty"
+            "commands::tests::standalone_wallet_import_command_restores_terminal_on_a_controlling_pty"
+            "wallet::tests::hidden_wallet_prompts_restore_terminal_on_a_controlling_pty"
+            "shutdown::tests::supported_os_signals_resolve_the_shutdown_signal"
+            "config::tests::journal_lock_excludes_a_second_process"
+            "config::tests::journal_lock_retries_until_a_short_holder_releases"
+            "config::tests::journal_lock_fails_closed_when_held_beyond_the_retry_bound"
+            "transaction::tests::zero_limit_opens_read_only_while_mainnet_cannot_open_a_journal"
+            "transaction::tests::zero_cap_preserves_unresolved_liability_without_new_authorization"
+            "transaction::tests::maximum_exposure_and_minimum_reserve_are_enforced_before_journaling"
+            "transaction::tests::journal_and_checkpoint_crash_boundaries_never_authorize_an_unpersisted_signature"
+            "transaction::tests::journal_sigkill_releases_lock_and_restart_preserves_unresolved_states"
+            "transaction::tests::sigkill_during_staged_journal_write_preserves_prior_state"
+            "commands::tests::matching_existing_session_cap_does_not_reset_allowance_after_config_repair"
+            "transaction::tests::copied_data_root_cannot_fork_a_session_checkpoint_or_spending_cap"
+          )
+          for test in "${tests[@]}"; do
+            printf '::group::%s\n' "$test"
+            set +e
+            output=$(timeout --signal=TERM --kill-after=10s 300s \
+              cargo test --locked --bin astatine -- --exact "$test" --nocapture 2>&1)
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [[ $status -ne 0 ]]; then
+              printf 'qualification test failed: %s\n' "$test" >&2
+              exit "$status"
+            fi
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<<"$output"; then
+              printf 'qualification test did not execute exactly one passing test: %s\n' "$test" >&2
+              exit 1
+            fi
+            printf '::endgroup::\n'
+          done
+
+  anvil-lifecycle:
+    needs: workflow-safety
+    name: Pinned local-loopback Anvil lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify Ubuntu 24.04 x86_64 runner
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          test "${ID:-}" = "ubuntu"
+          test "${VERSION_ID:-}" = "24.04"
+          test "$(uname -m)" = "x86_64"
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.1 --profile minimal
+          test "$(rustc --version | awk '{print $2}')" = "1.94.1"
+          test "$(rustc -vV | awk '$1 == "host:" {print $2}')" = "x86_64-unknown-linux-gnu"
+      - name: Install Anvil verification prerequisites
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl file python3 \
+            dbus gnome-keyring libglib2.0-bin
+      - name: Install pinned Anvil binary and verify provenance
+        run: |
+          set -euo pipefail
+          bash support/linux/install-anvil.sh "$RUNNER_TEMP/astatine-foundry"
+          echo "$RUNNER_TEMP/astatine-foundry/bin" >> "$GITHUB_PATH"
+      - name: Verify offline fixture provenance
+        run: python3 support/verify-fixture-provenance.py
+      - name: Compile the test harness without executing it
+        run: cargo test --locked --bin astatine --no-run
+      - name: Run pinned local-loopback Anvil lifecycle tests
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          real_home="$HOME"
+          export CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}"
+          test_home="$RUNNER_TEMP/astatine-phase-b-anvil-home"
+          mkdir -p "$test_home" "$test_home/runtime"
+          chmod 700 "$test_home" "$test_home/runtime"
+          export HOME="$test_home"
+          export XDG_CONFIG_HOME="$test_home/.config"
+          export XDG_DATA_HOME="$test_home/.local/share"
+          export XDG_CACHE_HOME="$test_home/.cache"
+          export XDG_RUNTIME_DIR="$test_home/runtime"
+          mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
+          export PATH="$RUNNER_TEMP/astatine-foundry/bin:$PATH"
+          test "$(command -v anvil)" = "$RUNNER_TEMP/astatine-foundry/bin/anvil"
+          anvil --version
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNNER_TEMP/astatine-phase-b-no-secret-service"
+          unset ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE
+          unset ASTATINE_E2E_DEVICE
+          unset ASTATINE_E2E_GPU_NODE_SET
+          tests=(
+            "transaction::tests::transaction_manager_local_anvil_lifecycle_recovery_reorg_and_spending_cap"
+            "transaction::tests::autonomous_startup_finalizes_nine_expired_windows_then_submits_signed_proof"
+            "transaction::tests::compute_only_hashes_with_unresolved_transaction_without_signing_or_resetting_session"
+          )
+          for test in "${tests[@]}"; do
+            printf '::group::%s\n' "$test"
+            set +e
+            output=$(timeout --signal=TERM --kill-after=10s 900s \
+              cargo test --locked --bin astatine -- --ignored --exact "$test" --nocapture --test-threads=1 2>&1)
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [[ $status -ne 0 ]]; then
+              printf 'Anvil qualification test failed: %s\n' "$test" >&2
+              exit "$status"
+            fi
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<<"$output"; then
+              printf 'Anvil qualification test did not execute exactly one passing test: %s\n' "$test" >&2
+              exit 1
+            fi
+            printf '::endgroup::\n'
+          done
+      - name: Verify native checkpoint and Anvil crash recovery
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export PATH="$RUNNER_TEMP/astatine-foundry/bin:$PATH"
+          status=0
+          output=$(ASTATINE_QUALIFICATION_TIMEOUT_SECONDS=300 \
+            bash support/linux/run-private-session.sh provider -- \
+            cargo test --locked --bin astatine -- --ignored --exact \
+              transaction::tests::linux_native_provider_anvil_broadcast_survives_fresh_process_sigkill \
+              --nocapture --test-threads=1 2>&1) || status=$?
+          printf '%s\n' "$output"
+          test "$status" -eq 0 || exit "$status"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' <<<"$output"
+      - name: Stop any leftover local Anvil process
+        if: always()
+        run: |
+          if command -v pkill >/dev/null 2>&1; then
+            pkill -x anvil || true
+          fi
+
+  ssh-loopback:
+    needs: workflow-safety
+    name: SSH loopback PTY smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify Ubuntu 24.04 x86_64 runner
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          test "${ID:-}" = "ubuntu"
+          test "${VERSION_ID:-}" = "24.04"
+          test "$(uname -m)" = "x86_64"
+      - name: Install disposable sshd
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          policy_rc="/usr/sbin/policy-rc.d"
+          created_policy="false"
+          if [[ ! -e "$policy_rc" ]]; then
+            printf '#!/bin/sh\nexit 101\n' | sudo tee "$policy_rc" >/dev/null
+            sudo chmod 0755 "$policy_rc"
+            created_policy="true"
+          fi
+          cleanup_policy() {
+            if [[ "$created_policy" == "true" ]]; then
+              sudo rm -f "$policy_rc"
+            fi
+          }
+          trap cleanup_policy EXIT
+          sudo apt-get install -y --no-install-recommends openssh-server openssh-client iproute2 \
+            dbus gnome-keyring libglib2.0-bin
+          cleanup_policy
+          trap - EXIT
+          dpkg-query -W -f='${Package} ${Version}\n' openssh-server openssh-client dbus gnome-keyring libglib2.0-bin
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.1 --profile minimal
+          test "$(rustc --version | awk '{print $2}')" = "1.94.1"
+          test "$(rustc -vV | awk '$1 == "host:" {print $2}')" = "x86_64-unknown-linux-gnu"
+      - name: Build application for SSH smoke
+        run: cargo build --locked --bin astatine
+      - name: Verify loopback-only SSH application and PTY allocation
+        env:
+          ASTATINE_SSH_TEST_BINARY: target/debug/astatine
+        run: bash support/linux/ssh-loopback-smoke.sh
+      - name: Verify SSH application lifecycle
+        run: |
+          set -euo pipefail
+          python3 support/linux/ssh-application-lifecycle.py target/debug/astatine

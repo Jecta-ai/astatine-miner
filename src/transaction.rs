@@ -25,7 +25,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -46,6 +49,14 @@ const ARCHIVE_AFTER_CONFIRMATIONS: u64 = 64;
 const MAX_FINALIZATION_ATTEMPTS_PER_WINDOW: usize = 2;
 const RECEIPT_WAIT: Duration = Duration::from_secs(90);
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+// Bound the raw-broadcast acknowledgement so a stalled RPC cannot hold the
+// mining runtime indefinitely. The HTTP client itself times out an individual
+// JSON-RPC request after eight seconds; this outer bound is a second line of
+// defence and stays above that client timeout so a client-reported in-flight
+// timeout normally reaches the broadcast error path as Unknown. If the outer
+// bound fires, the durable entry remains Prepared because whether a request
+// escaped cannot be established from that timeout alone.
+const BROADCAST_WAIT: Duration = Duration::from_secs(10);
 const REWARD_SCAN_JOBS_PER_BATCH: usize = 256;
 const REWARD_SCAN_CONCURRENCY: usize = 4;
 const REWARD_SCAN_BLOCK_RANGE: u64 = 10_000;
@@ -3311,6 +3322,26 @@ pub struct TransactionManager {
     session_limit_reached: bool,
     session_limit_sink_notified: bool,
     session_limit_reached_sink: Option<SessionLimitReachedSink>,
+    shutdown_request: Option<crate::shutdown::ShutdownRequest>,
+    prepared_broadcast_pending: Arc<AtomicBool>,
+    #[cfg(test)]
+    pre_sign_boundary_hook: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    post_prepare_boundary_hook: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    post_broadcast_boundary_hook: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    broadcast_wait_override: Option<Duration>,
+}
+
+/// Clears the shared "Prepared, first broadcast not yet concluded" flag on
+/// every exit path, including cancellation or unwind.
+struct PreparedBroadcastFlag(Arc<AtomicBool>);
+
+impl Drop for PreparedBroadcastFlag {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3363,6 +3394,20 @@ fn receipt_wait_timeout(hash: B256, last_error: Option<&str>) -> anyhow::Error {
             RECEIPT_WAIT.as_secs()
         ),
     }
+}
+
+/// True only when the HTTP client proves the request was never handed to a
+/// connection. Builder and connect failures are unsent; request timeouts,
+/// status errors, body-read failures, and RPC responses remain ambiguous or
+/// sent and are therefore classified as `Unknown` by the caller. In
+/// particular, reqwest's broad `is_request` predicate also covers timeouts and
+/// must not be treated as proof that nothing escaped.
+fn broadcast_error_is_definitely_unsent(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_builder() || error.is_connect())
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -3718,7 +3763,111 @@ impl TransactionManager {
             session_limit_reached: false,
             session_limit_sink_notified: false,
             session_limit_reached_sink: None,
+            shutdown_request: None,
+            prepared_broadcast_pending: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            pre_sign_boundary_hook: None,
+            #[cfg(test)]
+            post_prepare_boundary_hook: None,
+            #[cfg(test)]
+            post_broadcast_boundary_hook: None,
+            #[cfg(test)]
+            broadcast_wait_override: None,
         })
+    }
+
+    pub(crate) fn set_shutdown_request(&mut self, request: crate::shutdown::ShutdownRequest) {
+        self.shutdown_request = Some(request);
+    }
+
+    /// Shared flag used by the mining coordinator to distinguish a submission
+    /// that has already crossed the durable Prepared boundary from one that is
+    /// still in preflight when shutdown is delivered.
+    pub(crate) fn prepared_broadcast_pending(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.prepared_broadcast_pending)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pre_sign_boundary_hook(&mut self, hook: Box<dyn FnOnce() + Send>) {
+        self.pre_sign_boundary_hook = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_post_prepare_boundary_hook(&mut self, hook: Box<dyn FnOnce() + Send>) {
+        self.post_prepare_boundary_hook = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_post_broadcast_boundary_hook(&mut self, hook: Box<dyn FnOnce() + Send>) {
+        self.post_broadcast_boundary_hook = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_broadcast_wait_override(&mut self, wait: Duration) {
+        self.broadcast_wait_override = Some(wait);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_id_for_test(&self) -> Option<String> {
+        self.journal
+            .state
+            .active_session
+            .as_ref()
+            .map(|session| session.id.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_unresolved_liability_for_test(
+        &mut self,
+        signer: &SigningKey,
+        contract: Address,
+    ) -> Result<(B256, U256)> {
+        let request = Eip1559Request {
+            chain_id: self.chain_id,
+            nonce: 0,
+            max_priority_fee_per_gas: U256::from(1_000_000_000_u64),
+            max_fee_per_gas: U256::from(30_000_000_000_u64),
+            gas_limit: 75_000,
+            to: contract,
+            value: U256::ZERO,
+            data: crate::contracts::AstatineMinerRead::finalizeWindowCall {}.abi_encode(),
+        };
+        let intent = TransactionIntent {
+            contract,
+            node_id: 1,
+            window_id: 99,
+            action: TransactionAction::FinalizeWindow,
+            proof: None,
+            reward_destination: None,
+            forwarding: None,
+        };
+        let confirmed_balance = U256::MAX;
+        let maximum_exposure = self.journal.authorize_exposure(
+            &request,
+            &intent,
+            self.session_limit,
+            self.minimum_reserve,
+            confirmed_balance,
+        )?;
+        let signed = sign_eip1559(signer, &request)?;
+        self.journal.prepare(PreparedTransaction {
+            request,
+            tx_hash: signed.hash,
+            intent,
+            session_limit: self.session_limit,
+            minimum_reserve: self.minimum_reserve,
+            confirmed_balance,
+            confirmations_required: self.confirmations_required,
+        })?;
+        self.journal
+            .set_broadcast_state(signed.hash, TransactionStatus::Unknown)?;
+        Ok((signed.hash, maximum_exposure))
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown_request
+            .as_ref()
+            .is_some_and(crate::shutdown::ShutdownRequest::is_requested)
     }
 
     pub(crate) fn history_profile_line(&self) -> String {
@@ -4904,6 +5053,11 @@ impl TransactionManager {
         if self.read_only_recovery {
             bail!("read-only transaction recovery cannot sign or broadcast transactions");
         }
+        if self.shutdown_requested() {
+            bail!(
+                "a shutdown signal was received; refusing to sign or broadcast a new transaction"
+            );
+        }
         if self.session_limit_reached {
             bail!("paid mining session reached its terminal authorization limit");
         }
@@ -5258,6 +5412,10 @@ impl TransactionManager {
         let node_id = intent.node_id;
         let window_id = intent.window_id;
         let action = intent.action;
+        // A shutdown may have been requested while the preflight RPC calls
+        // above were in flight. Re-check before creating a durable
+        // authorization or signing anything.
+        self.require_signing_enabled()?;
         let maximum_exposure = match self.journal.authorize_exposure(
             &request,
             &intent,
@@ -5281,6 +5439,28 @@ impl TransactionManager {
         // the mining run now; this already-authorized transaction still follows
         // its normal signing, broadcast, and receipt-recovery path.
         self.refresh_session_limit_state()?;
+        #[cfg(test)]
+        if let Some(hook) = self.pre_sign_boundary_hook.take() {
+            hook();
+        }
+        // The permit acquisition is the pre-sign linearization point. If
+        // shutdown delivery is visible before the permit is acquired, retire
+        // only the unbound marker; the already-charged session authorization
+        // intentionally remains. If the permit was acquired first, this signing
+        // section is already in flight and its journaled Prepared state is
+        // preserved by the normal cancellation path.
+        let _signing_permit = match self.shutdown_request.as_ref() {
+            Some(request) => match request.begin_signing() {
+                Some(permit) => Some(permit),
+                None => {
+                    self.journal.abandon_pending_authorization()?;
+                    bail!(
+                        "a shutdown signal was received before the signing barrier; refusing to sign a new transaction"
+                    );
+                }
+            },
+            None => None,
+        };
         let signed = match sign_eip1559(signer, &request) {
             Ok(signed) => signed,
             Err(error) => {
@@ -5308,6 +5488,10 @@ impl TransactionManager {
                 "transaction journal preparation failed after reserving maximum session exposure; no authorization is refunded",
             );
         }
+        let _prepared_broadcast_flag =
+            PreparedBroadcastFlag(Arc::clone(&self.prepared_broadcast_pending));
+        self.prepared_broadcast_pending
+            .store(true, Ordering::SeqCst);
         if action == TransactionAction::SubmitProof {
             self.current_process_proof_hashes.insert(signed.hash);
         }
@@ -5316,11 +5500,57 @@ impl TransactionManager {
             "transaction prepared node={node_id:02} window={window_id} action={action:?} hash={:#x} maximum_exposure_wei={maximum_exposure}",
             signed.hash
         ));
+        #[cfg(test)]
+        if let Some(hook) = self.post_prepare_boundary_hook.take() {
+            hook();
+        }
+        if self.shutdown_requested() {
+            // The durable Prepared entry is already an authorized, signed
+            // liability. Suppressing the first broadcast here would guarantee a
+            // never-sent Prepared transaction with no safe automatic resolution.
+            // Perform the bounded first-broadcast attempt instead; the result
+            // below is recorded accurately, and nothing is rebroadcast.
+            self.report_warning(format!(
+                "shutdown signal was delivered after transaction {:#x} became Prepared; performing the bounded first-broadcast attempt for this prepared transaction. If this process exits before the broadcast outcome is durable, the Prepared liability remains unresolved without sufficient RPC evidence; it is not blindly cleared, refunded, marked Unknown without evidence, or rebroadcast by this process. Read-only recovery may settle it or classify it Unknown when evidence supports that",
+                signed.hash
+            ));
+        }
+        #[cfg(test)]
+        let broadcast_wait = self.broadcast_wait_override.unwrap_or(BROADCAST_WAIT);
+        #[cfg(not(test))]
+        let broadcast_wait = BROADCAST_WAIT;
 
-        match client.broadcast_raw_transaction(&signed.raw).await {
+        let broadcast_result = match tokio::time::timeout(
+            broadcast_wait,
+            client.broadcast_raw_transaction(&signed.raw),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // No client result was observed. The request may or may not
+                // have reached the node; keep the durable Prepared entry
+                // rather than inventing an `Unknown` outcome for a send we
+                // cannot prove happened.
+                self.report_warning(format!(
+                    "transaction broadcast acknowledgement timed out node={node_id:02} window={window_id} action={action:?} hash={:#x}; the Prepared journal entry and maximum exposure remain reserved, and this transaction will not be resent",
+                    signed.hash
+                ));
+                return Err(anyhow!(
+                    "broadcast acknowledgement for {:#x} did not complete within {} seconds; the Prepared journal entry remains unresolved and will not be rebroadcast",
+                    signed.hash,
+                    broadcast_wait.as_secs()
+                ));
+            }
+        };
+        match broadcast_result {
             Ok(returned_hash) if returned_hash == signed.hash => {
                 self.journal
                     .set_broadcast_state(signed.hash, TransactionStatus::Broadcast)?;
+                #[cfg(test)]
+                if let Some(hook) = self.post_broadcast_boundary_hook.take() {
+                    hook();
+                }
                 if action == TransactionAction::SubmitProof {
                     self.record_proof_metric(node_id, ProofMetric::Broadcast);
                 }
@@ -5346,6 +5576,19 @@ impl TransactionManager {
                 );
             }
             Err(error) => {
+                if broadcast_error_is_definitely_unsent(&error) {
+                    // A connect/build failure proves no raw request escaped.
+                    // Keep the durable Prepared liability and do not claim an
+                    // Unknown outcome for an unsent transaction.
+                    self.report_warning(format!(
+                        "transaction broadcast request could not be sent node={node_id:02} window={window_id} action={action:?} hash={:#x}; the Prepared journal entry and maximum exposure remain reserved, and this transaction will not be retried automatically: {error:#}",
+                        signed.hash
+                    ));
+                    return Err(error.context(format!(
+                        "broadcast request for {:#x} was not sent; the Prepared journal entry remains unresolved and will not be retried automatically",
+                        signed.hash
+                    )));
+                }
                 self.journal
                     .set_broadcast_state(signed.hash, TransactionStatus::Unknown)?;
                 if action == TransactionAction::SubmitProof {
@@ -5362,6 +5605,11 @@ impl TransactionManager {
                 ));
             }
         }
+        // The first broadcast outcome is durable at this point (Broadcast on
+        // success; error paths returned above). Receipt confirmation may take
+        // longer than the shutdown grace and no longer needs to block it.
+        self.prepared_broadcast_pending
+            .store(false, Ordering::SeqCst);
         self.publish_dashboard_state();
 
         let deadline = Instant::now() + RECEIPT_WAIT;
@@ -7464,7 +7712,7 @@ mod tests {
         time::{Duration, Instant, SystemTime},
     };
     use tempfile::tempdir;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
 
     alloy_sol_types::sol! {
         interface LocalMockAST {
@@ -7509,6 +7757,12 @@ mod tests {
 
     fn recovery_signer() -> SigningKey {
         SigningKey::from_slice(&[0x11; 32]).unwrap()
+    }
+
+    fn local_rpc_client() -> reqwest::Client {
+        crate::rpc::local_test_http_client_builder()
+            .build()
+            .expect("create proxy-free local test RPC client")
     }
 
     fn test_request() -> Eip1559Request {
@@ -12286,11 +12540,19 @@ mod tests {
             Arc::new(HistoryTelemetry::default()),
         )
         .unwrap();
-        let mut ctrl_c: crate::startup::CtrlCSignal = Box::pin(async { Ok(()) });
+        let mut shutdown = crate::shutdown::ShutdownSignal::synthetic();
+        #[cfg(unix)]
+        shutdown.trigger_for_test(crate::shutdown::ShutdownReason::Interrupt);
+        #[cfg(not(unix))]
+        shutdown.trigger_for_test(crate::shutdown::ShutdownReason::CtrlC);
         assert!(
-            !crate::commands::reconcile_recovery_or_interrupt(&mut recovery, &client, &mut ctrl_c,)
-                .await
-                .unwrap()
+            !crate::commands::reconcile_recovery_or_interrupt(
+                &mut recovery,
+                &client,
+                &mut shutdown,
+            )
+            .await
+            .unwrap()
         );
         drop(recovery);
 
@@ -12315,6 +12577,744 @@ mod tests {
         assert_eq!(
             resumed_recovery.journal.pending_exposure().unwrap(),
             exposure
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_request_blocks_new_signing_and_preserves_the_closed_journal() {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let signer = test_signer();
+        let wallet = signer_address(&signer);
+        let contract = Address::with_last_byte(0xc1);
+        let token = Address::with_last_byte(0xc2);
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        let mut manager = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        let request = crate::shutdown::ShutdownRequest::default();
+        request.request_for_test();
+        manager.set_shutdown_request(request);
+
+        let client = NetworkClient::local_test_client(
+            "http://127.0.0.1:1",
+            contract,
+            B256::with_last_byte(0xc3),
+            token,
+            B256::with_last_byte(0xc4),
+            18,
+        )
+        .unwrap();
+        let submission = ProofSubmission {
+            contract,
+            node_id: 1,
+            window_id: 7,
+            nonce: 1,
+            header: b"shutdown-race".to_vec(),
+            work_hash: B256::with_last_byte(0xc5),
+        };
+        let error = manager
+            .submit_proof(&client, &signer, submission)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("shutdown signal"),
+            "a stop request must refuse signing before any journal authorization: {error:#}"
+        );
+        assert!(manager.journal.state.entries.is_empty());
+        assert!(manager.journal.state.pending_authorization.is_none());
+        assert_eq!(
+            manager.journal.session_authorized_total().unwrap(),
+            U256::ZERO
+        );
+
+        manager.close_session().unwrap();
+        drop(manager);
+
+        let snapshot = TransactionJournal::inspect_session(&store, &config).unwrap();
+        assert!(snapshot.closed);
+        assert!(snapshot.unresolved.is_empty());
+        assert_eq!(snapshot.authorized_exposure_wei.as_deref(), Some("0"));
+
+        // Restarting after the stop must not silently reopen a paid session.
+        let restarted = TransactionManager::open_with_session_policy(
+            &store,
+            &config,
+            wallet,
+            token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        );
+        assert!(
+            restarted.is_err(),
+            "restart must require explicit new-session authorization"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_pending_broadcast_preserves_prepared_liability() {
+        let fixture = submit_preflight_fixture();
+        fixture.client.delay_next_broadcast(Duration::from_secs(30));
+        let mut manager = TransactionManager::open(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+        )
+        .unwrap();
+        let session_id = manager
+            .journal
+            .state
+            .active_session
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+
+        let submit_client = fixture.client.clone();
+        let submit_signer = clone_signer(&fixture.signer);
+        let submission = fixture.submission.clone();
+        let submit_task = tokio::spawn(async move {
+            manager
+                .submit_proof(&submit_client, &submit_signer, submission)
+                .await
+        });
+        timeout(Duration::from_secs(5), async {
+            while fixture.client.broadcast_delays_started() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("submit should reach the pending raw-broadcast boundary");
+        // This models the runtime select dropping the in-flight submission
+        // future after a shutdown signal. The durable journal state must
+        // survive even though the local signing/authorization step completed.
+        submit_task.abort();
+        let _ = submit_task.await;
+
+        let bytes = fixture.store.read_transaction_journal().unwrap().unwrap();
+        let journal: super::JournalState = serde_json::from_slice(&bytes).unwrap();
+        assert!(journal.pending_authorization.is_none());
+        let entry = journal
+            .entries
+            .iter()
+            .find(|entry| entry.action == TransactionAction::SubmitProof)
+            .expect("the prepared transaction must remain journaled");
+        assert_eq!(entry.status, TransactionStatus::Prepared);
+        assert!(entry.status.is_unresolved());
+        let exposure = parse_decimal_wei(&entry.maximum_exposure_wei).unwrap();
+        assert!(exposure > U256::ZERO);
+        assert_eq!(
+            journal
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some(exposure.to_string().as_str())
+        );
+        assert_eq!(
+            journal.active_session.as_ref().unwrap().id,
+            session_id,
+            "the cancelled in-flight transaction must stay bound to its session"
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "the delayed raw broadcast must not have been sent"
+        );
+
+        // Restart sees the Prepared liability. It must not be dropped, and a
+        // shutdown request must stop the next signing attempt before it starts.
+        let mut restarted = TransactionManager::open_with_session_policy(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(restarted.signing_blocked_by_unresolved());
+        assert_eq!(restarted.journal.pending_exposure().unwrap(), exposure);
+        let request = crate::shutdown::ShutdownRequest::default();
+        request.request_for_test();
+        restarted.set_shutdown_request(request);
+        let retry_submission = ProofSubmission {
+            contract: fixture.contract,
+            node_id: 1,
+            window_id: 7,
+            nonce: 2,
+            header: b"pending-broadcast-cancellation-retry".to_vec(),
+            work_hash: fixture.submission.work_hash,
+        };
+        let error = restarted
+            .submit_proof(&fixture.client, &fixture.signer, retry_submission)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("shutdown signal"),
+            "a shutdown request must refuse the retry before it can sign: {error:#}"
+        );
+        assert_eq!(restarted.journal.state.entries.len(), 1);
+        assert!(restarted.journal.state.pending_authorization.is_none());
+        let close_error = restarted.close_session().unwrap_err();
+        assert!(
+            format!("{close_error:#}").contains("unresolved"),
+            "legacy unresolved exposure must keep the session open for read-only recovery: {close_error:#}"
+        );
+        drop(restarted);
+
+        let inspected =
+            TransactionJournal::inspect_session(&fixture.store, &fixture.config).unwrap();
+        assert!(!inspected.closed);
+        assert_eq!(inspected.unresolved.len(), 1);
+        assert_eq!(
+            inspected.pending_exposure_wei.as_deref(),
+            Some(exposure.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_connect_failure_is_classified_unsent_not_unknown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = local_rpc_client()
+            .post(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            super::broadcast_error_is_definitely_unsent(&anyhow::Error::new(error)),
+            "a refused connection must be classified as unsent"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_timeout_preserves_prepared_without_unknown_or_rebroadcast() {
+        let fixture = submit_preflight_fixture();
+        fixture.client.delay_next_broadcast(Duration::from_secs(30));
+        let mut manager = TransactionManager::open(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+        )
+        .unwrap();
+        manager.set_broadcast_wait_override(Duration::from_secs(1));
+        let error = manager
+            .submit_proof(&fixture.client, &fixture.signer, fixture.submission.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("did not complete within"),
+            "unexpected bounded-broadcast error: {error:#}"
+        );
+
+        let bytes = fixture.store.read_transaction_journal().unwrap().unwrap();
+        let journal: super::JournalState = serde_json::from_slice(&bytes).unwrap();
+        assert!(journal.pending_authorization.is_none());
+        let entry = journal
+            .entries
+            .iter()
+            .find(|entry| entry.action == TransactionAction::SubmitProof)
+            .expect("the timed-out broadcast must remain journaled");
+        assert_eq!(
+            entry.status,
+            TransactionStatus::Prepared,
+            "an unacknowledged broadcast must not be relabelled Unknown"
+        );
+        assert_eq!(entry.nonce, 0);
+        let exposure = parse_decimal_wei(&entry.maximum_exposure_wei).unwrap();
+        assert_eq!(
+            journal
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some(exposure.to_string().as_str()),
+            "a broadcast timeout must never refund the charged authorization"
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "the delayed test hook must time out before a raw send"
+        );
+        drop(manager);
+
+        let mut restarted = TransactionManager::open_with_session_policy(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        )
+        .unwrap();
+        let unavailable = NetworkClient::local_test_client(
+            "http://127.0.0.1:1",
+            fixture.contract,
+            B256::with_last_byte(0xe8),
+            fixture.token,
+            B256::with_last_byte(0xe9),
+            18,
+        )
+        .unwrap();
+        let _ = restarted.reconcile(&unavailable).await;
+        let recovered = restarted.journal.entry(entry_hash(entry).unwrap()).unwrap();
+        assert_eq!(recovered.status, TransactionStatus::Prepared);
+        assert_eq!(recovered.nonce, 0);
+        assert_eq!(
+            restarted.journal.pending_exposure().unwrap(),
+            parse_decimal_wei(&entry.maximum_exposure_wei).unwrap()
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "restart reconciliation must not send a Prepared transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_acknowledgement_survives_cancellation_and_restart_never_rebroadcasts() {
+        let fixture = submit_preflight_fixture();
+        let mut manager = TransactionManager::open(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+        )
+        .unwrap();
+        let (broadcast_tx, broadcast_rx) = tokio::sync::oneshot::channel();
+        manager.set_post_broadcast_boundary_hook(Box::new(move || {
+            let _ = broadcast_tx.send(());
+        }));
+
+        let submit_client = fixture.client.clone();
+        let submit_signer = clone_signer(&fixture.signer);
+        let submission = fixture.submission.clone();
+        let submit_task = tokio::spawn(async move {
+            manager
+                .submit_proof(&submit_client, &submit_signer, submission)
+                .await
+        });
+        timeout(Duration::from_secs(5), broadcast_rx)
+            .await
+            .expect("submit should reach the acknowledged-broadcast boundary")
+            .expect("broadcast boundary notifier dropped");
+        submit_task.abort();
+        let _ = submit_task.await;
+
+        let bytes = fixture.store.read_transaction_journal().unwrap().unwrap();
+        let journal: super::JournalState = serde_json::from_slice(&bytes).unwrap();
+        assert!(journal.pending_authorization.is_none());
+        let entry = journal
+            .entries
+            .iter()
+            .find(|entry| entry.action == TransactionAction::SubmitProof)
+            .expect("the broadcast transaction must remain journaled");
+        assert_eq!(entry.status, TransactionStatus::Broadcast);
+        let exposure = parse_decimal_wei(&entry.maximum_exposure_wei).unwrap();
+        assert_eq!(
+            journal
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some(exposure.to_string().as_str())
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "the acknowledged broadcast must have been sent exactly once"
+        );
+
+        let mut restarted = TransactionManager::open_with_session_policy(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        )
+        .unwrap();
+        restarted.reconcile(&fixture.client).await.unwrap();
+        restarted.reconcile(&fixture.client).await.unwrap();
+        let recovered = restarted.journal.entry(entry_hash(entry).unwrap()).unwrap();
+        assert_eq!(recovered.status, TransactionStatus::Broadcast);
+        assert_eq!(
+            restarted.journal.pending_exposure().unwrap(),
+            exposure,
+            "restart must preserve the acknowledged transaction's maximum exposure"
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "restart must not resend an acknowledged transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_without_observation_preserves_all_transaction_stages_without_rebroadcast() {
+        for (index, status) in [
+            TransactionStatus::Prepared,
+            TransactionStatus::Broadcast,
+            TransactionStatus::Unknown,
+            TransactionStatus::Included,
+            TransactionStatus::MinedSuccess,
+            TransactionStatus::MinedReverted,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(PathBuf::from(root.path()));
+            let signer = recovery_signer();
+            let wallet = signer_address(&signer);
+            let contract = Address::with_last_byte(0xe1);
+            let token = Address::with_last_byte(0xe2);
+            let config = AppConfig {
+                wallet_address: Some(format!("{wallet:#x}")),
+                per_session_spending_limit_inj: "1".to_owned(),
+                ..AppConfig::default()
+            };
+            store.save(&config).unwrap();
+            let nonce = 30 + index as u64;
+            let window_id = 40 + index as u64;
+            let (_session_id, request, hash, exposure) = create_closed_run_with_status(
+                &store, &config, wallet, token, &signer, contract, nonce, window_id, status,
+            );
+            let before = TransactionJournal::inspect_session(&store, &config).unwrap();
+            let authorization_before = before.authorized_exposure_wei.clone();
+
+            // Reopen and explicitly attempt unavailable observation. The exact
+            // stage, nonce, maximum exposure, and charged authorization must
+            // survive; nothing in the restart/reconcile path may send a raw
+            // transaction.
+            let mut restarted = TransactionManager::open_for_read_only_recovery(
+                &store,
+                &config,
+                wallet,
+                token,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .unwrap();
+            let unavailable = NetworkClient::local_test_client(
+                "http://127.0.0.1:1",
+                contract,
+                B256::with_last_byte(0xef),
+                token,
+                B256::with_last_byte(0xf0),
+                18,
+            )
+            .unwrap();
+            let _ = restarted.reconcile(&unavailable).await;
+            let entry = restarted.journal.entry(hash).unwrap();
+            assert_eq!(entry.status, status, "case {status:?}");
+            assert_eq!(entry.nonce, request.nonce, "case {status:?}");
+            assert_eq!(
+                entry.maximum_exposure_wei,
+                exposure.to_string(),
+                "case {status:?}"
+            );
+            assert_eq!(
+                restarted.journal.pending_exposure().unwrap(),
+                if status.is_unresolved() {
+                    exposure
+                } else {
+                    U256::ZERO
+                },
+                "case {status:?}"
+            );
+            assert_eq!(
+                restarted
+                    .journal
+                    .state
+                    .active_session
+                    .as_ref()
+                    .unwrap()
+                    .authorized_exposure_wei
+                    .clone(),
+                authorization_before,
+                "case {status:?} must never refund authorization"
+            );
+            assert!(
+                restarted.journal.state.pending_authorization.is_none(),
+                "case {status:?}"
+            );
+            assert_eq!(
+                restarted.journal.unresolved_transactions().len(),
+                usize::from(status.is_unresolved()),
+                "case {status:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_prepare_attempts_one_in_flight_broadcast_then_preserves_unknown() {
+        let fixture = submit_preflight_fixture_with_send_delay(Duration::from_secs(9));
+        let mut manager = TransactionManager::open(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+        )
+        .unwrap();
+        let diagnostics = DiagnosticBuffer::default();
+        manager.set_diagnostics(diagnostics.clone());
+        let request = crate::shutdown::ShutdownRequest::default();
+        manager.set_shutdown_request(request.clone());
+        let prepared_broadcast_pending = manager.prepared_broadcast_pending();
+        let hook_pending = Arc::clone(&prepared_broadcast_pending);
+        manager.set_post_prepare_boundary_hook(Box::new(move || {
+            assert!(
+                hook_pending.load(Ordering::SeqCst),
+                "the shared flag must be visible after the durable Prepared write"
+            );
+            request.request_for_test();
+        }));
+
+        let error = manager
+            .submit_proof(&fixture.client, &fixture.signer, fixture.submission.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("broadcast outcome is unknown"),
+            "the real in-flight timeout must be classified as Unknown: {error:#}"
+        );
+        assert!(
+            !prepared_broadcast_pending.load(Ordering::SeqCst),
+            "the prepared-broadcast flag must clear after the attempt concludes"
+        );
+        let diagnostics = diagnostics.drain();
+        assert!(
+            diagnostics.iter().any(|message| {
+                message.contains("shutdown signal was delivered after transaction")
+                    && message.contains("bounded first-broadcast attempt")
+                    && message.contains("unresolved without sufficient RPC evidence")
+                    && message.contains("Read-only recovery may settle it or classify it Unknown")
+            }),
+            "the post-prepare shutdown diagnostic must scope the attempt and recovery evidence: {diagnostics:?}"
+        );
+
+        let bytes = fixture.store.read_transaction_journal().unwrap().unwrap();
+        let journal: super::JournalState = serde_json::from_slice(&bytes).unwrap();
+        assert!(journal.pending_authorization.is_none());
+        let entry = journal
+            .entries
+            .iter()
+            .find(|entry| entry.action == TransactionAction::SubmitProof)
+            .expect("the broadcast transaction must remain journaled");
+        assert_eq!(
+            entry.status,
+            TransactionStatus::Unknown,
+            "a real request received by the node but timed out by the client is Unknown"
+        );
+        assert_eq!(entry.nonce, 0);
+        let exposure = parse_decimal_wei(&entry.maximum_exposure_wei).unwrap();
+        assert!(exposure > U256::ZERO);
+        assert_eq!(
+            journal
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some(exposure.to_string().as_str()),
+            "the in-flight Unknown outcome must never refund authorization"
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "the server must have received the raw broadcast exactly once"
+        );
+        drop(manager);
+
+        // Restart and reconcile twice against the same absent-receipt server.
+        // The Unknown liability must survive and no second send may occur.
+        let mut restarted = TransactionManager::open_with_session_policy(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        )
+        .unwrap();
+        restarted.reconcile(&fixture.client).await.unwrap();
+        restarted.reconcile(&fixture.client).await.unwrap();
+        let recovered = restarted.journal.entry(entry_hash(entry).unwrap()).unwrap();
+        assert_eq!(recovered.status, TransactionStatus::Unknown);
+        assert_eq!(recovered.nonce, 0);
+        assert_eq!(
+            parse_decimal_wei(&recovered.maximum_exposure_wei).unwrap(),
+            exposure
+        );
+        assert_eq!(restarted.journal.pending_exposure().unwrap(), exposure);
+        assert_eq!(
+            restarted
+                .journal
+                .state
+                .active_session
+                .as_ref()
+                .unwrap()
+                .authorized_exposure_wei
+                .as_deref(),
+            Some(exposure.to_string().as_str())
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "reconcile must never resend an Unknown transaction"
+        );
+        drop(restarted);
+
+        // A second restart with an unavailable RPC must also preserve Unknown.
+        let mut restarted_again = TransactionManager::open_with_session_policy(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+            Arc::new(HistoryTelemetry::default()),
+            false,
+            false,
+        )
+        .unwrap();
+        let unavailable = NetworkClient::local_test_client(
+            "http://127.0.0.1:1",
+            fixture.contract,
+            B256::with_last_byte(0xde),
+            fixture.token,
+            B256::with_last_byte(0xdf),
+            18,
+        )
+        .unwrap();
+        let _ = restarted_again.reconcile(&unavailable).await;
+        let recovered = restarted_again
+            .journal
+            .entry(entry_hash(entry).unwrap())
+            .unwrap();
+        assert_eq!(recovered.status, TransactionStatus::Unknown);
+        assert_eq!(
+            restarted_again.journal.pending_exposure().unwrap(),
+            exposure
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "an unavailable restart observation must not resend the transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_at_pre_sign_boundary_abandons_authorization_without_signing() {
+        let fixture = submit_preflight_fixture();
+        let mut manager = TransactionManager::open(
+            &fixture.store,
+            &fixture.config,
+            fixture.wallet,
+            fixture.token,
+        )
+        .unwrap();
+        let request = crate::shutdown::ShutdownRequest::default();
+        manager.set_shutdown_request(request.clone());
+        manager.set_pre_sign_boundary_hook(Box::new(move || request.request_for_test()));
+
+        let error = manager
+            .submit_proof(&fixture.client, &fixture.signer, fixture.submission.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("signing barrier"),
+            "the pre-sign barrier must refuse signing: {error:#}"
+        );
+        assert!(manager.journal.state.entries.is_empty());
+        assert!(manager.journal.state.pending_authorization.is_none());
+        let charged = manager.journal.session_authorized_total().unwrap();
+        assert!(
+            charged > U256::ZERO,
+            "the durable pre-sign authorization must remain charged"
+        );
+        assert_eq!(
+            fixture
+                .rpc_counts
+                .lock()
+                .unwrap()
+                .get("eth_sendRawTransaction")
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "the refused signing must not broadcast"
+        );
+
+        manager.close_session().unwrap();
+        drop(manager);
+        let inspected =
+            TransactionJournal::inspect_session(&fixture.store, &fixture.config).unwrap();
+        assert!(inspected.closed);
+        assert!(inspected.unresolved.is_empty());
+        assert_eq!(
+            parse_decimal_wei(inspected.authorized_exposure_wei.as_deref().unwrap()).unwrap(),
+            charged
         );
     }
 
@@ -12585,6 +13585,237 @@ mod tests {
         (format!("http://{address}"), counts, stop_server, thread)
     }
 
+    fn submit_preflight_rpc_server(
+        code: Vec<u8>,
+        send_response_delay: Duration,
+    ) -> HistoryRpcServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+        let server_counts = Arc::clone(&counts);
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop_server);
+        let thread = std::thread::spawn(move || {
+            loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if server_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("accept submit preflight RPC request: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                let request = read_history_http_request(&mut stream);
+                let method = request["method"].as_str().unwrap().to_owned();
+                *server_counts
+                    .lock()
+                    .unwrap()
+                    .entry(method.clone())
+                    .or_insert(0) += 1;
+                let result = match method.as_str() {
+                    "eth_estimateGas" => serde_json::json!("0x5208"),
+                    "eth_getBlockByNumber" => {
+                        let tag = request["params"][0].as_str().unwrap();
+                        let number = if tag == "latest" {
+                            1
+                        } else {
+                            u64::from_str_radix(tag.trim_start_matches("0x"), 16).unwrap()
+                        };
+                        serde_json::json!({
+                            "number": format!("0x{number:x}"),
+                            "timestamp": "0x1",
+                            "hash": format!("{:#x}", B256::with_last_byte(number as u8)),
+                            "baseFeePerGas": "0x3b9aca00",
+                        })
+                    }
+                    "eth_maxPriorityFeePerGas" => serde_json::json!("0x3b9aca00"),
+                    "eth_getTransactionCount" => serde_json::json!("0x0"),
+                    "eth_getBalance" => serde_json::json!("0xde0b6b3a7640000"),
+                    "eth_blockNumber" => serde_json::json!("0x1"),
+                    "eth_getCode" => serde_json::json!(format!("0x{}", hex::encode(&code))),
+                    "eth_sendRawTransaction" => {
+                        let raw = request["params"][0]
+                            .as_str()
+                            .expect("raw transaction parameter");
+                        let raw =
+                            hex::decode(raw.trim_start_matches("0x")).expect("raw transaction hex");
+                        serde_json::Value::String(format!("{:#x}", keccak256(raw)))
+                    }
+                    "eth_getTransactionReceipt" | "eth_getTransactionByHash" => {
+                        serde_json::Value::Null
+                    }
+                    other => panic!("unexpected submit preflight RPC method {other}"),
+                };
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": result,
+                })
+                .to_string();
+                if method == "eth_sendRawTransaction" && !send_response_delay.is_zero() {
+                    let deadline = Instant::now() + send_response_delay;
+                    let mut stopped = false;
+                    while Instant::now() < deadline {
+                        if server_stop.load(Ordering::Acquire) {
+                            stopped = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if stopped {
+                        break;
+                    }
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+            }
+        });
+        (format!("http://{address}"), counts, stop_server, thread)
+    }
+
+    struct SubmitPreflightFixture {
+        _root: tempfile::TempDir,
+        store: ConfigStore,
+        config: AppConfig,
+        client: NetworkClient,
+        signer: SigningKey,
+        wallet: Address,
+        contract: Address,
+        token: Address,
+        submission: ProofSubmission,
+        rpc_counts: HistoryRpcCounts,
+        stop_server: Arc<AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for SubmitPreflightFixture {
+        fn drop(&mut self) {
+            self.stop_server.store(true, Ordering::Release);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    fn submit_preflight_fixture() -> SubmitPreflightFixture {
+        submit_preflight_fixture_with_send_delay(Duration::ZERO)
+    }
+
+    fn submit_preflight_fixture_with_send_delay(
+        send_response_delay: Duration,
+    ) -> SubmitPreflightFixture {
+        let root = tempdir().unwrap();
+        let store = ConfigStore::at_root(PathBuf::from(root.path()));
+        let signer = test_signer();
+        let wallet = signer_address(&signer);
+        let contract = Address::with_last_byte(0xd1);
+        let token = Address::with_last_byte(0xd2);
+        let code = b"submit-preflight-runtime-code".to_vec();
+        let code_hash = keccak256(&code);
+        let (url, rpc_counts, stop_server, server) =
+            submit_preflight_rpc_server(code, send_response_delay);
+        let mut client = NetworkClient::local_test_client(
+            &url,
+            contract,
+            code_hash,
+            token,
+            B256::with_last_byte(0xd3),
+            18,
+        )
+        .unwrap();
+        let state = crate::rpc::NodeState {
+            work: crate::rpc::WorkInfo {
+                started: true,
+                ended: false,
+                window_id: 7,
+                window_start_time: 100,
+                window_expiry_time: 200,
+                seed: B256::with_last_byte(0x01),
+                prev_hash: B256::ZERO,
+                target: U256::MAX,
+                reward_per_window: U256::ZERO,
+                remaining_allocation: U256::from(1),
+                max_header_length: 128,
+                submission_fee: U256::from(SUBMISSION_FEE_WEI),
+            },
+            candidate: None,
+            mining_paused: false,
+            eligible: true,
+            finalizable: false,
+            eligibility_reason: "eligible",
+        };
+        client.synthetic_snapshot = Some(crate::rpc::ReadSnapshot {
+            block: crate::rpc::BlockSnapshot {
+                number: 1,
+                timestamp: 100,
+                hash: B256::with_last_byte(1),
+            },
+            native_balance: Some(U256::from(1_000_000_000_000_000_000_u128)),
+            native_balance_error: None,
+            ast_balance: None,
+            ast_balance_error: None,
+            nodes: vec![crate::rpc::NodeView {
+                id: 1,
+                address: contract,
+                pin: crate::rpc::ContractPinStatus {
+                    runtime_verified: true,
+                    abi_verified: true,
+                    error: None,
+                },
+                state: Some(state.clone()),
+                error: None,
+            }],
+        });
+
+        let header = b"submit-preflight-fixture".to_vec();
+        let context = WorkContext {
+            chain_id: 1439,
+            contract,
+            window_id: 7,
+            seed: state.work.seed,
+            miner: wallet,
+            header: header.clone(),
+        };
+        let work_hash = WorkHasher::new(&context).unwrap().hash(1);
+        let submission = ProofSubmission {
+            contract,
+            node_id: 1,
+            window_id: 7,
+            nonce: 1,
+            header,
+            work_hash,
+        };
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            minimum_reserve_inj: "0.1".to_owned(),
+            per_session_spending_limit_inj: "1".to_owned(),
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        SubmitPreflightFixture {
+            _root: root,
+            store,
+            config,
+            client,
+            signer,
+            wallet,
+            contract,
+            token,
+            submission,
+            rpc_counts,
+            stop_server,
+            server: Some(server),
+        }
+    }
+
     fn recovery_transaction_json(
         request: &Eip1559Request,
         hash: B256,
@@ -12758,6 +13989,67 @@ mod tests {
             .clone();
         manager.close_session().unwrap();
         drop(manager);
+        (session_id, request, hash, exposure)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_closed_run_with_status(
+        store: &ConfigStore,
+        config: &AppConfig,
+        wallet: Address,
+        ast_token: Address,
+        signer: &SigningKey,
+        contract: Address,
+        nonce: u64,
+        window_id: u64,
+        status: TransactionStatus,
+    ) -> (String, Eip1559Request, B256, U256) {
+        let (session_id, request, hash, exposure) = create_closed_broadcast_run(
+            store, config, wallet, ast_token, signer, contract, nonce, window_id,
+        );
+        let mut journal = TransactionJournal::open_for_read_only_recovery(
+            store,
+            config,
+            wallet,
+            Arc::new(HistoryTelemetry::default()),
+        )
+        .unwrap();
+        let entry = journal.entry_mut(hash).unwrap();
+        entry.status = status;
+        match status {
+            TransactionStatus::Prepared
+            | TransactionStatus::Broadcast
+            | TransactionStatus::Unknown => {
+                entry.receipt_verification = super::ReceiptVerification::Unverified;
+                entry.actual_cost_wei = None;
+                entry.last_known_cost_wei = None;
+                entry.outcome = None;
+                entry.receipt_block = None;
+                entry.receipt_block_hash = None;
+                entry.receipt_status = None;
+                entry.confirmations = 0;
+            }
+            TransactionStatus::Included => {
+                entry.receipt_verification = super::ReceiptVerification::TrustedRpcChecked;
+                entry.receipt_block = Some(20);
+                entry.receipt_block_hash = Some(format!("{:#x}", B256::with_last_byte(0x41)));
+                entry.receipt_status = Some(true);
+                entry.outcome = Some("window-finalized".to_owned());
+                entry.confirmations = 0;
+            }
+            TransactionStatus::MinedSuccess | TransactionStatus::MinedReverted => {
+                entry.receipt_verification = super::ReceiptVerification::TrustedRpcChecked;
+                entry.receipt_block = Some(20);
+                entry.receipt_block_hash = Some(format!("{:#x}", B256::with_last_byte(0x41)));
+                entry.receipt_status = Some(status == TransactionStatus::MinedSuccess);
+                entry.outcome = Some("window-finalized".to_owned());
+                entry.confirmations = u64::from(entry.confirmations_required);
+                entry.actual_cost_wei = Some("100000".to_owned());
+                entry.last_known_cost_wei = None;
+            }
+        }
+        journal.persist().unwrap();
+        drop(journal);
         (session_id, request, hash, exposure)
     }
 
@@ -16198,6 +17490,7 @@ mod tests {
         let root = tempdir().unwrap();
         let store = ConfigStore::at_root(PathBuf::from(root.path()));
         let wallet = Address::with_last_byte(0x99);
+        assert!(store.read_transaction_journal().unwrap().is_none());
         let readonly_config = AppConfig {
             per_session_spending_limit_inj: "0".to_owned(),
             ..AppConfig::default()
@@ -16206,12 +17499,320 @@ mod tests {
         assert!(readonly.state.active_session.is_none());
         assert!(!readonly.has_unresolved());
         drop(readonly);
+        assert!(
+            store.read_transaction_journal().unwrap().is_none(),
+            "opening with a zero cap must not create or mutate a transaction journal"
+        );
         let mainnet_config = AppConfig {
             network: Network::Mainnet,
             per_session_spending_limit_inj: "1".to_owned(),
             ..AppConfig::default()
         };
         assert!(TransactionJournal::open(&store, &mainnet_config, wallet).is_err());
+        assert!(store.read_transaction_journal().unwrap().is_none());
+    }
+
+    #[test]
+    fn zero_cap_preserves_unresolved_liability_without_new_authorization() {
+        for status in [TransactionStatus::Prepared, TransactionStatus::Broadcast] {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(root.path().to_path_buf());
+            let signer = recovery_signer();
+            let wallet = signer_address(&signer);
+            let previous = AppConfig {
+                per_session_spending_limit_inj: "1".to_owned(),
+                ..AppConfig::default()
+            };
+            let (_, request, hash, exposure) = create_closed_run_with_status(
+                &store,
+                &previous,
+                wallet,
+                Address::with_last_byte(0x92),
+                &signer,
+                Address::with_last_byte(0x91),
+                70,
+                80,
+                status,
+            );
+            let before = store.read_transaction_journal().unwrap().unwrap();
+            let zero = AppConfig {
+                per_session_spending_limit_inj: "0".to_owned(),
+                ..previous
+            };
+            let mut journal = TransactionJournal::open(&store, &zero, wallet).unwrap();
+            assert!(journal.has_unresolved());
+            assert_eq!(journal.entry(hash).unwrap().status, status);
+            assert_eq!(journal.pending_exposure().unwrap(), exposure);
+            assert_eq!(journal.unresolved_transactions().len(), 1);
+            let intent = TransactionIntent {
+                contract: request.to,
+                node_id: 1,
+                window_id: 81,
+                action: TransactionAction::FinalizeWindow,
+                proof: None,
+                reward_destination: None,
+                forwarding: None,
+            };
+            let refusal = journal
+                .authorize_exposure(&request, &intent, U256::ZERO, U256::ZERO, U256::MAX)
+                .unwrap_err();
+            assert!(
+                format!("{refusal:#}").contains("earlier transaction has unresolved broadcast"),
+                "the unresolved liability must block another authorization: {refusal:#}"
+            );
+            drop(journal);
+            assert_eq!(store.read_transaction_journal().unwrap().unwrap(), before);
+
+            let recovery = TransactionJournal::open_for_read_only_recovery(
+                &store,
+                &zero,
+                wallet,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .unwrap();
+            assert_eq!(recovery.pending_exposure().unwrap(), exposure);
+            assert_eq!(recovery.entry(hash).unwrap().status, status);
+        }
+    }
+
+    #[cfg(unix)]
+    const JOURNAL_SIGKILL_CHILD_ROOT_ENV: &str = "ASTATINE_JOURNAL_SIGKILL_CHILD_ROOT";
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child probe; invoked by journal_sigkill_releases_lock_and_restart_preserves_unresolved_states"]
+    fn journal_sigkill_lock_holder_child() {
+        let root = std::env::var_os(JOURNAL_SIGKILL_CHILD_ROOT_ENV)
+            .expect("SIGKILL lock-holder child requires its private test root");
+        let store = ConfigStore::at_root(PathBuf::from(&root));
+        let _lock = store.lock_transaction_journal().unwrap();
+        std::fs::write(
+            PathBuf::from(root).join("journal-lock-holder-ready"),
+            b"lock acquired",
+        )
+        .unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(unix)]
+    struct JournalSigkillChild(std::process::Child);
+
+    #[cfg(all(unix, target_os = "linux"))]
+    impl JournalSigkillChild {
+        fn wait_with_output(&mut self) -> std::io::Result<std::process::Output> {
+            let status = self.0.wait()?;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(mut pipe) = self.0.stdout.take() {
+                pipe.read_to_end(&mut stdout)?;
+            }
+            if let Some(mut pipe) = self.0.stderr.take() {
+                pipe.read_to_end(&mut stderr)?;
+            }
+            Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for JournalSigkillChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child probe; invoked by sigkill_during_staged_journal_write_preserves_prior_state"]
+    fn journal_staged_write_child() {
+        let root = PathBuf::from(std::env::var_os(JOURNAL_SIGKILL_CHILD_ROOT_ENV).unwrap());
+        let store = ConfigStore::at_root(root.clone());
+        let _lock = store.lock_transaction_journal().unwrap();
+        let path = store.transaction_journal_path_for_test().unwrap();
+        let mut replacement = store.read_transaction_journal().unwrap().unwrap();
+        replacement.push(b' ');
+        crate::config::pause_atomic_write_before_rename_for_test(
+            path,
+            root.join("staged-journal-write-ready"),
+        );
+        store.write_transaction_journal(&replacement).unwrap();
+        panic!("staged-write child must be killed at the injected pre-rename boundary");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigkill_during_staged_journal_write_preserves_prior_state() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for status in [TransactionStatus::Prepared, TransactionStatus::Broadcast] {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(root.path().to_path_buf());
+            let signer = recovery_signer();
+            let wallet = signer_address(&signer);
+            let config = AppConfig {
+                per_session_spending_limit_inj: "1".to_owned(),
+                ..AppConfig::default()
+            };
+            let (_, _, hash, exposure) = create_closed_run_with_status(
+                &store,
+                &config,
+                wallet,
+                Address::with_last_byte(0x92),
+                &signer,
+                Address::with_last_byte(0x91),
+                70,
+                80,
+                status,
+            );
+            let before = store.read_transaction_journal().unwrap().unwrap();
+            let ready = root.path().join("staged-journal-write-ready");
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "transaction::tests::journal_staged_write_child",
+                ])
+                .env(JOURNAL_SIGKILL_CHILD_ROOT_ENV, root.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut child = JournalSigkillChild(child);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !ready.exists() {
+                if let Some(exit) = child.0.try_wait().unwrap() {
+                    panic!("journal writer exited before the staged-write boundary: {exit}");
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "journal writer did not reach the boundary"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(store.read_transaction_journal().unwrap().unwrap(), before);
+            child.0.kill().unwrap();
+            assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+            assert_eq!(store.read_transaction_journal().unwrap().unwrap(), before);
+            let recovery = TransactionJournal::open_for_read_only_recovery(
+                &store,
+                &config,
+                wallet,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .unwrap();
+            assert_eq!(recovery.entry(hash).unwrap().status, status);
+            assert_eq!(recovery.pending_exposure().unwrap(), exposure);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_sigkill_releases_lock_and_restart_preserves_unresolved_states() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for (index, status) in [TransactionStatus::Prepared, TransactionStatus::Broadcast]
+            .into_iter()
+            .enumerate()
+        {
+            let root = tempdir().unwrap();
+            let store = ConfigStore::at_root(PathBuf::from(root.path()));
+            let signer = recovery_signer();
+            let wallet = signer_address(&signer);
+            let contract = Address::with_last_byte(0x91);
+            let token = Address::with_last_byte(0x92);
+            let config = AppConfig {
+                per_session_spending_limit_inj: "1".to_owned(),
+                ..AppConfig::default()
+            };
+            let nonce = 70 + index as u64;
+            let window_id = 80 + index as u64;
+            let (_, request, hash, exposure) = create_closed_run_with_status(
+                &store, &config, wallet, token, &signer, contract, nonce, window_id, status,
+            );
+            let durable_before_kill = store.read_transaction_journal().unwrap().unwrap();
+            let ready_path = root.path().join("journal-lock-holder-ready");
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "transaction::tests::journal_sigkill_lock_holder_child",
+                    "--nocapture",
+                ])
+                .env(JOURNAL_SIGKILL_CHILD_ROOT_ENV, root.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn a disposable journal-lock holder");
+            let mut child = JournalSigkillChild(child);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !ready_path.exists() {
+                if let Some(exit) = child.0.try_wait().unwrap() {
+                    panic!("journal lock-holder child exited before acquiring its lock: {exit}");
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "journal lock-holder child did not acquire the lock before the deadline"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            let contention = store
+                .lock_transaction_journal()
+                .expect_err("the live child must hold the transaction journal lock");
+            let contention = format!("{contention:#}");
+            assert!(
+                contention.contains("another astatine mining process")
+                    && contention.contains("operation would block"),
+                "expected bounded lock contention before SIGKILL, got: {contention}"
+            );
+
+            // SAFETY: the child is confirmed alive by the ready marker written
+            // only after it acquired the journal lock.
+            assert_eq!(
+                unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGKILL) },
+                0,
+                "SIGKILL the journal lock-holder: {}",
+                std::io::Error::last_os_error()
+            );
+            let exit = child.0.wait().unwrap();
+            assert_eq!(
+                exit.signal(),
+                Some(libc::SIGKILL),
+                "the journal lock-holder must exit from SIGKILL"
+            );
+
+            assert_eq!(
+                store.read_transaction_journal().unwrap().unwrap(),
+                durable_before_kill,
+                "killing a lock holder must not alter already-durable journal bytes"
+            );
+            let restarted = TransactionJournal::open_for_read_only_recovery(
+                &store,
+                &config,
+                wallet,
+                Arc::new(HistoryTelemetry::default()),
+            )
+            .expect("restart must reacquire the lock and authenticate the durable journal");
+            let recovered = restarted.entry(hash).unwrap();
+            assert_eq!(recovered.status, status);
+            assert_eq!(recovered.nonce, request.nonce);
+            assert_eq!(
+                parse_decimal_wei(&recovered.maximum_exposure_wei).unwrap(),
+                exposure
+            );
+            assert_eq!(restarted.pending_exposure().unwrap(), exposure);
+            assert_eq!(restarted.unresolved_transactions().len(), 1);
+        }
     }
 
     #[test]
@@ -16727,7 +18328,7 @@ mod tests {
             .expect("Anvil must be installed for the local EVM lifecycle test");
         let _process_guard = AnvilGuard(&mut process);
         let endpoint = format!("http://127.0.0.1:{port}");
-        let client = reqwest::Client::new();
+        let client = local_rpc_client();
         wait_for_anvil(&client, &endpoint).await;
 
         let signer = test_signer();
@@ -17060,7 +18661,7 @@ mod tests {
             .expect("Anvil must be installed for the compute-only recovery regression");
         let _process_guard = AnvilGuard(&mut process);
         let endpoint = format!("http://127.0.0.1:{port}");
-        let rpc = reqwest::Client::new();
+        let rpc = local_rpc_client();
         wait_for_anvil(&rpc, &endpoint).await;
 
         let signer = test_signer();
@@ -17396,7 +18997,7 @@ mod tests {
                 .expect("Anvil is required for genesis activation lifecycle tests");
             let _process_guard = AnvilGuard(&mut process);
             let endpoint = format!("http://127.0.0.1:{port}");
-            let rpc = reqwest::Client::new();
+            let rpc = local_rpc_client();
             wait_for_anvil(&rpc, &endpoint).await;
 
             let accounts =
@@ -18444,7 +20045,7 @@ mod tests {
                 .expect("Anvil is required for the paid session-limit lifecycle regression");
             let _process_guard = AnvilGuard(&mut process);
             let endpoint = format!("http://127.0.0.1:{port}");
-            let rpc = reqwest::Client::new();
+            let rpc = local_rpc_client();
             wait_for_anvil(&rpc, &endpoint).await;
 
             let signer = test_signer();
@@ -19106,7 +20707,7 @@ mod tests {
                 .expect("Anvil is required for the session-limit terminal regression");
             let _process_guard = AnvilGuard(&mut process);
             let endpoint = format!("http://127.0.0.1:{port}");
-            let rpc = reqwest::Client::new();
+            let rpc = local_rpc_client();
             wait_for_anvil(&rpc, &endpoint).await;
 
             let signer = test_signer();
@@ -19865,7 +21466,7 @@ mod tests {
                 .expect("Anvil is required for the autonomous local lifecycle test");
             let _process_guard = AnvilGuard(&mut process);
             let endpoint = format!("http://127.0.0.1:{port}");
-            let rpc = reqwest::Client::new();
+            let rpc = local_rpc_client();
             wait_for_anvil(&rpc, &endpoint).await;
 
             let signer = test_signer();
@@ -20937,7 +22538,7 @@ mod tests {
             .expect("Anvil must be installed for the verified session reward lifecycle test");
         let _process_guard = AnvilGuard(&mut process);
         let endpoint = format!("http://127.0.0.1:{port}");
-        let rpc = reqwest::Client::new();
+        let rpc = local_rpc_client();
         wait_for_anvil(&rpc, &endpoint).await;
 
         let signer = test_signer();
@@ -22036,7 +23637,7 @@ mod tests {
                 .expect("Anvil must be installed for the high-difficulty worker test");
             let _process_guard = AnvilGuard(&mut process);
             let endpoint = format!("http://127.0.0.1:{port}");
-            let rpc = reqwest::Client::new();
+            let rpc = local_rpc_client();
             wait_for_anvil(&rpc, &endpoint).await;
 
             let signer = test_signer();
@@ -22478,7 +24079,7 @@ mod tests {
             .expect("Anvil must be installed for the local EVM lifecycle test");
         let _process_guard = AnvilGuard(&mut process);
         let endpoint = format!("http://127.0.0.1:{port}");
-        let client = reqwest::Client::new();
+        let client = local_rpc_client();
         wait_for_anvil(&client, &endpoint).await;
 
         let signer = test_signer();
@@ -23548,6 +25149,776 @@ mod tests {
             finalization_entry.nonce,
             "reorg recovery must reserve exposure without rebroadcasting"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANVIL_ROOT_ENV: &str = "ASTATINE_NATIVE_ANVIL_ROOT";
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANVIL_RPC_ENV: &str = "ASTATINE_NATIVE_ANVIL_RPC";
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANVIL_MINER_ENV: &str = "ASTATINE_NATIVE_ANVIL_MINER";
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANVIL_TOKEN_ENV: &str = "ASTATINE_NATIVE_ANVIL_TOKEN";
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANVIL_READY_ENV: &str = "ASTATINE_NATIVE_ANVIL_READY";
+    #[cfg(target_os = "linux")]
+    const NATIVE_ANVIL_CHILD_TEST: &str =
+        "transaction::tests::linux_native_provider_anvil_broadcast_worker";
+
+    #[cfg(target_os = "linux")]
+    struct NativeJournalAnchorCleanup(ConfigStore);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for NativeJournalAnchorCleanup {
+        fn drop(&mut self) {
+            if self.0.delete_native_journal_anchor_for_test().is_err() {
+                // The surrounding private-session harness also destroys the
+                // disposable keyring, but make per-root cleanup best-effort
+                // even while unwinding from a failed assertion.
+                eprintln!("failed to remove disposable native journal checkpoint");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct AnvilRpcBoundary {
+        endpoint: String,
+        raw_send_count: Arc<std::sync::atomic::AtomicUsize>,
+        error: Arc<Mutex<Option<String>>>,
+        stop: Arc<AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl AnvilRpcBoundary {
+        fn start(target: std::net::SocketAddr) -> std::io::Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            listener.set_nonblocking(true)?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            let raw_send_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let error = Arc::new(Mutex::new(None));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_count = Arc::clone(&raw_send_count);
+            let thread_error = Arc::clone(&error);
+            let thread_stop = Arc::clone(&stop);
+            let server = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((client, _)) => {
+                            if let Err(failure) =
+                                forward_counted_anvil_rpc(client, target, &thread_count)
+                                && let Ok(mut first_error) = thread_error.lock()
+                            {
+                                first_error.get_or_insert_with(|| failure.to_string());
+                            }
+                        }
+                        Err(failure) if failure.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(failure) => {
+                            if let Ok(mut first_error) = thread_error.lock() {
+                                first_error.get_or_insert_with(|| failure.to_string());
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+            Ok(Self {
+                endpoint,
+                raw_send_count,
+                error,
+                stop,
+                server: Some(server),
+            })
+        }
+
+        fn raw_send_count(&self) -> usize {
+            self.raw_send_count.load(Ordering::SeqCst)
+        }
+
+        fn assert_healthy(&self) {
+            if let Some(error) = self.error.lock().unwrap().as_ref() {
+                panic!("local Anvil RPC counting proxy failed: {error}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for AnvilRpcBoundary {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn forward_counted_anvil_rpc(
+        mut client: TcpStream,
+        target: std::net::SocketAddr,
+        raw_send_count: &std::sync::atomic::AtomicUsize,
+    ) -> std::io::Result<()> {
+        use std::io::ErrorKind;
+
+        client.set_read_timeout(Some(Duration::from_secs(15)))?;
+        client.set_write_timeout(Some(Duration::from_secs(15)))?;
+        let (request, header_end) = read_rpc_http_message(&mut client)?;
+        let body = &request[header_end..];
+        let value: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+        let raw_sends = count_raw_send_methods(&value);
+        if raw_sends != 0 {
+            raw_send_count.fetch_add(raw_sends, Ordering::SeqCst);
+        }
+
+        let header = std::str::from_utf8(&request[..header_end - 4])
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+        let mut forwarded = Vec::with_capacity(request.len() + 64);
+        for line in header.split("\r\n") {
+            let name = line.split_once(':').map(|(name, _)| name.trim());
+            if name.is_some_and(|name| {
+                name.eq_ignore_ascii_case("connection") || name.eq_ignore_ascii_case("host")
+            }) {
+                continue;
+            }
+            forwarded.extend_from_slice(line.as_bytes());
+            forwarded.extend_from_slice(b"\r\n");
+        }
+        forwarded
+            .extend_from_slice(format!("Host: {target}\r\nConnection: close\r\n\r\n").as_bytes());
+        forwarded.extend_from_slice(body);
+
+        let mut upstream = TcpStream::connect(target)?;
+        upstream.set_read_timeout(Some(Duration::from_secs(15)))?;
+        upstream.set_write_timeout(Some(Duration::from_secs(15)))?;
+        upstream.write_all(&forwarded)?;
+        let (response, _) = read_rpc_http_message(&mut upstream)?;
+        client.write_all(&response)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn count_raw_send_methods(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Object(object) => usize::from(
+                object.get("method").and_then(serde_json::Value::as_str)
+                    == Some("eth_sendRawTransaction"),
+            ),
+            serde_json::Value::Array(values) => values.iter().map(count_raw_send_methods).sum(),
+            _ => 0,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_rpc_http_message(stream: &mut TcpStream) -> std::io::Result<(Vec<u8>, usize)> {
+        use std::io::ErrorKind;
+
+        const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        let mut header_end = None;
+        let mut total_len = None;
+        let mut chunk = [0_u8; 8192];
+        loop {
+            if let Some(total_len) = total_len
+                && bytes.len() >= total_len
+            {
+                bytes.truncate(total_len);
+                return Ok((bytes, header_end.unwrap()));
+            }
+            if bytes.len() >= MAX_MESSAGE_BYTES {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "local RPC HTTP message exceeded its size limit",
+                ));
+            }
+            let read = stream.read(&mut chunk)?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "local RPC HTTP message ended early",
+                ));
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            if header_end.is_none() {
+                if let Some(separator) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let end = separator + 4;
+                    let header = std::str::from_utf8(&bytes[..separator])
+                        .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+                    let mut content_length = None;
+                    for line in header.split("\r\n").skip(1) {
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.trim().eq_ignore_ascii_case("transfer-encoding")
+                                && !value.trim().eq_ignore_ascii_case("identity")
+                            {
+                                return Err(std::io::Error::new(
+                                    ErrorKind::InvalidData,
+                                    "chunked local RPC HTTP messages are unsupported",
+                                ));
+                            }
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                if content_length.is_some() {
+                                    return Err(std::io::Error::new(
+                                        ErrorKind::InvalidData,
+                                        "duplicate local RPC Content-Length header",
+                                    ));
+                                }
+                                content_length =
+                                    Some(value.trim().parse::<usize>().map_err(|error| {
+                                        std::io::Error::new(ErrorKind::InvalidData, error)
+                                    })?);
+                            }
+                        }
+                    }
+                    let content_length = content_length.ok_or_else(|| {
+                        std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "local RPC HTTP message has no Content-Length",
+                        )
+                    })?;
+                    let expected = end.checked_add(content_length).ok_or_else(|| {
+                        std::io::Error::new(ErrorKind::InvalidData, "HTTP length overflow")
+                    })?;
+                    if expected > MAX_MESSAGE_BYTES {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "local RPC HTTP message exceeded its size limit",
+                        ));
+                    }
+                    header_end = Some(end);
+                    total_len = Some(expected);
+                } else if bytes.len() > 64 * 1024 {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "local RPC HTTP headers exceeded their size limit",
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires pinned Anvil and the private unlocked Secret Service qualification session"]
+    async fn linux_native_provider_anvil_broadcast_survives_fresh_process_sigkill() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // This constructor checks the private D-Bus socket, HOME/XDG/TMPDIR
+        // layout, owner/mode of the directories, unlocked provider state, and
+        // the explicit required-provider marker before any credential access.
+        let root = tempdir().expect("create disposable native-journal root");
+        let store =
+            ConfigStore::at_root_with_native_journal_anchor_for_test(root.path().to_path_buf())
+                .expect("open the isolated native-checkpoint test store");
+        let _anchor_cleanup = NativeJournalAnchorCleanup(store.clone());
+
+        let port_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = port_listener.local_addr().unwrap().port();
+        drop(port_listener);
+        let mut anvil = Command::new("anvil")
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--chain-id",
+                "1439",
+                "--accounts",
+                "3",
+                "--silent",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("pinned Anvil must be installed for native-checkpoint crash qualification");
+        let _anvil_guard = AnvilGuard(&mut anvil);
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let rpc = local_rpc_client();
+        wait_for_anvil(&rpc, &endpoint).await;
+
+        let signer = recovery_signer();
+        let wallet = signer_address(&signer);
+        let unlocked_accounts =
+            rpc_request_local(&rpc, &endpoint, "eth_accounts", serde_json::json!([]))
+                .await
+                .unwrap();
+        let deployment_wallet = Address::from_str(unlocked_accounts[0].as_str().unwrap()).unwrap();
+        let balance = U256::from(1_000_u64) * U256::from(10_u8).pow(U256::from(18));
+        rpc_request_local(
+            &rpc,
+            &endpoint,
+            "anvil_setBalance",
+            serde_json::json!([format!("{wallet:#x}"), format!("{balance:#x}")]),
+        )
+        .await
+        .unwrap();
+
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        prepare_local_test_contracts(&fixtures);
+        let token_artifact = read_artifact(&fixtures.join("MockAST.json"));
+        let miner_artifact = read_artifact(&fixtures.join("AstatineMiner.json"));
+        let token_decimals = 9_u8;
+        let token_unit = U256::from(10_u8).pow(U256::from(token_decimals));
+        let allocation = U256::from(1_000_u64) * token_unit;
+        let reward = U256::from(100_u64) * token_unit;
+        let mut token_init = artifact_bytecode(&token_artifact);
+        let miner_bytecode = artifact_bytecode(&miner_artifact);
+        token_init.extend_from_slice(&abi_uint8_word(token_decimals));
+        let token = deploy_unlocked(&rpc, &endpoint, deployment_wallet, &token_init).await;
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(token),
+            &LocalMockAST::mintCall {
+                account: deployment_wallet,
+                amount: allocation,
+            }
+            .abi_encode(),
+            U256::ZERO,
+        )
+        .await;
+        let miner = deploy_local_miner(LocalMinerDeployment {
+            client: &rpc,
+            endpoint: &endpoint,
+            deployment_wallet,
+            token,
+            token_decimals,
+            allocation,
+            reward,
+            miner_bytecode: &miner_bytecode,
+            initial_target: U256::MAX,
+            retarget_interval: 3,
+            window_secs: 3_600,
+        })
+        .await;
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(token),
+            &LocalMockAST::approveCall {
+                spender: miner,
+                amount: allocation,
+            }
+            .abi_encode(),
+            U256::ZERO,
+        )
+        .await;
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &LocalAstatineMiner::fundASTCall { amount: allocation }.abi_encode(),
+            U256::ZERO,
+        )
+        .await;
+        send_unlocked(
+            &rpc,
+            &endpoint,
+            deployment_wallet,
+            Some(miner),
+            &LocalAstatineMiner::activateGenesisCall {
+                initialSeed: B256::with_last_byte(0x7a),
+            }
+            .abi_encode(),
+            U256::ZERO,
+        )
+        .await;
+
+        let config = AppConfig {
+            wallet_address: Some(format!("{wallet:#x}")),
+            per_session_spending_limit_inj: "1".to_owned(),
+            transaction_confirmations: 1,
+            ..AppConfig::default()
+        };
+        store.save(&config).unwrap();
+        drop(
+            TransactionJournal::open(&store, &config, wallet)
+                .expect("create the authenticated journal and native checkpoint"),
+        );
+        assert!(
+            store
+                .read_journal_anchor()
+                .expect("read the real native checkpoint")
+                .is_some(),
+            "the test must create a checkpoint in the isolated Secret Service"
+        );
+
+        let rpc_boundary = AnvilRpcBoundary::start(format!("127.0.0.1:{port}").parse().unwrap())
+            .expect("start the loopback RPC boundary that counts raw transaction sends");
+        let network = NetworkClient::local_test_client(
+            &rpc_boundary.endpoint,
+            miner,
+            local_code_hash(&rpc, &endpoint, miner).await,
+            token,
+            local_code_hash(&rpc, &endpoint, token).await,
+            token_decimals,
+        )
+        .unwrap();
+        let nonce_before_broadcast = local_pending_nonce(&rpc, &endpoint, wallet).await;
+        rpc_request_local(
+            &rpc,
+            &endpoint,
+            "anvil_setAutomine",
+            serde_json::json!([false]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rpc_boundary.raw_send_count(), 0);
+
+        let ready = root.path().join("native-anvil-broadcast-ready");
+        let mut child = JournalSigkillChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    NATIVE_ANVIL_CHILD_TEST,
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(NATIVE_ANVIL_ROOT_ENV, root.path())
+                .env(NATIVE_ANVIL_RPC_ENV, &rpc_boundary.endpoint)
+                .env(NATIVE_ANVIL_MINER_ENV, format!("{miner:#x}"))
+                .env(NATIVE_ANVIL_TOKEN_ENV, format!("{token:#x}"))
+                .env(NATIVE_ANVIL_READY_ENV, &ready)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn the fresh transaction-manager process"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !ready.exists() {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "native Anvil worker exited before durable broadcast ({status}): stdout={:?} stderr={:?}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            if Instant::now() >= deadline {
+                child.0.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "native Anvil worker did not durably broadcast before timeout: stdout={:?} stderr={:?}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let hash_text = std::fs::read_to_string(&ready).unwrap();
+        let transaction_hash = B256::from_str(hash_text.trim()).unwrap();
+        rpc_boundary.assert_healthy();
+        assert_eq!(
+            rpc_boundary.raw_send_count(),
+            1,
+            "the proof must cross the local RPC boundary exactly once before the crash"
+        );
+        let journal_before_kill = store.read_transaction_journal().unwrap().unwrap();
+        let state: super::JournalState = serde_json::from_slice(&journal_before_kill).unwrap();
+        let broadcast = state
+            .entries
+            .iter()
+            .find(|entry| entry.transaction_hash == format!("{transaction_hash:#x}"))
+            .expect("the worker's transaction must be in this same journal");
+        assert_eq!(broadcast.status, TransactionStatus::Broadcast);
+        assert_eq!(broadcast.nonce, nonce_before_broadcast);
+        let active_session = state
+            .active_session
+            .as_ref()
+            .expect("proof journal must retain its active spending session");
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .filter(|entry| entry.session_id == active_session.id)
+                .count(),
+            1,
+            "the test session should authorize only this proof transaction"
+        );
+        let session_authorized_before_recovery = parse_decimal_wei(
+            active_session
+                .authorized_exposure_wei
+                .as_deref()
+                .expect("the durable active session must record its authorization total"),
+        )
+        .unwrap();
+        let proof_maximum_exposure = parse_decimal_wei(&broadcast.maximum_exposure_wei).unwrap();
+        let spending_cap = parse_inj_wei(&config.per_session_spending_limit_inj).unwrap();
+        assert_eq!(session_authorized_before_recovery, proof_maximum_exposure);
+        assert_eq!(spending_cap, U256::from(10_u8).pow(U256::from(18)));
+        assert!(
+            session_authorized_before_recovery <= spending_cap,
+            "the durable proof authorization must remain within the configured 1 INJ cap"
+        );
+        let checkpoint_before_kill = store
+            .read_journal_anchor()
+            .unwrap()
+            .expect("fresh process must have persisted its native checkpoint");
+        let checkpoint_revision = u64::from_be_bytes(
+            checkpoint_before_kill[4..12]
+                .try_into()
+                .expect("checkpoint revision has the expected width"),
+        );
+        assert_eq!(
+            state.integrity.as_ref().unwrap().revision,
+            checkpoint_revision,
+            "the same journal and real Secret Service checkpoint must agree before SIGKILL"
+        );
+        assert!(network.transaction_known(transaction_hash).await.unwrap());
+        assert!(
+            network
+                .transaction_receipt(transaction_hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "the transaction must remain pending on Anvil at the crash boundary"
+        );
+        assert_eq!(
+            local_pending_nonce(&rpc, &endpoint, wallet).await,
+            nonce_before_broadcast + 1,
+            "Anvil must have exactly the one pending transaction before the crash"
+        );
+        assert_eq!(rpc_boundary.raw_send_count(), 1);
+
+        if let Some(status) = child.0.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "native Anvil worker exited after its ready marker ({status}): stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        child.0.kill().unwrap();
+        assert_eq!(
+            child.0.wait().unwrap().signal(),
+            Some(libc::SIGKILL),
+            "the transaction-manager worker must be terminated by SIGKILL"
+        );
+        assert_eq!(
+            store.read_transaction_journal().unwrap().unwrap(),
+            journal_before_kill,
+            "killing the worker must preserve the exact same journal bytes"
+        );
+        assert_eq!(
+            store.read_journal_anchor().unwrap().unwrap(),
+            checkpoint_before_kill,
+            "killing the worker must preserve the native checkpoint"
+        );
+
+        let mut recovered = TransactionManager::open(&store, &config, wallet, token).unwrap();
+        recovered.reconcile(&network).await.unwrap();
+        assert_eq!(
+            recovered.journal.session_authorized_total().unwrap(),
+            session_authorized_before_recovery,
+            "fresh-process recovery must preserve the durable session authorization total"
+        );
+        assert!(
+            recovered.journal.session_authorized_total().unwrap() <= spending_cap,
+            "recovered session authorization must remain within the 1 INJ cap"
+        );
+        let pending = recovered
+            .journal
+            .state
+            .entries
+            .iter()
+            .find(|entry| entry.transaction_hash == format!("{transaction_hash:#x}"))
+            .expect("restart must recover the same broadcast entry");
+        assert_eq!(pending.status, TransactionStatus::Broadcast);
+        assert!(recovered.journal.pending_exposure().unwrap() > U256::ZERO);
+        assert_eq!(
+            local_pending_nonce(&rpc, &endpoint, wallet).await,
+            nonce_before_broadcast + 1,
+            "recovery must observe, not rebroadcast, the pending Anvil transaction"
+        );
+        rpc_boundary.assert_healthy();
+        assert_eq!(
+            rpc_boundary.raw_send_count(),
+            1,
+            "restart reconciliation must issue zero additional eth_sendRawTransaction calls"
+        );
+
+        rpc_request_local(&rpc, &endpoint, "evm_mine", serde_json::json!([]))
+            .await
+            .unwrap();
+        recovered.reconcile(&network).await.unwrap();
+        recovered.reconcile(&network).await.unwrap();
+        let settled = recovered
+            .journal
+            .state
+            .entries
+            .iter()
+            .find(|entry| entry.transaction_hash == format!("{transaction_hash:#x}"))
+            .unwrap();
+        assert_eq!(settled.status, TransactionStatus::MinedSuccess);
+        assert_eq!(settled.outcome.as_deref(), Some("candidate-updated"));
+        assert_eq!(
+            local_pending_nonce(&rpc, &endpoint, wallet).await,
+            nonce_before_broadcast + 1,
+            "the mined transaction must not have been duplicated after restart"
+        );
+        assert_eq!(
+            recovered.journal.session_authorized_total().unwrap(),
+            session_authorized_before_recovery,
+            "mining and reconciliation must not refund or increase session authorization"
+        );
+        assert_eq!(
+            rpc_boundary.raw_send_count(),
+            1,
+            "the proof must remain a single raw transaction through settlement"
+        );
+        drop(recovered);
+
+        store
+            .delete_native_journal_anchor_for_test()
+            .expect("delete the disposable native checkpoint before the private session ends");
+        assert!(
+            store.read_journal_anchor().unwrap().is_none(),
+            "explicit native-checkpoint cleanup must leave no root-scoped entry"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "child probe; invoked by linux_native_provider_anvil_broadcast_survives_fresh_process_sigkill"]
+    async fn linux_native_provider_anvil_broadcast_worker() {
+        let root = PathBuf::from(
+            std::env::var_os(NATIVE_ANVIL_ROOT_ENV)
+                .expect("native Anvil worker requires its parent-provided root"),
+        );
+        let endpoint = std::env::var(NATIVE_ANVIL_RPC_ENV)
+            .expect("native Anvil worker requires its parent-provided loopback RPC");
+        let parsed = reqwest::Url::parse(&endpoint).expect("worker RPC URL must parse");
+        assert!(
+            parsed.scheme() == "http"
+                && parsed.host_str().is_some_and(|host| {
+                    host == "127.0.0.1" || host == "::1" || host == "localhost"
+                })
+                && parsed.username().is_empty()
+                && parsed.password().is_none(),
+            "worker RPC must be an unauthenticated local-loopback URL"
+        );
+        let miner = Address::from_str(
+            &std::env::var(NATIVE_ANVIL_MINER_ENV)
+                .expect("native Anvil worker requires its parent-provided miner"),
+        )
+        .unwrap();
+        let token = Address::from_str(
+            &std::env::var(NATIVE_ANVIL_TOKEN_ENV)
+                .expect("native Anvil worker requires its parent-provided token"),
+        )
+        .unwrap();
+        let ready = PathBuf::from(
+            std::env::var_os(NATIVE_ANVIL_READY_ENV)
+                .expect("native Anvil worker requires its parent-provided ready path"),
+        );
+
+        // No in-memory checkpoint bridge is used: this fresh process constructs
+        // its own test store, authenticates from the isolated native provider,
+        // and writes the very same root-scoped journal/checkpoint pair.
+        let store = ConfigStore::at_root_with_native_journal_anchor_for_test(root)
+            .expect("worker must prove it inherited the isolated unlocked provider");
+        let config = store
+            .load()
+            .expect("load parent-created miner configuration");
+        let signer = recovery_signer();
+        let wallet = signer_address(&signer);
+        let expected_wallet = format!("{wallet:#x}");
+        assert_eq!(
+            config.wallet_address.as_deref(),
+            Some(expected_wallet.as_str())
+        );
+        let rpc = local_rpc_client();
+        let token_decimals = 9_u8;
+        let network = NetworkClient::local_test_client(
+            &endpoint,
+            miner,
+            local_code_hash(&rpc, &endpoint, miner).await,
+            token,
+            local_code_hash(&rpc, &endpoint, token).await,
+            token_decimals,
+        )
+        .unwrap();
+        let work_bytes = local_call(
+            &rpc,
+            &endpoint,
+            miner,
+            &AstatineMinerRead::workCall {}.abi_encode(),
+        )
+        .await;
+        type WorkReturn = (
+            bool,
+            bool,
+            u64,
+            u64,
+            u64,
+            B256,
+            B256,
+            U256,
+            U256,
+            U256,
+            u32,
+            U256,
+        );
+        let work = <WorkReturn as SolValue>::abi_decode_validate(&work_bytes).unwrap();
+        let header = b"native-provider-fresh-process-crash";
+        let context = WorkContext {
+            chain_id: 1439,
+            contract: miner,
+            window_id: work.2,
+            seed: work.5,
+            miner: wallet,
+            header: header.to_vec(),
+        };
+        let hasher = WorkHasher::new(&context).unwrap();
+        let (nonce, work_hash) = (0..10_000_u128)
+            .find_map(|nonce| {
+                let hash = hasher.hash(nonce);
+                meets_target(hash, work.7).then_some((nonce, hash))
+            })
+            .expect("the local Anvil work target must have a valid test proof");
+        let submission = ProofSubmission {
+            contract: miner,
+            node_id: 1,
+            window_id: work.2,
+            nonce,
+            header: header.to_vec(),
+            work_hash,
+        };
+        let manager = TransactionManager::open(&store, &config, wallet, token)
+            .expect("open the same authenticated journal in a fresh process");
+        let submit_task = tokio::spawn(async move {
+            let mut manager = manager;
+            manager.submit_proof(&network, &signer, submission).await
+        });
+        let broadcast = wait_for_journal_entry(
+            &store,
+            TransactionAction::SubmitProof,
+            TransactionStatus::Broadcast,
+        )
+        .await;
+        let ready_staged = ready.with_extension("staged");
+        std::fs::write(
+            &ready_staged,
+            format!("{:#x}", entry_hash(&broadcast).unwrap()),
+        )
+        .expect("stage the parent signal after the authenticated broadcast is durable");
+        std::fs::rename(&ready_staged, &ready)
+            .expect("atomically signal the parent after durable broadcast");
+        loop {
+            assert!(
+                !submit_task.is_finished(),
+                "Anvil unexpectedly mined the transaction before the parent crash point"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
     }
 
     struct AnvilGuard<'a>(&'a mut Child);

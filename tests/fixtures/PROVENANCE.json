@@ -12,7 +12,8 @@
     "network_required": false,
     "build_required": false,
     "regenerated_in_this_review": false,
-    "date_utc": "2026-11-11"
+    "change_note": "FIX-04 was replaced in this review by a synthetic receipt authored in this repository; the three contract bytecode fixtures were not regenerated. The rights/notice checklist records the release-blocking actions.",
+    "date_utc": "2026-11-14"
   },
   "fixtures": [
     {
@@ -154,14 +155,14 @@
     },
     {
       "id": "FIX-04",
-      "path": "tests/fixtures/injective-testnet-virtual-receipt.json",
-      "kind": "public_chain_receipt",
+      "path": "tests/fixtures/synthetic-injective-virtual-receipt.json",
+      "kind": "synthetic_rpc_receipt",
       "contract": null,
-      "source_origin": "public Injective Testnet transaction receipt capture",
+      "source_origin": "Synthetic receipt authored in this repository from the shape of an Injective Testnet receipt (three EVM event logs plus five virtual Cosmos logs). Transaction-specific values are synthetic; the virtual-log address and ERC-20 Transfer topic are protocol/interface constants also present in the prior capture.",
       "source_commit": null,
-      "canonical_git_blob_sha1": "c067c654667ed214fa40b6387137500d25b80daf",
-      "sha256": "afa2890260b22d4a20f36729e7d7459e97cd0fcb1408a9b8d1e886214244d84c",
-      "bytes": 7722,
+      "canonical_git_blob_sha1": "0fc8080df896759f50dfa361231427d9e58710fc",
+      "sha256": "3c9b14d49d74a2fa62c1bddb1d7caef5f091f075649c45ab2c9a82f6cb09df51",
+      "bytes": 4832,
       "json_keys": [
         "blockHash",
         "blockNumber",
@@ -187,12 +188,12 @@
       ],
       "license": {
         "declared_spdx": null,
-        "declaration_evidence": "Public-chain transaction receipt data. No contract source or bytecode is included.",
-        "rights_status": "not a contract-code fixture; residual address-linkage review is a separate privacy decision"
+        "declaration_evidence": "Synthetic transaction-specific data authored in this repository for parser regression coverage; the virtual-log address and ERC-20 Transfer topic are protocol/interface constants also present in the prior capture. No contract source or bytecode is included.",
+        "rights_status": "no third-party rights expected for synthetic transaction-specific values; protocol constants are retained"
       },
       "regeneration": {
-        "status": "captured_not_regenerated",
-        "detail": "Captured from public Testnet chain data; the Rust parser test asserts the recorded hash and block values. No regeneration script is provided.",
+        "status": "not_scripted",
+        "detail": "Authored directly as synthetic JSON and preserved byte-identically by this inventory. The Rust parser test asserts the synthetic hash and block values; no capture or regeneration script is required.",
         "performed_in_this_review": false
       }
     }
@@ -200,8 +201,8 @@
   "documents": [
     {
       "path": "tests/fixtures/README.md",
-      "sha256": "c63d3952fefdb9a98c789101ee0b7cb64190f6b701d4df77d26a47ed43dd504d",
-      "bytes": 3167
+      "sha256": "7ea99fa618d6f281038aa85c4f1d14a7564a5a50f09824952aa0c00a5c74ddee",
+      "bytes": 5083
     }
   ],
   "legal_artifacts": [
@@ -236,6 +237,52 @@
       "independent_verification": false
     },
     "notice_applicability": "UNRESOLVED",
+    "notice_checklist": {
+      "status": "OPEN \u2014 publication remains BLOCKED",
+      "scope": "Manual release gate. No automated check can establish ownership, authority or NOTICE applicability; this list records the exact actions still required before publishing this repository or its release archive.",
+      "items": [
+        {
+          "id": "RIGHTS-01",
+          "action": "Record written first-party ownership of AstatineMiner and AstatineGenesisCoordinator and confirm the owner can license them for redistribution.",
+          "owner": "project owner",
+          "status": "OPEN",
+          "blocking": true,
+          "evidence": "rights_review.owner_attestation records only an owner statement; independent_verification is false."
+        },
+        {
+          "id": "RIGHTS-02",
+          "action": "Decide whether Apache-2.0 NOTICE propagation applies to each distributed artifact. The contract fixtures are not release-archive members, so any obligation follows source redistribution of the fixtures rather than the miner binary.",
+          "owner": "project owner and release approver",
+          "status": "OPEN",
+          "blocking": true,
+          "evidence": "rights_review.copyright_evidence; fixtures FIX-01 and FIX-02 both set release_archive_member to false."
+        },
+        {
+          "id": "RIGHTS-03",
+          "action": "If the two first-party contract fixtures remain in the public source tree, add the Apache-2.0 license text and a copyright statement for them, or remove those fixtures from the public tree.",
+          "owner": "project owner",
+          "status": "OPEN",
+          "blocking": true,
+          "evidence": "tests/fixtures ships OPENZEPPELIN_LICENSE.txt only; no Apache-2.0 license text accompanies FIX-01 or FIX-02."
+        },
+        {
+          "id": "RIGHTS-04",
+          "action": "Confirm authorship and redistribution authority for MockAST and keep the OpenZeppelin MIT notice with any redistribution of it.",
+          "owner": "project owner",
+          "status": "OPEN",
+          "blocking": true,
+          "evidence": "FIX-03 license.declaration_evidence; legal_artifacts OPENZEPPELIN_LICENSE.txt."
+        },
+        {
+          "id": "RIGHTS-05",
+          "action": "Record the final rights and notice decision in tests/fixtures/README.md and this inventory before publishing the repository or a release archive.",
+          "owner": "release approver",
+          "status": "OPEN",
+          "blocking": true,
+          "evidence": "rights_review.publication_decision is BLOCKED."
+        }
+      ]
+    },
     "publication_decision": "BLOCKED pending review of rights and notice applicability; first-party ownership is owner-attested and not independently verified.",
     "not_inferred": "Repository owner identity, commit-author metadata, a personal handle or the CLI MIT license do not by themselves establish ownership or redistribution authority. The owner attestation is an explicit statement of first-party ownership; it is recorded as OWNER-ATTESTED and is not independently verified."
   },
