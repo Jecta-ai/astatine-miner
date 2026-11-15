@@ -146,6 +146,27 @@ proves production restart with a native checkpoint after actual termination.
 
 ## Local reproduction
 
+For operator-attended headless state, provider and recovery requirements, see
+[`HEADLESS.md`](HEADLESS.md). That checklist is not a container-restart result.
+
+For a **manual** container-recreation qualification, use a disposable native
+Ubuntu 24.04 x86_64 host with a local Docker engine and an interactive terminal:
+
+```sh
+python3 support/linux/qualify-container-lifecycle.py
+```
+
+Enter a new disposable test-only keyring passphrase at the hidden prompts; never
+use a real wallet or production password. The fixture builds an image (build
+dependencies require network), then creates network-isolated runtime containers
+and a private named volume. It removes and recreates the container, checks
+unavailable and locked provider behavior, and asks a human to unlock the
+persisted provider. Check for `container-fixture-cleanup=ok`; if the run is
+interrupted or cleanup fails, its resources can remain and need manual review.
+This fixture checks a **zero-liability** journal only, not persistence of an
+outstanding transaction. Running the offline cleanup self-test or compiling
+the script does not qualify container recreation or manual unlock.
+
 The scripts require Linux. On macOS, use an amd64 Linux container. The Anvil
 asset is Linux-only; do not substitute a Homebrew binary when checking release
 provenance.

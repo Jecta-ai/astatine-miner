@@ -59,6 +59,7 @@ jobs:
             python3 -m py_compile "$script"
           done
           python3 -m json.tool support/linux/anvil-release.json >/dev/null
+          python3 -B support/linux/qualify-container-lifecycle.py --self-test-cleanup
           python3 support/verify-fixture-provenance.py
           python3 -m unittest discover -s support/tests -p 'test_*.py'
 
