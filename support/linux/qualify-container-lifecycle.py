@@ -5,17 +5,23 @@ Run interactively on Ubuntu 24.04 x86_64 with a local Docker engine:
 
     python3 support/linux/qualify-container-lifecycle.py
 
-Run the offline cleanup regression checks without Docker:
+Run the separate GitHub-hosted CI-only synthetic subset:
+
+    ASTATINE_CONTAINER_QUALIFICATION_MODE=ci-synthetic \\
+      python3 support/linux/qualify-container-lifecycle.py --ci-synthetic
+
+Run offline regression checks without Docker:
 
     python3 support/linux/qualify-container-lifecycle.py --self-test-cleanup
+    python3 support/linux/qualify-container-lifecycle.py --self-test-ci
 
 The fixture uses a random private Docker named volume, a fresh Ubuntu 24.04
 amd64 image built from a whitelist-only context, and containers with no network,
-ports, host mounts, or capabilities. It creates a synthetic wallet with the
-production CLI, destroys and recreates the container while retaining the named
-volume, checks unavailable and locked Secret Service fail-closed behavior, and
-requires a real human to type the test-only keyring passphrase again at a hidden
-terminal prompt before a fresh production `recover` process can succeed.
+ports, host mounts, or capabilities. Both modes create a synthetic wallet with
+the production CLI and check unavailable and locked Secret Service fail-closed
+behavior after genuine container recreation. The default interactive mode keeps
+its human keyring-unlock and post-unlock recovery gates. The CI-only mode instead
+stops after the fail-closed checks and makes no post-unlock recovery claim.
 
 No passphrase, mnemonic, wallet password, encrypted keystore, journal, or
 checkpoint is printed or written to host files, command arguments, or
@@ -242,7 +248,7 @@ def _remove_and_verify_absent(
     raise QualificationError(f"{kind} remained after cleanup")
 
 
-def _preflight() -> None:
+def _preflight(*, mode: str = "manual") -> None:
     _check_cancelled()
     _require(sys.platform == "linux", "Ubuntu 24.04 x86_64 is required; this is not evidence")
     distribution, version = _host_ubuntu_release()
@@ -254,10 +260,14 @@ def _preflight() -> None:
         platform.machine() in {"x86_64", "amd64"},
         "the host must be x86_64",
     )
-    _require(
-        sys.stdin.isatty() and sys.stdout.isatty(),
-        "a real interactive terminal is required for the manual keyring unlock gate",
-    )
+    if mode == "manual":
+        _require(
+            sys.stdin.isatty() and sys.stdout.isatty(),
+            "a real interactive terminal is required for the manual keyring unlock gate",
+        )
+    else:
+        _require(mode == "ci-synthetic", "unsupported container qualification mode")
+        _preflight_github_hosted_runner()
     _require(shutil.which("docker") is not None, "the Docker CLI is required")
     _require(
         "DOCKER_HOST" not in os.environ and "DOCKER_CONTEXT" not in os.environ,
@@ -278,6 +288,37 @@ def _preflight() -> None:
     _require(
         architecture in {"x86_64", "amd64"},
         "the Docker engine must be x86_64; emulation is not accepted",
+    )
+
+
+def _preflight_github_hosted_runner() -> None:
+    _require(
+        os.environ.get("ASTATINE_CONTAINER_QUALIFICATION_MODE") == "ci-synthetic",
+        "the CI synthetic mode requires its explicit workflow marker",
+    )
+    _require(
+        os.environ.get("GITHUB_ACTIONS") == "true"
+        and os.environ.get("CI") == "true"
+        and os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted"
+        and os.environ.get("RUNNER_OS") == "Linux"
+        and os.environ.get("RUNNER_ARCH") == "X64",
+        "CI synthetic mode is restricted to a GitHub-hosted Linux x86_64 runner",
+    )
+    _require(
+        os.environ.get("GITHUB_JOB") == "container-lifecycle-ci-synthetic",
+        "CI synthetic mode is restricted to its dedicated bounded job",
+    )
+    workspace = os.environ.get("GITHUB_WORKSPACE", "")
+    expected_workspace = str(Path(__file__).resolve().parents[2])
+    _require(
+        bool(workspace)
+        and Path(workspace).resolve() == Path(expected_workspace),
+        "CI synthetic mode must run from its checked-out repository workspace",
+    )
+    _require(
+        os.environ.get("GITHUB_RUN_ID", "").isdigit()
+        and os.environ.get("GITHUB_RUN_ATTEMPT", "").isdigit(),
+        "CI synthetic mode requires a GitHub Actions run identity",
     )
 
 
@@ -406,6 +447,7 @@ def _state_core(snapshot: dict[str, Any]) -> tuple[object, ...]:
             "journal_sha256",
             "keystore_sha256",
             "keystore_count",
+            "entry_count",
             "spending_limit",
             "policy_approval_present",
             "unresolved_count",
@@ -422,6 +464,7 @@ def _assert_state_valid(snapshot: dict[str, Any]) -> None:
     _require(snapshot.get("keystore_mode") == 0o600, "production keystore is not mode 0600")
     _require(snapshot.get("keystore_count") == 1, "expected exactly one synthetic keystore")
     _require(snapshot.get("keyring_count", 0) >= 1, "private keyring storage is missing")
+    _require(snapshot.get("entry_count") == 0, "the synthetic journal has transaction entries")
     _require(snapshot.get("spending_limit") == "0.1", "the spending cap changed")
     _require(snapshot.get("policy_approval_present") is True, "per-run policy approval is missing")
     _require(snapshot.get("unresolved_count") == 0, "the synthetic journal has an unresolved transaction")
@@ -435,6 +478,37 @@ def _assert_state_valid(snapshot: dict[str, Any]) -> None:
             and all(character in "0123456789abcdef" for character in value),
             f"{name} fingerprint is invalid",
         )
+
+
+CI_SYNTHETIC_STAGES = (
+    "keyring-bootstrapped",
+    "production-init-complete",
+    "initial-recovery-complete",
+    "container-recreated",
+    "state-preserved",
+    "unavailable-provider-failed-closed",
+    "locked-provider-failed-closed",
+    "complete",
+)
+
+
+class CiSyntheticStateMachine:
+    """Enforce the bounded CI path, which intentionally has no unlock stage."""
+
+    def __init__(self) -> None:
+        self._next_stage = 0
+
+    def advance(self, stage: str) -> None:
+        if self._next_stage >= len(CI_SYNTHETIC_STAGES):
+            raise QualificationError("CI synthetic lifecycle advanced past completion")
+        expected = CI_SYNTHETIC_STAGES[self._next_stage]
+        if stage != expected:
+            raise QualificationError("CI synthetic lifecycle stage was out of order")
+        self._next_stage += 1
+
+    def finish(self) -> None:
+        if self._next_stage != len(CI_SYNTHETIC_STAGES):
+            raise QualificationError("CI synthetic lifecycle ended before completion")
 
 
 class ContainerQualification:
@@ -563,6 +637,38 @@ class ContainerQualification:
         _require(
             output.decode("ascii", "replace").strip() == "ubuntu|24.04|x86_64",
             "container is not Ubuntu 24.04 x86_64",
+        )
+        inspected = self._docker_ok(
+            ["inspect", self.container_name], "container isolation inspection"
+        )
+        try:
+            records = json.loads(inspected)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise QualificationError("container isolation metadata is invalid") from None
+        _require(
+            isinstance(records, list) and len(records) == 1,
+            "container isolation metadata is invalid",
+        )
+        record = records[0]
+        labels = record.get("Config", {}).get("Labels") or {}
+        host_config = record.get("HostConfig", {})
+        mounts = record.get("Mounts") or []
+        volume_mounts = [mount for mount in mounts if mount.get("Type") == "volume"]
+        _require(
+            record.get("Name") == f"/{self.container_name}"
+            and labels.get(DOCKER_LABEL) == DOCKER_LABEL_VALUE
+            and labels.get(f"{DOCKER_LABEL}.id") == self.token
+            and host_config.get("NetworkMode") == "none"
+            and host_config.get("ReadonlyRootfs") is True
+            and host_config.get("Privileged") is False
+            and "ALL" in host_config.get("CapDrop", [])
+            and "no-new-privileges:true" in host_config.get("SecurityOpt", [])
+            and not host_config.get("PortBindings")
+            and len(volume_mounts) == 1
+            and volume_mounts[0].get("Name") == self.volume_name
+            and volume_mounts[0].get("Destination") == "/state"
+            and all(mount.get("Type") != "bind" for mount in mounts),
+            "container network, mount, or ownership isolation is invalid",
         )
 
     def _service_status(self) -> str:
@@ -709,6 +815,93 @@ class ContainerQualification:
             _ACTIVE_CHILD_PID = None
             password_buffer[:] = bytes(len(password_buffer))
             process.cleanup()
+
+    def _bootstrap_synthetic_keyring(self) -> None:
+        output = self._docker_ok(
+            [
+                "exec",
+                self.container_name,
+                "/usr/bin/python3",
+                SERVICE_HELPER,
+                "bootstrap-synthetic",
+            ],
+            "synthetic Secret Service bootstrap",
+        )
+        _require(
+            output.decode("ascii", "replace").strip()
+            == "secret-service=unlocked synthetic-keyring=created",
+            "synthetic Secret Service bootstrap did not create a fresh keyring",
+        )
+        _require(
+            self._service_status() == "secret-service=unlocked",
+            "synthetic Secret Service did not start unlocked",
+        )
+
+    def _run_ci_synthetic(self) -> None:
+        state = CiSyntheticStateMachine()
+        self._bootstrap_synthetic_keyring()
+        state.advance("keyring-bootstrapped")
+
+        self._run_init()
+        state.advance("production-init-complete")
+        baseline = self._snapshot()
+        self._run_recover(expected_success=True, stage="initial production recover")
+        after_initial_recover = self._snapshot()
+        _require(
+            _state_core(after_initial_recover) == _state_core(baseline),
+            "initial read-only recovery changed production state",
+        )
+        state.advance("initial-recovery-complete")
+
+        self._remove_container()
+        self._start_container()
+        state.advance("container-recreated")
+        after_recreation = self._snapshot()
+        _require(
+            _state_core(after_recreation) == _state_core(baseline)
+            and after_recreation.get("keyring_sha256") == baseline.get("keyring_sha256"),
+            "wallet, journal, policy, or keyring did not persist on the designated volume",
+        )
+        state.advance("state-preserved")
+
+        self._run_recover(
+            expected_success=False, stage="unavailable-provider production recover"
+        )
+        after_unavailable = self._snapshot()
+        _require(
+            _state_core(after_unavailable) == _state_core(baseline),
+            "unavailable-provider recovery changed production or spending state",
+        )
+        state.advance("unavailable-provider-failed-closed")
+
+        self._docker_ok(
+            ["exec", self.container_name, "/usr/bin/python3", SERVICE_HELPER, "start-locked"],
+            "locked Secret Service startup",
+        )
+        _require(self._service_status() == "secret-service=locked", "the provider is not genuinely locked")
+        self._run_recover(expected_success=False, stage="locked-provider production recover")
+        after_locked = self._snapshot()
+        _require(
+            _state_core(after_locked) == _state_core(baseline),
+            "locked-provider recovery changed production or spending state",
+        )
+        state.advance("locked-provider-failed-closed")
+        state.advance("complete")
+        state.finish()
+
+        print(f"container-runtime={RUNTIME_IMAGE}")
+        print("production-init=ok synthetic-wallet=created")
+        print("production-recover-initial=ok")
+        print("container-recreations=1 designated-volume=preserved")
+        print("unavailable-provider=fail-closed")
+        print("locked-provider=fail-closed")
+        print("manual-unlock=not-run")
+        print("post-unlock-recovery=not-tested")
+        print("root-mode=700 config-mode=600 journal-mode=600 keystore-mode=600")
+        print("spending-authorization=invariants-preserved journal-entries=0 unresolved-transactions=0")
+        print("synthetic-liability=zero no-funds no-signing no-submission")
+        print("container-network=none public-rpc=not-used")
+        print("recovery-scope=initial-only post-unlock-not-tested")
 
     def _run_recover(self, *, expected_success: bool, stage: str) -> None:
         command = [
@@ -893,11 +1086,16 @@ class ContainerQualification:
             print("container-fixture-cleanup=ok")
         return True
 
-    def run(self) -> None:
+    def run(self, *, mode: str = "manual") -> None:
         _check_cancelled()
         self._build()
         self._create_volume()
         self._start_container()
+
+        if mode == "ci-synthetic":
+            self._run_ci_synthetic()
+            self.success = True
+            return
 
         self._run_manual_unlock(
             "OPERATOR GATE: Create a disposable test-only keyring passphrase at the hidden prompt. "
@@ -973,8 +1171,255 @@ class ContainerQualification:
         print("production-recover-fresh-process=ok")
         print("root-mode=700 config-mode=600 journal-mode=600 keystore-mode=600")
         print("spending-authorization=invariants-preserved")
-        print("network=none public-rpc=not-used")
+        print("container-network=none public-rpc=not-used")
         self.success = True
+
+
+def _run_ci_self_tests() -> None:
+    import io
+    import tempfile
+    from contextlib import redirect_stderr, redirect_stdout
+    from unittest.mock import patch
+
+    def expect_rejected(
+        action: object,
+        message: str,
+        exceptions: tuple[type[BaseException], ...] = (QualificationError,),
+    ) -> None:
+        try:
+            action()  # type: ignore[operator]
+        except exceptions:
+            return
+        raise AssertionError(message)
+
+    out_of_order = CiSyntheticStateMachine()
+    expect_rejected(
+        lambda: out_of_order.advance("production-init-complete"),
+        "CI lifecycle accepted an out-of-order production init",
+    )
+    incomplete = CiSyntheticStateMachine()
+    incomplete.advance("keyring-bootstrapped")
+    expect_rejected(incomplete.finish, "CI lifecycle accepted an incomplete run")
+
+    no_unlock = CiSyntheticStateMachine()
+    for stage in CI_SYNTHETIC_STAGES[:5]:
+        no_unlock.advance(stage)
+    expect_rejected(
+        lambda: no_unlock.advance("manual-unlock"),
+        "CI lifecycle accepted a post-recreation manual unlock stage",
+    )
+    expect_rejected(
+        lambda: no_unlock.advance("post-unlock-recovery"),
+        "CI lifecycle accepted a post-unlock recovery stage",
+    )
+
+    complete = CiSyntheticStateMachine()
+    for stage in CI_SYNTHETIC_STAGES:
+        complete.advance(stage)
+    complete.finish()
+    expect_rejected(
+        lambda: complete.advance("manual-unlock"),
+        "CI lifecycle advanced after completion",
+    )
+    expect_rejected(
+        lambda: complete.advance("post-unlock-recovery"),
+        "CI lifecycle accepted post-completion work",
+    )
+
+    hosted_environment = {
+        "ASTATINE_CONTAINER_QUALIFICATION_MODE": "ci-synthetic",
+        "GITHUB_ACTIONS": "true",
+        "CI": "true",
+        "RUNNER_ENVIRONMENT": "github-hosted",
+        "RUNNER_OS": "Linux",
+        "RUNNER_ARCH": "X64",
+        "GITHUB_JOB": "container-lifecycle-ci-synthetic",
+        "GITHUB_WORKSPACE": str(Path(__file__).resolve().parents[2]),
+        "GITHUB_RUN_ID": "123456789",
+        "GITHUB_RUN_ATTEMPT": "1",
+    }
+    with patch.object(os, "environ", hosted_environment):
+        _preflight_github_hosted_runner()
+        hosted_environment["RUNNER_ENVIRONMENT"] = "self-hosted"
+        expect_rejected(
+            _preflight_github_hosted_runner,
+            "CI synthetic mode accepted a self-hosted runner",
+        )
+        hosted_environment["RUNNER_ENVIRONMENT"] = "github-hosted"
+        hosted_environment["ASTATINE_CONTAINER_QUALIFICATION_MODE"] = ""
+        expect_rejected(
+            _preflight_github_hosted_runner,
+            "CI synthetic mode accepted a missing explicit workflow marker",
+        )
+
+    runtime_qualification = ContainerQualification.__new__(ContainerQualification)
+    runtime_qualification.container_name = "astatine-container-d2-fixture"
+    runtime_qualification.volume_name = "astatine-container-d2-selftest-state"
+    runtime_qualification.token = runtime_qualification.container_name.rsplit("-", 1)[-1]
+    runtime_record = {
+        "Name": "/astatine-container-d2-fixture",
+        "Config": {
+            "Labels": {
+                DOCKER_LABEL: DOCKER_LABEL_VALUE,
+                f"{DOCKER_LABEL}.id": "fixture",
+            }
+        },
+        "HostConfig": {
+            "NetworkMode": "none",
+            "ReadonlyRootfs": True,
+            "Privileged": False,
+            "CapDrop": ["ALL"],
+            "SecurityOpt": ["no-new-privileges:true"],
+            "PortBindings": None,
+        },
+        "Mounts": [
+            {
+                "Type": "volume",
+                "Name": "astatine-container-d2-selftest-state",
+                "Destination": "/state",
+            },
+            {"Type": "tmpfs", "Destination": "/run/astatine"},
+        ],
+    }
+
+    def verify_runtime_record(record: dict[str, Any]) -> None:
+        answers = [
+            b"ubuntu|24.04|x86_64\n",
+            json.dumps([record]).encode(),
+        ]
+        runtime_qualification._docker_ok = lambda _args, _stage: answers.pop(0)  # type: ignore[method-assign]
+        runtime_qualification._verify_container_runtime()
+
+    verify_runtime_record(runtime_record)
+    unsafe_runtime = json.loads(json.dumps(runtime_record))
+    unsafe_runtime["HostConfig"]["NetworkMode"] = "bridge"
+    expect_rejected(
+        lambda: verify_runtime_record(unsafe_runtime),
+        "container runtime isolation accepted a networked container",
+    )
+
+    helper_path = Path(__file__).with_name("container-secret-service.py")
+    spec = importlib.util.spec_from_file_location(
+        "astatine_container_secret_service_selftest", helper_path
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("could not load the Secret Service helper for self-test")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+
+    seed = bytes(range(32))
+    secret = seed.hex().encode("ascii")
+    captured: dict[str, Any] = {}
+
+    class FakeStdin:
+        def write(self, value: bytes | bytearray) -> int:
+            captured.setdefault("stdin", bytearray()).extend(value)
+            return len(value)
+
+        def flush(self) -> None:
+            captured["flushed"] = True
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    class FakeDaemon:
+        def __init__(self, argv: list[str], **kwargs: object) -> None:
+            captured["argv"] = list(argv)
+            captured["kwargs"] = kwargs
+            self.stdin = FakeStdin() if kwargs.get("stdin") == subprocess.PIPE else None
+
+        def poll(self) -> None:
+            return None
+
+        def send_signal(self, _signum: int) -> None:
+            return
+
+        def wait(self, timeout: int | None = None) -> int:
+            del timeout
+            return 0
+
+        def kill(self) -> None:
+            return
+
+    with tempfile.TemporaryDirectory(prefix="astatine-container-secret-selftest.") as temp:
+        keyring_dir = Path(temp) / "keyrings"
+        helper.KEYRING_DIR = keyring_dir
+        original_spawn = helper._spawn_daemon
+        observed_secret_buffers: list[bytearray] = []
+
+        def observe_spawn(*, keyring_input: bytearray | None) -> Any:
+            if keyring_input is None:
+                raise AssertionError("synthetic bootstrap omitted the daemon stdin secret")
+            observed_secret_buffers.append(keyring_input)
+            return original_spawn(keyring_input=keyring_input)
+
+        def wait_for_unlocked_collection(
+            _process: object, *, expected_locked: bool
+        ) -> None:
+            if expected_locked:
+                raise AssertionError("synthetic bootstrap unexpectedly requested a locked ring")
+            keyring_dir.mkdir(mode=0o700)
+            os.chmod(keyring_dir, 0o700)
+            keyring = keyring_dir / "login.keyring"
+            keyring.write_bytes(b"encrypted synthetic test keyring")
+            os.chmod(keyring, 0o600)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        isolated_environment: dict[str, str] = {}
+        with (
+            patch.object(helper.secrets, "token_bytes", return_value=seed) as random_bytes,
+            patch.object(helper.os, "environ", isolated_environment),
+            patch.object(helper.subprocess, "Popen", FakeDaemon),
+            patch.object(helper, "_service_owned", return_value=False),
+            patch.object(helper, "_wait_for_collection", wait_for_unlocked_collection),
+            patch.object(helper, "_spawn_daemon", observe_spawn),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            helper._bootstrap_synthetic()
+
+        _require(random_bytes.call_args.args == (32,), "bootstrap used an unexpected random source size")
+        _require(
+            captured.get("stdin") == secret + b"\n"
+            and captured.get("flushed") is True
+            and captured.get("closed") is True,
+            "synthetic passphrase was not sent only through the daemon stdin pipe",
+        )
+        _require(
+            "--unlock" in captured.get("argv", [])
+            and secret not in repr(captured.get("argv", [])).encode()
+            and "env" not in captured.get("kwargs", {})
+            and all(secret.decode("ascii") not in value for value in isolated_environment.values()),
+            "synthetic passphrase was exposed in daemon arguments or a supplied environment",
+        )
+        _require(
+            captured.get("kwargs", {}).get("stdin") == subprocess.PIPE
+            and captured.get("kwargs", {}).get("stdout") == subprocess.DEVNULL
+            and captured.get("kwargs", {}).get("stderr") == subprocess.DEVNULL,
+            "synthetic keyring daemon did not use a private stdin-only secret channel",
+        )
+        _require(
+            len(observed_secret_buffers) == 1
+            and not any(observed_secret_buffers[0]),
+            "synthetic passphrase buffer was not erased after bootstrap",
+        )
+        output = stdout.getvalue().encode() + stderr.getvalue().encode()
+        _require(secret not in output, "synthetic passphrase appeared in helper output")
+        _require(
+            all(secret not in path.read_bytes() for path in Path(temp).rglob("*") if path.is_file()),
+            "synthetic passphrase appeared in a filesystem artifact",
+        )
+        _require(
+            output.decode().strip() == "secret-service=unlocked synthetic-keyring=created",
+            "synthetic bootstrap emitted an unexpected marker",
+        )
+
+        expect_rejected(
+            helper._require_new_keyring_location,
+            "synthetic bootstrap would accept an existing keyring directory",
+            (helper.ServiceError,),
+        )
 
 
 def _run_cleanup_self_tests() -> None:
@@ -1219,12 +1664,27 @@ def main() -> int:
             return 1
         print("container-cleanup-self-test=ok")
         return 0
+    if sys.argv[1:] == ["--self-test-ci"]:
+        try:
+            _run_ci_self_tests()
+        except BaseException as error:
+            print(
+                f"container-ci-self-test: failed ({type(error).__name__})",
+                file=sys.stderr,
+            )
+            return 1
+        print("container-ci-self-test=ok")
+        return 0
     global _SIGNAL_REQUESTED, _CLEANUP_IN_PROGRESS
     global _ACTIVE_DOCKER_PROCESS, _ACTIVE_CHILD_PID
-    if len(sys.argv) != 1:
+    if sys.argv[1:] == []:
+        mode = "manual"
+    elif sys.argv[1:] == ["--ci-synthetic"]:
+        mode = "ci-synthetic"
+    else:
         print(
             "usage: python3 support/linux/qualify-container-lifecycle.py "
-            "[--self-test-cleanup]",
+            "[--ci-synthetic|--self-test-cleanup|--self-test-ci]",
             file=sys.stderr,
         )
         return 2
@@ -1240,10 +1700,16 @@ def main() -> int:
     result = 1
     try:
         _check_cancelled()
-        _preflight()
+        if mode == "manual":
+            _preflight()
+        else:
+            _preflight(mode=mode)
         _check_cancelled()
         qualification = ContainerQualification()
-        qualification.run()
+        if mode == "manual":
+            qualification.run()
+        else:
+            qualification.run(mode=mode)
         _check_cancelled()
         result = 0
     except QualificationCancelled as error:

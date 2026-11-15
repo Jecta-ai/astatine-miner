@@ -155,6 +155,7 @@ def inspect() -> dict[str, object]:
         "keyring_sha256": keyring_digest,
         "spending_limit": config["per_session_spending_limit_inj"],
         "policy_approval_present": True,
+        "entry_count": len(entries),
         "unresolved_count": len(unresolved),
         "pending_authorization": False,
         "pending_session_transition": False,

@@ -60,6 +60,7 @@ jobs:
           done
           python3 -m json.tool support/linux/anvil-release.json >/dev/null
           python3 -B support/linux/qualify-container-lifecycle.py --self-test-cleanup
+          python3 -B support/linux/qualify-container-lifecycle.py --self-test-ci
           python3 support/verify-fixture-provenance.py
           python3 -m unittest discover -s support/tests -p 'test_*.py'
 
@@ -425,6 +426,56 @@ jobs:
           if command -v pkill >/dev/null 2>&1; then
             pkill -x anvil || true
           fi
+
+  container-lifecycle-ci-synthetic:
+    needs: workflow-safety
+    name: CI-only synthetic container lifecycle subset
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify GitHub-hosted Ubuntu 24.04 x86_64 runner
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          test "${ID:-}" = "ubuntu"
+          test "${VERSION_ID:-}" = "24.04"
+          test "$(uname -m)" = "x86_64"
+          test "${GITHUB_ACTIONS:-}" = "true"
+          test "${CI:-}" = "true"
+          test "${RUNNER_ENVIRONMENT:-}" = "github-hosted"
+          test "${RUNNER_OS:-}" = "Linux"
+          test "${RUNNER_ARCH:-}" = "X64"
+          test "${GITHUB_JOB:-}" = "container-lifecycle-ci-synthetic"
+      - name: Run bounded synthetic production-init container lifecycle
+        env:
+          ASTATINE_CONTAINER_QUALIFICATION_MODE: ci-synthetic
+        run: |
+          set -euo pipefail
+          status=0
+          output=$(python3 -B support/linux/qualify-container-lifecycle.py --ci-synthetic 2>&1) || status=$?
+          printf '%s\n' "$output"
+          test "$status" -eq 0 || exit "$status"
+          for marker in \
+            'container-runtime=ubuntu-24.04-linux-amd64' \
+            'production-init=ok synthetic-wallet=created' \
+            'production-recover-initial=ok' \
+            'container-recreations=1 designated-volume=preserved' \
+            'unavailable-provider=fail-closed' \
+            'locked-provider=fail-closed' \
+            'manual-unlock=not-run' \
+            'post-unlock-recovery=not-tested' \
+            'root-mode=700 config-mode=600 journal-mode=600 keystore-mode=600' \
+            'spending-authorization=invariants-preserved journal-entries=0 unresolved-transactions=0' \
+            'synthetic-liability=zero no-funds no-signing no-submission' \
+            'container-network=none public-rpc=not-used' \
+            'recovery-scope=initial-only post-unlock-not-tested' \
+            'container-fixture-cleanup=ok'
+          do
+            grep -qxF "$marker" <<<"$output"
+          done
 
   ssh-loopback:
     needs: workflow-safety

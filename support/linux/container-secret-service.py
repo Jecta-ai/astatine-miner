@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Private GNOME Keyring controller for the container lifecycle qualification.
 
-The only secret-bearing operation is `unlock`. It requires an interactive
-terminal, reads a test-only passphrase with terminal echo disabled, and sends it
-only on the child daemon's stdin pipe. It never places the passphrase in argv,
-the environment, a file, output, or a diagnostic.
+The interactive `unlock` operation reads a test-only passphrase with terminal
+echo disabled. The separate synthetic bootstrap generates a random passphrase
+in memory. Both send the passphrase only on the child daemon's stdin pipe and
+never place it in argv, the environment, a file, output, or a diagnostic.
 """
 
 from __future__ import annotations
@@ -12,16 +12,20 @@ from __future__ import annotations
 import getpass
 import os
 import re
+import secrets
 import signal
+import stat
 import subprocess
 import sys
 import time
 from collections.abc import Sequence
+from pathlib import Path
 
 
 DBUS_ADDRESS = "unix:path=/run/astatine/bus"
 DEFAULT_COLLECTION = re.compile(rb"objectpath '([^']*)'")
 SERVICE_TIMEOUT_SECONDS = 30.0
+KEYRING_DIR = Path("/state/home/.local/share/keyrings")
 
 
 class ServiceError(RuntimeError):
@@ -210,6 +214,65 @@ def _start_locked() -> None:
     print("secret-service=locked")
 
 
+def _require_new_keyring_location() -> None:
+    try:
+        os.lstat(KEYRING_DIR)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ServiceError("could not verify the disposable keyring location") from None
+    raise ServiceError("refusing to bootstrap over existing keyring state")
+
+
+def _require_created_keyring() -> None:
+    try:
+        directory = os.lstat(KEYRING_DIR)
+        entries = list(KEYRING_DIR.iterdir())
+    except OSError:
+        raise ServiceError("the disposable keyring was not created") from None
+    if (
+        not stat.S_ISDIR(directory.st_mode)
+        or directory.st_uid != os.getuid()
+        or stat.S_IMODE(directory.st_mode) != 0o700
+    ):
+        raise ServiceError("the disposable keyring directory is not private")
+    keyrings = [entry for entry in entries if entry.name.endswith(".keyring")]
+    if not keyrings:
+        raise ServiceError("the disposable keyring was not created")
+    for path in keyrings:
+        try:
+            metadata = os.lstat(path)
+        except OSError:
+            raise ServiceError("the disposable keyring is not private") from None
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ServiceError("the disposable keyring is not private")
+
+
+def _bootstrap_synthetic() -> None:
+    """Create a fresh keyring with a random passphrase held only in memory/stdin."""
+    if _service_owned():
+        raise ServiceError("refusing to replace an existing Secret Service")
+    _require_new_keyring_location()
+
+    passphrase = bytearray(secrets.token_bytes(32).hex().encode("ascii"))
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        process = _spawn_daemon(keyring_input=passphrase)
+        _wait_for_collection(process, expected_locked=False)
+        _require_created_keyring()
+    except BaseException:
+        if process is not None:
+            _stop_child(process)
+        raise
+    finally:
+        passphrase[:] = b"\x00" * len(passphrase)
+    print("secret-service=unlocked synthetic-keyring=created")
+
+
 def _unlock_manually() -> None:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise ServiceError("manual unlock requires a real interactive terminal")
@@ -250,9 +313,15 @@ def _status() -> None:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[1] not in {"status", "start-locked", "unlock"}:
+    if len(argv) != 2 or argv[1] not in {
+        "status",
+        "start-locked",
+        "unlock",
+        "bootstrap-synthetic",
+    }:
         print(
-            "usage: container-secret-service.py {status|start-locked|unlock}",
+            "usage: container-secret-service.py "
+            "{status|start-locked|unlock|bootstrap-synthetic}",
             file=sys.stderr,
         )
         return 2
@@ -262,6 +331,8 @@ def main(argv: list[str]) -> int:
             _status()
         elif argv[1] == "start-locked":
             _start_locked()
+        elif argv[1] == "bootstrap-synthetic":
+            _bootstrap_synthetic()
         else:
             _unlock_manually()
         return 0

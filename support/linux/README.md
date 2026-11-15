@@ -167,6 +167,14 @@ This fixture checks a **zero-liability** journal only, not persistence of an
 outstanding transaction. Running the offline cleanup self-test or compiling
 the script does not qualify container recreation or manual unlock.
 
+The separate hosted `--ci-synthetic` mode exercises production initialization,
+actual container recreation and locked/unavailable fail-closed checks using a
+disposable synthetic keyring. It stops before post-recreation unlock. A passing
+CI subset does not establish manual unlock or post-unlock recovery; consult the
+hosted job for the exact commit and its `manual-unlock=not-run` and
+`post-unlock-recovery=not-tested` markers. Runtime containers use no network;
+image builds still require network access for build dependencies.
+
 The scripts require Linux. On macOS, use an amd64 Linux container. The Anvil
 asset is Linux-only; do not substitute a Homebrew binary when checking release
 provenance.
