@@ -3,6 +3,7 @@ FROM rust:1.94.1-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml ./
 COPY src ./src
+COPY deployments ./deployments
 COPY support/release-repository.txt ./support/release-repository.txt
 COPY support/paste-shim ./support/paste-shim
 RUN cargo build --locked --release --bin astatine \

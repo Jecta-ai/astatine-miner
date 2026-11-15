@@ -37,6 +37,8 @@ import importlib.util
 import json
 import os
 import platform
+import posixpath
+import re
 import shutil
 import signal
 import stat
@@ -195,6 +197,39 @@ def _docker(args: list[str], *, timeout: int = TIMEOUT_DOCKER_SECONDS) -> subpro
 def _require_docker_ok(result: subprocess.CompletedProcess[bytes], stage: str) -> bytes:
     _require(result.returncode == 0, f"Docker {stage} failed with status {result.returncode}")
     return result.stdout
+
+
+def _safe_build_diagnostics(output: bytes) -> str:
+    """Reduce compiler output to allowlisted path/package diagnostics only."""
+    missing_file = re.compile(
+        r"error: couldn't read `([^`\r\n]{1,256})`: No such file or directory "
+        r"\(os error [0-9]+\)"
+    )
+    failed_crate = re.compile(r"error: could not compile `([A-Za-z0-9_.-]{1,128})`")
+    messages: list[str] = []
+    for raw_line in output.decode("utf-8", "replace").splitlines():
+        line = raw_line.strip()
+        missing = missing_file.search(line)
+        if missing is not None:
+            path = missing.group(1)
+            if not re.fullmatch(r"[A-Za-z0-9_./-]{1,256}", path):
+                continue
+            normalized = posixpath.normpath(path)
+            if normalized.startswith("../") or normalized in {".", ".."} or normalized.startswith("/"):
+                continue
+            message = f"missing build input: {normalized}"
+        else:
+            crate = failed_crate.search(line)
+            if crate is None:
+                continue
+            message = f"Rust crate failed to compile: {crate.group(1)}"
+        if message not in messages:
+            messages.append(message)
+        if len(messages) == 5:
+            break
+    if messages:
+        return "; ".join(messages)
+    return "no safe compiler summary matched; raw build diagnostics withheld"
 
 
 def _confirmed_not_found(
@@ -402,6 +437,11 @@ def _create_build_context(repository: Path, parent: Path) -> Path:
     for name in ("Cargo.toml", "Cargo.lock", "build.rs", "rust-toolchain.toml"):
         _copy_regular_file(repository / name, context / name)
     _copy_tree_without_links(repository / "src", context / "src")
+    for name in ("mainnet.toml", "testnet.toml"):
+        _copy_regular_file(
+            repository / "deployments" / name,
+            context / "deployments" / name,
+        )
     _copy_regular_file(
         repository / "support" / "release-repository.txt",
         context / "support" / "release-repository.txt",
@@ -426,6 +466,7 @@ def _create_build_context(repository: Path, parent: Path) -> Path:
         "build.rs",
         "rust-toolchain.toml",
         "src",
+        "deployments",
         "support",
     }
     _require(
@@ -533,10 +574,10 @@ class ContainerQualification:
         os.chmod(self.work, 0o700)
         self.context = _create_build_context(self.repository, self.work)
         self.image_requested = True
-        self._docker_ok(
+        build = _docker(
             [
                 "build",
-                "--quiet",
+                "--progress=plain",
                 "--pull",
                 "--platform=linux/amd64",
                 "--label",
@@ -547,9 +588,14 @@ class ContainerQualification:
                 self.image_tag,
                 str(self.context),
             ],
-            "production image build",
             timeout=TIMEOUT_BUILD_SECONDS,
         )
+        if build.returncode != 0:
+            details = _safe_build_diagnostics(build.stdout + build.stderr)
+            raise QualificationError(
+                "Docker production image build failed with "
+                f"status {build.returncode}; {details}"
+            )
         labels = self._docker_ok(
             ["image", "inspect", "--format", "{{json .Config.Labels}}", self.image_tag],
             "built image inspection",
@@ -1191,6 +1237,65 @@ def _run_ci_self_tests() -> None:
         except exceptions:
             return
         raise AssertionError(message)
+
+    safe_diagnostic = _safe_build_diagnostics(
+        b"error: couldn't read `src/../deployments/testnet.toml`: "
+        b"No such file or directory (os error 2)\n"
+        b"error: couldn't read `src/../deployments/mainnet.toml`: "
+        b"No such file or directory (os error 2)\n"
+        b"error: could not compile `astatine-cli-rust` (bin \"astatine\")\n"
+        b"build output password=offline-" + b"diagnostic-" + b"canary"
+    )
+    _require(
+        "missing build input: deployments/testnet.toml" in safe_diagnostic
+        and "missing build input: deployments/mainnet.toml" in safe_diagnostic
+        and "Rust crate failed to compile: astatine-cli-rust" in safe_diagnostic
+        and "[REDACTED]" not in safe_diagnostic,
+        "Docker build diagnostics were not reduced to safe actionable summaries",
+    )
+    _require(
+        "private-input" not in _safe_build_diagnostics(
+            b"error: couldn't read `../../private-input`: "
+            b"No such file or directory (os error 2)\n"
+        ),
+        "Docker build diagnostics exposed a path outside the build context",
+    )
+
+    with tempfile.TemporaryDirectory(prefix="astatine-container-context-selftest.") as temp:
+        fixture_root = Path(temp) / "repository"
+        fixture_parent = Path(temp) / "build"
+        fixture_files = {
+            "Cargo.toml": "[package]\n",
+            "Cargo.lock": "version = 4\n",
+            "build.rs": "fn main() {}\n",
+            "rust-toolchain.toml": "[toolchain]\nchannel = 'stable'\n",
+            "src/main.rs": "fn main() {}\n",
+            "deployments/mainnet.toml": "mainnet fixture\n",
+            "deployments/testnet.toml": "testnet fixture\n",
+            "deployments/README.md": "not a build input\n",
+            "support/release-repository.txt": "owner/repository\n",
+            "support/paste-shim/Cargo.toml": "[package]\n",
+            "support/paste-shim/src/lib.rs": "// fixture\n",
+            "support/linux/container-qualification.Dockerfile": "FROM scratch\n",
+            "support/linux/container-entrypoint.sh": "#!/bin/sh\n",
+            "support/linux/container-secret-service.py": "# fixture\n",
+            "support/linux/container-state-probe.py": "# fixture\n",
+            "support/linux/container-session.conf": "<busconfig/>\n",
+        }
+        for relative, contents in fixture_files.items():
+            source = fixture_root / relative
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(contents, encoding="utf-8")
+        fixture_parent.mkdir()
+        fixture_context = _create_build_context(fixture_root, fixture_parent)
+        _require(
+            (fixture_context / "deployments" / "mainnet.toml").read_text(encoding="utf-8")
+            == "mainnet fixture\n"
+            and (fixture_context / "deployments" / "testnet.toml").read_text(encoding="utf-8")
+            == "testnet fixture\n"
+            and not (fixture_context / "deployments" / "README.md").exists(),
+            "whitelisted build context omitted deployment inputs or copied extra docs",
+        )
 
     out_of_order = CiSyntheticStateMachine()
     expect_rejected(
