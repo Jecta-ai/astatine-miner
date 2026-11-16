@@ -59,6 +59,95 @@ EXPECTED_SCRUB_PATHS = frozenset(
 )
 
 ATTESTED_RIGHTS = "OWNER-ATTESTED — not independently verified"
+EXPECTED_PUBLICATION_DECISION = (
+    "BLOCKED pending review of rights and notice applicability; "
+    "first-party ownership is owner-attested and not independently verified."
+)
+EXPECTED_NOTICE_APPLICABILITY = "UNRESOLVED"
+EXPECTED_CHECKLIST_STATUS = "OPEN — publication remains BLOCKED"
+EXPECTED_REVIEW_PUSH_STATUS = "AUTHORIZED — REVIEW/CI ONLY"
+EXPECTED_REVIEW_PUSH_DATE = "2026-11-16"
+EXPECTED_REVIEW_PUSH_SCOPE = (
+    "Push the fix/phase-e-e02-e07 remediation branch to the already-public "
+    "repository solely for review and CI."
+)
+EXPECTED_REVIEW_PUSH_VISIBILITY = (
+    "The repository is already public. That visibility does not authorize a "
+    "source archive, binary archive or release, tag or release publication, "
+    "or workflow attestation dispatch."
+)
+EXPECTED_REVIEW_PUSH_NOT_AUTHORIZED = [
+    "source archive distribution",
+    "binary archive or release distribution",
+    "tag or public release publication",
+    "workflow attestation dispatch",
+    "broader license grant or legal clearance",
+    "resolution of RIGHTS-02 through RIGHTS-05",
+]
+EXPECTED_REVIEW_PUSH_GATE_UNCHANGED = (
+    "RIGHTS-02 through RIGHTS-05 remain OPEN and blocking; "
+    "source_distribution and binary_distribution remain BLOCKED."
+)
+EXPECTED_REVIEW_PUSH_AUTH = {
+    "status": EXPECTED_REVIEW_PUSH_STATUS,
+    "authorized_by": "project owner",
+    "authorized_on": EXPECTED_REVIEW_PUSH_DATE,
+    "scope": EXPECTED_REVIEW_PUSH_SCOPE,
+    "public_repository_visibility": EXPECTED_REVIEW_PUSH_VISIBILITY,
+    "not_authorized": EXPECTED_REVIEW_PUSH_NOT_AUTHORIZED,
+    "rights_gate_unchanged": EXPECTED_REVIEW_PUSH_GATE_UNCHANGED,
+}
+# Pinned canonical notice-checklist entries for the blocking items. A reworded
+# action, owner, or evidence string must fail; no legal approval is inferred.
+# Kept in this file so the fixture verifier stands independent of the
+# distribution inventory verifier.
+EXPECTED_BLOCKER_DETAILS = {
+    "RIGHTS-02": {
+        "action": (
+            "Decide whether Apache-2.0 NOTICE propagation applies to each "
+            "distributed artifact. The contract fixtures are not "
+            "release-archive members, so any obligation follows source "
+            "redistribution of the fixtures rather than the miner binary."
+        ),
+        "owner": "project owner and release approver",
+        "evidence": (
+            "rights_review.copyright_evidence; fixtures FIX-01 and FIX-02 "
+            "both set release_archive_member to false."
+        ),
+    },
+    "RIGHTS-03": {
+        "action": (
+            "If the two first-party contract fixtures remain in the public "
+            "source tree, add the Apache-2.0 license text and a copyright "
+            "statement for them, or remove those fixtures from the public tree."
+        ),
+        "owner": "project owner",
+        "evidence": (
+            "tests/fixtures ships OPENZEPPELIN_LICENSE.txt only; no "
+            "Apache-2.0 license text accompanies FIX-01 or FIX-02."
+        ),
+    },
+    "RIGHTS-04": {
+        "action": (
+            "Confirm authorship and redistribution authority for MockAST and "
+            "keep the OpenZeppelin MIT notice with any redistribution of it."
+        ),
+        "owner": "project owner",
+        "evidence": (
+            "FIX-03 license.declaration_evidence; legal_artifacts "
+            "OPENZEPPELIN_LICENSE.txt."
+        ),
+    },
+    "RIGHTS-05": {
+        "action": (
+            "Record the final rights and notice decision in "
+            "tests/fixtures/README.md and this inventory before publishing "
+            "the repository or a release archive."
+        ),
+        "owner": "release approver",
+        "evidence": "rights_review.publication_decision is BLOCKED.",
+    },
+}
 
 FIXTURE_REQUIRED_FIELDS = (
     "id",
@@ -276,6 +365,10 @@ def validate_fixture_entry(entry: object, index: int) -> None:
     require_string(entry["runtime_purpose"], f"{label} runtime_purpose")
     require_bool(entry["production_runtime_use"], f"{label} production_runtime_use")
     require_bool(entry["release_archive_member"], f"{label} release_archive_member")
+    require(
+        entry["release_archive_member"] is False,
+        f"{label} must not be a release archive member: {entry['path']}",
+    )
     consumers = require_list(entry["consumers"], f"{label} consumers")
     require(consumers, f"{label} consumers must not be empty")
     require(all(isinstance(value, str) and value for value in consumers), f"{label} consumers must be strings")
@@ -534,32 +627,109 @@ def verify_inventory(root: Path) -> dict:
         attestation["independent_verification"] is False,
         "owner attestation must not be represented as independent verification",
     )
-    require(rights["notice_applicability"] == "UNRESOLVED", "NOTICE status must remain honest")
-    require(rights["publication_decision"].startswith("BLOCKED"), "publication must remain blocked")
+    require(rights["notice_applicability"] == EXPECTED_NOTICE_APPLICABILITY, "NOTICE status must remain honest")
+    require(
+        rights["publication_decision"] == EXPECTED_PUBLICATION_DECISION,
+        "publication decision changed; publication remains blocked",
+    )
+    push_auth = require_object(
+        rights.get("review_ci_branch_push_authorization"),
+        "rights_review review_ci_branch_push_authorization",
+    )
+    require(
+        push_auth.get("status") == EXPECTED_REVIEW_PUSH_STATUS,
+        "review/CI branch push authorization status changed",
+    )
+    require(
+        push_auth.get("authorized_by") == "project owner",
+        "review/CI branch push authorization author changed",
+    )
+    require(
+        push_auth.get("authorized_on") == EXPECTED_REVIEW_PUSH_DATE,
+        "review/CI branch push authorization date changed",
+    )
+    require(
+        push_auth.get("scope") == EXPECTED_REVIEW_PUSH_SCOPE,
+        "review/CI branch push authorization scope changed",
+    )
+    require(
+        push_auth.get("public_repository_visibility") == EXPECTED_REVIEW_PUSH_VISIBILITY,
+        "review/CI branch push visibility statement changed",
+    )
+    require(
+        push_auth.get("not_authorized") == EXPECTED_REVIEW_PUSH_NOT_AUTHORIZED,
+        "review/CI branch push blocked list changed; no item may be removed",
+    )
+    require(
+        push_auth.get("rights_gate_unchanged") == EXPECTED_REVIEW_PUSH_GATE_UNCHANGED,
+        "review/CI branch push gate statement changed",
+    )
+    require(
+        push_auth == EXPECTED_REVIEW_PUSH_AUTH,
+        "review/CI branch push authorization changed",
+    )
 
     checklist = require_object(rights["notice_checklist"], "rights_review notice_checklist")
     require_fields(checklist, ("status", "scope", "items"), "rights_review notice_checklist")
     require_string(checklist["status"], "notice_checklist status")
     require_string(checklist["scope"], "notice_checklist scope")
-    require(checklist["status"].startswith("OPEN"), "notice checklist must stay open while publication is blocked")
+    require(
+        checklist["status"] == EXPECTED_CHECKLIST_STATUS,
+        "notice checklist status changed; the gate must stay exactly "
+        "OPEN — publication remains BLOCKED",
+    )
     items = require_list(checklist["items"], "notice_checklist items")
     require(items, "notice_checklist items must not be empty")
     item_ids = []
     blocking_open = 0
+    seen_blockers: set[str] = set()
     for index, item in enumerate(items):
         label = f"notice_checklist items[{index}]"
         item = require_object(item, label)
         require_fields(item, ("id", "action", "owner", "status", "blocking", "evidence"), label)
         item_ids.append(require_string(item["id"], f"{label} id"))
-        require_string(item["action"], f"{label} action")
-        require_string(item["owner"], f"{label} owner")
+        action = require_string(item["action"], f"{label} action")
+        owner = require_string(item["owner"], f"{label} owner")
         item_status = require_string(item["status"], f"{label} status")
         require(item_status in {"OPEN", "DONE"}, f"{label} status is unknown: {item_status}")
         blocking = require_bool(item["blocking"], f"{label} blocking")
-        require_string(item["evidence"], f"{label} evidence")
+        evidence = require_string(item["evidence"], f"{label} evidence")
+        if item_ids[-1] in EXPECTED_BLOCKER_DETAILS:
+            expected_detail = EXPECTED_BLOCKER_DETAILS[item_ids[-1]]
+            require(
+                item_ids[-1] not in seen_blockers,
+                f"notice_checklist contains duplicate blocking id: {item_ids[-1]}",
+            )
+            seen_blockers.add(item_ids[-1])
+            require(
+                blocking is True,
+                f"rights gate item is not blocking: {item_ids[-1]}",
+            )
+            require(
+                item_status == "OPEN",
+                f"rights gate blocking item is not OPEN: {item_ids[-1]}",
+            )
+            require(
+                action == expected_detail["action"],
+                f"rights gate item action changed: {item_ids[-1]}; rewording the "
+                "checklist cannot imply approval",
+            )
+            require(
+                owner == expected_detail["owner"],
+                f"rights gate item owner changed: {item_ids[-1]}",
+            )
+            require(
+                evidence == expected_detail["evidence"],
+                f"rights gate item evidence changed: {item_ids[-1]}",
+            )
         if blocking and item_status == "OPEN":
             blocking_open += 1
     require(len(set(item_ids)) == len(item_ids), "notice_checklist contains duplicate ids")
+    require(
+        seen_blockers == set(EXPECTED_BLOCKER_DETAILS),
+        "rights gate is missing a blocking checklist item; expected "
+        f"{sorted(EXPECTED_BLOCKER_DETAILS)}, got {sorted(seen_blockers)}",
+    )
     require(
         blocking_open > 0,
         "publication is BLOCKED but no blocking notice-checklist item is open",
@@ -628,9 +798,11 @@ def verify_inventory(root: Path) -> dict:
         "owner_attestation_status": attestation["status"],
         "owner_attestation_independent_verification": attestation["independent_verification"],
         "notice_applicability": rights["notice_applicability"],
+        "notice_checklist_status": checklist["status"],
         "notice_checklist_items_checked": len(items),
         "notice_checklist_blocking_open": blocking_open,
         "publication_decision": rights["publication_decision"],
+        "review_ci_branch_push_authorization": push_auth["status"],
         "status": "PASS",
     }
 

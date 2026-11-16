@@ -198,7 +198,140 @@ class FixtureProvenanceTests(unittest.TestCase):
         self.write_inventory(inventory)
         with self.assertRaisesRegex(
             VERIFIER.VerificationError,
-            "publication is BLOCKED but no blocking notice-checklist item is open",
+            "rights gate item is not blocking: RIGHTS-02",
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_publication_decision_blocked_but_approved_fails(self) -> None:
+        inventory = self.inventory()
+        inventory["rights_review"]["publication_decision"] = "BLOCKED but approved"
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "publication decision changed"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_checklist_status_open_approved_fails(self) -> None:
+        inventory = self.inventory()
+        inventory["rights_review"]["notice_checklist"]["status"] = "OPEN \u2014 approved"
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "notice checklist status changed"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_blocker_action_reword_fails(self) -> None:
+        inventory = self.inventory()
+        for item in inventory["rights_review"]["notice_checklist"]["items"]:
+            if item["id"] == "RIGHTS-03":
+                item["action"] = "If the fixtures remain, add license text."
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "item action changed: RIGHTS-03"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_blocker_evidence_reword_fails(self) -> None:
+        inventory = self.inventory()
+        for item in inventory["rights_review"]["notice_checklist"]["items"]:
+            if item["id"] == "RIGHTS-05":
+                item["evidence"] = "rights_review.publication_decision is APPROVED."
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "item evidence changed: RIGHTS-05"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_fixture_release_member_true_fails(self) -> None:
+        inventory = self.inventory()
+        inventory["fixtures"][0]["release_archive_member"] = True
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must not be a release archive member"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_fixture_release_member_missing_fails(self) -> None:
+        inventory = self.inventory()
+        del inventory["fixtures"][1]["release_archive_member"]
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "is missing required fields"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_pass_reports_exact_gate_values(self) -> None:
+        result = VERIFIER.verify(self.root)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(
+            result["publication_decision"],
+            "BLOCKED pending review of rights and notice applicability; "
+            "first-party ownership is owner-attested and not independently verified.",
+        )
+        self.assertEqual(
+            result["notice_checklist_status"], "OPEN \u2014 publication remains BLOCKED"
+        )
+        self.assertEqual(
+            result["review_ci_branch_push_authorization"],
+            "AUTHORIZED \u2014 REVIEW/CI ONLY",
+        )
+
+    def test_review_push_status_release_fails(self) -> None:
+        inventory = self.inventory()
+        auth = inventory["rights_review"]["review_ci_branch_push_authorization"]
+        auth["status"] = "AUTHORIZED \u2014 RELEASE"
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "push authorization status changed"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_review_push_date_change_fails(self) -> None:
+        inventory = self.inventory()
+        auth = inventory["rights_review"]["review_ci_branch_push_authorization"]
+        auth["authorized_on"] = "2026-11-17"
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "push authorization date changed"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_review_push_scope_change_fails(self) -> None:
+        inventory = self.inventory()
+        auth = inventory["rights_review"]["review_ci_branch_push_authorization"]
+        auth["scope"] = "Push the branch for review, CI and release."
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "push authorization scope changed"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_review_push_blocked_item_removed_fails(self) -> None:
+        inventory = self.inventory()
+        auth = inventory["rights_review"]["review_ci_branch_push_authorization"]
+        auth["not_authorized"].remove("tag or public release publication")
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "push blocked list changed"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_review_push_gate_statement_change_fails(self) -> None:
+        inventory = self.inventory()
+        auth = inventory["rights_review"]["review_ci_branch_push_authorization"]
+        auth["rights_gate_unchanged"] = "RIGHTS-02 through RIGHTS-05 resolved."
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "push gate statement changed"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_review_push_authorization_missing_fails(self) -> None:
+        inventory = self.inventory()
+        del inventory["rights_review"]["review_ci_branch_push_authorization"]
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must be an object"
         ):
             VERIFIER.verify(self.root)
 

@@ -47,6 +47,11 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain components
         run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+      - name: Assert exact pinned Rust compiler version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(rustc --version | awk '{print $2}')" = "1.94.1"
       - name: Verify native runner architecture
         # A cross-compiled binary is not native-smoke-verified.
         shell: bash
@@ -159,6 +164,8 @@ jobs:
           persist-credentials: false
       - name: Require immutable full-SHA workflow action references
         run: python3 support/check_workflow_pins.py
+      - name: Verify blocked fixture distribution inventory
+        run: python3 -B support/verify-distribution-inventory.py
       - name: Install pinned Rust toolchain components
         run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
       - name: Install pinned dependency validation tools
@@ -169,16 +176,7 @@ jobs:
       - name: Validate dependency policies
         run: cargo deny check
       - name: Keep inactive vulnerable optional package out of the active graph
-        run: |
-          set -euo pipefail
-          cargo tree --locked --all-features --target all -i crypto-bigint@0.5.5 > "$RUNNER_TEMP/crypto-bigint-0.5.5-tree.txt" 2>&1
-          python3 - "$RUNNER_TEMP/crypto-bigint-0.5.5-tree.txt" <<'PY'
-          import pathlib
-          import sys
-
-          tree = pathlib.Path(sys.argv[1]).read_text()
-          assert "crypto-bigint v0.5.5" not in tree, "RUSTSEC-2026-0387 package entered the active all-features/all-targets graph"
-          PY
+        run: python3 support/check_dependency_policy.py --require-inactive
       - name: Audit locked dependencies
         run: cargo audit --ignore RUSTSEC-2026-0387
       - name: Regenerate third-party license notices

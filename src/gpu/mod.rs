@@ -384,6 +384,162 @@ impl GpuBackendEngine {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct ReadbackRing {
+    in_flight: [bool; 2],
+    next_slot: usize,
+    poison: Option<String>,
+}
+
+impl ReadbackRing {
+    fn new() -> Self {
+        Self {
+            in_flight: [false, false],
+            next_slot: 0,
+            poison: None,
+        }
+    }
+
+    fn poison_reason(&self) -> Option<&str> {
+        self.poison.as_deref()
+    }
+
+    fn ensure_healthy(&self) -> Result<()> {
+        if let Some(reason) = self.poison.as_deref() {
+            bail!("GPU readback engine is poisoned and must not be reused: {reason}");
+        }
+        Ok(())
+    }
+
+    fn pending_slot(&self) -> Result<usize> {
+        self.ensure_healthy()?;
+        let slot = self.next_slot;
+        if slot >= self.in_flight.len() {
+            bail!("GPU readback ring is in an invalid state");
+        }
+        if self.in_flight[slot] {
+            bail!("GPU readback ring slot {slot} is still in flight");
+        }
+        Ok(slot)
+    }
+
+    fn mark_dispatched(&mut self, slot: usize) -> Result<()> {
+        self.ensure_healthy()?;
+        if slot >= self.in_flight.len() || slot != self.next_slot {
+            bail!("GPU readback ring slot {slot} does not match the pending dispatch slot");
+        }
+        if self.in_flight[slot] {
+            bail!("GPU readback ring slot {slot} is still in flight");
+        }
+        self.in_flight[slot] = true;
+        self.next_slot = 1 - slot;
+        Ok(())
+    }
+
+    fn begin_collect(&self, slot: usize) -> Result<()> {
+        if let Some(reason) = self.poison.as_deref() {
+            bail!("GPU readback engine is poisoned and must not be reused: {reason}");
+        }
+        if slot >= self.in_flight.len() {
+            bail!("GPU readback ring slot {slot} is invalid");
+        }
+        if !self.in_flight[slot] {
+            bail!("GPU readback ring slot was collected more than once");
+        }
+        Ok(())
+    }
+
+    /// Claim the pending slot for an exclusive readback (the raw SHA-256
+    /// boundary self-test) that must run with no batch in flight. The slot is
+    /// marked dispatched and opened for collection before the GPU operation
+    /// runs, so the ring considers it in flight while the operation runs.
+    fn begin_exclusive_readback(&mut self) -> Result<usize> {
+        self.ensure_healthy()?;
+        if self.in_flight.contains(&true) {
+            bail!("GPU readback ring is not idle: a batch is still in flight");
+        }
+        let slot = self.pending_slot()?;
+        self.mark_dispatched(slot)?;
+        self.begin_collect(slot)?;
+        Ok(slot)
+    }
+
+    fn finish_collect(&mut self, slot: usize) {
+        if slot < self.in_flight.len() {
+            self.in_flight[slot] = false;
+        }
+    }
+
+    fn fail_collect(&mut self, slot: usize, reason: String) {
+        let message = if reason.is_empty() {
+            format!("GPU readback collection failed on slot {slot}")
+        } else {
+            format!("GPU readback collection failed on slot {slot}: {reason}")
+        };
+        self.poison = Some(message);
+        // The failed slot stays marked in flight so it is never silently reused;
+        // the poison gate above rejects every future dispatch and collection.
+        if slot < self.in_flight.len() {
+            self.in_flight[slot] = true;
+        }
+    }
+
+    #[cfg(test)]
+    fn in_flight_slots(&self) -> [bool; 2] {
+        self.in_flight
+    }
+}
+
+/// Deterministic seam shared by production collection paths and tests: it
+/// performs the exact begin + collect + finish/fail wiring. Production
+/// `collect_batch` runs through `run_collection`, and the raw self-test
+/// readback shares `complete_collection` for finalization (after claiming its
+/// slot via `begin_exclusive_readback`); the seam tests drive the same helpers
+/// with injected outcomes, so breaking the shared guard/poison wiring breaks
+/// the tests. That said, these tests cover the shared helpers — the fact that
+/// production call sites keep calling them (rather than inlining a bypass)
+/// is review-verified, not test-enforced.
+trait CollectionSeam<T> {
+    type Pending;
+    fn pending_slot(&self, pending: &Self::Pending) -> usize;
+    fn ring_mut(&mut self) -> &mut ReadbackRing;
+    fn collect_pending(&mut self, pending: Self::Pending, stop: Option<&AtomicBool>) -> Result<T>;
+}
+
+fn run_collection<S: CollectionSeam<T>, T>(
+    seam: &mut S,
+    pending: S::Pending,
+    stop: Option<&AtomicBool>,
+    label: &str,
+) -> Result<T> {
+    let slot = seam.pending_slot(&pending);
+    seam.ring_mut().begin_collect(slot)?;
+    let result = seam.collect_pending(pending, stop);
+    complete_collection(seam.ring_mut(), slot, result, label)
+}
+
+fn complete_collection<T>(
+    ring: &mut ReadbackRing,
+    slot: usize,
+    result: Result<T>,
+    label: &str,
+) -> Result<T> {
+    match result {
+        Ok(value) => {
+            ring.finish_collect(slot);
+            Ok(value)
+        }
+        Err(error) => {
+            ring.fail_collect(slot, format!("{error:#}"));
+            let poison = ring
+                .poison_reason()
+                .unwrap_or("unknown readback failure")
+                .to_owned();
+            Err(error).with_context(|| format!("{label} failed; engine poisoned: {poison}"))
+        }
+    }
+}
+
 pub(crate) struct GpuEngine {
     _instance: Instance,
     device: Device,
@@ -399,10 +555,29 @@ pub(crate) struct GpuEngine {
     batch_size: usize,
     workgroup_size: u32,
     midstate_enabled: bool,
-    next_readback_slot: usize,
-    readback_in_flight: [bool; 2],
+    readback_ring: ReadbackRing,
     device_lost: Arc<AtomicBool>,
     uncaptured_error: Arc<Mutex<Option<String>>>,
+}
+
+impl CollectionSeam<GpuBatchResult> for GpuEngine {
+    type Pending = PendingGpuBatch;
+
+    fn pending_slot(&self, pending: &PendingGpuBatch) -> usize {
+        pending.readback_slot
+    }
+
+    fn ring_mut(&mut self) -> &mut ReadbackRing {
+        &mut self.readback_ring
+    }
+
+    fn collect_pending(
+        &mut self,
+        pending: PendingGpuBatch,
+        stop: Option<&AtomicBool>,
+    ) -> Result<GpuBatchResult> {
+        self.collect_batch_inner(pending, stop)
+    }
 }
 
 impl GpuEngine {
@@ -688,8 +863,7 @@ impl GpuEngine {
             batch_size,
             workgroup_size,
             midstate_enabled,
-            next_readback_slot: 0,
-            readback_in_flight: [false, false],
+            readback_ring: ReadbackRing::new(),
             initialization: GpuInitializationTimings {
                 device_request,
                 pipeline_creation,
@@ -810,13 +984,9 @@ impl GpuEngine {
 
     fn hash_batch_with_profiling(&mut self, params: GpuBatchParams<'_>) -> Result<GpuBatchResult> {
         let stop = params.stop;
-        let readback_slot = self.next_readback_slot;
-        if self.readback_in_flight[readback_slot] {
-            bail!("GPU readback ring slot {readback_slot} is still in flight");
-        }
+        let readback_slot = self.readback_ring.pending_slot()?;
         let pending = self.submit_batch_with_profiling(params, readback_slot)?;
-        self.readback_in_flight[readback_slot] = true;
-        self.next_readback_slot = 1 - readback_slot;
+        self.readback_ring.mark_dispatched(readback_slot)?;
         self.collect_batch(pending, stop)
     }
 
@@ -864,13 +1034,9 @@ impl GpuEngine {
         &mut self,
         params: GpuBatchParams<'_>,
     ) -> Result<PendingGpuBatch> {
-        let readback_slot = self.next_readback_slot;
-        if self.readback_in_flight[readback_slot] {
-            bail!("GPU readback ring slot {readback_slot} is still in flight");
-        }
+        let readback_slot = self.readback_ring.pending_slot()?;
         let pending = self.submit_batch_with_profiling(params, readback_slot)?;
-        self.readback_in_flight[readback_slot] = true;
-        self.next_readback_slot = 1 - readback_slot;
+        self.readback_ring.mark_dispatched(readback_slot)?;
         Ok(pending)
     }
 
@@ -879,13 +1045,7 @@ impl GpuEngine {
         pending: PendingGpuBatch,
         stop: Option<&AtomicBool>,
     ) -> Result<GpuBatchResult> {
-        let readback_slot = pending.readback_slot;
-        if !self.readback_in_flight[readback_slot] {
-            bail!("GPU readback ring slot was collected more than once");
-        }
-        let result = self.collect_batch_inner(pending, stop)?;
-        self.readback_in_flight[readback_slot] = false;
-        Ok(result)
+        run_collection(self, pending, stop, "GPU readback collection")
     }
 
     fn submit_batch_with_profiling(
@@ -906,6 +1066,7 @@ impl GpuEngine {
         if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
             bail!("GPU batch cancelled before dispatch");
         }
+        self.readback_ring.ensure_healthy()?;
         if self.device_lost.load(Ordering::Acquire) {
             bail!("GPU device was lost");
         }
@@ -1246,10 +1407,27 @@ impl GpuEngine {
         })
     }
 
-    fn raw_sha256(&self, message: &[u8]) -> Result<[u8; 32]> {
+    fn raw_sha256(&mut self, message: &[u8]) -> Result<[u8; 32]> {
+        // Pure input validation runs before any ring or poison state is touched,
+        // so an oversized self-test message is a normal validation error.
         if message.len() > MAX_ABI_TEMPLATE_BYTES {
             bail!("raw SHA-256 self-test message exceeds its bounded input buffer");
         }
+        // The raw boundary self-test runs exclusively (no batch in flight), so it
+        // claims the pending ring slot before submitting: the slot is marked
+        // in flight while the GPU operation runs, exactly like any other
+        // dispatch. A failed read poisons the engine on the slot it used.
+        let slot = self.readback_ring.begin_exclusive_readback()?;
+        let outcome = self.raw_sha256_inner(message, slot);
+        complete_collection(
+            &mut self.readback_ring,
+            slot,
+            outcome,
+            "GPU raw SHA-256 readback",
+        )
+    }
+
+    fn raw_sha256_inner(&self, message: &[u8], readback_slot: usize) -> Result<[u8; 32]> {
         let mut input_bytes =
             Vec::with_capacity(INPUT_HEADER_WORDS * 4 + message.len().div_ceil(4) * 4);
         push_u32(&mut input_bytes, u32::try_from(message.len())?);
@@ -1295,12 +1473,12 @@ impl GpuEngine {
         encoder.copy_buffer_to_buffer(
             &self.output,
             0,
-            &self.readback[0],
+            &self.readback[readback_slot],
             0,
             u64::try_from(result_bytes)?,
         );
         let submission = self.queue.submit([encoder.finish()]);
-        let mapped = self.read_mapped_buffer(0, result_bytes, None, submission)?;
+        let mapped = self.read_mapped_buffer(readback_slot, result_bytes, None, submission)?;
         if read_u32(&mapped.bytes, 0)? != 1 {
             bail!("GPU raw SHA-256 test shader did not write its result");
         }
@@ -1313,6 +1491,7 @@ impl GpuEngine {
     }
 
     pub(crate) fn self_test(&mut self) -> Result<()> {
+        self.readback_ring.ensure_healthy()?;
         let mut context = WorkContext {
             chain_id: 31_337,
             contract: "0x1234567890abcdef1234567890abcdef12345678".parse()?,
@@ -2084,9 +2263,64 @@ fn cpu_group_winners(
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuEngine, is_software_name, reduced_gpu_batch_size, validate_gpu_config, validate_shader,
+        CollectionSeam, GpuEngine, ReadbackRing, complete_collection, is_software_name,
+        reduced_gpu_batch_size, run_collection, validate_gpu_config, validate_shader,
     };
+    use anyhow::{Result, anyhow};
+    use std::sync::atomic::AtomicBool;
     use wgpu::{AdapterInfo, Backend, DeviceType};
+
+    /// Hardware-free stand-in for a dispatched GPU batch. The slot is reserved
+    /// through the real `ReadbackRing` in production dispatch order; only the
+    /// GPU outcome itself is injected, so these tests drive the exact
+    /// production `run_collection` wiring.
+    struct FakePending {
+        slot: usize,
+    }
+
+    #[derive(Default)]
+    struct FakeCollection {
+        ring: ReadbackRing,
+        outcome: Option<Result<()>>,
+        collect_calls: usize,
+        stop_seen: bool,
+    }
+
+    impl FakeCollection {
+        fn dispatched(outcome: Result<()>) -> (FakePending, Self) {
+            let mut seam = Self::default();
+            let slot = seam.ring.pending_slot().expect("fresh ring offers a slot");
+            seam.ring
+                .mark_dispatched(slot)
+                .expect("fresh slot dispatches");
+            seam.outcome = Some(outcome);
+            (FakePending { slot }, seam)
+        }
+    }
+
+    impl CollectionSeam<()> for FakeCollection {
+        type Pending = FakePending;
+
+        fn pending_slot(&self, pending: &FakePending) -> usize {
+            pending.slot
+        }
+
+        fn ring_mut(&mut self) -> &mut ReadbackRing {
+            &mut self.ring
+        }
+
+        fn collect_pending(
+            &mut self,
+            _pending: FakePending,
+            stop: Option<&AtomicBool>,
+        ) -> Result<()> {
+            self.collect_calls += 1;
+            self.stop_seen = stop.is_some();
+            self.outcome
+                .take()
+                .expect("fake collection outcome consumed twice")
+        }
+    }
 
     #[test]
     fn wgsl_shader_parses_and_validates_without_gpu_hardware() {
@@ -2138,6 +2372,343 @@ mod tests {
         assert_eq!(
             reduced_gpu_batch_size(2_048, Duration::from_millis(101)),
             None
+        );
+    }
+
+    #[test]
+    fn readback_ring_alternates_slots_across_successful_collections() {
+        let mut ring = ReadbackRing::new();
+        assert_eq!(ring.pending_slot().unwrap(), 0);
+        ring.mark_dispatched(0).unwrap();
+        ring.begin_collect(0).unwrap();
+        ring.finish_collect(0);
+        assert_eq!(ring.in_flight_slots(), [false, false]);
+        assert!(ring.poison_reason().is_none());
+
+        assert_eq!(ring.pending_slot().unwrap(), 1);
+        ring.mark_dispatched(1).unwrap();
+        ring.begin_collect(1).unwrap();
+        ring.finish_collect(1);
+        assert_eq!(ring.in_flight_slots(), [false, false]);
+        assert_eq!(ring.pending_slot().unwrap(), 0);
+        assert!(ring.poison_reason().is_none());
+    }
+
+    #[test]
+    fn readback_ring_blocks_a_third_dispatch_while_both_slots_are_in_flight() {
+        let mut ring = ReadbackRing::new();
+        ring.mark_dispatched(0).unwrap();
+        ring.mark_dispatched(1).unwrap();
+        let err = ring.pending_slot().unwrap_err();
+        assert!(format!("{err:#}").contains("still in flight"));
+        assert!(ring.poison_reason().is_none());
+    }
+
+    #[test]
+    fn readback_ring_rejects_double_collection_without_poisoning() {
+        let mut ring = ReadbackRing::new();
+        ring.mark_dispatched(0).unwrap();
+        ring.begin_collect(0).unwrap();
+        ring.finish_collect(0);
+        let err = ring.begin_collect(0).unwrap_err();
+        assert!(format!("{err:#}").contains("collected more than once"));
+        assert!(ring.poison_reason().is_none());
+        // The healthy ring still offers the alternating slot.
+        assert_eq!(ring.pending_slot().unwrap(), 1);
+    }
+
+    #[test]
+    fn readback_ring_failure_poisons_engine_and_keeps_slot_unavailable() {
+        let mut ring = ReadbackRing::new();
+        ring.mark_dispatched(0).unwrap();
+        ring.begin_collect(0).unwrap();
+        ring.fail_collect(
+            0,
+            "map GPU SHA-256d readback buffer: device lost".to_owned(),
+        );
+
+        let reason = ring
+            .poison_reason()
+            .expect("poison reason is retained")
+            .to_owned();
+        assert!(reason.contains("slot 0"));
+        assert!(reason.contains("map GPU SHA-256d readback buffer"));
+        // The failed slot is never silently freed for reuse.
+        assert!(ring.in_flight_slots()[0]);
+    }
+
+    #[test]
+    fn poisoned_readback_ring_rejects_future_dispatch_and_collection() {
+        let mut ring = ReadbackRing::new();
+        ring.mark_dispatched(0).unwrap();
+        ring.begin_collect(0).unwrap();
+        ring.fail_collect(0, "result decode out of bounds".to_owned());
+
+        for result in [
+            ring.begin_collect(0),
+            ring.begin_collect(1),
+            ring.ensure_healthy(),
+        ] {
+            let err = result.unwrap_err();
+            let text = format!("{err:#}");
+            assert!(text.contains("poisoned"), "unexpected error: {text}");
+            assert!(
+                text.contains("result decode out of bounds"),
+                "poison reason dropped: {text}"
+            );
+        }
+        let dispatch_err = ring.pending_slot().unwrap_err();
+        let dispatch_text = format!("{dispatch_err:#}");
+        assert!(dispatch_text.contains("poisoned"));
+        assert!(dispatch_text.contains("result decode out of bounds"));
+        assert!(
+            ring.poison_reason()
+                .is_some_and(|reason| reason.contains("result decode out of bounds"))
+        );
+    }
+
+    #[test]
+    fn seam_success_returns_value_releases_slot_and_alternates() {
+        let stop = AtomicBool::new(false);
+        let mut seam = FakeCollection::default();
+        for expected_slot in [0_usize, 1, 0] {
+            let slot = seam.ring.pending_slot().expect("ring offers a slot");
+            assert_eq!(slot, expected_slot);
+            seam.ring.mark_dispatched(slot).expect("slot dispatches");
+            seam.outcome = Some(Ok(()));
+            run_collection(
+                &mut seam,
+                FakePending { slot },
+                Some(&stop),
+                "GPU readback collection",
+            )
+            .expect("successful collection returns the value");
+            assert_eq!(seam.ring.in_flight_slots(), [false, false]);
+            assert!(seam.ring.poison_reason().is_none());
+        }
+        assert_eq!(seam.collect_calls, 3);
+    }
+
+    #[test]
+    fn seam_mapping_error_poisons_with_cause_and_context() {
+        let (pending, mut seam) =
+            FakeCollection::dispatched(Err(anyhow!("map GPU SHA-256d readback buffer: lost")));
+        let err = run_collection(&mut seam, pending, None, "GPU readback collection")
+            .expect_err("mapping failure must not return Ok");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("map GPU SHA-256d readback buffer"),
+            "cause lost: {text}"
+        );
+        assert!(text.contains("poisoned"), "poison context lost: {text}");
+        assert!(
+            seam.ring.in_flight_slots()[0],
+            "failed slot stays unavailable"
+        );
+        assert!(
+            seam.ring
+                .poison_reason()
+                .is_some_and(|reason| reason.contains("map GPU SHA-256d readback buffer")),
+            "poison reason not retained"
+        );
+        let dispatch_err = seam
+            .ring
+            .pending_slot()
+            .expect_err("poisoned ring rejects dispatch");
+        assert!(
+            format!("{dispatch_err:#}").contains("map GPU SHA-256d readback buffer"),
+            "dispatch error lost the retained reason"
+        );
+        let collect_err = seam
+            .ring
+            .begin_collect(0)
+            .expect_err("poisoned ring rejects collection");
+        assert!(
+            format!("{collect_err:#}").contains("map GPU SHA-256d readback buffer"),
+            "collection error lost the retained reason"
+        );
+    }
+
+    #[test]
+    fn seam_decode_error_poisons_with_cause_and_context() {
+        let (pending, mut seam) = FakeCollection::dispatched(Err(anyhow!(
+            "GPU result buffer was shorter than its declared layout"
+        )));
+        let err = run_collection(&mut seam, pending, None, "GPU readback collection")
+            .expect_err("decode failure must not return Ok");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("shorter than its declared layout"),
+            "cause lost: {text}"
+        );
+        assert!(text.contains("poisoned"), "poison context lost: {text}");
+        assert!(
+            seam.ring.in_flight_slots()[0],
+            "failed slot stays unavailable"
+        );
+        assert!(
+            seam.ring
+                .poison_reason()
+                .is_some_and(|reason| reason.contains("shorter than its declared layout")),
+            "poison reason not retained"
+        );
+    }
+
+    #[test]
+    fn seam_cancellation_poisons_without_stale_ok() {
+        let (pending, mut seam) =
+            FakeCollection::dispatched(Err(anyhow!("GPU batch cancelled during shutdown")));
+        let stop = AtomicBool::new(false);
+        let err = run_collection(&mut seam, pending, Some(&stop), "GPU readback collection")
+            .expect_err("cancellation must not yield an Ok result");
+        assert!(
+            seam.stop_seen,
+            "stop flag must be forwarded to the device read"
+        );
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("cancelled during shutdown"),
+            "cause lost: {text}"
+        );
+        assert!(text.contains("poisoned"), "poison context lost: {text}");
+        assert!(
+            seam.ring.in_flight_slots()[0],
+            "cancelled slot stays unavailable"
+        );
+        // A later collection attempt fails at the poison gate without reaching
+        // the device read again.
+        let calls_before = seam.collect_calls;
+        let later = run_collection(
+            &mut seam,
+            FakePending { slot: 0 },
+            None,
+            "GPU readback collection",
+        )
+        .expect_err("poisoned ring rejects future collection");
+        assert!(format!("{later:#}").contains("poisoned"));
+        assert!(format!("{later:#}").contains("cancelled during shutdown"));
+        assert_eq!(seam.collect_calls, calls_before);
+    }
+
+    #[test]
+    fn seam_rejects_collection_without_dispatch_before_device_read() {
+        let mut seam = FakeCollection {
+            outcome: Some(Ok(())),
+            ..FakeCollection::default()
+        };
+        let err = run_collection(
+            &mut seam,
+            FakePending { slot: 0 },
+            None,
+            "GPU readback collection",
+        )
+        .expect_err("undispatched slot must be rejected");
+        assert!(format!("{err:#}").contains("collected more than once"));
+        assert_eq!(
+            seam.collect_calls, 0,
+            "guard must run before the device read"
+        );
+        assert!(seam.ring.poison_reason().is_none());
+    }
+
+    #[test]
+    fn exclusive_start_requires_a_fully_idle_ring() {
+        // Only slot 0 in flight.
+        let mut ring = ReadbackRing::new();
+        ring.mark_dispatched(0).expect("dispatch slot 0");
+        let flight = ring.in_flight_slots();
+        let err = ring
+            .begin_exclusive_readback()
+            .expect_err("busy ring rejects exclusive start");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("idle") || text.contains("in flight"),
+            "diagnostic lost: {text}"
+        );
+        assert_eq!(
+            ring.in_flight_slots(),
+            flight,
+            "failed start must not mutate the ring"
+        );
+        assert!(ring.poison_reason().is_none());
+
+        // Only slot 1 in flight.
+        let mut ring = ReadbackRing::new();
+        ring.mark_dispatched(0).expect("dispatch slot 0");
+        ring.mark_dispatched(1).expect("dispatch slot 1");
+        ring.finish_collect(0);
+        assert!(ring.in_flight_slots()[1]);
+        let flight = ring.in_flight_slots();
+        let err = ring
+            .begin_exclusive_readback()
+            .expect_err("busy ring rejects exclusive start");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("idle") || text.contains("in flight"),
+            "diagnostic lost: {text}"
+        );
+        assert_eq!(
+            ring.in_flight_slots(),
+            flight,
+            "failed start must not mutate the ring"
+        );
+        assert!(ring.poison_reason().is_none());
+    }
+
+    #[test]
+    fn exclusive_start_claims_alternating_slot_until_finished() {
+        let mut ring = ReadbackRing::new();
+        let first = ring
+            .begin_exclusive_readback()
+            .expect("idle ring grants exclusive start");
+        assert_eq!(first, 0);
+        assert!(
+            ring.in_flight_slots()[first],
+            "slot is in flight while claimed"
+        );
+        let busy = ring
+            .begin_exclusive_readback()
+            .expect_err("claimed ring is not idle");
+        assert!(format!("{busy:#}").contains("in flight"));
+        assert!(ring.poison_reason().is_none());
+        ring.finish_collect(first);
+        let second = ring
+            .begin_exclusive_readback()
+            .expect("released ring grants exclusive start");
+        assert_eq!(second, 1, "exclusive claims alternate slots");
+        ring.finish_collect(second);
+        assert_eq!(ring.in_flight_slots(), [false, false]);
+        assert!(ring.poison_reason().is_none());
+    }
+
+    #[test]
+    fn exclusive_claim_failure_poisons_the_claimed_slot() {
+        let mut ring = ReadbackRing::new();
+        let slot = ring
+            .begin_exclusive_readback()
+            .expect("idle ring grants exclusive start");
+        let outcome: Result<()> = Err(anyhow!("map GPU SHA-256d readback buffer: gone"));
+        let err: Result<()> =
+            complete_collection(&mut ring, slot, outcome, "GPU raw SHA-256 readback");
+        let err = err.expect_err("failed exclusive read must not return Ok");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("map GPU SHA-256d readback buffer"),
+            "cause lost: {text}"
+        );
+        assert!(text.contains("poisoned"), "poison context lost: {text}");
+        assert!(
+            ring.in_flight_slots()[slot],
+            "failed slot stays unavailable"
+        );
+        assert!(
+            ring.poison_reason()
+                .is_some_and(|reason| reason.contains("map GPU SHA-256d readback buffer")),
+            "poison reason not retained"
+        );
+        assert!(
+            ring.pending_slot().is_err(),
+            "poisoned ring rejects dispatch"
         );
     }
 

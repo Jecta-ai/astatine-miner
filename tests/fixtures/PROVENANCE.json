@@ -201,8 +201,8 @@
   "documents": [
     {
       "path": "tests/fixtures/README.md",
-      "sha256": "c61ab2f8f53dcdd49ea3841133237c657a86a3b02374c37c118921e736d01f8d",
-      "bytes": 5106
+      "sha256": "3b2322fd6a8b2d2c264fb8b3933ee779bf18322950ddeff5126f48180fd0ba8d",
+      "bytes": 5948
     }
   ],
   "legal_artifacts": [
@@ -284,7 +284,23 @@
       ]
     },
     "publication_decision": "BLOCKED pending review of rights and notice applicability; first-party ownership is owner-attested and not independently verified.",
-    "not_inferred": "Repository owner identity, commit-author metadata, a personal handle or the CLI MIT license do not by themselves establish ownership or redistribution authority. The owner attestation is an explicit statement of first-party ownership; it is recorded as OWNER-ATTESTED and is not independently verified."
+    "not_inferred": "Repository owner identity, commit-author metadata, a personal handle or the CLI MIT license do not by themselves establish ownership or redistribution authority. The owner attestation is an explicit statement of first-party ownership; it is recorded as OWNER-ATTESTED and is not independently verified.",
+    "review_ci_branch_push_authorization": {
+      "status": "AUTHORIZED \u2014 REVIEW/CI ONLY",
+      "authorized_by": "project owner",
+      "authorized_on": "2026-11-16",
+      "scope": "Push the fix/phase-e-e02-e07 remediation branch to the already-public repository solely for review and CI.",
+      "public_repository_visibility": "The repository is already public. That visibility does not authorize a source archive, binary archive or release, tag or release publication, or workflow attestation dispatch.",
+      "not_authorized": [
+        "source archive distribution",
+        "binary archive or release distribution",
+        "tag or public release publication",
+        "workflow attestation dispatch",
+        "broader license grant or legal clearance",
+        "resolution of RIGHTS-02 through RIGHTS-05"
+      ],
+      "rights_gate_unchanged": "RIGHTS-02 through RIGHTS-05 remain OPEN and blocking; source_distribution and binary_distribution remain BLOCKED."
+    }
   },
   "scrub_policy": {
     "scope": "Source tree only; exact deployment pins, protocol identities, contract names and fixture hashes are retained.",

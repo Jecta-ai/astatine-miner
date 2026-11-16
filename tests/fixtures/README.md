@@ -10,7 +10,7 @@ The pinned upstream `AstatineMiner` and `AstatineGenesisCoordinator` source file
 
 ## Rights and notice checklist
 
-Publication of this repository or a release archive stays BLOCKED until every item is resolved and recorded in `rights_review.notice_checklist` of `PROVENANCE.json`. No automated check can establish ownership, authority or NOTICE applicability; these actions need a human decision.
+Publication of this repository or a release archive stays BLOCKED until every item is resolved and recorded in `rights_review.notice_checklist` of `PROVENANCE.json`. The repository itself is already public; that visibility is not publication of a source archive or binary release, which remain BLOCKED. The narrow 2026-11-16 review/CI branch-push exception is recorded below and authorizes no archive or release distribution. No automated check can establish ownership, authority or NOTICE applicability; these actions need a human decision.
 
 - [x] **RIGHTS-01** — The project owner confirmed ownership of the first-party `AstatineMiner` and `AstatineGenesisCoordinator` contracts for Phase D. This is an owner attestation, not independent verification or a waiver of third-party obligations.
 - [ ] **RIGHTS-02** — Decide whether Apache-2.0 NOTICE propagation applies to each distributed artifact. The contract fixtures are not release-archive members, so any obligation follows source redistribution of the fixtures rather than the miner binary.
@@ -19,6 +19,10 @@ Publication of this repository or a release archive stays BLOCKED until every it
 - [ ] **RIGHTS-05** — Record the final decision here and in `PROVENANCE.json` before publishing the repository or a release archive.
 
 The OpenZeppelin license identity is verified and reproduced; that resolves the license text only, not first-party rights or notice applicability.
+
+## Review/CI branch push authorization (2026-11-16)
+
+The project owner authorized pushing the `fix/phase-e-e02-e07` remediation branch to the already-public repository solely for review and CI. That visibility does not authorize a source archive, binary archive or release, tag or release publication, or workflow attestation dispatch. It grants no broader license or legal clearance and does not resolve RIGHTS-02 through RIGHTS-05, which remain OPEN and blocking. Source and binary distribution remain BLOCKED; the exact gate is recorded in `rights_review` of `PROVENANCE.json`.
 
 To regenerate the bytecode fixtures from isolated checkouts of the exact source commits (keep adjacent contract worktrees untouched):
 
