@@ -3464,6 +3464,16 @@ mod tests {
 
     const LOCAL_CLIENT_PROXY_TEST_URL_ENV: &str = "ASTATINE_LOCAL_CLIENT_PROXY_TEST_URL";
 
+    fn prepare_accepted_proxy_test_stream(stream: &TcpStream) {
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+    }
+
     #[test]
     fn local_test_client_ignores_environment_proxies() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3485,6 +3495,7 @@ mod tests {
                         Err(error) => panic!("accept local proxy test request: {error}"),
                     }
                 };
+                prepare_accepted_proxy_test_stream(&stream);
                 read_http_request(&mut stream);
                 write!(
                     stream,
@@ -3550,6 +3561,113 @@ mod tests {
             assert_eq!(response.status(), reqwest::StatusCode::OK);
             assert_eq!(response.text().await.unwrap(), "ok");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_proxy_test_stream_clears_nonblocking_flag() {
+        use std::os::unix::io::AsRawFd;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "loopback accept did not complete"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept regression test request: {error}"),
+            }
+        };
+        // Reproduce the BSD/macOS inheritance condition on Linux so the
+        // helper's blocking-reset contract is tested on every Unix platform.
+        stream.set_nonblocking(true).unwrap();
+        prepare_accepted_proxy_test_stream(&stream);
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "fcntl(F_GETFL) failed for harness-prepared stream"
+        );
+        assert_eq!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "harness-prepared stream must have O_NONBLOCK cleared"
+        );
+        assert_eq!(
+            stream.read_timeout().unwrap(),
+            Some(Duration::from_secs(5)),
+            "harness-prepared stream must have a bounded read timeout"
+        );
+        assert_eq!(
+            stream.write_timeout().unwrap(),
+            Some(Duration::from_secs(5)),
+            "harness-prepared stream must have a bounded write timeout"
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn prepared_proxy_test_stream_waits_for_delayed_client_bytes() {
+        use std::sync::mpsc::channel;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (reader_ready_tx, reader_ready_rx) = channel::<()>();
+        let (write_permit_tx, write_permit_rx) = channel::<()>();
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "delayed-bytes server did not observe its loopback client"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept delayed-bytes test request: {error}"),
+                }
+            };
+            // Reproduce the BSD/macOS inheritance condition for platform realism.
+            stream.set_nonblocking(true).unwrap();
+            prepare_accepted_proxy_test_stream(&stream);
+            reader_ready_tx.send(()).unwrap();
+            // This single blocking read must wait for the delayed client byte
+            // instead of failing with WouldBlock.
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [0xA5]);
+            stream.write_all(b"ack").unwrap();
+        });
+        let client = thread::spawn(move || {
+            let mut client = TcpStream::connect(address).unwrap();
+            write_permit_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            client.write_all(&[0xA5]).unwrap();
+            client.flush().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut ack = [0_u8; 3];
+            client.read_exact(&mut ack).unwrap();
+            assert_eq!(&ack, b"ack");
+        });
+        reader_ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        write_permit_tx.send(()).unwrap();
+        server.join().unwrap();
+        client.join().unwrap();
     }
 
     #[tokio::test]

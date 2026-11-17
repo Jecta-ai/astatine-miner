@@ -17,8 +17,10 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -61,6 +63,8 @@ FIXTURE_PATHS = [
     "tests/fixtures/synthetic-injective-virtual-receipt.json",
 ]
 EXPECTED_MEMBERS = ["BUILD-INFO.json", "INSTALL.md", "LICENSE-MIT", "THIRD_PARTY_LICENSES.md", "astatine"]
+LEGIT_RUSTC_LINE = "rustc 1.94.1 (e408947bf 2026-03-25)"
+LEGIT_CARGO_LINE = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
 TEST_LOCK_BYTES = b"# test lock\n"
 TEST_CARGO_TOML = (
     '[package]\n'
@@ -264,11 +268,11 @@ class DryRunBuildTests(unittest.TestCase):
         self.root = Path(self.source_tmp.name)
         self.out = Path(self.out_tmp.name) / "out"
         self.toolchain_patch = mock.patch.object(
-            DRY_RUN, "observed_toolchain", return_value="rustc 1.94.1 (test)"
+            DRY_RUN, "observed_toolchain", return_value=LEGIT_RUSTC_LINE
         )
         self.toolchain_patch.start()
         self.cargo_patch = mock.patch.object(
-            DRY_RUN, "observed_cargo_version", return_value="cargo 1.94.1 (test)"
+            DRY_RUN, "observed_cargo_version", return_value=LEGIT_CARGO_LINE
         )
         self.cargo_patch.start()
         self.write_tree(make_provenance(), make_inventory())
@@ -350,9 +354,8 @@ class DryRunBuildTests(unittest.TestCase):
         self.assertEqual(build_info["build"]["command"], "cargo build --locked --release")
         self.assertIs(build_info["build"]["command_is_documented"], True)
         self.assertIs(build_info["build"]["verified_by_this_script"], False)
-        self.assertTrue(build_info["build"]["rustc_version"].startswith("rustc 1.94.1 "))
-        self.assertEqual(build_info["build"]["cargo_version"], "cargo 1.94.1 (test)")
-        self.assertEqual(build_info["build"]["rustc_version"], "rustc 1.94.1 (test)")
+        self.assertEqual(build_info["build"]["rustc_version"], LEGIT_RUSTC_LINE)
+        self.assertEqual(build_info["build"]["cargo_version"], LEGIT_CARGO_LINE)
         self.assertEqual(build_info["build"]["cargo_lock_sha256"], record["cargo_lock_sha256"])
         self.assertIn("git clone https://github.com/Jecta-ai/astatine-miner.git && git checkout", build_info["corresponding_source"]["how_to_obtain"])
         self.assertIs(build_info["corresponding_source"]["included_in_archive"], False)
@@ -761,12 +764,12 @@ class DryRunBuildTests(unittest.TestCase):
             self.run_dry_run()
 
     def test_toolchain_mismatch_fails(self) -> None:
-        with mock.patch.object(DRY_RUN, "observed_toolchain", return_value="rustc 1.95.0 (test)"):
+        with mock.patch.object(DRY_RUN, "observed_toolchain", return_value="rustc 1.95.0 (e408947bf 2026-03-25)"):
             with self.assertRaisesRegex(DRY_RUN.DryRunError, "pinned Rust"):
                 self.run_dry_run()
 
     def test_cargo_mismatch_fails(self) -> None:
-        with mock.patch.object(DRY_RUN, "observed_cargo_version", return_value="cargo 1.95.0 (test)"):
+        with mock.patch.object(DRY_RUN, "observed_cargo_version", return_value="cargo 1.95.0 (29ea6fb6a 2026-03-24)"):
             with self.assertRaisesRegex(DRY_RUN.DryRunError, "pinned Cargo"):
                 self.run_dry_run()
 
@@ -942,13 +945,13 @@ class DryRunBuildTests(unittest.TestCase):
             record["cargo_lock_sha256"],
             hashlib.sha256((self.root / "Cargo.lock").read_bytes()).hexdigest(),
         )
-        self.assertEqual(record["observed_cargo_version"], "cargo 1.94.1 (test)")
+        self.assertEqual(record["observed_cargo_version"], LEGIT_CARGO_LINE)
         self.assertEqual(record["binary_install"]["archive_path"], "astatine")
         self.assertEqual(record["binary_install"]["source"], "target/release/astatine")
         self.assertEqual(record["binary_install"]["placement"], "archive root")
         self.assertIn("unverified", record["binary_build_linkage"])
         self.assertEqual(record["pinned_toolchain"], "1.94.1")
-        self.assertTrue(record["observed_toolchain"].startswith("rustc 1.94.1 "))
+        self.assertEqual(record["observed_toolchain"], LEGIT_RUSTC_LINE)
         self.assertIs(record["git_verified"], True)
         self.assertIs(record["source_clean_at_head"], True)
         self.assertTrue(record["source_clean_status"]["gate_files_clean"]["tests/fixtures/PROVENANCE.json"])
@@ -1216,6 +1219,361 @@ class DryRunBuildTests(unittest.TestCase):
             out = Path(self.out_tmp.name) / "plain-out"
             with self.assertRaisesRegex(DRY_RUN.DryRunError, "verifiably clean Git checkout"):
                 DRY_RUN.run(source_root=root, output_dir=out, mode="dry-run")
+
+
+class DryRunToolchainStrictnessTests(unittest.TestCase):
+    """Strict complete-line toolchain validation (R-01).
+
+    The builder must accept only the complete official single-line
+    Rust/Cargo 1.94.1 outputs, with at most one optional trailing LF or CRLF.
+    A synthetic toolchain emitting the correct prefix plus an extra marker
+    line or same-line suffix must fail closed, and rejected content must never
+    reach provenance/BUILD-INFO or error text.
+    """
+
+    def setUp(self) -> None:
+        self.source_tmp = tempfile.TemporaryDirectory(prefix="astatine-dryrun-strict-src-")
+        self.out_tmp = tempfile.TemporaryDirectory(prefix="astatine-dryrun-strict-out-")
+        self.root = Path(self.source_tmp.name)
+        self.out = Path(self.out_tmp.name) / "out"
+        self.toolchain_patch = mock.patch.object(
+            DRY_RUN, "observed_toolchain", return_value=LEGIT_RUSTC_LINE
+        )
+        self.toolchain_patch.start()
+        self.cargo_patch = mock.patch.object(
+            DRY_RUN, "observed_cargo_version", return_value=LEGIT_CARGO_LINE
+        )
+        self.cargo_patch.start()
+        self.write_tree(make_provenance(), make_inventory())
+        (self.root / ".gitignore").write_text("target/\n", encoding="utf-8")
+        init_git_repo(self.root)
+
+    def tearDown(self) -> None:
+        self.cargo_patch.stop()
+        self.toolchain_patch.stop()
+        self.source_tmp.cleanup()
+        self.out_tmp.cleanup()
+
+    def write_tree(self, provenance: dict, inventory: dict) -> None:
+        (self.root / "tests" / "fixtures").mkdir(parents=True, exist_ok=True)
+        (self.root / "support" / "release").mkdir(parents=True, exist_ok=True)
+        (self.root / "target" / "release").mkdir(parents=True, exist_ok=True)
+        (self.root / "tests" / "fixtures" / "PROVENANCE.json").write_text(
+            json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
+        )
+        (self.root / "support" / "release" / "distribution-inventory.json").write_text(
+            json.dumps(inventory, indent=2) + "\n", encoding="utf-8"
+        )
+        (self.root / "target" / "release" / "astatine").write_bytes(FAKE_ELF_BINARY)
+        (self.root / "LICENSE-MIT").write_text("test MIT\n", encoding="utf-8")
+        (self.root / "THIRD_PARTY_LICENSES.md").write_text("test notices\n", encoding="utf-8")
+        (self.root / "Cargo.toml").write_text(TEST_CARGO_TOML, encoding="utf-8")
+        (self.root / "Cargo.lock").write_bytes(TEST_LOCK_BYTES)
+        (self.root / "support" / "release-repository.txt").write_text(TEST_REPOSITORY, encoding="utf-8")
+
+    def run_dry_run(self, **overrides):
+        kwargs = {"source_root": self.root, "output_dir": self.out, "mode": "dry-run"}
+        kwargs.update(overrides)
+        return DRY_RUN.run(**kwargs)
+
+    def assert_run_rejects_and_writes_nothing(self, rustc_value: str, cargo_value: str, marker: str = "MARKER") -> None:
+        with mock.patch.object(DRY_RUN, "observed_toolchain", return_value=rustc_value):
+            with mock.patch.object(DRY_RUN, "observed_cargo_version", return_value=cargo_value):
+                try:
+                    DRY_RUN.run(source_root=self.root, output_dir=self.out, mode="dry-run")
+                except DRY_RUN.DryRunError as error:
+                    message = str(error)
+                    self.assertNotIn(marker, message)
+                    self.assertNotIn("\n", message)
+                    self.assertNotIn("\r", message)
+                    self.assertNotIn("\x00", message)
+                    self.assertNotIn("\x1b", message)
+                else:
+                    self.fail("expected DryRunError for malicious toolchain output")
+        self.assertFalse(self.out.exists(), "malicious toolchain output must not create any output")
+
+    def test_valid_canonical_lines_pass(self) -> None:
+        result = self.run_dry_run()
+        record = json.loads((self.out / "release-provenance.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["observed_toolchain"], LEGIT_RUSTC_LINE)
+        self.assertEqual(record["observed_cargo_version"], LEGIT_CARGO_LINE)
+        with tarfile.open(result["artifact_path"], mode="r") as tar:
+            build_info = json.loads(tar.extractfile("BUILD-INFO.json").read().decode("utf-8"))
+        self.assertEqual(build_info["build"]["rustc_version"], LEGIT_RUSTC_LINE)
+        self.assertEqual(build_info["build"]["cargo_version"], LEGIT_CARGO_LINE)
+
+    def test_normalize_accepts_optional_trailing_lf_and_crlf(self) -> None:
+        self.assertEqual(
+            DRY_RUN._normalize_rustc_output((LEGIT_RUSTC_LINE + "\n").encode("utf-8")),
+            LEGIT_RUSTC_LINE,
+        )
+        self.assertEqual(
+            DRY_RUN._normalize_rustc_output((LEGIT_RUSTC_LINE + "\r\n").encode("utf-8")),
+            LEGIT_RUSTC_LINE,
+        )
+        self.assertEqual(
+            DRY_RUN._normalize_cargo_output((LEGIT_CARGO_LINE + "\n").encode("utf-8")),
+            LEGIT_CARGO_LINE,
+        )
+        self.assertEqual(
+            DRY_RUN._normalize_cargo_output((LEGIT_CARGO_LINE + "\r\n").encode("utf-8")),
+            LEGIT_CARGO_LINE,
+        )
+        self.assertEqual(DRY_RUN._normalize_rustc_output(LEGIT_RUSTC_LINE.encode("utf-8")), LEGIT_RUSTC_LINE)
+        self.assertEqual(DRY_RUN._normalize_cargo_output(LEGIT_CARGO_LINE.encode("utf-8")), LEGIT_CARGO_LINE)
+
+    def test_observed_helpers_accept_trailing_newline_via_subprocess(self) -> None:
+        # End-to-end through the real bounded helper: producers emit the
+        # official line with a single trailing LF / CRLF.
+        rustc_script = "import sys; sys.stdout.buffer.write(%r)" % (
+            (LEGIT_RUSTC_LINE + "\n").encode("utf-8"),
+        )
+        cargo_script = "import sys; sys.stdout.buffer.write(%r)" % (
+            (LEGIT_CARGO_LINE + "\r\n").encode("utf-8"),
+        )
+        raw_rustc = DRY_RUN._capture_version_bytes([sys.executable, "-c", rustc_script], timeout=5)
+        raw_cargo = DRY_RUN._capture_version_bytes([sys.executable, "-c", cargo_script], timeout=5)
+        self.assertEqual(raw_rustc, (LEGIT_RUSTC_LINE + "\n").encode("utf-8"))
+        self.assertEqual(raw_cargo, (LEGIT_CARGO_LINE + "\r\n").encode("utf-8"))
+        self.assertEqual(DRY_RUN._normalize_rustc_output(raw_rustc), LEGIT_RUSTC_LINE)
+        self.assertEqual(DRY_RUN._normalize_cargo_output(raw_cargo), LEGIT_CARGO_LINE)
+        # Wiring: observed_* normalizes trailing newlines via the new helper.
+        self.toolchain_patch.stop()
+        self.cargo_patch.stop()
+        try:
+            with mock.patch.object(
+                DRY_RUN, "_capture_version_bytes", return_value=(LEGIT_RUSTC_LINE + "\n").encode("utf-8")
+            ) as rustc_cap:
+                self.assertEqual(DRY_RUN.observed_toolchain(), LEGIT_RUSTC_LINE)
+                rustc_cap.assert_called_once()
+            with mock.patch.object(
+                DRY_RUN, "_capture_version_bytes", return_value=(LEGIT_CARGO_LINE + "\r\n").encode("utf-8")
+            ) as cargo_cap:
+                self.assertEqual(DRY_RUN.observed_cargo_version(), LEGIT_CARGO_LINE)
+                cargo_cap.assert_called_once()
+        finally:
+            self.toolchain_patch.start()
+            self.cargo_patch.start()
+
+    def test_prefix_plus_extra_line_marker_rejected(self) -> None:
+        evil_rustc = LEGIT_RUSTC_LINE + "\nMARKER"
+        evil_cargo = LEGIT_CARGO_LINE + "\nMARKER"
+        self.assertIsNone(DRY_RUN._normalize_rustc_output(evil_rustc.encode("utf-8")))
+        self.assertIsNone(DRY_RUN._normalize_cargo_output(evil_cargo.encode("utf-8")))
+        self.assert_run_rejects_and_writes_nothing(evil_rustc, LEGIT_CARGO_LINE)
+        self.assert_run_rejects_and_writes_nothing(LEGIT_RUSTC_LINE, evil_cargo)
+
+    def test_same_line_suffix_marker_rejected(self) -> None:
+        evil_rustc = LEGIT_RUSTC_LINE + " MARKER"
+        evil_cargo = LEGIT_CARGO_LINE + " MARKER"
+        self.assertIsNone(DRY_RUN._normalize_rustc_output(evil_rustc.encode("utf-8")))
+        self.assertIsNone(DRY_RUN._normalize_cargo_output(evil_cargo.encode("utf-8")))
+        self.assert_run_rejects_and_writes_nothing(evil_rustc, LEGIT_CARGO_LINE)
+        self.assert_run_rejects_and_writes_nothing(LEGIT_RUSTC_LINE, evil_cargo)
+
+    def test_embedded_controls_rejected(self) -> None:
+        rustc_cases = [
+            LEGIT_RUSTC_LINE + "\r",
+            LEGIT_RUSTC_LINE + "\r\n\n",
+            LEGIT_RUSTC_LINE + "\n\n",
+            LEGIT_RUSTC_LINE + "\x00",
+            LEGIT_RUSTC_LINE + "\x1b[31m",
+            LEGIT_RUSTC_LINE + "\nsecond-line",
+        ]
+        cargo_cases = [
+            LEGIT_CARGO_LINE + "\r",
+            LEGIT_CARGO_LINE + "\r\n\n",
+            LEGIT_CARGO_LINE + "\n\n",
+            LEGIT_CARGO_LINE + "\x00",
+            LEGIT_CARGO_LINE + "\x1b[0m",
+            LEGIT_CARGO_LINE + "\nsecond-line",
+        ]
+        for rustc_value in rustc_cases:
+            with self.subTest(tool="rustc", value=repr(rustc_value)):
+                self.assertIsNone(DRY_RUN._normalize_rustc_output(rustc_value.encode("utf-8")))
+                self.assert_run_rejects_and_writes_nothing(rustc_value, LEGIT_CARGO_LINE, marker="MARKER")
+        for cargo_value in cargo_cases:
+            with self.subTest(tool="cargo", value=repr(cargo_value)):
+                self.assertIsNone(DRY_RUN._normalize_cargo_output(cargo_value.encode("utf-8")))
+                self.assert_run_rejects_and_writes_nothing(LEGIT_RUSTC_LINE, cargo_value, marker="MARKER")
+
+    def test_nul_and_ansi_bytes_rejected(self) -> None:
+        self.assertIsNone(DRY_RUN._normalize_rustc_output(LEGIT_RUSTC_LINE.encode("utf-8") + b"\x00"))
+        self.assertIsNone(DRY_RUN._normalize_cargo_output(LEGIT_CARGO_LINE.encode("utf-8") + b"\x1b[0m"))
+        self.assert_run_rejects_and_writes_nothing(LEGIT_RUSTC_LINE + "\x00", LEGIT_CARGO_LINE)
+        self.assert_run_rejects_and_writes_nothing(LEGIT_RUSTC_LINE, LEGIT_CARGO_LINE + "\x1b[0m")
+
+    def test_oversized_output_rejected(self) -> None:
+        oversized_rustc = LEGIT_RUSTC_LINE + " " + "x" * 600
+        oversized_cargo = LEGIT_CARGO_LINE + " " + "y" * 600
+        self.assertGreater(len(oversized_rustc.encode("utf-8")), DRY_RUN.MAX_TOOLCHAIN_OUTPUT_BYTES)
+        self.assertGreater(len(oversized_cargo.encode("utf-8")), DRY_RUN.MAX_TOOLCHAIN_OUTPUT_BYTES)
+        self.assertIsNone(DRY_RUN._normalize_rustc_output(oversized_rustc.encode("utf-8")))
+        self.assertIsNone(DRY_RUN._normalize_cargo_output(oversized_cargo.encode("utf-8")))
+        # True bounded capture: a producer emitting 10000 bytes must be killed
+        # after MAX+1 bytes without buffering the whole flood.
+        flood_script = "import sys; sys.stdout.buffer.write(b'x' * 10000)"
+        start = time.monotonic()
+        raw = DRY_RUN._capture_version_bytes([sys.executable, "-c", flood_script], timeout=5)
+        elapsed = time.monotonic() - start
+        self.assertIsNone(raw)
+        self.assertLess(elapsed, 5)
+        self.toolchain_patch.stop()
+        try:
+            with mock.patch.object(DRY_RUN, "_capture_version_bytes", return_value=None):
+                self.assertEqual(DRY_RUN.observed_toolchain(), "not-observed")
+        finally:
+            self.toolchain_patch.start()
+        self.assert_run_rejects_and_writes_nothing(oversized_rustc, LEGIT_CARGO_LINE)
+        self.assert_run_rejects_and_writes_nothing(LEGIT_RUSTC_LINE, oversized_cargo)
+
+    def test_bounded_capture_rejects_oversized_stdout_without_unbounded_buffer(self) -> None:
+        flood_script = "import sys; sys.stdout.buffer.write(b'A' * 100000)"
+        start = time.monotonic()
+        raw = DRY_RUN._capture_version_bytes([sys.executable, "-c", flood_script], timeout=5)
+        elapsed = time.monotonic() - start
+        self.assertIsNone(raw)
+        self.assertLess(elapsed, 5)
+
+    def test_bounded_capture_ignores_stderr_flood(self) -> None:
+        # Stderr is DEVNULL: a multi-megabyte stderr flood must not block or
+        # affect the valid stdout line.
+        script = (
+            "import sys; "
+            "sys.stderr.buffer.write(b'e' * 2000000); "
+            "sys.stdout.buffer.write(%r)" % ((LEGIT_RUSTC_LINE + "\n").encode("utf-8"),)
+        )
+        start = time.monotonic()
+        raw = DRY_RUN._capture_version_bytes([sys.executable, "-c", script], timeout=5)
+        elapsed = time.monotonic() - start
+        self.assertEqual(raw, (LEGIT_RUSTC_LINE + "\n").encode("utf-8"))
+        self.assertEqual(DRY_RUN._normalize_rustc_output(raw), LEGIT_RUSTC_LINE)
+        self.assertLess(elapsed, 5)
+
+    def test_bounded_capture_nonzero_exit_rejected(self) -> None:
+        script = "import sys; sys.stdout.buffer.write(%r); sys.exit(1)" % (
+            (LEGIT_RUSTC_LINE + "\n").encode("utf-8"),
+        )
+        raw = DRY_RUN._capture_version_bytes([sys.executable, "-c", script], timeout=5)
+        self.assertIsNone(raw)
+
+    def test_bounded_capture_empty_output_rejected(self) -> None:
+        script = "import sys; sys.exit(0)"
+        raw = DRY_RUN._capture_version_bytes([sys.executable, "-c", script], timeout=5)
+        self.assertIsNone(raw)
+        self.assertIsNone(DRY_RUN._capture_version_bytes(["definitely-not-a-real-toolchain-binary-xyz"], timeout=2))
+
+    def test_bounded_capture_hung_process_times_out_fast(self) -> None:
+        hung_script = "import time; time.sleep(10)"
+        start = time.monotonic()
+        raw = DRY_RUN._capture_version_bytes([sys.executable, "-c", hung_script], timeout=0.3)
+        elapsed = time.monotonic() - start
+        self.assertIsNone(raw)
+        self.assertLess(elapsed, 5)
+        # Silent process holding the pipe open with no bytes also fails closed.
+        silent_script = "import time; time.sleep(10)"
+        start = time.monotonic()
+        raw_silent = DRY_RUN._capture_version_bytes([sys.executable, "-c", silent_script], timeout=0.3)
+        elapsed = time.monotonic() - start
+        self.assertIsNone(raw_silent)
+        self.assertLess(elapsed, 5)
+
+    def test_bounded_capture_rejects_nonfinite_timeout_before_spawn(self) -> None:
+        self.toolchain_patch.stop()
+        self.cargo_patch.stop()
+        try:
+            for value in (float("inf"), float("-inf"), float("nan")):
+                with self.subTest(value=value):
+                    with mock.patch.object(
+                        DRY_RUN.subprocess,
+                        "Popen",
+                        side_effect=AssertionError(
+                            "non-finite timeout must not spawn"
+                        ),
+                    ):
+                        self.assertIsNone(
+                            DRY_RUN._capture_version_bytes(
+                                ["rustc", "--version"], timeout=value
+                            )
+                        )
+                        self.assertEqual(
+                            DRY_RUN.observed_toolchain(timeout=value),
+                            "not-observed",
+                        )
+                        self.assertEqual(
+                            DRY_RUN.observed_cargo_version(timeout=value),
+                            "not-observed",
+                        )
+        finally:
+            self.toolchain_patch.start()
+            self.cargo_patch.start()
+
+    def test_wrong_version_rejected(self) -> None:
+        self.assert_run_rejects_and_writes_nothing("rustc 1.95.0 (e408947bf 2026-03-25)", LEGIT_CARGO_LINE)
+        self.assert_run_rejects_and_writes_nothing(LEGIT_RUSTC_LINE, "cargo 1.95.0 (29ea6fb6a 2026-03-24)")
+
+    def test_missing_hash_date_rejected(self) -> None:
+        self.assert_run_rejects_and_writes_nothing("rustc 1.94.1", LEGIT_CARGO_LINE)
+        self.assert_run_rejects_and_writes_nothing(LEGIT_RUSTC_LINE, "cargo 1.94.1")
+        self.assert_run_rejects_and_writes_nothing("rustc 1.94.1 (test)", LEGIT_CARGO_LINE)
+        self.assert_run_rejects_and_writes_nothing(LEGIT_RUSTC_LINE, "cargo 1.94.1 (test)")
+        self.assertIsNone(DRY_RUN._normalize_rustc_output(b"rustc 1.94.1"))
+        self.assertIsNone(DRY_RUN._normalize_cargo_output(b"cargo 1.94.1 (test)"))
+
+    def test_not_observed_rejected(self) -> None:
+        with mock.patch.object(DRY_RUN, "observed_toolchain", return_value="not-observed"):
+            with self.assertRaisesRegex(DRY_RUN.DryRunError, "pinned Rust"):
+                DRY_RUN.run(source_root=self.root, output_dir=self.out, mode="dry-run")
+        self.assertFalse(self.out.exists())
+        with mock.patch.object(DRY_RUN, "observed_cargo_version", return_value="not-observed"):
+            with self.assertRaisesRegex(DRY_RUN.DryRunError, "pinned Cargo"):
+                DRY_RUN.run(source_root=self.root, output_dir=self.out, mode="dry-run")
+        self.assertFalse(self.out.exists())
+        # Real bounded helper: nonzero exit and hung process fail closed.
+        bad_script = "import sys; sys.exit(1)"
+        raw = DRY_RUN._capture_version_bytes([sys.executable, "-c", bad_script], timeout=5)
+        self.assertIsNone(raw)
+        hung_script = "import time; time.sleep(10)"
+        start = time.monotonic()
+        raw_hung = DRY_RUN._capture_version_bytes([sys.executable, "-c", hung_script], timeout=0.3)
+        elapsed = time.monotonic() - start
+        self.assertIsNone(raw_hung)
+        self.assertLess(elapsed, 5)
+        self.toolchain_patch.stop()
+        self.cargo_patch.stop()
+        try:
+            with mock.patch.object(DRY_RUN, "_capture_version_bytes", return_value=None):
+                self.assertEqual(DRY_RUN.observed_toolchain(), "not-observed")
+                self.assertEqual(DRY_RUN.observed_cargo_version(), "not-observed")
+        finally:
+            self.toolchain_patch.start()
+            self.cargo_patch.start()
+
+    def test_error_message_withholds_malicious_content(self) -> None:
+        evil = LEGIT_RUSTC_LINE + "\nEVIL-MARKER-\x1b[31m-\x00-tail"
+        with mock.patch.object(DRY_RUN, "observed_toolchain", return_value=evil):
+            try:
+                DRY_RUN.run(source_root=self.root, output_dir=self.out, mode="dry-run")
+            except DRY_RUN.DryRunError as error:
+                message = str(error)
+                self.assertNotIn("EVIL-MARKER", message)
+                self.assertNotIn("\n", message)
+                self.assertNotIn("\r", message)
+                self.assertNotIn("\x00", message)
+                self.assertNotIn("\x1b", message)
+            else:
+                self.fail("expected DryRunError")
+        self.assertFalse(self.out.exists())
+
+    def test_workflow_uses_complete_line_validation(self) -> None:
+        text = WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertNotIn('.startswith("rustc 1.94.1 ")', text)
+        self.assertNotIn(".startswith('rustc 1.94.1 ')", text)
+        self.assertNotIn('.startswith("cargo 1.94.1 ")', text)
+        self.assertNotIn(".startswith('cargo 1.94.1 ')", text)
+        self.assertIn("re.fullmatch", text)
+        self.assertIn(r"rustc 1\.94\.1 \(e408947bf 2026-03-25\)", text)
+        self.assertIn(r"cargo 1\.94\.1 \(29ea6fb6a 2026-03-24\)", text)
 
 
 class DryRunWorkflowInvariantTests(unittest.TestCase):

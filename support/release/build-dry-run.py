@@ -40,8 +40,18 @@ Gate semantics (fail closed):
     tree does NOT prove the archived binary was built from HEAD; that linkage
     is workflow-build-only (fresh checkout, then build) and is recorded as
     unverified (see binary_build_linkage).
-  * The observed compiler must be exactly Rust 1.94.1 and the archived
-    binary must be an ELF64 little-endian x86_64 object before it is archived.
+  * The observed `rustc --version` and `cargo --version` output must be
+    exactly the official single-line Rust/Cargo 1.94.1 lines
+    (`rustc 1.94.1 (e408947bf 2026-03-25)` and
+    `cargo 1.94.1 (29ea6fb6a 2026-03-24)`), with at most one trailing LF or
+    CRLF. Capture is bounded to 513 bytes with a timeout; extra lines,
+    control characters, oversize output, nonzero exit, and timeouts fail
+    closed. This is a format check, not toolchain or publisher authentication.
+    The bounded capture path uses POSIX pipe `select`; it is verified on macOS
+    and intended for the Linux x86_64 dry-run, and is not supported for
+    Windows execution.
+  * The archived binary must be an ELF64 little-endian x86_64 object before
+    it is archived.
   * release-provenance.json always records publication_authorized: false.
 
 The GitHub workflow performs no artifact attestation and no attestation
@@ -69,12 +79,15 @@ import gzip
 import hashlib
 import io
 import json
+import math
 import os
 import re
+import select
 import stat
 import subprocess
 import sys
 import tarfile
+import time
 from pathlib import Path, PurePosixPath
 
 PROVENANCE_REL = "tests/fixtures/PROVENANCE.json"
@@ -153,8 +166,17 @@ EXPECTED_BLOCKING_ITEMS = {
 }
 EXPECTED_TARGET = "x86_64-unknown-linux-gnu"
 EXPECTED_TOOLCHAIN = "1.94.1"
-EXPECTED_TOOLCHAIN_PREFIX = "rustc 1.94.1 "
-EXPECTED_CARGO_PREFIX = "cargo 1.94.1 "
+# Strict complete-line toolchain identity. Only the official single-line
+# `rustc --version` / `cargo --version` outputs for Rust 1.94.1 are accepted,
+# optionally followed by a single trailing LF or CRLF at capture time. The
+# recorded provenance always holds the canonical line without any trailing
+# newline. This does not authenticate the toolchain or publisher; it only
+# rejects synthetic prefix-plus-marker output from reaching provenance.
+EXPECTED_RUSTC_VERSION_LINE = "rustc 1.94.1 (e408947bf 2026-03-25)"
+EXPECTED_CARGO_VERSION_LINE = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
+MAX_TOOLCHAIN_OUTPUT_BYTES = 512
+_RUSTC_VERSION_LINE_RE = re.compile(r"rustc 1\.94\.1 \(e408947bf 2026-03-25\)(?:\r\n|\n)?")
+_CARGO_VERSION_LINE_RE = re.compile(r"cargo 1\.94\.1 \(29ea6fb6a 2026-03-24\)(?:\r\n|\n)?")
 EXPECTED_PACKAGE_NAME = "astatine-cli-rust"
 EXPECTED_BINARY_NAME = "astatine"
 EXPECTED_BUILD_PROFILE = "release"
@@ -728,34 +750,256 @@ def git_source_date(source_root: Path) -> str:
         return "unavailable"
 
 
-def observed_toolchain() -> str:
+def _capture_version_bytes(argv: list[str], timeout: float = 30) -> bytes | None:
+    """Capture version-tool stdout bytes with a true hard bound, fail closed.
+
+    Uses `Popen(stdout=PIPE, stderr=DEVNULL)` and reads at most
+    `MAX_TOOLCHAIN_OUTPUT_BYTES + 1` bytes. Stderr is never buffered, so a
+    stderr flood cannot block or fill memory. The child is killed as soon as
+    oversize output is observed, and every wait is bounded by `timeout`, so a
+    hung or silent toolchain cannot deadlock the builder. Returns None on
+    spawn errors, timeout, non-zero exit, empty output, oversized output, or
+    any read error; oversized bytes are discarded and never returned.
+    Non-finite timeouts are rejected rather than used in select/wait
+    arithmetic.
+    """
     try:
-        completed = subprocess.run(
-            ["rustc", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
+        timeout_value = float(timeout)
+    except (TypeError, ValueError):
+        timeout_value = 30.0
+    if not math.isfinite(timeout_value):
+        return None
+    if timeout_value <= 0:
+        timeout_value = 30.0
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
     except (OSError, ValueError, subprocess.SubprocessError):
-        return "not-observed"
-    value = (completed.stdout or "").strip()
-    return value if completed.returncode == 0 and value else "not-observed"
-
-
-def observed_cargo_version() -> str:
+        return None
+    stdout = proc.stdout
+    if stdout is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        return None
     try:
-        completed = subprocess.run(
-            ["cargo", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, ValueError, subprocess.SubprocessError):
+        try:
+            fd = stdout.fileno()
+        except (OSError, ValueError, AttributeError):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return None
+        try:
+            os.set_blocking(fd, False)
+        except (OSError, ValueError, AttributeError):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return None
+        data = bytearray()
+        limit = MAX_TOOLCHAIN_OUTPUT_BYTES + 1
+        deadline = time.monotonic() + timeout_value
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                return None
+            try:
+                rlist, _, _ = select.select([stdout], [], [], remaining)
+            except InterruptedError:
+                continue
+            except (OSError, ValueError):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                return None
+            if not rlist:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                return None
+            to_read = limit - len(data)
+            if to_read <= 0:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                return None
+            try:
+                chunk = os.read(fd, to_read)
+            except InterruptedError:
+                continue
+            except BlockingIOError:
+                if proc.poll() is not None:
+                    continue
+                continue
+            except OSError:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                return None
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > MAX_TOOLCHAIN_OUTPUT_BYTES:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return None
+        try:
+            returncode = proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return None
+        except (OSError, ValueError):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return None
+        if returncode != 0:
+            return None
+        if not data:
+            return None
+        if len(data) > MAX_TOOLCHAIN_OUTPUT_BYTES:
+            return None
+        return bytes(data)
+    finally:
+        try:
+            stdout.close()
+        except Exception:
+            pass
+        try:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+def _normalize_rustc_output(raw: bytes) -> str | None:
+    """Strictly validate raw `rustc --version` bytes.
+
+    Accepts only the complete official line, with at most one optional
+    trailing LF or CRLF. Returns the canonical line without trailing newline
+    on success, else None. Never returns attacker-controlled content.
+    """
+    if len(raw) > MAX_TOOLCHAIN_OUTPUT_BYTES:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if _RUSTC_VERSION_LINE_RE.fullmatch(text) is None:
+        return None
+    return EXPECTED_RUSTC_VERSION_LINE
+
+
+def _normalize_cargo_output(raw: bytes) -> str | None:
+    """Strictly validate raw `cargo --version` bytes (same rules as rustc)."""
+    if len(raw) > MAX_TOOLCHAIN_OUTPUT_BYTES:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if _CARGO_VERSION_LINE_RE.fullmatch(text) is None:
+        return None
+    return EXPECTED_CARGO_VERSION_LINE
+
+
+def observed_toolchain(timeout: float = 30) -> str:
+    raw = _capture_version_bytes(["rustc", "--version"], timeout=timeout)
+    if raw is None:
         return "not-observed"
-    value = (completed.stdout or "").strip()
-    return value if completed.returncode == 0 and value else "not-observed"
+    normalized = _normalize_rustc_output(raw)
+    return normalized if normalized is not None else "not-observed"
+
+
+def observed_cargo_version(timeout: float = 30) -> str:
+    raw = _capture_version_bytes(["cargo", "--version"], timeout=timeout)
+    if raw is None:
+        return "not-observed"
+    normalized = _normalize_cargo_output(raw)
+    return normalized if normalized is not None else "not-observed"
 
 
 def git_member_status(source_root: Path, relative: str) -> str | None:
@@ -1162,13 +1406,13 @@ def run(
 
     observed = observed_toolchain()
     require(
-        observed.startswith(EXPECTED_TOOLCHAIN_PREFIX),
-        f"observed toolchain is not the pinned Rust {EXPECTED_TOOLCHAIN}: {observed!r}",
+        observed == EXPECTED_RUSTC_VERSION_LINE,
+        "observed toolchain is not the pinned Rust 1.94.1 exact version line",
     )
     cargo_version = observed_cargo_version()
     require(
-        cargo_version.startswith(EXPECTED_CARGO_PREFIX),
-        f"observed cargo is not the pinned Cargo {EXPECTED_TOOLCHAIN}: {cargo_version!r}",
+        cargo_version == EXPECTED_CARGO_VERSION_LINE,
+        "observed cargo is not the pinned Cargo 1.94.1 exact version line",
     )
     lock_bytes = read_confined_bytes(resolved_root, CARGO_LOCK_REL, "cargo lockfile")
     lock_sha = sha256_hex(lock_bytes)

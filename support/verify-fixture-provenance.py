@@ -243,6 +243,27 @@ def git_blob_sha1(data: bytes) -> str:
     return hashlib.sha1(header + data).hexdigest()
 
 
+def sanitize_log_text(value: object) -> str:
+    """Render untrusted filesystem/error text as one printable ASCII line.
+
+    Fixture filenames and OSError strings can contain newlines or control
+    characters. Checks continue to use the original value; only the
+    diagnostic rendering is escaped so it cannot inject terminal/log lines.
+    """
+    return str(value).encode("unicode_escape").decode("ascii")
+
+
+def fixture_rel_path(inventory_path: str) -> str | None:
+    """Return the fixture-relative POSIX path for inventory paths under FIXTURE_DIR."""
+    try:
+        rel = PurePosixPath(inventory_path).relative_to(FIXTURE_DIR)
+    except ValueError:
+        return None
+    if not rel.parts or any(part in ("", ".", "..") for part in rel.parts):
+        return None
+    return rel.as_posix()
+
+
 def validate_relative_path(value: object, label: str) -> str:
     require(isinstance(value, str) and value, f"{label} must be a non-empty relative path string")
     require("\x00" not in value, f"{label} must not contain NUL")
@@ -498,24 +519,109 @@ def verify_inventory(root: Path) -> dict:
 
     fixture_dir = root / FIXTURE_DIR
     require(fixture_dir.is_dir() and not fixture_dir.is_symlink(), "fixture directory is missing or a symlink")
-    expected_names = {PurePosixPath(path).name for path in EXPECTED_FIXTURE_PATHS}
+    expected_fixture_rels = {
+        rel for path in EXPECTED_FIXTURE_PATHS if (rel := fixture_rel_path(path)) is not None
+    }
+    expected_dir_files = {
+        rel
+        for path in (
+            *EXPECTED_FIXTURE_PATHS,
+            *EXPECTED_DOCUMENT_PATHS,
+            *EXPECTED_LEGAL_ARTIFACT_PATHS,
+            INVENTORY_PATH,
+        )
+        if (rel := fixture_rel_path(path)) is not None
+    }
     actual_names: set[str] = set()
+    # R-02: extension-independent, recursive membership check confined to
+    # tests/fixtures. Every entry is examined via lstat (no symlink following,
+    # no extension filter, dotfiles included). Only the seven expected regular
+    # files are allowed; any symlink, directory, or other non-regular entry at
+    # any depth, any unlisted regular file, and any expected path that is not
+    # a regular file fails closed with the offending fixture-relative path.
+    violations: list[tuple[str, str]] = []
+    pending: list[tuple[Path, str]] = [(fixture_dir, "")]
     try:
-        with os.scandir(fixture_dir) as items:
-            for item in items:
-                require(not item.is_symlink(), f"fixture directory contains a symlink: {item.name}")
-                is_regular = item.is_file(follow_symlinks=False)
-                if not is_regular and item.name in expected_names:
-                    raise VerificationError(f"fixture JSON entry must be a regular file: {item.name}")
-                if (
-                    is_regular
-                    and item.name.endswith(".json")
-                    and item.name != Path(INVENTORY_PATH).name
-                ):
-                    actual_names.add(item.name)
+        while pending:
+            current_dir, prefix = pending.pop()
+            with os.scandir(current_dir) as items:
+                ordered = sorted(list(items), key=lambda entry: entry.name)
+                for item in ordered:
+                    rel = item.name if prefix == "" else f"{prefix}/{item.name}"
+                    display_rel = sanitize_log_text(rel)
+                    if item.is_symlink():
+                        violations.append(
+                            (
+                                rel,
+                                f"fixture directory contains a symlink: {display_rel}",
+                            )
+                        )
+                    elif item.is_dir(follow_symlinks=False):
+                        if rel in expected_fixture_rels:
+                            violations.append(
+                                (
+                                    rel,
+                                    "fixture JSON entry must be a regular file: "
+                                    f"{sanitize_log_text(item.name)}",
+                                )
+                            )
+                        else:
+                            violations.append(
+                                (
+                                    rel,
+                                    "fixture directory contains an unexpected "
+                                    f"directory: {display_rel}",
+                                )
+                            )
+                        pending.append((Path(item.path), rel))
+                    elif item.is_file(follow_symlinks=False):
+                        if rel not in expected_dir_files:
+                            violations.append(
+                                (
+                                    rel,
+                                    "fixture directory contains an unexpected "
+                                    f"file: {display_rel}",
+                                )
+                            )
+                        elif rel in expected_fixture_rels:
+                            actual_names.add(rel)
+                    else:
+                        if rel in expected_fixture_rels:
+                            violations.append(
+                                (
+                                    rel,
+                                    "fixture JSON entry must be a regular file: "
+                                    f"{sanitize_log_text(item.name)}",
+                                )
+                            )
+                        elif rel in expected_dir_files:
+                            violations.append(
+                                (
+                                    rel,
+                                    "fixture entry must be a regular file: "
+                                    f"{display_rel}",
+                                )
+                            )
+                        else:
+                            violations.append(
+                                (
+                                    rel,
+                                    "fixture directory contains an unexpected "
+                                    f"entry: {display_rel}",
+                                )
+                            )
     except OSError as error:
-        raise VerificationError(f"cannot scan fixture directory {FIXTURE_DIR}: {error}") from error
-    require(actual_names == expected_names, "fixture JSON file set changed")
+        errno_value = getattr(error, "errno", None)
+        errno_text = str(errno_value) if isinstance(errno_value, int) else "unknown"
+        raise VerificationError(
+            "cannot scan fixture directory "
+            f"{sanitize_log_text(FIXTURE_DIR)}: "
+            f"{sanitize_log_text(type(error).__name__)} (errno {errno_text})"
+        ) from error
+    if violations:
+        violations.sort(key=lambda pair: pair[0])
+        raise VerificationError(violations[0][1])
+    require(actual_names == expected_fixture_rels, "fixture JSON file set changed")
 
     for entry in entries:
         verify_fixture(root, entry)

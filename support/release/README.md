@@ -15,11 +15,20 @@ from the dispatched commit that stays blocked, not publisher authentication.
 - The workflow builds the locked Linux x86_64 binary from the dispatched
   checkout (`cargo build --locked --release` with pinned Rust `1.94.1`) and
   passes CLI smoke checks (`--version`, `--help`). The builder additionally
-  requires the observed compiler to report exactly `rustc 1.94.1`, records
-  the observed `cargo` version and the `Cargo.lock` SHA-256, and requires
-  the archived binary to be an ELF64 little-endian x86_64 object before it
-  is archived. The packaged scope is the `astatine` native binary from the
-  `astatine-cli-rust` package (release profile) — not an npm package.
+  requires the observed `rustc --version` and `cargo --version` output to be
+  exactly the official single-line Rust/Cargo 1.94.1 lines
+  (`rustc 1.94.1 (e408947bf 2026-03-25)` and
+  `cargo 1.94.1 (29ea6fb6a 2026-03-24)`), with at most one trailing LF or
+  CRLF. It captures at most 513 bytes with a bounded timeout and fails closed
+  on extra lines, control characters, oversize output, nonzero exit, or
+  timeout. This is a strict format check, not toolchain or publisher
+  authentication. The bounded capture path uses POSIX pipe `select`; it is
+  verified on macOS and intended for the Linux x86_64 dry-run, and is not
+  supported for Windows execution. The builder records the `Cargo.lock`
+  SHA-256 and requires the archived binary to be an ELF64 little-endian
+  x86_64 object before it is archived. The packaged scope is the `astatine`
+  native binary from the `astatine-cli-rust` package (release profile) — not
+  an npm package.
 - `support/verify-fixture-provenance.py` and
   `support/verify-distribution-inventory.py` independently confirm the
   recorded gate before anything is archived.

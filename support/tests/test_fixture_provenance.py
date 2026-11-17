@@ -523,6 +523,305 @@ class FixtureProvenanceTests(unittest.TestCase):
         self.assertEqual(payload["status"], "FAIL")
         self.assertIn("source root is not readable", payload["error"])
 
+    def test_unlisted_txt_extra_fails(self) -> None:
+        probe = self.root / "tests" / "fixtures" / "extra-probe.txt"
+        probe.write_text("unlisted", encoding="utf-8")
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("unexpected file", message)
+        self.assertIn("extra-probe.txt", message)
+        self.assertTrue(probe.is_file())
+        self.assertTrue((self.root / FIXTURE_REL).is_file())
+
+    def test_unlisted_extensionless_extra_fails(self) -> None:
+        probe = self.root / "tests" / "fixtures" / "extra-noext"
+        probe.write_text("unlisted", encoding="utf-8")
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("unexpected file", message)
+        self.assertIn("extra-noext", message)
+
+    def test_unlisted_uppercase_json_extra_fails(self) -> None:
+        probe = self.root / "tests" / "fixtures" / "EXTRA-PROBE.JSON"
+        probe.write_text("unlisted", encoding="utf-8")
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("unexpected file", message)
+        self.assertIn("EXTRA-PROBE.JSON", message)
+
+    def test_unlisted_lowercase_json_extra_fails(self) -> None:
+        probe = self.root / "tests" / "fixtures" / "extra-probe.json"
+        probe.write_text("unlisted", encoding="utf-8")
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("unexpected file", message)
+        self.assertIn("extra-probe.json", message)
+
+    def test_hidden_file_fails(self) -> None:
+        probe = self.root / "tests" / "fixtures" / ".hidden-probe"
+        probe.write_text("unlisted", encoding="utf-8")
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("unexpected file", message)
+        self.assertIn(".hidden-probe", message)
+
+    def test_hidden_directory_fails(self) -> None:
+        probe_dir = self.root / "tests" / "fixtures" / ".hidden-dir"
+        probe_dir.mkdir()
+        (probe_dir / "inner.txt").write_text("nested", encoding="utf-8")
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn(".hidden-dir", message)
+        self.assertIn("unexpected directory", message)
+
+    def test_nested_directory_fails(self) -> None:
+        nested = self.root / "tests" / "fixtures" / "nested-probe"
+        nested.mkdir()
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("nested-probe", message)
+        self.assertIn("unexpected directory", message)
+
+    def test_nested_file_fails(self) -> None:
+        nested = self.root / "tests" / "fixtures" / "nested-file-probe"
+        nested.mkdir()
+        (nested / "inner.txt").write_text("nested", encoding="utf-8")
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("nested-file-probe", message)
+
+    def test_nested_basename_collision_fails(self) -> None:
+        nested = self.root / "tests" / "fixtures" / "nested-collision"
+        nested.mkdir()
+        shutil.copy2(self.root / FIXTURE_REL, nested / "AstatineMiner.json")
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("nested-collision", message)
+
+    def test_symlink_to_listed_file_fails(self) -> None:
+        link = self.root / "tests" / "fixtures" / "link-to-listed.json"
+        os.symlink(self.root / FIXTURE_REL, link)
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "symlink"):
+            VERIFIER.verify(self.root)
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        self.assertIn("link-to-listed.json", str(ctx.exception))
+        self.assertTrue(link.is_symlink())
+
+    def test_symlink_to_unlisted_outside_file_fails(self) -> None:
+        outside = self.root / "outside-target.txt"
+        outside.write_text("outside", encoding="utf-8")
+        link = self.root / "tests" / "fixtures" / "evil-outside-link"
+        os.symlink(outside, link)
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("symlink", message)
+        self.assertIn("evil-outside-link", message)
+
+    def test_symlink_to_directory_fails(self) -> None:
+        real_dir = self.root / "real-dir"
+        real_dir.mkdir()
+        (real_dir / "kept.txt").write_text("kept", encoding="utf-8")
+        link = self.root / "tests" / "fixtures" / "link-to-dir"
+        os.symlink(real_dir, link)
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("symlink", message)
+        self.assertIn("link-to-dir", message)
+
+    def test_dangling_symlink_fails(self) -> None:
+        link = self.root / "tests" / "fixtures" / "dangling-link"
+        os.symlink(self.root / "no-such-target-xyz-12345", link)
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("symlink", message)
+        self.assertIn("dangling-link", message)
+
+    def test_directory_replacing_expected_document_fails(self) -> None:
+        path = self.root / FIXTURE_README_REL
+        path.unlink()
+        path.mkdir()
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("README.md", message)
+
+    def test_fifo_entry_fails(self) -> None:
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("os.mkfifo is unavailable on this platform")
+        probe = self.root / "tests" / "fixtures" / "fifo-probe"
+        try:
+            os.mkfifo(probe)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"FIFO is unsupported in this environment: {error}")
+        try:
+            with self.assertRaises(VERIFIER.VerificationError) as ctx:
+                VERIFIER.verify(self.root)
+            message = str(ctx.exception)
+            self.assertIn("fifo-probe", message)
+        finally:
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+
+    def test_valid_tree_passes_with_exact_counts(self) -> None:
+        result = VERIFIER.verify(self.root)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["fixtures_checked"], 4)
+        self.assertEqual(result["documents_checked"], 1)
+        self.assertEqual(result["legal_artifacts_checked"], 1)
+        self.assertEqual(result["scrub_paths_checked"], 5)
+        fixture_dir = self.root / "tests" / "fixtures"
+        names = sorted(entry.name for entry in os.scandir(fixture_dir))
+        self.assertEqual(
+            names,
+            sorted(
+                [
+                    "AstatineGenesisCoordinator.json",
+                    "AstatineMiner.json",
+                    "MockAST.json",
+                    "OPENZEPPELIN_LICENSE.txt",
+                    "PROVENANCE.json",
+                    "README.md",
+                    "synthetic-injective-virtual-receipt.json",
+                ]
+            ),
+        )
+        self.assertEqual(
+            result["publication_decision"],
+            "BLOCKED pending review of rights and notice applicability; "
+            "first-party ownership is owner-attested and not independently verified.",
+        )
+        self.assertEqual(result["notice_applicability"], "UNRESOLVED")
+
+    def test_failed_verification_is_read_only(self) -> None:
+        probe = self.root / "tests" / "fixtures" / "readonly-probe.txt"
+        probe.write_text("probe-bytes", encoding="utf-8")
+        before = {
+            relative: (self.root / relative).read_bytes()
+            for relative in (
+                FIXTURE_REL,
+                FIXTURE_README_REL,
+                LICENSE_REL,
+                INVENTORY_REL,
+            )
+        }
+        with self.assertRaises(VERIFIER.VerificationError):
+            VERIFIER.verify(self.root)
+        self.assertTrue(probe.is_file())
+        self.assertEqual(probe.read_text(encoding="utf-8"), "probe-bytes")
+        for relative, data in before.items():
+            self.assertTrue((self.root / relative).is_file())
+            self.assertEqual((self.root / relative).read_bytes(), data)
+
+    def test_cli_unlisted_extra_returns_structured_json(self) -> None:
+        probe = self.root / "tests" / "fixtures" / "cli-extra-probe.txt"
+        probe.write_text("unlisted", encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "argv", ["verify-fixture-provenance.py", str(self.root)]):
+            with contextlib.redirect_stderr(stderr):
+                return_code = VERIFIER.main()
+        self.assertEqual(return_code, 1)
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["status"], "FAIL")
+        self.assertIn("unexpected file", payload["error"])
+        self.assertIn("cli-extra-probe.txt", payload["error"])
+        self.assertTrue(probe.is_file())
+
+    def test_cli_nested_directory_returns_structured_json(self) -> None:
+        nested = self.root / "tests" / "fixtures" / "cli-nested-probe"
+        nested.mkdir()
+        (nested / "inner.txt").write_text("nested", encoding="utf-8")
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "argv", ["verify-fixture-provenance.py", str(self.root)]):
+            with contextlib.redirect_stderr(stderr):
+                return_code = VERIFIER.main()
+        self.assertEqual(return_code, 1)
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["status"], "FAIL")
+        self.assertIn("cli-nested-probe", payload["error"])
+
+    def test_fixture_rel_path_helper_uses_relative_paths(self) -> None:
+        self.assertEqual(
+            VERIFIER.fixture_rel_path("tests/fixtures/README.md"), "README.md"
+        )
+        self.assertEqual(
+            VERIFIER.fixture_rel_path("tests/fixtures/AstatineMiner.json"),
+            "AstatineMiner.json",
+        )
+        self.assertIsNone(VERIFIER.fixture_rel_path("other/README.md"))
+        self.assertIsNone(VERIFIER.fixture_rel_path("tests/other/README.md"))
+        self.assertIsNone(
+            VERIFIER.fixture_rel_path("tests/fixtures/../fixtures/README.md")
+        )
+
+    def test_nested_readme_basename_collision_fails(self) -> None:
+        nested = self.root / "tests" / "fixtures" / "nested-readme-collision"
+        nested.mkdir()
+        shutil.copy2(self.root / FIXTURE_README_REL, nested / "README.md")
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        self.assertIn("nested-readme-collision", str(ctx.exception))
+
+    def test_unlisted_control_character_filename_is_escaped(self) -> None:
+        if os.name != "posix":
+            self.skipTest("control characters in filenames are not portable")
+        name = "control\nname-\x1b[31m"
+        probe = self.root / "tests" / "fixtures" / name
+        try:
+            probe.write_text("unlisted", encoding="utf-8")
+        except OSError as error:
+            self.skipTest(f"control-character filename unsupported: {error}")
+        with self.assertRaises(VERIFIER.VerificationError) as ctx:
+            VERIFIER.verify(self.root)
+        message = str(ctx.exception)
+        self.assertIn("unexpected file", message)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("\x1b", message)
+        self.assertIn("control\\nname-\\x1b[31m", message)
+        self.assertTrue(probe.is_file())
+
+    def test_scandir_oserror_reports_generic_errno_not_path(self) -> None:
+        secret = "[REDACTED]"
+        cases = (
+            (
+                PermissionError(13, f"{self.root}/{secret}\nEVIL\x1b[31m"),
+                "PermissionError (errno 13)",
+            ),
+            (
+                OSError(f"{self.root}/{secret}\nEVIL\x1b[31m"),
+                "OSError (errno unknown)",
+            ),
+        )
+        for denied, expected in cases:
+            with self.subTest(expected=expected):
+                with mock.patch.object(VERIFIER.os, "scandir", side_effect=denied):
+                    with self.assertRaises(VERIFIER.VerificationError) as ctx:
+                        VERIFIER.verify(self.root)
+                message = str(ctx.exception)
+                self.assertIn(
+                    "cannot scan fixture directory tests/fixtures", message
+                )
+                self.assertIn(expected, message)
+                self.assertNotIn(str(self.root), message)
+                self.assertNotIn(secret, message)
+                self.assertNotIn("EVIL", message)
+                self.assertNotIn("\n", message)
+                self.assertNotIn("\x1b", message)
+
 
 if __name__ == "__main__":
     unittest.main()

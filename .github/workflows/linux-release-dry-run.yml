@@ -86,6 +86,7 @@ jobs:
           python3 -B - "$out/release-provenance.json" "$out/astatine-x86_64-unknown-linux-gnu.dry-run.tar.gz" <<'PY'
           import json
           import os
+          import re
           import sys
 
           record = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -95,8 +96,8 @@ jobs:
           assert record["git_verified"] is True, "tracked dry-run members must match the dispatched commit"
           assert record["commit"] == os.environ["GITHUB_SHA"], "dry-run commit does not match the workflow checkout"
           assert record["tree"] != "unavailable", "dry-run tree identity is unavailable"
-          assert record["observed_toolchain"].startswith("rustc 1.94.1 "), "dry-run compiler does not match the pin"
-          assert record["observed_cargo_version"].startswith("cargo 1.94.1 "), "dry-run Cargo version does not match the pin"
+          assert re.fullmatch(r"rustc 1\.94\.1 \(e408947bf 2026-03-25\)", record["observed_toolchain"]), "dry-run compiler does not match the pin"
+          assert re.fullmatch(r"cargo 1\.94\.1 \(29ea6fb6a 2026-03-24\)", record["observed_cargo_version"]), "dry-run Cargo version does not match the pin"
           assert "source_root" not in record, "dry-run provenance must not record an absolute checkout path"
           assert "invocation" not in record, "dry-run provenance must not record raw invocation"
           import hashlib
