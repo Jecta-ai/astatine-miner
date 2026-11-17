@@ -6253,6 +6253,43 @@ async fn receive_backend_event(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuFailureDisposition {
+    Stop,
+    CpuFallback,
+    ExplicitFailure,
+}
+
+fn gpu_failure_disposition(selection: DeviceChoice, stop: bool) -> GpuFailureDisposition {
+    if stop {
+        GpuFailureDisposition::Stop
+    } else if selection == DeviceChoice::Auto {
+        GpuFailureDisposition::CpuFallback
+    } else {
+        GpuFailureDisposition::ExplicitFailure
+    }
+}
+
+fn dispatch_gpu_failure(
+    disposition: GpuFailureDisposition,
+    failure: String,
+    cpu_threads: usize,
+    context: MiningWorkerContext,
+    events: mpsc::UnboundedSender<BackendEvent>,
+) {
+    match disposition {
+        GpuFailureDisposition::Stop => {}
+        GpuFailureDisposition::CpuFallback => {
+            activate_cpu_fallback(cpu_threads, context, events, failure);
+        }
+        GpuFailureDisposition::ExplicitFailure => {
+            let _ = events.send(BackendEvent::Failed(format!(
+                "{failure}; explicit GPU mode does not substitute CPU hashing"
+            )));
+        }
+    }
+}
+
 fn gpu_worker_controller(
     selection: DeviceChoice,
     cpu_threads: usize,
@@ -6300,7 +6337,8 @@ fn gpu_worker_controller(
         bail!("GPU compute worker stopped unexpectedly")
     }));
 
-    if context.stop.load(Ordering::Acquire) {
+    let disposition = gpu_failure_disposition(selection, context.stop.load(Ordering::Acquire));
+    if disposition == GpuFailureDisposition::Stop {
         return;
     }
     let failure = match gpu_result {
@@ -6308,13 +6346,7 @@ fn gpu_worker_controller(
         Ok(Err(error)) => format!("GPU failed: {error:#}"),
         Err(payload) => format!("GPU backend panicked: {}", panic_payload_message(payload)),
     };
-    if selection == DeviceChoice::Auto {
-        activate_cpu_fallback(cpu_threads, context, events, failure);
-    } else {
-        let _ = events.send(BackendEvent::Failed(format!(
-            "{failure}; explicit GPU mode does not substitute CPU hashing"
-        )));
-    }
+    dispatch_gpu_failure(disposition, failure, cpu_threads, context, events);
 }
 
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -7117,20 +7149,20 @@ mod tests {
     }
 
     use super::{
-        ActiveBackend, DashboardContext, FinalizationState, HashedCandidate, HashingContext,
-        MiningWorkerContext, NodeSlot, NonceAllocator, ObserverUpdate,
+        ActiveBackend, DashboardContext, FinalizationState, GpuFailureDisposition, HashedCandidate,
+        HashingContext, MiningWorkerContext, NodeSlot, NonceAllocator, ObserverUpdate,
         PENDING_PROOF_CANDIDATE_CAPACITY, PaidRunSessionOpenLimits, PendingDashboardSync,
         ProofFound, SnapshotFreshness, activate_cpu_fallback, apply_genesis_poll_error,
         apply_transaction_state_to_model, approved_session_limit, clear_genesis_poll_error,
-        compare_snapshot_freshness, dashboard_model, dashboard_node_status,
-        finalization_retry_delay, gpu_is_meaningfully_faster, gpu_worker_controller,
-        gpu_worker_loop, history_profile_enabled, inactive_genesis_nodes, next_poll_delay,
-        next_scheduled_slot, open_paid_per_run_session, paid_run_session_open_limits,
-        per_run_authorization_cap, process_hashed_candidate, proof_inbox, reconcile_head_progress,
-        revalidate_queued_proof, revalidate_queued_proof_at, selected_nodes,
-        should_open_transaction_manager, start_cpu_worker_threads, suggested_session_limit,
-        take_observer_update, traced_node_status, unresolved_session_blocks_mining, update_slots,
-        worker_loop,
+        compare_snapshot_freshness, dashboard_model, dashboard_node_status, dispatch_gpu_failure,
+        finalization_retry_delay, gpu_failure_disposition, gpu_is_meaningfully_faster,
+        gpu_worker_controller, gpu_worker_loop, history_profile_enabled, inactive_genesis_nodes,
+        next_poll_delay, next_scheduled_slot, open_paid_per_run_session,
+        paid_run_session_open_limits, per_run_authorization_cap, process_hashed_candidate,
+        proof_inbox, reconcile_head_progress, revalidate_queued_proof, revalidate_queued_proof_at,
+        selected_nodes, should_open_transaction_manager, start_cpu_worker_threads,
+        suggested_session_limit, take_observer_update, traced_node_status,
+        unresolved_session_blocks_mining, update_slots, worker_loop,
     };
     use crate::{
         cli::{DeviceChoice, MineArgs, Network},
@@ -11510,6 +11542,157 @@ mod tests {
         ));
         stop.store(true, Ordering::Release);
         controller.join().unwrap();
+    }
+
+    #[test]
+    fn gpu_failure_disposition_routes_stop_auto_and_explicit() {
+        assert_eq!(
+            gpu_failure_disposition(DeviceChoice::Auto, false),
+            GpuFailureDisposition::CpuFallback
+        );
+        assert_eq!(
+            gpu_failure_disposition(DeviceChoice::Gpu, false),
+            GpuFailureDisposition::ExplicitFailure
+        );
+        assert_eq!(
+            gpu_failure_disposition(DeviceChoice::Auto, true),
+            GpuFailureDisposition::Stop
+        );
+        assert_eq!(
+            gpu_failure_disposition(DeviceChoice::Gpu, true),
+            GpuFailureDisposition::Stop
+        );
+    }
+
+    #[test]
+    fn gpu_failure_auto_dispatch_falls_back_to_cpu_with_notice() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (proof_sender, _proof_receiver) = proof_inbox(false);
+        let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let context = MiningWorkerContext {
+            slots: Arc::new((1..=9).map(NodeSlot::new).collect()),
+            schedule: Arc::new(RwLock::new(Vec::new())),
+            stop: Arc::clone(&stop),
+            cursor: Arc::new(AtomicUsize::new(0)),
+            total_hashes: Arc::new(AtomicU64::new(0)),
+            proofs: proof_sender,
+            telemetry: Arc::new(ProofPipelineTelemetry::default()),
+        };
+        let controller = thread::spawn(move || {
+            dispatch_gpu_failure(
+                GpuFailureDisposition::CpuFallback,
+                "test-injected GPU failure".to_owned(),
+                2,
+                context,
+                events,
+            );
+        });
+        let event = receiver.blocking_recv().unwrap();
+        assert!(
+            matches!(
+                event,
+                super::BackendEvent::Activated(ActiveBackend::Cpu { threads: 2 })
+            ),
+            "auto GPU failure must activate CPU hashing, got unexpected event"
+        );
+        let fallback_notice = receiver.blocking_recv().unwrap();
+        assert!(
+            matches!(
+                fallback_notice,
+                super::BackendEvent::FallbackNotice(reason)
+                    if reason.contains("test-injected GPU failure")
+            ),
+            "auto GPU failure must carry a fallback notice"
+        );
+        stop.store(true, Ordering::Release);
+        controller.join().unwrap();
+    }
+
+    #[test]
+    fn gpu_failure_explicit_dispatch_reports_failure_without_cpu_substitution() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (proof_sender, _proof_receiver) = proof_inbox(false);
+        let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let context = MiningWorkerContext {
+            slots: Arc::new(vec![NodeSlot::new(1)]),
+            schedule: Arc::new(RwLock::new(Vec::new())),
+            stop: Arc::clone(&stop),
+            cursor: Arc::new(AtomicUsize::new(0)),
+            total_hashes: Arc::new(AtomicU64::new(0)),
+            proofs: proof_sender,
+            telemetry: Arc::new(ProofPipelineTelemetry::default()),
+        };
+        dispatch_gpu_failure(
+            GpuFailureDisposition::ExplicitFailure,
+            "test-injected GPU failure".to_owned(),
+            2,
+            context,
+            events,
+        );
+        let event = receiver.blocking_recv().unwrap();
+        assert!(
+            matches!(
+                event,
+                super::BackendEvent::Failed(reason)
+                    if reason.contains("test-injected GPU failure")
+                        && reason.contains("explicit GPU mode does not substitute CPU hashing")
+            ),
+            "explicit GPU failure must report without substituting CPU hashing"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "explicit GPU failure must not activate CPU workers"
+        );
+    }
+
+    #[test]
+    fn gpu_failure_stop_dispatch_emits_no_events_and_no_cpu_fallback() {
+        let stop = Arc::new(AtomicBool::new(true));
+        let (proof_sender, _proof_receiver) = proof_inbox(false);
+        let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let context = MiningWorkerContext {
+            slots: Arc::new(vec![NodeSlot::new(1)]),
+            schedule: Arc::new(RwLock::new(Vec::new())),
+            stop: Arc::clone(&stop),
+            cursor: Arc::new(AtomicUsize::new(0)),
+            total_hashes: Arc::new(AtomicU64::new(0)),
+            proofs: proof_sender,
+            telemetry: Arc::new(ProofPipelineTelemetry::default()),
+        };
+        dispatch_gpu_failure(
+            GpuFailureDisposition::Stop,
+            "test-injected GPU failure".to_owned(),
+            2,
+            context,
+            events,
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "terminal stop must emit no backend events"
+        );
+    }
+
+    #[test]
+    fn gpu_controller_does_not_fallback_after_terminal_stop_in_auto_mode() {
+        let stop = Arc::new(AtomicBool::new(true));
+        let telemetry = Arc::new(ProofPipelineTelemetry::default());
+        let (proofs, _receiver) = proof_inbox(true);
+        let context = MiningWorkerContext {
+            slots: Arc::new(vec![NodeSlot::new(1)]),
+            schedule: Arc::new(RwLock::new(Vec::new())),
+            stop: Arc::clone(&stop),
+            cursor: Arc::new(AtomicUsize::new(0)),
+            total_hashes: Arc::new(AtomicU64::new(0)),
+            proofs,
+            telemetry,
+        };
+        let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        gpu_worker_controller(DeviceChoice::Auto, 1, context, events);
+        assert!(stop.load(Ordering::Acquire));
+        assert!(
+            receiver.try_recv().is_err(),
+            "terminal stop must not initialize GPU or fall back to CPU in auto mode"
+        );
     }
 
     #[test]

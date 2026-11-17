@@ -1,0 +1,110 @@
+# Local Linux release dry-run (no publication, no attestation).
+#
+# Prerequisite: green Rust CI for the exact dispatched commit (see
+# support/release/README.md). Do not dispatch unless the hosted CI result
+# for that commit is green. Manual dispatch only. Builds the locked Linux x86_64 release binary on a
+# GitHub-hosted Ubuntu 24.04 runner, rechecks the distribution gate (blocked or authorized licensing), builds
+# a deterministic dry-run archive from the explicit allowlist, and records
+# local dry-run provenance. This workflow never publishes an artifact or
+# GitHub release, never creates a tag, never signs an external release
+# binary, never requests an attestation, and never runs paid mining. No
+# artifact is uploaded and no attestation record is stored. The dry-run remains
+# nonpublishing in either licensing state and fails closed on any gate error.
+# Bit-for-bit reproducibility across hosts is not claimed.
+#
+# Attestation alignment: the dry-run never dispatches an attestation and never
+# requests an OIDC identity, regardless of the licensing state. Job permissions
+# are contents: read only. The absence of attestation is intentional and does
+# not satisfy release-evidence requirements.
+#
+# Supply-chain notes: pinned actions, the locked dependency graph, and the
+# absence of untrusted workflow inputs reduce but do not eliminate build
+# boundary risk; no untrusted workflow inputs (pull-request data, issue bodies,
+# comments) are used by any step. The local provenance record contains no
+# absolute checkout path and no raw invocation, to avoid identifying data.
+name: Linux release dry-run
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-release-dry-run-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUSTUP_TOOLCHAIN: "1.94.1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-release-dry-run:
+    name: Linux release dry-run (x86_64, no attestation, no publication)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify Ubuntu 24.04 x86_64 runner
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          test "${ID:-}" = "ubuntu"
+          test "${VERSION_ID:-}" = "24.04"
+          test "$(uname -m)" = "x86_64"
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+          test "$(rustc --version | awk '{print $2}')" = "1.94.1"
+          test "$(rustc -vV | awk '$1 == "host:" {print $2}')" = "x86_64-unknown-linux-gnu"
+      - name: Verify offline fixture provenance
+        run: python3 -B support/verify-fixture-provenance.py
+      - name: Verify distribution inventory
+        run: python3 -B support/verify-distribution-inventory.py
+      - name: Build locked release binary
+        run: cargo build --locked --release
+      - name: CLI smoke test
+        run: |
+          set -euo pipefail
+          ./target/release/astatine --version
+          ./target/release/astatine --help >/dev/null
+      - name: Build deterministic dry-run archive (no publication)
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/astatine-dry-run-out"
+          rm -rf "$out"
+          python3 -B support/release/build-dry-run.py --mode dry-run --output-dir "$out"
+          test -f "$out/astatine-x86_64-unknown-linux-gnu.dry-run.tar.gz"
+          test -f "$out/SHA256SUMS"
+          test -f "$out/release-provenance.json"
+          python3 -B - "$out/release-provenance.json" "$out/astatine-x86_64-unknown-linux-gnu.dry-run.tar.gz" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          record = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert record["publication_authorized"] is False, "dry-run must not authorize publication"
+          assert record["source_clean_at_head"] is True, "tracked source tree is not clean at HEAD"
+          assert "unverified" in record["binary_build_linkage"], "binary build linkage must be recorded as unverified"
+          assert record["git_verified"] is True, "tracked dry-run members must match the dispatched commit"
+          assert record["commit"] == os.environ["GITHUB_SHA"], "dry-run commit does not match the workflow checkout"
+          assert record["tree"] != "unavailable", "dry-run tree identity is unavailable"
+          assert re.fullmatch(r"rustc 1\.94\.1 \(e408947bf 2026-03-25\)", record["observed_toolchain"]), "dry-run compiler does not match the pin"
+          assert re.fullmatch(r"cargo 1\.94\.1 \(29ea6fb6a 2026-03-24\)", record["observed_cargo_version"]), "dry-run Cargo version does not match the pin"
+          assert "source_root" not in record, "dry-run provenance must not record an absolute checkout path"
+          assert "invocation" not in record, "dry-run provenance must not record raw invocation"
+          import hashlib
+          lock_hash = hashlib.sha256(open("Cargo.lock", "rb").read()).hexdigest()
+          assert record["cargo_lock_sha256"] == lock_hash, "dry-run Cargo.lock hash does not match the checkout"
+          import tarfile
+          with tarfile.open(sys.argv[2], mode="r") as tar:
+              names = sorted(tar.getnames())
+          assert names == ["BUILD-INFO.json", "INSTALL.md", "LICENSE-MIT", "THIRD_PARTY_LICENSES.md", "astatine"], names
+          PY
+          (cd "$out" && sha256sum -c SHA256SUMS)

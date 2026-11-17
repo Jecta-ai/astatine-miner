@@ -1,0 +1,60 @@
+Astatine fixture NOTICE
+
+This NOTICE accompanies source redistribution of the test-only fixtures in
+tests/fixtures.
+
+First-party fixtures:
+
+- AstatineMiner fixture bytecode (tests/fixtures/AstatineMiner.json) is
+  first-party work owned by the project owner, copyright Copyright (c) 2026
+  emyrinj, licensed under the Apache License, Version 2.0 (Apache-2.0). The
+  full license text is included in
+  tests/fixtures/LICENSE-APACHE-2.0.txt.
+
+- AstatineGenesisCoordinator fixture bytecode
+  (tests/fixtures/AstatineGenesisCoordinator.json) is first-party work owned
+  by the project owner, copyright Copyright (c) 2026 emyrinj, licensed under
+  the Apache License, Version 2.0 (Apache-2.0). The full license text is
+  included in tests/fixtures/LICENSE-APACHE-2.0.txt.
+
+- MockAST fixture bytecode (tests/fixtures/MockAST.json) is first-party work
+  owned by the project owner, copyright Copyright (c) 2026 emyrinj, licensed
+  under the MIT License. The full license text is included in
+  tests/fixtures/LICENSE-MIT.txt. MIT redistribution of MockAST reflects
+  owner-authorized release intent by the project owner (emyrinj).
+
+OpenZeppelin attribution:
+
+- The pinned EVM source trees reference OpenZeppelin Contracts commit
+  dbb6104ce834628e473d2173bbc9d47f81a9eec3, which is MIT licensed. The
+  MockAST pinned source imports one OpenZeppelin component; the
+  AstatineGenesisCoordinator pinned source declares zero direct OpenZeppelin
+  imports. No OpenZeppelin code in AstatineMiner is asserted here.
+  The OpenZeppelin MIT license and copyright notice (Copyright (c) 2016-2023
+  zOS Global Limited and contributors) are retained in
+  tests/fixtures/OPENZEPPELIN_LICENSE.txt for any fixture redistribution
+  to which it applies. This notice does not assert OpenZeppelin code in
+  every fixture.
+
+Technical NOTICE review:
+
+- Repository technical review on 2026-11-17 found no separate upstream
+  NOTICE file in the pinned contract fixture subtrees. The private EVM root
+  contains an Apache NOTICE scoped to a separate Rust subtree; the contract
+  subtrees have no NOTICE. Apache-2.0 license text and this fixture NOTICE
+  are included for source redistribution. Citations:
+  tests/fixtures/PROVENANCE.json, tests/fixtures/README.md,
+  tests/fixtures/LICENSE-APACHE-2.0.txt, tests/fixtures/LICENSE-MIT.txt,
+  tests/fixtures/OPENZEPPELIN_LICENSE.txt, tests/fixtures/NOTICE. This is an
+  evidence-based technical review, not a legal conclusion or separate
+  approval.
+
+Authority and release intent:
+
+- Ownership and redistribution authority for these fixtures are
+  owner-attested by the project owner authorization dated 2026-11-17 for
+  owner-authorized release intent for v0.1.0-testnet.1. Project owner only; no
+  separate release approver was appointed, consulted, or asserted. Final
+  release controls remain outstanding. This NOTICE makes no legal conclusion,
+  claims no independent legal verification, and has not been independently
+  verified.

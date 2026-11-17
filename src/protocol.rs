@@ -122,8 +122,8 @@ mod tests {
     use alloy_primitives::{Address, B256, U256};
     use std::str::FromStr;
 
-    // Canonical fixture: astatineEVM/evm/test/vectors/v2_work_vectors.json
-    // (read-only reference; no Go implementation or dependency source is copied here).
+    // Canonical work vector from the read-only reference fixture; no upstream
+    // implementation, dependency source, or private-origin identifier is copied.
     fn canonical_work() -> (WorkContext, u128, B256) {
         (
             WorkContext {

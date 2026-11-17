@@ -1,9 +1,11 @@
 # macOS ARM64 manual installation
 
-This guide describes the `v0.1.0-testnet.0` macOS ARM64 Testnet prerelease, Apple
-Silicon only. Confirm the release record and publication status before use. Source
-is MIT; binary archives include MIT and third-party notices. Linux/Windows
-distribution needs separate qualification.
+This guide describes the `v0.1.0-testnet.1` macOS ARM64 Testnet prerelease candidate, Apple
+Silicon only. Confirm the release record and publication status before use. The
+miner source is MIT; the source tree also contains Apache-2.0 and MIT fixture
+license texts and a fixture NOTICE. Binary archives include MIT and third-party notices. Linux x86_64 is
+documented separately in the [Linux x86_64 guide](LINUX_X86_64.md); Windows is
+outside this package and remains unqualified.
 
 The compiled `support/release-repository.txt` contains only the owner/name pair; it
 does not contain a numeric repository ID or release commit. Obtain the
@@ -14,46 +16,60 @@ itself change compiled inputs or require a rebuild.
 
 ## Download and authenticate — before extracting or running
 
-Choose `astatine-v0.1.0-testnet.0-macos-arm64.tar.gz`, not a debug/source archive.
+Choose `astatine-v0.1.0-testnet.1-macos-arm64.tar.gz`, not a debug/source archive.
 Use a trusted GitHub CLI with `release verify`/`verify-asset` support. Run each
 command individually; **stop on any failure or mismatch**. Never pipe downloads
 to a shell. These commands do not authorize installation or paid mining themselves.
 
 ```sh
-tag=v0.1.0-testnet.0
-asset=astatine-v0.1.0-testnet.0-macos-arm64.tar.gz
+tag=v0.1.0-testnet.1
+asset=astatine-v0.1.0-testnet.1-macos-arm64.tar.gz
 # Set these from the authenticated release record after read-back.
 # Use the verified repository name and numeric ID from that record.
 : "${repo:?set the verified OWNER/REPOSITORY}"
 : "${repo_id:?set the verified numeric repository ID}"
+: "${source_commit:?set the exact source commit from the release record}"
+: "${signer_workflow:?set the verified signer workflow from the release record}"
+source_digest="$source_commit"
+source_ref="refs/tags/$tag"
 curl --fail --location --proto '=https' --tlsv1.2 --output "$asset" \
   "https://github.com/$repo/releases/download/$tag/$asset"
 curl --fail --location --proto '=https' --tlsv1.2 --output SHA256SUMS \
   "https://github.com/$repo/releases/download/$tag/SHA256SUMS"
+curl --fail --location --proto '=https' --tlsv1.2 --output release-provenance.json \
+  "https://github.com/$repo/releases/download/$tag/release-provenance.json"
 test "$(gh api "repos/$repo" --jq .id)" = "$repo_id"
 gh release verify "$tag" --repo "$repo"
 gh release verify-asset "$tag" "./$asset" --repo "$repo"
 gh release verify-asset "$tag" ./SHA256SUMS --repo "$repo"
+gh release verify-asset "$tag" ./release-provenance.json --repo "$repo"
+gh attestation verify "./$asset" --repo "$repo" \
+  --signer-workflow "$signer_workflow" \
+  --source-digest "$source_digest" --source-ref "$source_ref"
 grep -F "  $asset" SHA256SUMS
 ```
 
 Check the exact archive filename and 64-hex digest in the authenticated checksum
 record, then compare `shasum -a 256 "$asset"` to that value. Also check the intended
 release tag/commit against the authenticated release record.
-Release attestations bind GitHub release assets; they do not independently prove
-honest source-to-binary compilation or remove administrator trust. If attestations
-are unavailable, stop pending an explicitly approved alternative authentication
-channel. A checksum and archive from the same unauthenticated source alone do not
-authenticate a publisher. No Actions/SLSA build attestation is promised.
+Check the archive's build-provenance attestation against the authenticated
+release record, including its exact source commit and signer workflow. The
+release-asset checks above also cover `SHA256SUMS`. Attestations and checksums do
+not independently prove reproducible source-to-binary compilation or remove
+administrator trust. If attestations are unavailable or mismatch, stop. A
+checksum and archive from the same unauthenticated source alone do not
+authenticate a publisher.
 
 Inspect `tar -tzvf "$asset"` first. Exactly one root directory
-`astatine-v0.1.0-testnet.0-macos-arm64/` must contain four regular files:
-`astatine` (0755), `LICENSE-MIT`, `THIRD_PARTY_LICENSES.md`, `INSTALL.md` (0644).
+`astatine-v0.1.0-testnet.1-macos-arm64/` must contain exactly five regular files:
+`astatine` (0755), `LICENSE-MIT`, `THIRD_PARTY_LICENSES.md`, `BUILD-INFO.json`,
+and `INSTALL.md` (0644).
 Reject extra/hidden/absolute/traversal paths, duplicates, links and special files.
 Extract as your ordinary user into a **new empty private directory**, never with
 sudo. Hash the extracted executable against the independently approved binary
-digest in the release manifest, and run `codesign --verify --strict --verbose=4`
-on that file. Keep both license files with your copy.
+digest recorded in the verified `release-provenance.json` release asset, and run
+`codesign --verify --strict --verbose=4` on that file. Keep both license files
+with your copy.
 
 ## macOS security boundary
 
@@ -86,7 +102,7 @@ install -m 755 "$verified/astatine" "$HOME/.local/bin/astatine"
 "$HOME/.local/bin/astatine" --help
 ```
 
-Require `astatine 0.1.0-testnet.0`, and recheck the installed binary's approved
+Require `astatine 0.1.0-testnet.1`, and recheck the installed binary's approved
 hash. Store `LICENSE-MIT` and `THIRD_PARTY_LICENSES.md` with your installation
 records. Inspect `type -a astatine`/`command -v astatine` for aliases, functions or
 older copies; use the full verified path if resolution is ambiguous.
@@ -154,7 +170,8 @@ the old executable/hash and replace **only** the executable; retain notices and
 leave configuration, keystores, journal/archives and Keychain at the same canonical
 root untouched. Recheck binary hash/version/PATH. Binary rollback does not roll
 back authenticated state; historical v8 no-prior interrupted-init compatibility
-is unqualified, and `.0` is not an automatic safe upgrade from older `.18` builds.
+is unqualified. The `v0.1.0-testnet.0` prerelease remains an immutable historical
+prerelease and is not an automatic safe upgrade from older `.18` builds.
 
 To uninstall, after stopping the process and checking the exact nonsymlink path,
 remove only the installed executable (and optionally its installation-only notice
