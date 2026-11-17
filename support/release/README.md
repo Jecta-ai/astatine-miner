@@ -75,6 +75,184 @@ Offline checks cannot establish environment,
 tag, CI, or immutable-setting state. The workflow creates and verifies a
 **draft only**; it does not publish.
 
+## GitHub App admin-visible verification (isolated, owner-authorized, NOT activated here)
+
+The default workflow token's read access to tag-ruleset `bypass_actors` is not
+established (see above): a snapshot without the field fails closed as
+unverifiable. The only authorized path to an admin-visible read is a dedicated,
+isolated GitHub App verification job, documented here and NOT activated by this
+revision. If the candidate read permission is absent or the field is missing,
+STOP: dispatch remains blocked rather than weakening creation protection.
+
+Contract (the three isolated jobs `tag-ruleset-admin-verify`,
+`tag-ruleset-admin-verify-package`, and `tag-ruleset-admin-verify-draft` are
+defined in `.github/workflows/release.yml` by the workflow lane; this section
+is the authorization boundary, not an activation):
+
+- Dual-environment separation (read-first). The three verifier jobs are each
+  bound to the dedicated protected `release-admin` environment
+  (`environment: release-admin`) — verifiers only, never package/draft.
+  `release-package` and `release-draft` stay bound to the protected `release`
+  environment (`environment: release`). That is 3 `release-admin` + 2
+  `release` = 5 protected environments total, out of 10 jobs total. Both
+  environments share the same owner-only gate: owner sole self-approval
+  (owner reviewer pinned to immutable numeric GitHub id 86115037 and login,
+  `prevent_self_review: false`, no admin bypass `can_admins_bypass: false`,
+  exact-tag deployment policy for the exact tag `v0.1.0-testnet.2` with
+  verified pagination `total_count`). Credentials are owner-provided
+  environment secrets (`RELEASE_ADMIN_APP_ID` /
+  `RELEASE_ADMIN_APP_PRIVATE_KEY`) bound ONLY to the `release-admin`
+  environment: 2 references x 3 verifier jobs = 6 total secret references,
+  zero in `release` (package/draft carry no App secrets). Needs sequencing is
+  exact: `tag-ruleset-admin-verify` needs `preflight` (initial verification
+  before builds); `tag-ruleset-admin-verify-package` needs `attest-macos`,
+  `attest-linux`, and `tag-ruleset-admin-verify` (fresh verification
+  immediately before packaging); `tag-ruleset-admin-verify-draft` needs
+  `release-package` (fresh verification immediately before draft creation).
+  `release-package` needs the fresh `tag-ruleset-admin-verify-package` job
+  (not the stale initial verification), plus the four build/attest jobs;
+  `release-draft` needs `[release-package, tag-ruleset-admin-verify-draft]`
+  (fresh before draft mutation).
+- No checkout, no repository code, no candidate executables, and no build/test
+  scripts run while any token is live; each job only mints its own token and
+  performs bounded read-only `gh api` GET fetches of the live
+  ruleset/environment state. Read-only allowlist only: `gh api "repos/$repo"`
+  with `--jq .id`, `gh api "repos/$repo/rulesets?includes_parents=true&per_page=100"`,
+  `gh api "repos/$repo/rulesets/$creation_id"`,
+  `gh api "repos/$repo/rulesets/$immutability_id"`, and the draft tag-ref
+  peeling reads (`gh api "repos/$repo/git/ref/tags/$tag"`,
+  `gh api "repos/$repo/git/tags/$obj_sha"`). Mutating invocations are
+  FORBIDDEN in all three admin jobs: no `-X`/`--method`, no POST/PATCH/PUT/DELETE,
+  no `gh api -X POST`, no `gh release create/edit/delete`, no
+  `gh attestation`, no `support/` scripts, no `cargo build`, no
+  `target/release`. No job checks out code, downloads/uploads artifacts,
+  executes candidate binaries, or runs repository scripts while its token is
+  live. Negative tests attempting mutating commands must fail.
+- The token is minted with the pinned third-party action
+  `actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510`
+  (`# v3.3.0`), scoped to exactly one repository (`owner: Jecta-ai`,
+  `repositories: astatine-miner`, i.e. `Jecta-ai/astatine-miner` id
+  `1454137135`) with a CANDIDATE permission under test
+  (`permission-administration: read`). Research-librarian confirmation:
+  `v3.3.0` SHA `64ab729a6294000f5aa4a4bc0b73d1f32bc45510` resolved via
+  `api.github.com/repos/actions/create-github-app-token/git/ref/tags/v3.3.0`
+  (type commit); `action.yml`/`README` at that SHA verified: `skip-token-revoke`
+  defaults to `false`, the token output is masked and the installation token
+  is revoked by the post-step unless `skip-token-revoke: true`, installation
+  token expiry is 1 hour, and scoping is `owner` plus `repositories`
+  (`owner` alone means all repositories of the owner; `repositories` narrows
+  to the single named repository). Docs permission claims for the ruleset
+  read were UNVERIFIED (upstream redirects to `llms.txt`); per the official
+  researcher, the ruleset GET documents `Metadata: read` as its minimum,
+  while `bypass_actors` is returned only to a caller with ruleset-write
+  access. Whether Administration `read` grants that visibility is UNPROVEN —
+  Administration `read` is plausible but NEITHER proven necessary NOR
+  sufficient until the owner tests it live AFTER audit. There is NO write
+  fallback: broadening to `permission-administration: write` without a
+  reviewed contract update and fresh audit is PROHIBITED. Nothing broader is
+  granted in the meantime, and each isolated job MUST fail closed if the
+  field is absent. No other repositories, no other permissions. The same
+  strict validation, same single-repo scope, same explicit revocation config,
+  and same no-reuse rule apply identically to all three jobs; no signed
+  snapshot is reused across jobs.
+- Credentials are owner-provided `release-admin` environment secrets
+  (`RELEASE_ADMIN_APP_ID` / `RELEASE_ADMIN_APP_PRIVATE_KEY`). This
+  implementation creates NO GitHub App, stores NO keys, changes NO repository
+  or environment settings, and contains NO secret values. The owner creates
+  the App and stores the secrets manually, only AFTER independent audit of
+  this contract. Do not ask for, print, or transmit secrets here. No
+  credentials are activated by this revision.
+- The minted tokens are short-lived (1-hour installation-token expiry) and
+  scoped to the single repository; each of the three jobs sets explicit
+  `skip-token-revoke: false` so the action post-step revokes the token.
+  This is a neutral config check only: the `Check admin token handling`
+  step (`if: always()`) `echo` does NOT prove revocation — do NOT claim echo
+  proves revoke, and no test asserts that echo verifies revocation. The private key and each token
+  are never printed, logged, stored, or uploaded: no `echo`/`print` of
+  secrets, no artifact uploads from any admin job, and `GH_TOKEN` inside each
+  job is sourced only from `steps.app-token.outputs.token` of that same job.
+  Token reuse outside the three isolated admin jobs is PROHIBITED, and reuse
+  across the three jobs is likewise prohibited: each job mints and consumes
+  only its own token.
+- Each admin job independently checks the exact tag `v0.1.0-testnet.2`,
+  `GITHUB_REF`, canonical repository `Jecta-ai/astatine-miner`, and numeric
+  repository id `1454137135` live. The admin jobs do not compare
+  `GITHUB_SHA` directly: no checkout occurs while the App token is live.
+  `needs` does NOT automatically inherit SHA binding; instead, GITHUB_SHA trust
+  is inherited through each same-run needs chain from preflight, which verifies
+  `HEAD==GITHUB_SHA` and `tag peel==GITHUB_SHA` via checkout. No stale
+  snapshots are accepted and no signed snapshot is reused across jobs. The
+  pre-existing exact-tag, exact-commit main CI, and fixture/provenance gates
+  are preserved unchanged. Ruleset/repository/ref checks are live; a snapshot
+  file carried across jobs (including via artifacts) would be stale by
+  definition and is prohibited.
+- Tag-protection semantics are unchanged: `astatine-release-tag-creation`
+  keeps exactly the `creation` rule on exactly `refs/tags/v*` with no
+  exclusions and exactly the owner-user bypass (`User 86115037`, always);
+  `astatine-release-tags` keeps exactly `update`/`deletion`/`non_fast_forward`
+  on exactly `refs/tags/v*` with no exclusions and zero bypass actors. Both
+  fail closed; administrator bypass stays disabled. Each verification result
+  feeds only its immediate mutation gate and is re-verified before mutation:
+  the initial verification gates the build chain, the fresh package
+  verification (which lists attestations plus the initial verification in
+  `needs`) gates `release-package` (which lists the fresh package job in
+  `needs`, not the stale initial job), and the fresh draft verification
+  (which lists `release-package` in `needs`) gates `release-draft` (which
+  lists `[release-package, tag-ruleset-admin-verify-draft]` in `needs`); no
+  verification weakens or replaces those gates. Temporal disclosure
+  (corrected): environment approvals can delay execution, so no
+  atomic/immediate claim is made; a check-then-mutate race remains between
+  each fresh check and its immediately following mutation (rulesets or
+  environment could change after the fresh fetch and before package/draft
+  mutation). It is mitigated by `needs` sequencing, `release-admin`
+  approval on every verifier plus `release` approval on every mutation job,
+  and re-verification immediately before each mutation, but it cannot be
+  eliminated; this contract does NOT claim atomicity or immediacy between
+  check and mutation. Manual prepublish recheck remains required immediately
+  before publication (immutable-releases flag, exact tag, split rulesets with
+  an owner/admin-visible token, every draft asset digest, draft body).
+- Package and draft delegate bypass validation to the fresh admin jobs and
+  run no default-token detail checks there. Each mutation job carries only a
+  fresh-delegation comment (authoritative bypass validation is delegated to
+  the fresh isolated App job sequenced via needs before this stage); the default
+  token cannot see bypass_actors, so no ruleset-detail fetch and no
+  verify-tag-ruleset.py run occur in either mutation job, and
+  package-rulesets.json / draft-rulesets.json snapshot files are forbidden
+  there. Authoritative validation lives only in the three isolated admin
+  jobs, each live-fetching immediately before its stage with no stale signed
+  snapshot reuse. Stale one-time owner check disclaimer: any one-time
+  owner/admin console check is unavoidably stale the moment it is recorded —
+  do NOT substitute it for the live per-job checks; live fetches in each of
+  the three verifier jobs remain mandatory.
+- Validator coverage is three `verify-protected-environment.py` invocations: preflight verifies BOTH live environments (`--expected-environment release` with `$env_out` plus `--expected-environment release-admin` with `$admin_env_out` variables), and `release-package` keeps its `release` re-verify before mutation; each admin job re-verifies `release-admin` live inline before mint; `release-draft` keeps its `release` re-verify. Temporal/SHA language is `same-run needs does NOT inherit SHA`, `not atomic or immediate`, `manual prepublish recheck remains`.
+- No mining, wallet, payment, or network-mining behavior is added or changed.
+
+Residual risk (stated honestly, not mitigated away): the minting action is a
+third-party action handling the App private key and the installation token; a
+compromised or mistaken action version, owner account, or leaked short-lived
+token could weaken or dismantle the very protections these jobs verify. A SHA
+pin only fixes the mutable-tag risk, not inherent action safety. Stated
+mitigations are ONLY pin + isolation + revoke + single-repo: the exact SHA
+pin `64ab729a6294000f5aa4a4bc0b73d1f32bc45510` (`# v3.3.0`) against tag
+mutability, per-job isolation (no checkout/artifact/candidate/script while
+the token is live), explicit `skip-token-revoke: false` per job with 1-hour
+token lifetime, and single-repository scoping (`owner: Jecta-ai`,
+`repositories: astatine-miner`). None of them constrains the
+owner/administrator account itself, and owner self-approval already removes
+independent review (see the tradeoff above). Token reuse outside the three
+isolated admin jobs is PROHIBITED, and cross-job token reuse is likewise
+PROHIBITED. Broadening permissions beyond `administration: read`, or
+extending repository scope beyond `Jecta-ai/astatine-miner`, is PROHIBITED
+without a reviewed contract update and fresh audit.
+
+Until the owner has manually created the App, stored the `release-admin`
+environment secrets, and each isolated job demonstrates the admin-visible
+read in a controlled run, dispatch remains blocked rather than weakening
+creation protection, and any missing candidate field fails closed with STOP.
+This revision creates NO GitHub App, stores NO keys, changes NO repository or
+environment settings, and activates NO credentials; all token minting occurs
+only in the workflow at dispatch time after audit-gated App/secret setup.
+
 ## Nonpublishing Linux x86_64 dry-run (`build-dry-run.py`)
 
 The dry-run is a local rehearsal that never becomes a release path. It accepts

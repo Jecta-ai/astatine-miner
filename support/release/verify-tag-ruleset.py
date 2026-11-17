@@ -21,11 +21,49 @@ candidate would leave future ``v*`` tags unprotected and is rejected.
 Creation protection is never removed. GitHub bypass actors are role/team/app/
 user based; this validator accepts exactly the owner-user bypass actor:
 the owner user (numeric id 86115037, always). Repository-admin bypass is
-rejected and administrator bypass is disabled. GitHub
-only returns ``bypass_actors`` to a caller with write access to the ruleset;
-whether a given workflow token has that access must be established at runtime.
-A snapshot without ``bypass_actors`` fails closed rather than being treated as
-an empty list. No stored token or secret is added. Both snapshots must be
+rejected and administrator bypass is disabled.
+Admin-visible path (candidate under test): three sequenced
+tag-ruleset-admin-verify workflow jobs each mint a short-lived App installation
+token (pinned create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+# v3.3.0 action, research-librarian independently re-verified via GitHub API
+refs/tags/v3.3.0 at this SHA; action.yml declares app-id/client-id,
+private-key required, owner/repositories optional, skip-token-revoke default
+false, permission-administration input, token output, main+post entrypoints;
+README states masked token, post-step revoke unless skip true, 1h expiry,
+single-repo narrowing; ruleset docs fetch redirected to llms.txt so Metadata
+minimum is NOT independently confirmed) for read-only ruleset GET with explicit
+skip-token-revoke false and read-only GET (no -X/--method, no release/attest
+mutations): the initial gate (needs preflight),
+tag-ruleset-admin-verify-package sequenced via needs before release-package
+(needs attest-macos, attest-linux, tag-ruleset-admin-verify), and
+tag-ruleset-admin-verify-draft sequenced via needs before release-draft
+(needs release-package); each runs in the dedicated release-admin environment
+(owner sole self-approval User 86115037, prevent_self_review false,
+can_admins_bypass false, exact tag v0.1.0-testnet.2) and re-verifies
+release-admin live inline before mint, with App secrets only in those jobs.
+Repository ruleset GET documents Metadata read minimum in some sources, plus
+``bypass_actors`` is returned only when the caller has ruleset-write access;
+whether the candidate App permission (permission-administration read) grants
+it is UNPROVEN until owner-tested live runtime -- candidate under test,
+verification needed, no write fallback. If read cannot access bypass_actors,
+STOP: a later explicit write decision is required and must not be
+auto-escalated here. This validator still fails closed on any snapshot without
+``bypass_actors`` rather than treating it as an empty list, so default-token
+snapshots without the field keep failing closed here; only the isolated admin
+jobs (each itself fails closed if absent) are authoritative for the live bypass
+check. Each admin job live-fetches the rulesets in its own run and verifies
+GITHUB_REF/tag/repo-id live. Same-run needs does NOT automatically inherit SHA
+binding; GITHUB_SHA trust is inherited from same-run preflight (HEAD==GITHUB_SHA
+and tag peel==GITHUB_SHA verified via checkout) through the needs chain. Admin
+jobs do no direct SHA equality check by design (no checkout while the App token
+is live). Environment approvals can delay mutation after a check, so no check
+is atomic or immediate; no stale signed snapshot is stored and manual
+prepublish recheck still required. SHA pinning fixes
+the mutable tag only, not inherent safety; third-party action risk (private key
+and token handling, compromise impact) is described only as pin plus isolation
+plus explicit revoke plus single-repo scope, without claiming elimination.
+No stored token
+or secret is added by this offline validator. Both snapshots must be
 active and repository-scoped. Creation is exactly scoped to
 ``refs/tags/v*``; immutability is exactly scoped to ``refs/tags/v*`` with no
 exclusions. Missing, extra, combined, broadened, narrowed, or bypassable

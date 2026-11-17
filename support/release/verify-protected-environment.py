@@ -1,26 +1,37 @@
 #!/usr/bin/env python3
-"""Offline bounded validator for the release environment and tag policies.
+"""Offline bounded validator for the release and release-admin environments.
 
 Validates actual GitHub environment/tag-protection JSON snapshots against the
 fail-closed, version-scoped owner self-approval requirements without network
-access. GitHub deployment branch and tag policies combine with OR, so the
-policies snapshot must contain exactly one policy and that policy must be the
-exact current release tag; anything broader fails closed. The deployment-policy
-response must include a ``total_count`` that equals the number of returned
-policies so a paginated response cannot hide a second, broadening policy.
+access, for EITHER ``release`` (package/draft mutation jobs) OR
+``release-admin`` (three verifier jobs only) selected via
+``--expected-environment`` (default ``release``). Both environments require the
+same policy: owner sole self-approval (User 86115037), ``prevent_self_review``
+exactly false, ``can_admins_bypass`` false, and the exact current release tag
+``v0.1.0-testnet.2`` with no wildcards. GitHub deployment branch and tag
+policies combine with OR, so the policies snapshot must contain exactly one
+policy and that policy must be the exact current release tag; anything broader
+fails closed. The deployment-policy response must include a ``total_count``
+that equals the number of returned policies so a paginated response cannot
+hide a second, broadening policy.
 
 The required reviewer is pinned to the owner's immutable numeric GitHub user id
 (86115037) and login. ``prevent_self_review`` must be exactly false because the
 owner explicitly authorized owner self-approval; this is a documented reduction
 in separation of duties, not independent review. Admin bypass must be false and
-the environment must use custom tag policies. Reads only the two JSON files
+the environment must use custom tag policies. Sequencing note (temporal,
+non-atomic): environment approvals can introduce delays between a check and a
+later mutation, so no check is atomic or immediate and same-run ``needs`` does
+NOT inherit SHA/tag binding; each job independently verifies its own gate live
+and manual prepublish recheck remains required. Reads only the two JSON files
 given on the command line, prints only safe booleans and field names (never
 reviewer identities or full JSON), and exits 0 on PASS or 1 on any failure.
 Stdlib-only and offline.
 
 Usage:
     python3 -B support/release/verify-protected-environment.py \\
-        --environment-json <json> --policies-json <json> --tag <tag>
+        --environment-json <json> --policies-json <json> --tag <tag> \\
+        [--expected-environment release|release-admin]
 """
 
 from __future__ import annotations
@@ -69,11 +80,18 @@ def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def validate_environment(data: object) -> dict:
+def validate_environment(data: object, expected_environment: str = "release") -> dict:
     require(isinstance(data, dict), "environment JSON must be an object")
+    require(
+        expected_environment in ("release", "release-admin"),
+        "expected environment must be release or release-admin",
+    )
     env = data
     require("name" in env, "environment JSON is missing field: name")
-    require(env["name"] == "release", "environment name must be exactly release")
+    if expected_environment == "release-admin":
+        require(env["name"] == "release-admin", "environment name must be exactly release-admin")
+    else:
+        require(env["name"] == "release", "environment name must be exactly release")
     require("can_admins_bypass" in env, "environment JSON is missing field: can_admins_bypass")
     require(env["can_admins_bypass"] is False, "can_admins_bypass must be false")
     require(
@@ -237,10 +255,10 @@ def validate_policies(data: object, tag: str) -> dict:
     }
 
 
-def verify(environment_path: Path, policies_path: Path, tag: str) -> dict:
+def verify(environment_path: Path, policies_path: Path, tag: str, expected_environment: str = "release") -> dict:
     environment_data = load_json_file(environment_path, "environment")
     policies_data = load_json_file(policies_path, "policies")
-    env_summary = validate_environment(environment_data)
+    env_summary = validate_environment(environment_data, expected_environment)
     policy_summary = validate_policies(policies_data, tag)
     return {
         "status": "PASS",
@@ -255,6 +273,7 @@ def verify(environment_path: Path, policies_path: Path, tag: str) -> dict:
         "protected_branches": False,
         "reviewer_rule_count": env_summary["reviewer_rule_count"],
         "reviewer_count": env_summary["reviewer_count"],
+        "environment_name": expected_environment,
         "tag_policy_matched": policy_summary["tag_policy_matched"],
         "pagination_total_count_verified": True,
         "pagination_total_count": policy_summary["pagination_total_count"],
@@ -263,14 +282,20 @@ def verify(environment_path: Path, policies_path: Path, tag: str) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Offline validator for the owner self-approval release environment and exact tag policies."
+        description="Offline validator for the owner self-approval release and release-admin environments and exact tag policies."
     )
     parser.add_argument("--environment-json", required=True, type=Path)
     parser.add_argument("--policies-json", required=True, type=Path)
     parser.add_argument("--tag", required=True)
+    parser.add_argument(
+        "--expected-environment",
+        default="release",
+        choices=("release", "release-admin"),
+        help="Expected environment name: release (package/draft) or release-admin (verifiers only).",
+    )
     args = parser.parse_args(argv)
     try:
-        result = verify(args.environment_json, args.policies_json, args.tag)
+        result = verify(args.environment_json, args.policies_json, args.tag, args.expected_environment)
     except ProtectedEnvironmentError as error:
         print(json.dumps({"status": "FAIL", "error": str(error)}, indent=2), file=sys.stderr)
         return 1
