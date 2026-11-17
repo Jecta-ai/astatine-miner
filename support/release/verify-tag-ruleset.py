@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 """Offline fail-closed validator for the split release-tag rulesets.
 
-The protected tag policy uses two composable repository rulesets with strict
-exact-tag scope:
+The protected tag policy uses two composable repository rulesets, each exactly
+scoped to ``refs/tags/v*`` with no exclusions:
 
 * ``astatine-release-tag-creation``: only the ``creation`` rule, with exactly
-  one designated owner-user or repository-admin bypass actor for the controlled
-  owner/admin creation of the exact ``v0.1.0-testnet.2`` tag.
+  the owner-user bypass actor (User 86115037, always) for owner-only creation
+  covering all ``v*`` tags; repository-admin bypass is rejected.
 * ``astatine-release-tags``: ``update``, ``deletion`` and ``non_fast_forward``
-  with zero bypass actors, covering the existing ``v0.1.0-testnet.0``,
-  ``v0.1.0-testnet.1`` and ``v0.1.0-testnet.2`` tags so the historical tags
-  remain protected and the new tag is protected too.
+  with zero bypass actors, covering all ``refs/tags/v*`` tags so every version
+  tag remains protected.
+
+This preserves the breadth of the live tag protection, which restricts
+creation/update/deletion for all ``refs/tags/v*``. Narrowing either ruleset
+to the single ``v0.1.0-testnet.2`` tag, or to the historical
+``v0.1.0-testnet.0``/``.1``/``.2`` list, weakens protection for all other
+``v*`` tags and fails closed. Replacing the live ruleset with a narrowed
+candidate would leave future ``v*`` tags unprotected and is rejected.
 
 Creation protection is never removed. GitHub bypass actors are role/team/app/
-user based; this validator accepts exactly one designated bypass actor:
-the owner user (numeric id 86115037) or the repository-admin role (id 5). GitHub
+user based; this validator accepts exactly the owner-user bypass actor:
+the owner user (numeric id 86115037, always). Repository-admin bypass is
+rejected and administrator bypass is disabled. GitHub
 only returns ``bypass_actors`` to a caller with write access to the ruleset;
 whether a given workflow token has that access must be established at runtime.
 A snapshot without ``bypass_actors`` fails closed rather than being treated as
 an empty list. No stored token or secret is added. Both snapshots must be
 active and repository-scoped. Creation is exactly scoped to
-``refs/tags/v0.1.0-testnet.2``; immutability covers the existing
-``refs/tags/v0.1.0-testnet.0``, ``.1`` and ``.2`` tags. Missing, extra,
-combined, broadened, or bypassable immutability rulesets fail closed.
+``refs/tags/v*``; immutability is exactly scoped to ``refs/tags/v*`` with no
+exclusions. Missing, extra, combined, broadened, narrowed, or bypassable
+rulesets fail closed.
 
 Usage:
     python3 -B support/release/verify-tag-ruleset.py \\
@@ -39,27 +46,19 @@ from pathlib import Path
 
 EXPECTED_REPOSITORY = "Jecta-ai/astatine-miner"
 EXPECTED_RELEASE_TAG = "v0.1.0-testnet.2"
-EXPECTED_IMMUTABILITY_TAGS = (
-    "v0.1.0-testnet.0",
-    "v0.1.0-testnet.1",
-    "v0.1.0-testnet.2",
-)
+# Both composable rulesets must preserve the live breadth: exactly
+# refs/tags/v* with no exclusions. Narrowing to the single .2 tag or to the
+# historical .0/.1/.2 list weakens protection for all other v* tags.
+EXPECTED_TAG_SCOPE = ["refs/tags/v*"]
 EXPECTED_CREATION_RULESET_NAME = "astatine-release-tag-creation"
 EXPECTED_IMMUTABILITY_RULESET_NAME = "astatine-release-tags"
 EXPECTED_CREATION_RULES = frozenset({"creation"})
 EXPECTED_IMMUTABILITY_RULES = frozenset({"update", "deletion", "non_fast_forward"})
-EXPECTED_CREATION_BYPASS_ACTORS = (
-    {
-        "actor_id": 86115037,
-        "actor_type": "User",
-        "bypass_mode": "always",
-    },
-    {
-        "actor_id": 5,
-        "actor_type": "RepositoryRole",
-        "bypass_mode": "always",
-    },
-)
+EXPECTED_CREATION_BYPASS_ACTOR = {
+    "actor_id": 86115037,
+    "actor_type": "User",
+    "bypass_mode": "always",
+}
 
 
 class TagRulesetError(Exception):
@@ -102,7 +101,7 @@ def _validate_common(
     require(isinstance(exclude, list), "ruleset ref_name.exclude must be a list")
     require(
         include == expected_include,
-        "ruleset ref_name.include must be exactly the required release-tag scope; broader, narrower, or additional scopes are rejected",
+        "ruleset ref_name.include must be exactly [\"refs/tags/v*\"]; broader, narrower (including the single .2 tag or the historical .0/.1/.2 list), or additional scopes are rejected",
     )
     require(
         exclude == [],
@@ -125,7 +124,10 @@ def _rule_types(data: dict) -> set[str]:
 
 
 def validate_creation_ruleset(data: object, repository: str, tag: str) -> dict:
-    data = _validate_common(data, EXPECTED_CREATION_RULESET_NAME, repository, [f"refs/tags/{tag}"])
+    # ``tag`` Pins the release identity (verified in verify()); the ruleset
+    # scope itself must remain the broad v* pattern to preserve live protection.
+    require(tag == EXPECTED_RELEASE_TAG, "tag must be exactly the current release tag")
+    data = _validate_common(data, EXPECTED_CREATION_RULESET_NAME, repository, list(EXPECTED_TAG_SCOPE))
     require(
         _rule_types(data) == EXPECTED_CREATION_RULES,
         "creation ruleset must contain exactly the creation rule; do not remove creation protection",
@@ -136,9 +138,8 @@ def validate_creation_ruleset(data: object, repository: str, tag: str) -> dict:
         "creation ruleset bypass_actors must be present as a list; GitHub only returns it to callers with ruleset write access, and this snapshot did not provide it, so the creation bypass cannot be verified and the check fails closed",
     )
     require(
-        len(bypass) == 1
-        and any(bypass[0] == actor for actor in EXPECTED_CREATION_BYPASS_ACTORS),
-        "creation ruleset must have exactly one designated owner-user or repository-admin bypass actor",
+        len(bypass) == 1 and bypass[0] == EXPECTED_CREATION_BYPASS_ACTOR,
+        "creation ruleset must have exactly the owner-user bypass actor (User 86115037, always); repository-admin bypass is rejected",
     )
     current_user_can_bypass = data.get("current_user_can_bypass")
     # ``current_user_can_bypass`` describes the calling identity, not the
@@ -152,16 +153,17 @@ def validate_creation_ruleset(data: object, repository: str, tag: str) -> dict:
         "ruleset_name": EXPECTED_CREATION_RULESET_NAME,
         "rules": sorted(EXPECTED_CREATION_RULES),
         "bypass_actor_count": 1,
-        "exact_tag_scope": True,
+        "tag_scope": EXPECTED_TAG_SCOPE[0],
     }
 
 
 def validate_immutability_ruleset(data: object, repository: str, tag: str) -> dict:
+    require(tag == EXPECTED_RELEASE_TAG, "tag must be exactly the current release tag")
     data = _validate_common(
         data,
         EXPECTED_IMMUTABILITY_RULESET_NAME,
         repository,
-        [f"refs/tags/{release_tag}" for release_tag in EXPECTED_IMMUTABILITY_TAGS],
+        list(EXPECTED_TAG_SCOPE),
     )
     rule_types = _rule_types(data)
     require(
@@ -183,7 +185,7 @@ def validate_immutability_ruleset(data: object, repository: str, tag: str) -> di
         "ruleset_name": EXPECTED_IMMUTABILITY_RULESET_NAME,
         "rules": sorted(EXPECTED_IMMUTABILITY_RULES),
         "bypass_actor_count": 0,
-        "protected_tags": list(EXPECTED_IMMUTABILITY_TAGS),
+        "protected_tags": list(EXPECTED_TAG_SCOPE),
     }
 
 

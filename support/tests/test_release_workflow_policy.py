@@ -1123,7 +1123,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             "source": "Jecta-ai/astatine-miner",
             "enforcement": "active",
             "conditions": {
-                "ref_name": {"include": ["refs/tags/v0.1.0-testnet.2"], "exclude": []}
+                "ref_name": {"include": ["refs/tags/v*"], "exclude": []}
             },
             "rules": [{"type": "creation"}],
             "bypass_actors": [
@@ -1139,16 +1139,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             "source_type": "Repository",
             "source": "Jecta-ai/astatine-miner",
             "enforcement": "active",
-            "conditions": {
-                "ref_name": {
-                    "include": [
-                        "refs/tags/v0.1.0-testnet.0",
-                        "refs/tags/v0.1.0-testnet.1",
-                        "refs/tags/v0.1.0-testnet.2",
-                    ],
-                    "exclude": [],
-                }
-            },
+            "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
             "rules": [
                 {"type": "update"},
                 {"type": "deletion"},
@@ -1199,9 +1190,36 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
     def test_draft_inline_rulesets_reject_2_only_immutability_scope(self) -> None:
+        # Narrowing immutability to the single .2 tag weakens protection for
+        # all other v* tags and must fail closed.
         immutability = self._valid_immutability_ruleset()
         immutability["conditions"]["ref_name"]["include"] = [
             "refs/tags/v0.1.0-testnet.2"
+        ]
+        result = self._run_draft_ruleset_inline(
+            self._valid_creation_ruleset(), immutability
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_rulesets_reject_2_only_creation_scope(self) -> None:
+        # Narrowing creation to the single .2 tag weakens protection for all
+        # other v* tags and must fail closed.
+        creation = self._valid_creation_ruleset()
+        creation["conditions"]["ref_name"]["include"] = [
+            "refs/tags/v0.1.0-testnet.2"
+        ]
+        result = self._run_draft_ruleset_inline(
+            creation, self._valid_immutability_ruleset()
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_rulesets_reject_historical_list_scope(self) -> None:
+        # The historical .0/.1/.2 list is narrower than v* and must fail.
+        immutability = self._valid_immutability_ruleset()
+        immutability["conditions"]["ref_name"]["include"] = [
+            "refs/tags/v0.1.0-testnet.0",
+            "refs/tags/v0.1.0-testnet.1",
+            "refs/tags/v0.1.0-testnet.2",
         ]
         result = self._run_draft_ruleset_inline(
             self._valid_creation_ruleset(), immutability
@@ -1294,6 +1312,17 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         ]
         result = self._run_draft_ruleset_inline(
             self._valid_creation_ruleset(), immutability
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_rulesets_reject_admin_creation_bypass(self) -> None:
+        # Repository-admin creation bypass contradicts the owner-only model.
+        creation = self._valid_creation_ruleset()
+        creation["bypass_actors"] = [
+            {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+        ]
+        result = self._run_draft_ruleset_inline(
+            creation, self._valid_immutability_ruleset()
         )
         self.assertNotEqual(result.returncode, 0)
 

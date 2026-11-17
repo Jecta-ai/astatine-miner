@@ -129,8 +129,8 @@ EXPECTED_OWNER_SELF_APPROVAL_POLICY = {
     "compensating_controls": [
         "exact release tag pinned to v0.1.0-testnet.2 and an exact-tag environment deployment policy",
         "environment cannot be bypassed by administrators (can_admins_bypass: false)",
-        "separate tag creation ruleset must be active with the creation rule and exactly one designated owner-user or repository-admin bypass for the exact tag",
-        "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering the existing .0, .1 and .2 tags",
+        "separate tag creation ruleset must be active with the creation rule and exactly the owner-user bypass (User 86115037, always) for exactly refs/tags/v* with no exclusions; repository-admin bypass is rejected",
+        "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering exactly refs/tags/v* with no exclusions",
         "tag creation protection must be retained; it must not be removed or broadened",
         "immutable releases must be enabled before dispatch and rechecked before publication",
         "exact-commit green main CI for Rust CI and Linux native qualification",

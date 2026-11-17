@@ -23,7 +23,7 @@ DRY_RUN_WORKFLOW_FILENAME = "linux-release-dry-run.yml"
 RELEASE_WORKFLOW_FILENAME = "release.yml"
 # Pinned SHA-256 of .github/workflows/release.yml. Update only after review.
 # Recompute with: python3 -B support/check_workflow_pins.py --print-release-sha256
-RELEASE_WORKFLOW_SHA256 = "41ab7c95e6f9753d8a0a67f60b522d90027f06afa7d05932c8b354acc5d93d57"
+RELEASE_WORKFLOW_SHA256 = "b5394ef4fb7c813ee20c98a0364b9830f6cf34c44d94a79ea46d6f4f61d6ff8c"
 PINNED_RELEASE_ACTIONS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",

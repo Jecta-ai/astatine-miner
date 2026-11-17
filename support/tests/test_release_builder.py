@@ -470,7 +470,7 @@ class ReleaseBuilderTests(unittest.TestCase):
             self.assertEqual(info["release_controls"]["tag_policy"], "refs/tags/v0.1.0-testnet.2")
             self.assertEqual(
                 info["release_controls"]["tag_ruleset_exact_scope"],
-                "refs/tags/v0.1.0-testnet.2",
+                "refs/tags/v*",
             )
             self.assertTrue(info["release_controls"]["tag_creation_rule_required"])
             self.assertEqual(
@@ -485,11 +485,6 @@ class ReleaseBuilderTests(unittest.TestCase):
                         "actor_type": "User",
                         "bypass_mode": "always",
                     },
-                    {
-                        "actor_id": 5,
-                        "actor_type": "RepositoryRole",
-                        "bypass_mode": "always",
-                    },
                 ],
             )
             self.assertEqual(
@@ -498,11 +493,7 @@ class ReleaseBuilderTests(unittest.TestCase):
             )
             self.assertEqual(
                 info["release_controls"]["tag_immutability_scope"],
-                [
-                    "refs/tags/v0.1.0-testnet.0",
-                    "refs/tags/v0.1.0-testnet.1",
-                    "refs/tags/v0.1.0-testnet.2",
-                ],
+                ["refs/tags/v*"],
             )
             self.assertEqual(
                 info["release_controls"]["tag_immutability_bypass_actors_allowed"], 0
@@ -534,11 +525,11 @@ class ReleaseBuilderTests(unittest.TestCase):
             blockers,
         )
         self.assertIn(
-            "separate active astatine-release-tag-creation ruleset restricted to the exact tag with exactly one designated owner-user or repository-admin creation bypass",
+            "separate active astatine-release-tag-creation ruleset restricted to exactly refs/tags/v* with no exclusions and with exactly the owner-user (User 86115037, always) creation bypass; repository-admin bypass is rejected",
             blockers,
         )
         self.assertIn(
-            "separate active astatine-release-tags ruleset limited to update, deletion and non-fast-forward for the existing .0, .1 and .2 tags with zero bypass actors",
+            "separate active astatine-release-tags ruleset limited to update, deletion and non-fast-forward for exactly refs/tags/v* with no exclusions and with zero bypass actors",
             blockers,
         )
         self.assertIn(

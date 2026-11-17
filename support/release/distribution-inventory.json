@@ -64,8 +64,8 @@
         "compensating_controls": [
           "exact release tag pinned to v0.1.0-testnet.2 and an exact-tag environment deployment policy",
           "environment cannot be bypassed by administrators (can_admins_bypass: false)",
-          "separate tag creation ruleset must be active with the creation rule and exactly one designated owner-user or repository-admin bypass for the exact tag",
-          "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering the existing .0, .1 and .2 tags",
+          "separate tag creation ruleset must be active with the creation rule and exactly the owner-user bypass (User 86115037, always) for exactly refs/tags/v* with no exclusions; repository-admin bypass is rejected",
+          "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering exactly refs/tags/v* with no exclusions",
           "tag creation protection must be retained; it must not be removed or broadened",
           "immutable releases must be enabled before dispatch and rechecked before publication",
           "exact-commit green main CI for Rust CI and Linux native qualification",
@@ -187,7 +187,7 @@
     "final_release_controls_complete": false,
     "tag_policy": "refs/tags/v0.1.0-testnet.2",
     "exact_tag_required": true,
-    "tag_ruleset_exact_scope": "refs/tags/v0.1.0-testnet.2",
+    "tag_ruleset_exact_scope": "refs/tags/v*",
     "immutable_release": true,
     "immutable_tag_required": true,
     "tag_creation_ruleset_name": "astatine-release-tag-creation",
@@ -197,18 +197,11 @@
         "actor_id": 86115037,
         "actor_type": "User",
         "bypass_mode": "always"
-      },
-      {
-        "actor_id": 5,
-        "actor_type": "RepositoryRole",
-        "bypass_mode": "always"
       }
     ],
     "tag_immutability_ruleset_name": "astatine-release-tags",
     "tag_immutability_scope": [
-      "refs/tags/v0.1.0-testnet.0",
-      "refs/tags/v0.1.0-testnet.1",
-      "refs/tags/v0.1.0-testnet.2"
+      "refs/tags/v*"
     ],
     "tag_immutability_bypass_actors_allowed": 0,
     "immutable_setting_admin_verification_required": true,
@@ -219,8 +212,8 @@
     "external_blockers": [
       "protected release environment requires the owner reviewer (immutable numeric GitHub user id 86115037) with prevent_self_review false and administrator bypass disabled",
       "exact tag v0.1.0-testnet.2 for the exact release commit, with the environment deployment policy restricted to that exact tag",
-      "separate active astatine-release-tag-creation ruleset restricted to the exact tag with exactly one designated owner-user or repository-admin creation bypass",
-      "separate active astatine-release-tags ruleset limited to update, deletion and non-fast-forward for the existing .0, .1 and .2 tags with zero bypass actors",
+      "separate active astatine-release-tag-creation ruleset restricted to exactly refs/tags/v* with no exclusions and with exactly the owner-user (User 86115037, always) creation bypass; repository-admin bypass is rejected",
+      "separate active astatine-release-tags ruleset limited to update, deletion and non-fast-forward for exactly refs/tags/v* with no exclusions and with zero bypass actors",
       "tag creation protection is retained; no broader bypass or removal of the creation rule is authorized",
       "green exact-commit main CI for Rust CI and Linux native qualification",
       "owner/admin verifies immutable releases are enabled before dispatch and again immediately before manual publication",
@@ -244,8 +237,8 @@
       "compensating_controls": [
         "exact release tag pinned to v0.1.0-testnet.2 and an exact-tag environment deployment policy",
         "environment cannot be bypassed by administrators (can_admins_bypass: false)",
-        "separate tag creation ruleset must be active with the creation rule and exactly one designated owner-user or repository-admin bypass for the exact tag",
-        "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering the existing .0, .1 and .2 tags",
+        "separate tag creation ruleset must be active with the creation rule and exactly the owner-user bypass (User 86115037, always) for exactly refs/tags/v* with no exclusions; repository-admin bypass is rejected",
+        "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering exactly refs/tags/v* with no exclusions",
         "tag creation protection must be retained; it must not be removed or broadened",
         "immutable releases must be enabled before dispatch and rechecked before publication",
         "exact-commit green main CI for Rust CI and Linux native qualification",

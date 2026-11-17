@@ -118,20 +118,21 @@ Before dispatch, these prerequisites must pass:
   prerequisite, not a claim that final CI is complete.
 - Dispatch the workflow against the exact tag ref (`GITHUB_REF=refs/tags/<tag>`),
   not a branch with the tag supplied only as an input.
-- Two active composable repository rulesets must be configured:
+- Two active composable repository rulesets must be configured, each exactly
+  `refs/tags/v*` with no exclusions:
   - `astatine-release-tag-creation`: exactly the `creation` rule, scoped
-    exactly to `refs/tags/v0.1.0-testnet.2`, with exactly one designated bypass
-    actor: the owner user (`actor_type: User`, `actor_id: 86115037`) or the
-    repository-admin role (`RepositoryRole`, `actor_id: 5`), with
-    `bypass_mode: always`. The owner-user form is preferred; either form is the
-    controlled owner/admin creation path. **Creation protection is retained and
-    must not be removed or broadened.**
+    exactly to `refs/tags/v*`, with exactly one designated bypass
+    actor: the owner user (`actor_type: User`, `actor_id: 86115037`) with
+    `bypass_mode: always` for owner-only creation. Repository-admin bypass
+    (`RepositoryRole`, `actor_id: 5`) is rejected and administrator bypass is
+    disabled. **Creation protection is retained and
+    must not be removed, broadened, or narrowed.**
   - `astatine-release-tags`: exactly `update`, `deletion`, and
-    `non_fast_forward` with **zero bypass actors**, scoped to the existing
-    `refs/tags/v0.1.0-testnet.0`, `refs/tags/v0.1.0-testnet.1`, and
-    `refs/tags/v0.1.0-testnet.2` tags. This preserves `.1` protection while
-    protecting `.2`; do not narrow it to `.2` only.
-  The owner creates the `.2` tag through the designated creation bypass; the
+    `non_fast_forward` with **zero bypass actors**, scoped to exactly
+    `refs/tags/v*` with no exclusions. This preserves protection for all `v*`
+    tags; do not narrow it to the single `.2` tag or to the historical
+    `.0`/`.1`/`.2` list.
+  The owner creates the `.2` tag through the owner-only creation bypass; the
   workflow preflight then validates both ruleset snapshots and fails closed if
   either is missing, combined, broadened, or bypassable. A repository admin can
   still reconfigure or delete rulesets, so tag immutability cannot constrain
@@ -156,12 +157,14 @@ reflected the historical `.1` reviewer/tag policy and the live tag ruleset was
 still the combined historical configuration with an administrator-role bypass.
 Those live settings were **not** changed by this revision. A
 coordinator-approved split-ruleset and environment update is required before
-dispatch; until then the workflow preflight fails closed. When updating the
+dispatch; until then the workflow preflight fails closed. The split update
+preserves live breadth: both creation and immutability rulesets are exactly
+`refs/tags/v*` with no exclusions. When updating the
 environment, set the exact `.2` tag deployment policy first, then adjust the
 reviewer/self-review settings; do not approve the pending `.1` run or use it as
-`.2` evidence. Creation is exact-tag scoped to `.2`; immutability covers the
-existing `.0`, `.1`, and `.2` tags. A future release requires a reviewed scope
-update rather than a permanent broad pattern.
+`.2` evidence. Creation and immutability are each exactly scoped to
+`refs/tags/v*` with no exclusions. A future release requires a reviewed scope
+update.
 
 The protected `release` environment requires approval by the owner reviewer
 when the workflow reaches that gate, before it creates the draft. Because

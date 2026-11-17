@@ -32,7 +32,7 @@ remains externally gated and draft-only: the exact tag, protected `release`
 environment with explicit owner self-approval (owner reviewer pinned to
 immutable numeric GitHub id 86115037 and login, `prevent_self_review: false`, no
 admin bypass, exact-tag deployment policy, verified pagination total count),
-separate exact-tag creation and immutability rulesets, exact-commit main CI
+separate refs/tags/v* creation and immutability rulesets, exact-commit main CI
 (Rust CI + Linux native qualification), and build-provenance attestations are
 enforced by
 `.github/workflows/release.yml` preflight/build jobs; immutable-release
@@ -52,22 +52,25 @@ self-approval environment snapshot (owner reviewer id `86115037`, false
 self-review prevention, no admin bypass, exact tag policy, verified pagination
 `total_count`). `support/release/verify-tag-ruleset.py` validates the two
 composable ruleset snapshots:
-`astatine-release-tag-creation` (exactly the creation rule, exact `.2` scope,
-with one designated owner-user or repository-admin bypass for the owner/admin
-creation path) and `astatine-release-tags` (exactly
-update/deletion/non-fast-forward with zero bypass actors, covering the existing
-`.0`, `.1`, and `.2` tags). Creation protection is retained; it is not removed
-or broadened. Narrowing the immutability ruleset to `.2` only would leave `.1`
-unprotected and is rejected. Both are offline fail-closed inputs to the workflow; a missing,
-combined, broadened, or bypassable snapshot fails closed. GitHub returns
+`astatine-release-tag-creation` (exactly the creation rule, exactly
+`refs/tags/v*` with no exclusions, with exactly the owner-user bypass
+(User 86115037, always) for owner-only creation; repository-admin bypass is
+rejected) and
+`astatine-release-tags` (exactly update/deletion/non-fast-forward with zero
+bypass actors, covering exactly `refs/tags/v*` with no exclusions). Creation
+protection is retained; it is not removed or broadened. Narrowing either
+ruleset to the single `.2` tag or to the historical `.0`/`.1`/`.2` list
+weakens protection for all other `v*` tags and is rejected. Both are offline
+fail-closed inputs to the workflow; a missing, combined, broadened, narrowed,
+or bypassable snapshot fails closed. GitHub returns
 `bypass_actors` only to a caller with write access to the ruleset; whether the
 default workflow token has that access is not established by this revision. A
 snapshot without the field fails closed as unverifiable. No token or secret is
 added. Until a controlled runtime demonstrates the field is visible, or an
 authorized admin-visible verification path exists, dispatch remains blocked
-rather than weakening creation protection. Creation is exact-tag scoped to
-`.2`; immutability covers the existing `.0`, `.1`, and `.2` tags. Future
-releases require a reviewed scope update rather than a permanent broad pattern.
+rather than weakening creation protection. Creation and immutability are
+each exactly scoped to `refs/tags/v*` with no exclusions, preserving the live
+breadth. Future releases require a reviewed scope update.
 Offline checks cannot establish environment,
 tag, CI, or immutable-setting state. The workflow creates and verifies a
 **draft only**; it does not publish.

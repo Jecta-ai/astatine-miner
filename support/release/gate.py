@@ -44,6 +44,11 @@ REPOSITORY_REL = "support/release-repository.txt"
 EXPECTED_RELEASE_VERSION = "0.1.0-testnet.2"
 EXPECTED_RELEASE_TAG = "v0.1.0-testnet.2"
 EXPECTED_RELEASE_TAG_POLICY = f"refs/tags/{EXPECTED_RELEASE_TAG}"
+# Both composable tag rulesets preserve the live breadth: exactly refs/tags/v*
+# with no exclusions. Narrowing to the single .2 tag or the historical
+# .0/.1/.2 list would weaken protection for all other v* tags.
+EXPECTED_TAG_RULESET_SCOPE = "refs/tags/v*"
+EXPECTED_TAG_IMMUTABILITY_SCOPE = ["refs/tags/v*"]
 EXPECTED_RELEASE_REVIEWER_ID = 86115037
 EXPECTED_RELEASE_REVIEWER_LOGIN = "emyrinj"
 EXPECTED_RELEASE_TAG_CREATION_RULESET_NAME = "astatine-release-tag-creation"
@@ -52,11 +57,6 @@ EXPECTED_RELEASE_TAG_CREATION_BYPASS_ACTORS = [
     {
         "actor_id": EXPECTED_RELEASE_REVIEWER_ID,
         "actor_type": "User",
-        "bypass_mode": "always",
-    },
-    {
-        "actor_id": 5,
-        "actor_type": "RepositoryRole",
         "bypass_mode": "always",
     },
 ]
@@ -69,7 +69,7 @@ HISTORICAL_RELEASE_COMMIT = "99a8630a7ae7f5c5950031dfba8c3b0c3f132cbc"
 HISTORICAL_RELEASE_NOTES_REL = "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md"
 HISTORICAL_RELEASE_NOTES_SHA256 = "12d7605b5e48c80f1c838a95d245c08da8cd5c831d008da3bb3dea420bdc31b9"
 RELEASE_NOTES_REL = "support/release/RELEASE_NOTES-v0.1.0-testnet.2.md"
-RELEASE_NOTES_SHA256 = "74e61967c406153706c774e58a42965a3f8e19ecca7ada33d6b1abb6d2c9adc2"
+RELEASE_NOTES_SHA256 = "9d53ff55538a0001fcae14da115e4b28791d5a657ea310d48cfdcf683d7f2a9a"
 HISTORICAL_RIGHTS_DECISION = (
     "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party "
     "source and binary distribution intent for v0.1.0-testnet.1; technical "
@@ -349,8 +349,8 @@ OWNER_SELF_APPROVAL_POLICY = {
     "compensating_controls": [
         "exact release tag pinned to v0.1.0-testnet.2 and an exact-tag environment deployment policy",
         "environment cannot be bypassed by administrators (can_admins_bypass: false)",
-        "separate tag creation ruleset must be active with the creation rule and exactly one designated owner-user or repository-admin bypass for the exact tag",
-        "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering the existing .0, .1 and .2 tags",
+        "separate tag creation ruleset must be active with the creation rule and exactly the owner-user bypass (User 86115037, always) for exactly refs/tags/v* with no exclusions; repository-admin bypass is rejected",
+        "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering exactly refs/tags/v* with no exclusions",
         "tag creation protection must be retained; it must not be removed or broadened",
         "immutable releases must be enabled before dispatch and rechecked before publication",
         "exact-commit green main CI for Rust CI and Linux native qualification",
@@ -401,14 +401,14 @@ AUTHORIZED_RELEASE_CONTROLS = {
     "final_release_controls_complete": False,
     "tag_policy": EXPECTED_RELEASE_TAG_POLICY,
     "exact_tag_required": True,
-    "tag_ruleset_exact_scope": EXPECTED_RELEASE_TAG_POLICY,
+    "tag_ruleset_exact_scope": EXPECTED_TAG_RULESET_SCOPE,
     "immutable_release": True,
     "immutable_tag_required": True,
     "tag_creation_ruleset_name": EXPECTED_RELEASE_TAG_CREATION_RULESET_NAME,
     "tag_creation_rule_required": True,
     "tag_creation_bypass_actors_allowed": [dict(actor) for actor in EXPECTED_RELEASE_TAG_CREATION_BYPASS_ACTORS],
     "tag_immutability_ruleset_name": EXPECTED_RELEASE_TAG_IMMUTABILITY_RULESET_NAME,
-    "tag_immutability_scope": [f"refs/tags/{tag}" for tag in ("v0.1.0-testnet.0", "v0.1.0-testnet.1", "v0.1.0-testnet.2")],
+    "tag_immutability_scope": list(EXPECTED_TAG_IMMUTABILITY_SCOPE),
     "tag_immutability_bypass_actors_allowed": 0,
     "immutable_setting_admin_verification_required": True,
     "attestations": ["build-provenance"],
@@ -416,8 +416,8 @@ AUTHORIZED_RELEASE_CONTROLS = {
     "external_blockers": [
         "protected release environment requires the owner reviewer (immutable numeric GitHub user id 86115037) with prevent_self_review false and administrator bypass disabled",
         "exact tag v0.1.0-testnet.2 for the exact release commit, with the environment deployment policy restricted to that exact tag",
-        "separate active astatine-release-tag-creation ruleset restricted to the exact tag with exactly one designated owner-user or repository-admin creation bypass",
-        "separate active astatine-release-tags ruleset limited to update, deletion and non-fast-forward for the existing .0, .1 and .2 tags with zero bypass actors",
+        "separate active astatine-release-tag-creation ruleset restricted to exactly refs/tags/v* with no exclusions and with exactly the owner-user (User 86115037, always) creation bypass; repository-admin bypass is rejected",
+        "separate active astatine-release-tags ruleset limited to update, deletion and non-fast-forward for exactly refs/tags/v* with no exclusions and with zero bypass actors",
         "tag creation protection is retained; no broader bypass or removal of the creation rule is authorized",
         "green exact-commit main CI for Rust CI and Linux native qualification",
         "owner/admin verifies immutable releases are enabled before dispatch and again immediately before manual publication",
@@ -1031,15 +1031,15 @@ def _validate_release_intent(
     require(controls.get("manual_publish_required") is True, "release_controls manual_publish_required must be true")
     require(controls.get("tag_policy") == AUTHORIZED_RELEASE_CONTROLS["tag_policy"], "release_controls tag_policy changed; it must be the exact current tag policy, not a series wildcard")
     require(controls.get("exact_tag_required") is True, "release_controls exact_tag_required must be true")
-    require(controls.get("tag_ruleset_exact_scope") == EXPECTED_RELEASE_TAG_POLICY, "release_controls tag_ruleset_exact_scope must be the exact current tag")
+    require(controls.get("tag_ruleset_exact_scope") == EXPECTED_TAG_RULESET_SCOPE, "release_controls tag_ruleset_exact_scope must be exactly refs/tags/v* with no exclusions to preserve live breadth")
     require(controls.get("final_release_controls_complete") is False, "release_controls final release controls must remain outstanding")
     require(controls.get("immutable_release") is True, "release_controls immutable_release must be true as the recorded repository setting; verified immutable behavior additionally requires external admin verification")
     require(controls.get("immutable_tag_required") is True, "release_controls immutable_tag_required must be true")
     require(controls.get("tag_creation_ruleset_name") == EXPECTED_RELEASE_TAG_CREATION_RULESET_NAME, "release_controls tag_creation_ruleset_name changed")
     require(controls.get("tag_creation_rule_required") is True, "release_controls must retain the tag creation rule")
-    require(controls.get("tag_creation_bypass_actors_allowed") == [dict(actor) for actor in EXPECTED_RELEASE_TAG_CREATION_BYPASS_ACTORS], "release_controls must pin exactly the designated owner-user or repository-admin creation bypass")
+    require(controls.get("tag_creation_bypass_actors_allowed") == [dict(actor) for actor in EXPECTED_RELEASE_TAG_CREATION_BYPASS_ACTORS], "release_controls must pin exactly the owner-user (User 86115037, always) creation bypass; repository-admin bypass is rejected")
     require(controls.get("tag_immutability_ruleset_name") == EXPECTED_RELEASE_TAG_IMMUTABILITY_RULESET_NAME, "release_controls tag_immutability_ruleset_name changed")
-    require(controls.get("tag_immutability_scope") == [f"refs/tags/{tag}" for tag in ("v0.1.0-testnet.0", "v0.1.0-testnet.1", "v0.1.0-testnet.2")], "release_controls tag_immutability_scope must cover the existing .0, .1 and .2 tags")
+    require(controls.get("tag_immutability_scope") == list(EXPECTED_TAG_IMMUTABILITY_SCOPE), "release_controls tag_immutability_scope must be exactly [\"refs/tags/v*\"] with no exclusions to preserve live breadth")
     require(controls.get("tag_immutability_bypass_actors_allowed") == 0, "release_controls must allow zero immutability-ruleset bypass actors")
     require(controls.get("immutable_setting_admin_verification_required") is True, "release_controls immutable_setting_admin_verification_required must be true")
     require(list(controls.get("attestations", [])) == list(AUTHORIZED_RELEASE_CONTROLS["attestations"]), "release_controls attestations changed")

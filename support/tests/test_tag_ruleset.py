@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Offline tests for support/release/verify-tag-ruleset.py.
 
-The .2 release requires two composable, exact-tag-scoped rulesets:
+The .2 release requires two composable rulesets, each exactly
+`refs/tags/v*` with no exclusions, preserving the live breadth:
 
-* ``astatine-release-tag-creation``: exactly the creation rule with one
-  designated repository-admin bypass actor (creation protection is retained).
+* ``astatine-release-tag-creation``: exactly the creation rule with exactly
+  the owner-user bypass actor (User 86115037, always) for owner-only creation;
+  repository-admin bypass is rejected (creation protection is retained for all
+  v* tags with administrator bypass disabled).
 * ``astatine-release-tags``: exactly update/deletion/non-fast-forward with zero
-  bypass actors.
+  bypass actors covering all v* tags.
+
+Narrowing either ruleset to the single .2 tag or to the historical
+.0/.1/.2 list weakens protection for all other v* tags and fails closed.
 
 Temp files only; no network or repository mutation. Run with ``python3 -B``.
 """
@@ -45,10 +51,10 @@ def make_creation(**overrides):
         "source_type": "Repository",
         "source": REPOSITORY,
         "enforcement": "active",
-        "conditions": {"ref_name": {"include": [f"refs/tags/{TAG}"], "exclude": []}},
+        "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
         "rules": [{"type": "creation"}],
         "bypass_actors": [
-            {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+            {"actor_id": 86115037, "actor_type": "User", "bypass_mode": "always"}
         ],
     }
     data.update(overrides)
@@ -63,16 +69,7 @@ def make_immutability(**overrides):
         "source_type": "Repository",
         "source": REPOSITORY,
         "enforcement": "active",
-        "conditions": {
-            "ref_name": {
-                "include": [
-                    "refs/tags/v0.1.0-testnet.0",
-                    "refs/tags/v0.1.0-testnet.1",
-                    f"refs/tags/{TAG}",
-                ],
-                "exclude": [],
-            }
-        },
+        "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
         "rules": [
             {"type": "update"},
             {"type": "deletion"},
@@ -106,12 +103,20 @@ class TagRulesetTests(unittest.TestCase):
         )
         self.assertEqual(result["immutability_ruleset"]["bypass_actor_count"], 0)
 
-    def test_creation_exact_tag_scope_passes(self) -> None:
+    def test_creation_vstar_scope_passes(self) -> None:
+        creation = make_creation()
+        creation["conditions"]["ref_name"]["include"] = ["refs/tags/v*"]
+        result = self.verify(creation, make_immutability())
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["creation_ruleset"]["tag_scope"], "refs/tags/v*")
+
+    def test_creation_narrow_2_only_scope_fails(self) -> None:
+        # Narrowing creation to the single .2 tag would leave all other v*
+        # tags unprotected and must fail closed.
         creation = make_creation()
         creation["conditions"]["ref_name"]["include"] = [f"refs/tags/{TAG}"]
-        self.assertEqual(
-            self.verify(creation, make_immutability())["status"], "PASS"
-        )
+        with self.assertRaises(MOD.TagRulesetError):
+            self.verify(creation, make_immutability())
 
     def test_wrong_creation_name_fails(self) -> None:
         with self.assertRaises(MOD.TagRulesetError):
@@ -144,17 +149,23 @@ class TagRulesetTests(unittest.TestCase):
         with self.assertRaises(MOD.TagRulesetError):
             self.verify(creation, make_immutability())
 
-    def test_creation_broad_scope_fails(self) -> None:
+    def test_creation_historical_list_scope_fails(self) -> None:
+        # The historical .0/.1/.2 list is narrower than v* and weakens
+        # protection for all other v* tags.
         creation = make_creation()
-        creation["conditions"]["ref_name"]["include"] = ["refs/tags/v*"]
+        creation["conditions"]["ref_name"]["include"] = [
+            "refs/tags/v0.1.0-testnet.0",
+            "refs/tags/v0.1.0-testnet.1",
+            f"refs/tags/{TAG}",
+        ]
         with self.assertRaises(MOD.TagRulesetError):
             self.verify(creation, make_immutability())
 
     def test_creation_additional_scope_fails(self) -> None:
         creation = make_creation()
         creation["conditions"]["ref_name"]["include"] = [
-            f"refs/tags/{TAG}",
             "refs/tags/v*",
+            f"refs/tags/{TAG}",
         ]
         with self.assertRaises(MOD.TagRulesetError):
             self.verify(creation, make_immutability())
@@ -197,7 +208,18 @@ class TagRulesetTests(unittest.TestCase):
     def test_creation_wrong_bypass_mode_fails(self) -> None:
         creation = make_creation(
             bypass_actors=[
-                {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "pull_request"}
+                {"actor_id": 86115037, "actor_type": "User", "bypass_mode": "pull_request"}
+            ]
+        )
+        with self.assertRaises(MOD.TagRulesetError):
+            self.verify(creation, make_immutability())
+
+    def test_creation_admin_bypass_rejected(self) -> None:
+        # Repository-admin bypass contradicts the owner-only model and must
+        # fail closed even with otherwise valid scope/rules.
+        creation = make_creation(
+            bypass_actors=[
+                {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
             ]
         )
         with self.assertRaises(MOD.TagRulesetError):
@@ -271,15 +293,30 @@ class TagRulesetTests(unittest.TestCase):
                 make_creation(), make_immutability(current_user_can_bypass="always")
             )
 
-    def test_immutability_exact_tag_scope_only(self) -> None:
+    def test_immutability_vstar_scope_passes(self) -> None:
         data = make_immutability()
         data["conditions"]["ref_name"]["include"] = ["refs/tags/v*"]
+        result = self.verify(make_creation(), data)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["immutability_ruleset"]["protected_tags"], ["refs/tags/v*"])
+
+    def test_immutability_exact_2_only_scope_fails_historical_tags_unprotected(self) -> None:
+        # Narrowing immutability to the single .2 tag would leave all other
+        # v* tags unprotected and must fail closed.
+        data = make_immutability()
+        data["conditions"]["ref_name"]["include"] = [f"refs/tags/{TAG}"]
         with self.assertRaises(MOD.TagRulesetError):
             self.verify(make_creation(), data)
 
-    def test_immutability_exact_2_only_scope_fails_historical_tags_unprotected(self) -> None:
+    def test_immutability_historical_list_scope_fails(self) -> None:
+        # The historical .0/.1/.2 list is narrower than v* and weakens
+        # protection for all other v* tags.
         data = make_immutability()
-        data["conditions"]["ref_name"]["include"] = [f"refs/tags/{TAG}"]
+        data["conditions"]["ref_name"]["include"] = [
+            "refs/tags/v0.1.0-testnet.0",
+            "refs/tags/v0.1.0-testnet.1",
+            f"refs/tags/{TAG}",
+        ]
         with self.assertRaises(MOD.TagRulesetError):
             self.verify(make_creation(), data)
 

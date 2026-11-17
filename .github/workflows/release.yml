@@ -13,12 +13,15 @@
 # separation of duties and is documented as a security tradeoff in the release
 # notes and inventories; no independent review is claimed.
 #
-# Tag policy is enforced by two composable repository rulesets:
-# `astatine-release-tag-creation` (exactly the creation rule, exact .2 scope,
-# with one designated owner-user or repository-admin bypass for the controlled
-# owner/admin creation path) and `astatine-release-tags` (exactly
-# update/deletion/non-fast-forward with zero bypass actors, covering the
-# existing .0, .1 and .2 tags). Both must be active.
+# Tag policy is enforced by two composable repository rulesets, each exactly
+# `refs/tags/v*` with no exclusions:
+# `astatine-release-tag-creation` (exactly the creation rule, exactly
+# refs/tags/v* scope, with exactly the owner-user bypass (User 86115037,
+# always) for owner-only creation; repository-admin bypass is rejected) and
+# `astatine-release-tags` (exactly update/deletion/non-fast-forward with zero
+# bypass actors, covering exactly refs/tags/v*). Both must be active.
+# Narrowing either ruleset to the single .2 tag or the historical .0/.1/.2
+# list weakens protection for all other v* tags and fails closed.
 # Creation protection is never removed or broadened. Immutable releases must
 # still be enabled by the owner/admin; this workflow does not verify that
 # repository setting.
@@ -1450,7 +1453,6 @@ jobs:
           immutability = json.load(open(immutability_path, encoding="utf-8"))
           allowed_bypasses = [
               {"actor_id": 86115037, "actor_type": "User", "bypass_mode": "always"},
-              {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"},
           ]
 
           def common(data, name, expected_include):
@@ -1481,9 +1483,15 @@ jobs:
                   sys.exit(1)
               return set(types), bypass
 
-          creation_rules, creation_bypass = common(creation, "astatine-release-tag-creation", ["refs/tags/" + tag])
+          if repository != "Jecta-ai/astatine-miner":
+              print("split ruleset source must be the canonical repository", file=sys.stderr)
+              sys.exit(1)
+          if tag != "v0.1.0-testnet.2":
+              print("draft tag must be exactly v0.1.0-testnet.2", file=sys.stderr)
+              sys.exit(1)
+          creation_rules, creation_bypass = common(creation, "astatine-release-tag-creation", ["refs/tags/v*"])
           if creation_rules != {"creation"} or len(creation_bypass) != 1 or creation_bypass[0] not in allowed_bypasses:
-              print("creation ruleset must retain exactly the creation rule and one designated owner-user or repository-admin bypass", file=sys.stderr)
+              print("creation ruleset must retain exactly the creation rule and exactly the owner-user bypass (User 86115037, always); repository-admin bypass is rejected", file=sys.stderr)
               sys.exit(1)
           if creation.get("current_user_can_bypass") not in (None, "always", "exempt", "never"):
               print("creation ruleset designated bypass is not effective", file=sys.stderr)
@@ -1491,7 +1499,7 @@ jobs:
           immutability_rules, immutability_bypass = common(
               immutability,
               "astatine-release-tags",
-              ["refs/tags/" + release_tag for release_tag in ("v0.1.0-testnet.0", "v0.1.0-testnet.1", "v0.1.0-testnet.2")],
+              ["refs/tags/v*"],
           )
           if immutability_rules != {"update", "deletion", "non_fast_forward"} or immutability_bypass != []:
               print("immutability ruleset must use exactly update/deletion/non-fast-forward with zero bypass actors", file=sys.stderr)
