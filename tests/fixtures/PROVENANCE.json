@@ -391,21 +391,23 @@
     "prohibited_name_marker_sha256": [
       "dc89c3c8d6473e598bdf24889eb348cb625d362d51f2cd2eaf11683da2c3e65d",
       "b6947854ec434189b2fb7c345bcb4e3aeefe24c34ed41c10db9ce1a2e42d1548",
-      "eadb388c9b61b5fcea50bb3f0468318785b025dfb4f108d3ea3b9932f199075f"
+      "eadb388c9b61b5fcea50bb3f0468318785b025dfb4f108d3ea3b9932f199075f",
+      "7b061874e35a17d3ef7943229e63a5da2df201ebfa0caf431d5fe57d6d8e650d"
     ],
     "marker_check": "SHA-256 of each lowercase OWNER/REPOSITORY token found in the scrub paths is compared with the withheld marker digests. The private-origin names themselves are not stored in this source tree.",
     "paths": [
       "README.md",
       "MACOS_ARM64.md",
+      "src/protocol.rs",
       "support/update-evm-test-fixtures.py",
       "support/update-genesis-coordinator-fixture.py",
       "tests/fixtures/README.md"
     ],
     "retained_private_origin_reference": {
       "path": "src/protocol.rs",
-      "status": "retained in source",
-      "reason": "`src/protocol.rs` is production Rust source. The reference is a comment inside the `#[cfg(test)]` test module and is not compiled into the release binary. It is retained unchanged in this source tree; any privacy decision about it is outside this inventory."
+      "status": "genericized",
+      "reason": "`src/protocol.rs` test-module comment was genericized to remove the private-origin repository/path reference; no production code changed and no fixture bytes, deployment pins or protocol identifiers were altered."
     },
-    "note": "Private-origin repository names were replaced with generic descriptions in prose and help text. No fixture bytes, deployment pins or protocol identifiers were changed."
+    "note": "Private-origin repository names were replaced with generic descriptions in prose, help text, and source/protocol test comments. No fixture bytes, deployment pins or protocol identifiers were changed."
   }
 }

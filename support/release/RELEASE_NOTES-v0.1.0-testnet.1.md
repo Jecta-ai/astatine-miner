@@ -55,19 +55,23 @@ consulted, and no separate release approval is claimed.
 ## Draft verification and manual publication
 
 The protected release workflow creates and verifies a GitHub release draft
-only; it does not auto-publish. Build jobs generate binary build attestations
-for the compiled executables before the protected `release` environment gate.
-After a non-self reviewer approves that environment, the protected package job
-verifies those binary attestations before packaging and generates archive
-attestations. The protected draft job then validates each archive's exact
-member allowlist, paths, and modes without extracting untrusted paths, extracts
-only the binary member, checks its target-specific Mach-O ARM64 or ELF x86_64
-header, and verifies that extracted binary against its build attestation with
-the exact repository, signer workflow, source digest, and tag before
-creating/verifying the draft. The environment gates archive
-packaging/attestation and draft creation, not the earlier non-release binary
-build attestations or the manual publish action. An archive attestation alone
-is not accepted as proof of compilation of its binary member.
+only; it does not auto-publish. Read-only build jobs compile the candidate,
+observe and assert the exact Rust/Cargo version lines, run the smoke checks, and
+upload the raw binary; they do not receive OIDC or attestation-write
+permissions. Separate pinned attestation jobs download the build artifact,
+verify its SHA-256 against the build job output, and attest the raw binary
+without executing it, before the protected `release` environment gate. After a
+non-self reviewer approves that environment, the protected package job verifies
+those binary attestations before packaging and generates archive attestations.
+The protected draft job then validates each archive's exact member allowlist,
+paths, and modes without extracting untrusted paths, extracts only the binary
+member, checks its target-specific Mach-O ARM64 or ELF x86_64 header, and
+verifies that extracted binary against its build attestation with the exact
+repository, signer workflow, source digest, and tag before creating/verifying
+the draft. The environment gates archive packaging/attestation and draft
+creation, not the earlier non-release binary build attestations or the manual
+publish action. An archive attestation alone is not accepted as proof of
+compilation of its binary member.
 
 Any repository writer or write-capable app could publish or modify the verified
 draft unless release authority is restricted to the owner/admin. Establish that

@@ -1827,6 +1827,8 @@ class DryRunAuthorizedGateTests(unittest.TestCase):
             "tests/fixtures/LICENSE-MIT.txt",
             "tests/fixtures/NOTICE",
             "tests/fixtures/OPENZEPPELIN_LICENSE.txt",
+            "support/update-evm-test-fixtures.py",
+            "support/update-genesis-coordinator-fixture.py",
         ):
             src = SOURCE_ROOT / rel
             dest = self.root / rel

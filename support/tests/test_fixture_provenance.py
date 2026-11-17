@@ -120,7 +120,7 @@ class FixtureProvenanceTests(unittest.TestCase):
         self.assertEqual(result["fixtures_checked"], 4)
         self.assertEqual(result["documents_checked"], 1)
         self.assertEqual(result["legal_artifacts_checked"], 4)
-        self.assertEqual(result["scrub_paths_checked"], 5)
+        self.assertEqual(result["scrub_paths_checked"], 6)
         self.assertTrue(result["release_intent_authorized"])
         self.assertFalse(result["publication_authorized"])
         self.assertFalse(result["final_release_controls_complete"])
@@ -401,6 +401,91 @@ class FixtureProvenanceTests(unittest.TestCase):
         self.write_inventory(inventory)
         with self.assertRaisesRegex(VERIFIER.VerificationError, "private-origin marker"):
             VERIFIER.verify(self.root)
+
+    def test_regeneration_script_sha256_mismatch_fails(self) -> None:
+        inventory = self.inventory()
+        for entry in inventory["fixtures"]:
+            if entry["id"] == "FIX-01":
+                digest = entry["regeneration"]["script_sha256"]
+                mutated = ("0" if digest[0] != "0" else "1") + digest[1:]
+                entry["regeneration"]["script_sha256"] = mutated
+                break
+        else:
+            self.fail("FIX-01 regeneration entry missing")
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "regeneration script SHA-256 changed"):
+            VERIFIER.verify(self.root)
+
+    def test_missing_regeneration_script_fails(self) -> None:
+        (self.root / "support" / "update-evm-test-fixtures.py").unlink()
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "regeneration script"):
+            VERIFIER.verify(self.root)
+
+    def test_renamed_regeneration_script_fails(self) -> None:
+        original = self.root / "support" / "update-genesis-coordinator-fixture.py"
+        renamed = self.root / "support" / "update-genesis-coordinator-fixture-renamed.py"
+        original.rename(renamed)
+        try:
+            with self.assertRaisesRegex(VERIFIER.VerificationError, "regeneration script"):
+                VERIFIER.verify(self.root)
+        finally:
+            if renamed.exists():
+                renamed.rename(original)
+
+    def test_scripted_status_downgrade_fails(self) -> None:
+        inventory = self.inventory()
+        for entry in inventory["fixtures"]:
+            if entry["id"] == "FIX-02":
+                entry["regeneration"] = {
+                    "status": "not_scripted",
+                    "performed_in_this_review": False,
+                    "detail": "data-only downgrade must not bypass script verification",
+                }
+                break
+        else:
+            self.fail("FIX-02 regeneration entry missing")
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "scripted regeneration coverage"):
+            VERIFIER.verify(self.root)
+
+    def test_regeneration_script_swap_fails(self) -> None:
+        inventory = self.inventory()
+        for entry in inventory["fixtures"]:
+            if entry["id"] == "FIX-02":
+                entry["regeneration"]["script"] = "support/update-evm-test-fixtures.py"
+                entry["regeneration"]["script_sha256"] = (
+                    "8d96c7ee80c021de9d3f679c17322db4da1fa7433c23429fde9eef1407b18615"
+                )
+                break
+        else:
+            self.fail("FIX-02 regeneration entry missing")
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "script mapping changed"):
+            VERIFIER.verify(self.root)
+
+    def test_private_origin_marker_in_protocol_rs_fails(self) -> None:
+        marker = "fixture-test-owner/fixture-test-protocol"
+        path = self.root / "src" / "protocol.rs"
+        data = path.read_bytes() + f"\n// leak: {marker}\n".encode()
+        path.write_bytes(data)
+        inventory = self.inventory()
+        inventory["scrub_policy"]["prohibited_name_marker_sha256"].append(
+            sha256_hex(marker.lower().encode())
+        )
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "private-origin marker"):
+            VERIFIER.verify(self.root)
+
+    def test_scrub_policy_covers_protocol_test_comment(self) -> None:
+        inventory = self.inventory()
+        self.assertIn("src/protocol.rs", inventory["scrub_policy"]["paths"])
+        self.assertEqual(
+            inventory["scrub_policy"]["retained_private_origin_reference"]["status"],
+            "genericized",
+        )
+        result = VERIFIER.verify(self.root)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["scrub_paths_checked"], 6)
 
     def test_rights_status_cannot_be_upgraded(self) -> None:
         inventory = self.inventory()
@@ -1032,7 +1117,7 @@ class FixtureProvenanceTests(unittest.TestCase):
         self.assertEqual(result["fixtures_checked"], 4)
         self.assertEqual(result["documents_checked"], 1)
         self.assertEqual(result["legal_artifacts_checked"], 4)
-        self.assertEqual(result["scrub_paths_checked"], 5)
+        self.assertEqual(result["scrub_paths_checked"], 6)
         fixture_dir = self.root / "tests" / "fixtures"
         names = sorted(entry.name for entry in os.scandir(fixture_dir))
         self.assertEqual(
@@ -1179,6 +1264,19 @@ class FixtureProvenanceTests(unittest.TestCase):
     def test_blocked_state_regression_passes_for_blocked_copy(self) -> None:
         inventory = self.inventory()
         inventory["schema"] = "astatine-fixture-provenance/v1"
+        inventory["scrub_policy"]["paths"] = [
+            "README.md",
+            "MACOS_ARM64.md",
+            "support/update-evm-test-fixtures.py",
+            "support/update-genesis-coordinator-fixture.py",
+            "tests/fixtures/README.md",
+        ]
+        inventory["scrub_policy"]["retained_private_origin_reference"] = {
+            "path": "src/protocol.rs",
+            "status": "retained in source",
+            "reason": "`src/protocol.rs` is production Rust source. The reference is a comment inside the `#[cfg(test)]` test module and is not compiled into the release binary. It is retained unchanged in this source tree; any privacy decision about it is outside this inventory.",
+        }
+        inventory["scrub_policy"]["note"] = "Private-origin repository names were replaced with generic descriptions in prose and help text. No fixture bytes, deployment pins or protocol identifiers were changed."
         inventory["verification"]["date_utc"] = "2026-11-14"
         inventory["verification"]["change_note"] = "FIX-04 was replaced in this review by a synthetic receipt authored in this repository; the three contract bytecode fixtures were not regenerated. The rights/notice checklist records the release-blocking actions."
         inventory["legal_artifacts"] = [

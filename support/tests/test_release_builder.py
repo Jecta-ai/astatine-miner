@@ -42,6 +42,8 @@ EXPECTED_LINUX_MEMBERS = sorted([
     f"{LINUX_ROOT}/INSTALL.md",
 ])
 TAG = "v0.1.0-testnet.1"
+LEGIT_RUSTC_LINE = "rustc 1.94.1 (e408947bf 2026-03-25)"
+LEGIT_CARGO_LINE = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
 
 FAKE_ELF = (
     b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8)
@@ -99,6 +101,8 @@ class ReleaseBuilderTests(unittest.TestCase):
             "THIRD_PARTY_LICENSES.md",
             "support/release-repository.txt",
             "rust-toolchain.toml",
+            "support/update-evm-test-fixtures.py",
+            "support/update-genesis-coordinator-fixture.py",
         ):
             src = SOURCE_ROOT / rel
             if not src.is_file():
@@ -127,6 +131,8 @@ class ReleaseBuilderTests(unittest.TestCase):
             repository_id="123456789",
             macos_binary=self.macos_bin,
             linux_binary=self.linux_bin,
+            rustc_version=LEGIT_RUSTC_LINE,
+            cargo_version=LEGIT_CARGO_LINE,
         )
         kwargs.update(overrides)
         return BUILDER.run(**kwargs)
@@ -162,6 +168,8 @@ class ReleaseBuilderTests(unittest.TestCase):
             repository_id="123456789",
             macos_binary=self.macos_bin,
             linux_binary=self.linux_bin,
+            rustc_version=LEGIT_RUSTC_LINE,
+            cargo_version=LEGIT_CARGO_LINE,
         )
         for e in result["archives"]:
             self.assertEqual(first[e["filename"]], (second_out / e["filename"]).read_bytes())
@@ -278,10 +286,162 @@ class ReleaseBuilderTests(unittest.TestCase):
             self.assertIn("workflow-built", info["binary_build_linkage"])
             self.assertIn("attestation", info["binary_build_linkage"])
             self.assertIn("not claimed", info["binary_build_linkage"])
+            self.assertEqual(info["build"]["rustc_version"], LEGIT_RUSTC_LINE)
+            self.assertEqual(info["build"]["cargo_version"], LEGIT_CARGO_LINE)
+            self.assertEqual(info["build"]["pinned_toolchain"], "1.94.1")
             self.assertEqual(
                 info["build"]["toolchain_observation"],
-                "pinned expected lines; CI build jobs install and assert Rust/Cargo 1.94.1; this offline packager does not independently re-observe the toolchain",
+                "exact version lines observed in the CI build jobs and asserted again by this offline packager against the pinned 1.94.1 lines; the packager did not independently execute rustc or cargo",
             )
+            self.assertNotIn("independently observed", info["build"]["toolchain_observation"])
+            self.assertNotIn("independently re-observe", info["build"]["toolchain_observation"])
+            self.assertIn("observed in the CI build jobs", info["build"]["toolchain_observation"])
+            self.assertIn("asserted again by this offline packager", info["build"]["toolchain_observation"])
+            self.assertIn("did not independently execute rustc", info["build"]["toolchain_observation"])
+            for key, expected in (
+                ("rustc", LEGIT_RUSTC_LINE),
+                ("cargo", LEGIT_CARGO_LINE),
+                ("rustc_version", LEGIT_RUSTC_LINE),
+                ("cargo_version", LEGIT_CARGO_LINE),
+            ):
+                self.assertEqual(info["toolchain"][key], expected)
+            for key in ("pinned", "pinned_toolchain"):
+                self.assertEqual(info["toolchain"][key], "1.94.1")
+
+    def test_toolchain_exact_success(self) -> None:
+        result = self.run_builder(rustc_version=LEGIT_RUSTC_LINE, cargo_version=LEGIT_CARGO_LINE)
+        self.assertEqual(result["tag"], TAG)
+        prov = json.loads((self.out / "release-provenance.json").read_text(encoding="utf-8"))
+        self.assertEqual(prov["toolchain"]["rustc"], LEGIT_RUSTC_LINE)
+        self.assertEqual(prov["toolchain"]["cargo"], LEGIT_CARGO_LINE)
+
+    def test_mutated_regeneration_script_rejected(self) -> None:
+        script = self.root / "support" / "update-evm-test-fixtures.py"
+        script.write_text(script.read_text(encoding="utf-8") + "\n# tamper\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-q", "-m", "tamper script"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "tag", "-f", TAG], check=True)
+        with self.assertRaisesRegex(BUILDER.ReleaseError, "regeneration script SHA-256 changed"):
+            self.run_builder()
+
+    def _rewrite_provenance(self, mutate) -> None:
+        path = self.root / "tests/fixtures/PROVENANCE.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        mutate(data)
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-q", "-m", "provenance change"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "tag", "-f", TAG], check=True)
+
+    def test_gate_status_downgrade_rejected(self) -> None:
+        def mutate(data):
+            for entry in data["fixtures"]:
+                if entry["id"] == "FIX-02":
+                    entry["regeneration"] = {
+                        "status": "not_scripted",
+                        "performed_in_this_review": False,
+                        "detail": "data-only downgrade",
+                    }
+                    return
+            self.fail("FIX-02 fixture missing")
+
+        self._rewrite_provenance(mutate)
+        with self.assertRaisesRegex(BUILDER.ReleaseError, "regeneration status must be scripted"):
+            self.run_builder()
+
+    def test_gate_script_swap_rejected(self) -> None:
+        def mutate(data):
+            for entry in data["fixtures"]:
+                if entry["id"] == "FIX-02":
+                    entry["regeneration"]["script"] = "support/update-evm-test-fixtures.py"
+                    entry["regeneration"]["script_sha256"] = (
+                        "8d96c7ee80c021de9d3f679c17322db4da1fa7433c23429fde9eef1407b18615"
+                    )
+                    return
+            self.fail("FIX-02 fixture missing")
+
+        self._rewrite_provenance(mutate)
+        with self.assertRaisesRegex(BUILDER.ReleaseError, "regeneration script changed"):
+            self.run_builder()
+
+    def test_mismatched_rustc_rejected(self) -> None:
+        with self.assertRaisesRegex(BUILDER.ReleaseError, "--rustc-version"):
+            self.run_builder(rustc_version="rustc 1.95.0 (e408947bf 2026-03-25)")
+        self.assertFalse(self.out.exists())
+
+    def test_mismatched_cargo_rejected(self) -> None:
+        with self.assertRaisesRegex(BUILDER.ReleaseError, "--cargo-version"):
+            self.run_builder(cargo_version="cargo 1.95.0 (29ea6fb6a 2026-03-24)")
+        self.assertFalse(self.out.exists())
+
+    def test_missing_toolchain_args_rejected(self) -> None:
+        with self.assertRaises(BUILDER.ReleaseError):
+            BUILDER.run(
+                source_root=self.root,
+                output_dir=self.out,
+                tag=TAG,
+                repository_id="123456789",
+                macos_binary=self.macos_bin,
+                linux_binary=self.linux_bin,
+            )
+        with self.assertRaises(BUILDER.ReleaseError):
+            BUILDER.run(
+                source_root=self.root,
+                output_dir=self.out,
+                tag=TAG,
+                repository_id="123456789",
+                macos_binary=self.macos_bin,
+                linux_binary=self.linux_bin,
+                rustc_version=LEGIT_RUSTC_LINE,
+            )
+        with self.assertRaises(BUILDER.ReleaseError):
+            BUILDER.run(
+                source_root=self.root,
+                output_dir=self.root / "should-not-exist",
+                tag=TAG,
+                repository_id="123456789",
+                macos_binary=self.macos_bin,
+                linux_binary=self.linux_bin,
+                rustc_version=LEGIT_RUSTC_LINE,
+                cargo_version="",
+            )
+        with self.assertRaises(SystemExit) as context:
+            BUILDER.main(
+                [
+                    "--tag", TAG,
+                    "--repository-id", "123456789",
+                    "--macos-binary", str(self.macos_bin),
+                    "--linux-binary", str(self.linux_bin),
+                    "--source-root", str(self.root),
+                    "--output-dir", str(self.out),
+                ]
+            )
+        self.assertEqual(context.exception.code, 2)
+        self.assertFalse(self.out.exists())
+
+    def test_provenance_toolchain_fields(self) -> None:
+        self.run_builder()
+        prov = json.loads((self.out / "release-provenance.json").read_text(encoding="utf-8"))
+        toolchain = prov["toolchain"]
+        self.assertEqual(toolchain["rustc"], LEGIT_RUSTC_LINE)
+        self.assertEqual(toolchain["cargo"], LEGIT_CARGO_LINE)
+        self.assertEqual(toolchain["rustc_version"], LEGIT_RUSTC_LINE)
+        self.assertEqual(toolchain["cargo_version"], LEGIT_CARGO_LINE)
+        for key in ("pinned", "pinned_toolchain"):
+            self.assertEqual(toolchain[key], "1.94.1")
+
+    def test_no_unsupported_independently_observed_claim(self) -> None:
+        self.run_builder()
+        prov_text = (self.out / "release-provenance.json").read_text(encoding="utf-8")
+        self.assertNotIn("independently observed", prov_text)
+        self.assertNotIn("independently re-observe", prov_text)
+        for e in json.loads(prov_text)["archives"]:
+            root = MACOS_ROOT if "macos" in e["filename"] else LINUX_ROOT
+            with tarfile.open(self.out / e["filename"], mode="r") as tar:
+                info_text = tar.extractfile(f"{root}/BUILD-INFO.json").read().decode("utf-8")
+            self.assertNotIn("independently observed", info_text)
+            self.assertNotIn("independently re-observe", info_text)
+            self.assertIn("did not independently execute rustc", info_text)
 
     def test_draft_only_release_controls(self) -> None:
         result = self.run_builder()

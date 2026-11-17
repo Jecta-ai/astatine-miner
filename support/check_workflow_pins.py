@@ -23,7 +23,7 @@ DRY_RUN_WORKFLOW_FILENAME = "linux-release-dry-run.yml"
 RELEASE_WORKFLOW_FILENAME = "release.yml"
 # Pinned SHA-256 of .github/workflows/release.yml. Update only after review.
 # Recompute with: python3 -B support/check_workflow_pins.py --print-release-sha256
-RELEASE_WORKFLOW_SHA256 = "57a0d1f9949883b77a8d64c04a26a8bc18c0499dde024e83b46576c9cebe2caa"
+RELEASE_WORKFLOW_SHA256 = "2b66efa3b33a0722ccbea5dea57012d72fd869336ba16ad9b30afa88ef3b01f3"
 PINNED_RELEASE_ACTIONS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
@@ -529,16 +529,19 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
 
     # Job set and job-level least privilege.
     # M1: packaging/attestation and draft creation occur only in protected
-    # release-draft; builds are unprivileged except binary build attestations.
-    expected_jobs = {"preflight", "build-macos", "build-linux", "release-package", "release-draft"}
+    # release-draft; builds are read-only with no OIDC. Separate attest jobs
+    # hold OIDC/attestation write and never execute the candidate.
+    expected_jobs = {"preflight", "build-macos", "build-linux", "attest-macos", "attest-linux", "release-package", "release-draft"}
     if set(job_perms) != expected_jobs:
         raise AssertionError(
             f"{workflow}: release jobs must be exactly {sorted(expected_jobs)}, got {sorted(job_perms)}"
         )
     expected_perms: dict[str, dict[str, str]] = {
         "preflight": {"contents": "read", "actions": "read"},
-        "build-macos": {"contents": "read", "id-token": "write", "attestations": "write"},
-        "build-linux": {"contents": "read", "id-token": "write", "attestations": "write"},
+        "build-macos": {"contents": "read"},
+        "build-linux": {"contents": "read"},
+        "attest-macos": {"contents": "read", "id-token": "write", "attestations": "write"},
+        "attest-linux": {"contents": "read", "id-token": "write", "attestations": "write"},
         "release-package": {
             "contents": "read",
             "id-token": "write",
@@ -555,6 +558,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             )
     # Explicit scoped assertions for clear errors (B2 split).
     # release-package: protected build (no contents:write); release-draft: protected draft-only.
+    # builds are read-only; attest jobs hold OIDC/attestation write.
     for job, perms in job_perms.items():
         if perms.get("attestations") == "read" and job != "release-draft":
             raise AssertionError(
@@ -570,18 +574,345 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             if key == "contents" and job != "release-draft":
                 raise AssertionError(f"{workflow}: contents: write is allowed only on release-draft (found in {job})")
             if key in ("id-token", "attestations") and job not in (
-                "build-macos",
-                "build-linux",
+                "attest-macos",
+                "attest-linux",
                 "release-package",
             ):
                 raise AssertionError(
-                    f"{workflow}: {key}: write is allowed only on builds and release-package (found in {job})"
+                    f"{workflow}: {key}: write is allowed only on attest jobs and release-package (found in {job})"
                 )
             if key not in ("contents", "id-token", "attestations", "actions"):
                 raise AssertionError(f"{workflow}: unexpected write permission {key} in {job}")
         if perms.get("checks") == "read":
             raise AssertionError(
                 f"{workflow}: checks: read is not used by the release profile (found in {job})"
+            )
+
+    # Structural checks over indentation-bounded job sections (no YAML
+    # dependency): job needs, outputs, attest-job execution isolation,
+    # preflight gate placement, artifact hash chain, and toolchain arguments.
+    def _job_section(job_name: str) -> str:
+        pattern = (
+            r"(?ms)^  " + re.escape(job_name)
+            + r":\s*\n(.*?)(?=^  [a-z0-9-]+:\s*$|\Z)"
+        )
+        match = re.search(pattern, raw)
+        if match is None:
+            raise AssertionError(f"{workflow}: job {job_name} section is missing")
+        return match.group(1)
+
+    def _job_lines(job_name: str) -> list[str]:
+        return _job_section(job_name).splitlines()
+
+    def _job_uses(job_name: str) -> list[str]:
+        found = []
+        for line in _job_lines(job_name):
+            match = re.match(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)", line)
+            if match:
+                found.append(match.group(1))
+        return found
+
+    def _job_run_blocks(job_name: str) -> list[str]:
+        lines = _job_lines(job_name)
+        blocks: list[str] = []
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            block_match = re.match(r"^(\s*)run:\s*\|\s*$", line)
+            if block_match:
+                base = len(block_match.group(1))
+                index += 1
+                block: list[str] = []
+                while index < len(lines):
+                    current = lines[index]
+                    indent = len(current) - len(current.lstrip())
+                    if current.strip() and indent <= base:
+                        break
+                    block.append(current.strip())
+                    index += 1
+                blocks.append("\n".join(block))
+                continue
+            inline_match = re.match(r"^(\s*)run:\s*(.+)$", line)
+            if inline_match:
+                blocks.append(inline_match.group(2).strip())
+            index += 1
+        return blocks
+
+    def _job_run_text(job_name: str) -> str:
+        return "\n".join(_job_run_blocks(job_name))
+
+    def _strict_lines(text: str) -> set[str]:
+        return {
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+
+    def _job_needs(job_name: str) -> set[str]:
+        lines = _job_lines(job_name)
+        for index, line in enumerate(lines):
+            match = re.match(r"^    needs:\s*(.*)$", line)
+            if not match:
+                continue
+            inline = match.group(1).strip()
+            if inline:
+                return {item.strip() for item in inline.split(",") if item.strip()}
+            needs: set[str] = set()
+            for follow in lines[index + 1:]:
+                item = re.match(r"^      -\s+([A-Za-z0-9_-]+)\s*$", follow)
+                if item:
+                    needs.add(item.group(1))
+                    continue
+                if follow.strip():
+                    break
+            return needs
+        return set()
+
+    def _job_outputs(job_name: str) -> set[str]:
+        lines = _job_lines(job_name)
+        for index, line in enumerate(lines):
+            if not re.match(r"^    outputs:\s*$", line):
+                continue
+            keys: set[str] = set()
+            for follow in lines[index + 1:]:
+                if not follow.strip():
+                    continue
+                key = re.match(r"^      ([A-Za-z0-9_]+):", follow)
+                if key:
+                    keys.add(key.group(1))
+                    continue
+                if len(follow) - len(follow.lstrip()) <= 4:
+                    break
+            return keys
+        return set()
+
+    def _job_step_runs(job_name: str) -> dict[str, dict]:
+        """Map step name -> {id, runs} using indentation-bounded step blocks."""
+        lines = _job_lines(job_name)
+        for index, line in enumerate(lines):
+            if re.match(r"^    steps:\s*$", line):
+                lines = lines[index + 1:]
+                break
+        else:
+            raise AssertionError(f"{workflow}: job {job_name} must define steps")
+        steps: list[list[str]] = []
+        current: list[str] | None = None
+        for line in lines:
+            if re.match(r"^      -\s+", line):
+                if current is not None:
+                    steps.append(current)
+                current = [line]
+                continue
+            if current is not None:
+                current.append(line)
+        if current is not None:
+            steps.append(current)
+
+        parsed: dict[str, dict] = {}
+        for block in steps:
+            name = None
+            step_id = None
+            runs: list[str] = []
+            index = 0
+            while index < len(block):
+                line = block[index]
+                name_match = re.match(r"^\s*(?:-\s*)?name:\s*(.+?)\s*$", line)
+                if name_match:
+                    name = name_match.group(1).strip().strip("'\"")
+                id_match = re.match(r"^\s*(?:-\s*)?id:\s*(\S+)\s*$", line)
+                if id_match:
+                    step_id = id_match.group(1)
+                block_match = re.match(
+                    r"^(\s*)(?:-\s*)?run\s*:\s*([|>])\s*$", line
+                )
+                if block_match:
+                    base = len(block_match.group(1))
+                    index += 1
+                    run_lines: list[str] = []
+                    while index < len(block):
+                        current_line = block[index]
+                        indent = len(current_line) - len(current_line.lstrip())
+                        if current_line.strip() and indent <= base:
+                            break
+                        run_lines.append(current_line.strip())
+                        index += 1
+                    runs.append("\n".join(run_lines))
+                    continue
+                inline_match = re.match(
+                    r"^\s*(?:-\s*)?run\s*:\s*(.+)$", line
+                )
+                if inline_match:
+                    runs.append(inline_match.group(1).strip())
+                index += 1
+            key = name if name is not None else "<unnamed>"
+            if key in parsed:
+                raise AssertionError(f"{workflow}: job {job_name} has duplicate/unparseable step name {key!r}")
+            parsed[key] = {"id": step_id, "runs": set(_strict_lines("\n".join(runs)))}
+        return parsed
+
+    expected_needs = {
+        "preflight": set(),
+        "build-macos": {"preflight"},
+        "build-linux": {"preflight"},
+        "attest-macos": {"build-macos"},
+        "attest-linux": {"build-linux"},
+        "release-package": {"build-macos", "build-linux", "attest-macos", "attest-linux"},
+        "release-draft": {"release-package"},
+    }
+    for job_name, expected in expected_needs.items():
+        actual = _job_needs(job_name)
+        if actual != expected:
+            raise AssertionError(
+                f"{workflow}: job {job_name} needs must be exactly {sorted(expected)}, got {sorted(actual)}"
+            )
+
+    for build_job, binary_artifact in (
+        ("build-macos", "astatine-macos-arm64"),
+        ("build-linux", "astatine-linux-x86_64"),
+    ):
+        outputs = _job_outputs(build_job)
+        expected_output_keys = {"binary_sha256", "rustc_version", "cargo_version"}
+        if outputs != expected_output_keys:
+            raise AssertionError(
+                f"{workflow}: {build_job} outputs must be exactly {sorted(expected_output_keys)}"
+            )
+        build_steps = _job_step_runs(build_job)
+        observe = build_steps.get("Observe pinned toolchain versions")
+        if observe is None or observe.get("id") != "observe-toolchain":
+            raise AssertionError(
+                f"{workflow}: {build_job} must have the id=observe-toolchain observation step"
+            )
+        for required in (
+            'rustc_line="$(rustc --version)"',
+            'cargo_line="$(cargo --version)"',
+            'test "$rustc_line" = "rustc 1.94.1 (e408947bf 2026-03-25)"',
+            'test "$cargo_line" = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"',
+        ):
+            if required not in observe["runs"]:
+                raise AssertionError(
+                    f"{workflow}: {build_job} toolchain observation step must execute exact line {required!r}"
+                )
+        hash_step = build_steps.get("Record binary SHA-256")
+        if hash_step is None or not any(
+            "sha256" in line or "shasum" in line for line in hash_step["runs"]
+        ):
+            raise AssertionError(f"{workflow}: {build_job} must execute a binary hash step")
+        for expression in (
+            "steps.observe-toolchain.outputs.rustc_version",
+            "steps.observe-toolchain.outputs.cargo_version",
+            "steps.record-hash.outputs.binary_sha256",
+        ):
+            if expression not in _job_section(build_job):
+                raise AssertionError(f"{workflow}: {build_job} outputs must bind {expression}")
+        if any("attest-build-provenance" in uses for uses in _job_uses(build_job)):
+            raise AssertionError(f"{workflow}: {build_job} must not attest in the candidate-execution job (R3)")
+        if binary_artifact not in _job_section(build_job):
+            raise AssertionError(f"{workflow}: {build_job} must upload artifact {binary_artifact!r}")
+
+    for attest_job, build_job, expected_artifact in (
+        ("attest-macos", "build-macos", "astatine-macos-arm64"),
+        ("attest-linux", "build-linux", "astatine-linux-x86_64"),
+    ):
+        allowed_uses = {
+            "actions/download-artifact",
+            "actions/attest-build-provenance",
+        }
+        for uses in _job_uses(attest_job):
+            if not any(uses.startswith(f"{allowed}@") for allowed in allowed_uses):
+                raise AssertionError(
+                    f"{workflow}: {attest_job} may only use download-artifact/attest-build-provenance, got {uses!r}"
+                )
+        attest_text = _job_section(attest_job)
+        if f"needs.{build_job}.outputs.binary_sha256" not in attest_text:
+            raise AssertionError(
+                f"{workflow}: {attest_job} must bind the downloaded artifact to {build_job} binary_sha256"
+            )
+        if expected_artifact not in attest_text:
+            raise AssertionError(f"{workflow}: {attest_job} must download artifact {expected_artifact!r}")
+        attest_steps = _job_step_runs(attest_job)
+        expected_hash_step = (
+            "Verify macOS binary hash matches build output"
+            if attest_job == "attest-macos"
+            else "Verify Linux binary hash matches build output"
+        )
+        run_steps = {name: data for name, data in attest_steps.items() if data["runs"]}
+        if set(run_steps) != {expected_hash_step}:
+            raise AssertionError(
+                f"{workflow}: {attest_job} candidate execution/repo scripts outside the attest allowlist are forbidden; only the exact hash step is allowed, got {sorted(run_steps)}"
+            )
+        attest_runs = "\n".join(run_steps[expected_hash_step]["runs"])
+        allowed_exact = {
+            "set -euo pipefail",
+            'test -n "$EXPECTED_SHA256"',
+            'test -f "$binary"',
+            'actual="$(sha256sum "$binary" | cut -d\' \' -f1)"',
+            'if [ "$actual" != "$EXPECTED_SHA256" ]; then',
+            "exit 1",
+            "fi",
+        }
+        for line in attest_runs.splitlines():
+            command = line.strip()
+            if not command or command.startswith("#"):
+                continue
+            if command in allowed_exact:
+                continue
+            if re.fullmatch(r'binary="\$RUNNER_TEMP/attest/(macos|linux)/astatine"', command):
+                continue
+            if re.fullmatch(r'echo "[^"$`]*"(?: >&2)?', command):
+                continue
+            raise AssertionError(
+                f"{workflow}: {attest_job} candidate execution/repo scripts outside the attest allowlist: {command!r}"
+            )
+
+    package_steps = _job_step_runs("release-package")
+    hash_step = package_steps.get("Verify binaries match build outputs")
+    build_step = package_steps.get("Build release bundle without executing binaries")
+    if hash_step is None or build_step is None:
+        raise AssertionError(
+            f"{workflow}: release-package must have exact hash-verification and builder steps"
+        )
+    for required in (
+        'actual_macos="$(sha256sum "$macos_binary" | cut -d\' \' -f1)"',
+        'actual_linux="$(sha256sum "$linux_binary" | cut -d\' \' -f1)"',
+        'if [ "$actual_macos" != "$EXPECTED_MACOS_SHA256" ]; then',
+        'if [ "$actual_linux" != "$EXPECTED_LINUX_SHA256" ]; then',
+    ):
+        if required not in hash_step["runs"]:
+            raise AssertionError(
+                f"{workflow}: release-package hash/toolchain step must execute exact line {required!r}"
+            )
+    builder_line = 'python3 -B support/release/build-release.py --tag "$tag" --repository-id "$repo_id" --macos-binary "$RUNNER_TEMP/retrieved/macos/astatine" --linux-binary "$RUNNER_TEMP/retrieved/linux/astatine" --output-dir "$out" --rustc-version "$RUSTC_VERSION" --cargo-version "$CARGO_VERSION"'
+    if builder_line not in build_step["runs"]:
+        raise AssertionError(f"{workflow}: release-package builder step must execute the exact command with --rustc-version/--cargo-version")
+
+    preflight_steps = _job_step_runs("preflight")
+    fixture_step = preflight_steps.get("Verify fixture provenance")
+    distribution_step = preflight_steps.get("Verify distribution inventory")
+    if fixture_step is None or distribution_step is None:
+        raise AssertionError(
+            f"{workflow}: preflight must have exact fixture and distribution gate steps"
+        )
+    for required in (
+        'python3 -B support/verify-fixture-provenance.py > "$RUNNER_TEMP/fixture-provenance.json"',
+        'if data.get("schema") != "astatine-fixture-provenance/v3":',
+        'if data.get("release_intent_authorized") is not True:',
+        'if data.get("publication_authorized") is not False:',
+        'if data.get("final_release_controls_complete") is not False:',
+    ):
+        if required not in fixture_step["runs"]:
+            raise AssertionError(
+                f"{workflow}: preflight release-intent gate fixture step must execute exact line {required!r}"
+            )
+    for required in (
+        'python3 -B support/verify-distribution-inventory.py > "$RUNNER_TEMP/distribution-inventory.json"',
+        'if data.get("schema") != "astatine-distribution-inventory/v3":',
+        'if data.get("release_intent_authorized") is not True:',
+        'if data.get("publication_authorized") is not False:',
+        'if data.get("final_release_controls_complete") is not False:',
+    ):
+        if required not in distribution_step["runs"]:
+            raise AssertionError(
+                f"{workflow}: preflight release-intent gate distribution step must execute exact line {required!r}"
             )
 
     # Both protected jobs are environment-gated (B2); no pre-approval package job.
@@ -607,6 +938,8 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         ("preflight", "ubuntu-24.04"),
         ("build-macos", "macos-15"),
         ("build-linux", "ubuntu-24.04"),
+        ("attest-macos", "ubuntu-24.04"),
+        ("attest-linux", "ubuntu-24.04"),
         ("release-package", "ubuntu-24.04"),
         ("release-draft", "ubuntu-24.04"),
     ):
@@ -615,6 +948,27 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             raise AssertionError(f"{workflow}: job {job} must run on {runner}")
     if "needs:" not in raw:
         raise AssertionError(f"{workflow}: release jobs must declare needs dependencies")
+    # R3 needs chain: attest jobs need their build; package needs builds+attests.
+    for required in (
+        "needs: build-macos",
+        "needs: build-linux",
+        "needs.build-macos.outputs.binary_sha256",
+        "needs.build-linux.outputs.binary_sha256",
+        "needs.build-macos.outputs.rustc_version",
+        "needs.build-macos.outputs.cargo_version",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must contain needs marker {required!r} (R3 build/attest hash and toolchain chain)")
+    # release-package must need all four upstream jobs.
+    _pkg_section = raw.split("release-package:", 1)[-1].split("release-draft:", 1)[0] if "release-package:" in raw else ""
+    for dep in ("build-macos", "build-linux", "attest-macos", "attest-linux"):
+        if dep not in _pkg_section:
+            raise AssertionError(f"{workflow}: release-package must need {dep} (R3 needs attest+build)")
+    # Attest jobs must need their build job and must not need anything else privileged.
+    for attest_job, build_job in (("attest-macos", "build-macos"), ("attest-linux", "build-linux")):
+        _att = raw.split(attest_job + ":", 1)[-1].split("release-package:", 1)[0] if attest_job + ":" in raw else ""
+        if f"needs: {build_job}" not in _att:
+            raise AssertionError(f"{workflow}: {attest_job} must declare needs: {build_job} (R3)")
 
     # Pinned actions with exact allowlist (L3): only the four pinned actions, no other uses even if pinned.
     for number, line in enumerate(raw.splitlines(), 1):
@@ -868,6 +1222,29 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     ):
         if required not in raw:
             raise AssertionError(f"{workflow}: release workflow must run gate verifier {required!r}")
+    # R5: preflight must gate release intent via JSON, not merely verifier exit 0.
+    # Both verifiers redirect stdout to $RUNNER_TEMP JSON and require v3 intent.
+    for required in (
+        'support/verify-fixture-provenance.py > "$RUNNER_TEMP/fixture-provenance.json"',
+        'support/verify-distribution-inventory.py > "$RUNNER_TEMP/distribution-inventory.json"',
+        "astatine-fixture-provenance/v3",
+        "astatine-distribution-inventory/v3",
+        "blocked v1 rejected",
+        "release_intent_authorized",
+        "publication_authorized",
+        "final_release_controls_complete",
+        "fixture provenance release intent authorized",
+        "distribution inventory release intent authorized",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: preflight must gate release intent with marker {required!r} (R5)")
+    for required in (
+        'data.get("release_intent_authorized") is not True',
+        'data.get("publication_authorized") is not False',
+        'data.get("final_release_controls_complete") is not False',
+    ):
+        if raw.count(required) < 2:
+            raise AssertionError(f"{workflow}: preflight JSON gate must require {required!r} for both fixture and distribution (R5)")
     # Provenance semantic verification before ending at draft.
     # Owner-authorized release intent (not final publication): release_intent true,
     # publication_authorized false, final controls false; prefer rights_decision.
@@ -922,8 +1299,9 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         raise AssertionError(f"{workflow}: release workflow must not use exact-one run matching (L5: use latest safe selection)")
     # B1: per-job exact tag identity immediately after every checkout.
     # preflight + 2 builds + release-package each assert HEAD, tag^{}, describe.
-    if raw.count("Assert exact tag identity") < 4:
-        raise AssertionError(f"{workflow}: release workflow must assert exact tag identity after every checkout (B1)")
+    # Attest jobs have no checkout and must not assert tag identity.
+    if raw.count("Assert exact tag identity") != 4:
+        raise AssertionError(f"{workflow}: release workflow must assert exact tag identity after every checkout exactly 4x (B1: preflight+2 builds+package, none in attest/draft), got {raw.count('Assert exact tag identity')}")
     for required in (
         'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
         'test "$(git rev-parse "$RELEASE_TAG^{}")" = "$GITHUB_SHA"',
@@ -958,11 +1336,10 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             f"{workflow}: release-draft must verify each extracted packaged binary with exact repo, "
             "signer workflow, source digest, and tag flags"
         )
-    # L7: compilation binding via binary attestations.
+    # L7: compilation binding via separate attest jobs (R3 split).
     for required in (
         "Attest raw macOS binary",
         "Attest raw Linux binary",
-        "subject-path: target/release/astatine",
         "Verify binary build attestations before packaging",
         'gh attestation verify "$binary"',
         "bound to compiled binaries",
@@ -972,6 +1349,31 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     ):
         if required not in raw:
             raise AssertionError(f"{workflow}: release workflow must contain compilation-binding marker {required!r} (L7)")
+    # R3 split: builds must not attest directly; attest jobs attest downloaded binaries.
+    if "subject-path: target/release/astatine" in raw:
+        raise AssertionError(f"{workflow}: build jobs must not attest target/release directly; attest jobs attest downloaded binaries (R3 split)")
+    for required in (
+        "subject-path: ${{ runner.temp }}/attest/macos/astatine",
+        "subject-path: ${{ runner.temp }}/attest/linux/astatine",
+        "Verify macOS binary hash matches build output",
+        "Verify Linux binary hash matches build output",
+        "hash verified against build output",
+        "hash mismatch against build output",
+        "binaries verified against build outputs",
+        "Observe pinned toolchain versions",
+        "Record binary SHA-256",
+        "binary_sha256",
+        "rustc_version",
+        "cargo_version",
+        "rustc 1.94.1 (e408947bf 2026-03-25)",
+        "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+        "--rustc-version",
+        "--cargo-version",
+        "needs.build-macos.outputs.rustc_version",
+        "needs.build-macos.outputs.cargo_version",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must contain build/attest split marker {required!r} (R3)")
     # Draft-side binding: the packaged archive member must be the separately
     # attested compiled binary, not merely covered by an archive attestation.
     for required in (
@@ -1009,23 +1411,99 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         raise AssertionError(f"{workflow}: release workflow must not define an unprotected package job (B2/M1)")
     if raw.count("astatine-release-bundle") < 2:
         raise AssertionError(f"{workflow}: bundle artifact must be uploaded by release-package and downloaded by release-draft (B2)")
+    # Artifact names: raw binaries round-trip through attest and package.
+    for required in ("astatine-macos-arm64", "astatine-linux-x86_64"):
+        if raw.count(required) < 3:
+            raise AssertionError(f"{workflow}: binary artifact {required!r} must appear in build upload, attest download, and package download (R3)")
     # B2: per-job isolation — package builds (no contents:write, no draft mutation);
     # draft creates draft only (no checkout, no repo scripts/build).
-    # Checkout count must be exactly preflight+2 builds+package (draft has none).
+    # attest jobs attest only (no checkout, no candidate execution, no repo scripts).
+    # Checkout count must be exactly preflight+2 builds+package (draft+attests have none).
     _checkout_total = raw.count("actions/checkout@")
     if _checkout_total != 4:
-        raise AssertionError(f"{workflow}: release workflow must have exactly 4 checkouts (preflight+builds+package, none in draft), got {_checkout_total} (B2)")
+        raise AssertionError(f"{workflow}: release workflow must have exactly 4 checkouts (preflight+builds+package, none in draft/attest), got {_checkout_total} (B2)")
+    # Attest jobs must not checkout; draft must not checkout (B2 isolation, R3 split).
+    for _isolated_job in ("attest-macos", "attest-linux", "release-draft"):
+        _section = raw.split(_isolated_job + ":", 1)[-1] if _isolated_job + ":" in raw else ""
+        # Bound to the job: cut at the next top-level job (two-space job key).
+        _next = None
+        for _candidate in ("preflight:", "build-macos:", "build-linux:", "attest-macos:", "attest-linux:", "release-package:", "release-draft:"):
+            if _candidate == _isolated_job + ":":
+                continue
+            if _candidate in _section:
+                _pos = _section.find(_candidate)
+                if _next is None or _pos < _next:
+                    _next = _pos
+        if _next is not None:
+            _section = _section[:_next]
+        if "actions/checkout@" in _section:
+            raise AssertionError(f"{workflow}: {_isolated_job} must not checkout (no checkout in {_isolated_job}) (B2/R3)")
+    # Attest jobs must not execute the candidate nor run repo scripts (R3).
+    for _attest_job in ("attest-macos", "attest-linux"):
+        _section = raw.split(_attest_job + ":", 1)[-1] if _attest_job + ":" in raw else ""
+        _next = None
+        for _candidate in ("preflight:", "build-macos:", "build-linux:", "attest-macos:", "attest-linux:", "release-package:", "release-draft:"):
+            if _candidate == _attest_job + ":":
+                continue
+            if _candidate in _section:
+                _pos = _section.find(_candidate)
+                if _next is None or _pos < _next:
+                    _next = _pos
+        if _next is not None:
+            _section = _section[:_next]
+        for _forbidden in (
+            "target/release/astatine",
+            "./target/release",
+            "cargo build",
+            "rustc ",
+            "support/release/",
+            "support/verify-",
+            "gh attestation verify",
+            "gh release",
+            "codesign",
+            "otool",
+            "Assert exact tag identity",
+        ):
+            if _forbidden in _section:
+                raise AssertionError(f"{workflow}: {_attest_job} must not contain candidate execution or repo scripts ({_forbidden!r}) (R3)")
+    # Build jobs must not hold OIDC/attestation write nor attest directly (R3 split).
+    for _build_job in ("build-macos", "build-linux"):
+        _section = raw.split(_build_job + ":", 1)[-1] if _build_job + ":" in raw else ""
+        _next = None
+        for _candidate in ("preflight:", "build-macos:", "build-linux:", "attest-macos:", "attest-linux:", "release-package:", "release-draft:"):
+            if _candidate == _build_job + ":":
+                continue
+            if _candidate in _section:
+                _pos = _section.find(_candidate)
+                if _next is None or _pos < _next:
+                    _next = _pos
+        if _next is not None:
+            _section = _section[:_next]
+        if "actions/attest-build-provenance@" in _section:
+            raise AssertionError(f"{workflow}: {_build_job} must not attest directly; attestation lives in attest jobs (R3)")
+        if "id-token: write" in _section or "attestations: write" in _section:
+            raise AssertionError(f"{workflow}: {_build_job} must not request OIDC/attestations write; read-only build (R3)")
     # Validator script only in preflight + package (draft uses inline, no repo script).
     if raw.count('python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag"') != 2:
         raise AssertionError(f"{workflow}: protected-environment validator must run in preflight and package only (2x), inline in draft (B2/L2)")
-    # Builder only in package.
+    # Builder only in package with observed toolchain args (R3).
     if raw.count("support/release/build-release.py") != 1:
         raise AssertionError(f"{workflow}: release builder must run exactly once in release-package (B2)")
+    for required in (
+        "--rustc-version",
+        "--cargo-version",
+        "RUSTC_VERSION: ${{ needs.build-macos.outputs.rustc_version }}",
+        "CARGO_VERSION: ${{ needs.build-macos.outputs.cargo_version }}",
+        'test "$RUSTC_VERSION" = "rustc 1.94.1 (e408947bf 2026-03-25)"',
+        'test "$CARGO_VERSION" = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"',
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release-package must pass observed toolchain with marker {required!r} (R3)")
     # Draft must create the draft exactly once; package must not.
     if raw.count("gh release create") != 1:
         raise AssertionError(f"{workflow}: gh release create must appear exactly once in release-draft (B2 draft-only)")
-    if "Assert exact tag identity" not in raw or raw.count("Assert exact tag identity") < 4:
-        raise AssertionError(f"{workflow}: release workflow must assert tag identity after every checkout (B1: preflight+builds+package)")
+    if "Assert exact tag identity" not in raw or raw.count("Assert exact tag identity") != 4:
+        raise AssertionError(f"{workflow}: release workflow must assert tag identity after every checkout exactly 4x (B1: preflight+builds+package)")
     # Draft inline env check markers (no validator script in draft).
     for _m in (
         "Re-verify protected environment before mutation",

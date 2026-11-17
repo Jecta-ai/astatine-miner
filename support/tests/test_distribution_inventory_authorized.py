@@ -43,6 +43,8 @@ NEEDED_FILES = [
     "tests/fixtures/OPENZEPPELIN_LICENSE.txt",
     "Cargo.toml",
     "support/release-repository.txt",
+    "support/update-evm-test-fixtures.py",
+    "support/update-genesis-coordinator-fixture.py",
 ]
 
 

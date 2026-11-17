@@ -94,9 +94,13 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("default", tag)
         self.assertEqual(parsed.get("name"), "Release")
         jobs = parsed["jobs"]
-        self.assertEqual(set(jobs), {"preflight", "build-macos", "build-linux", "release-package", "release-draft"})
+        self.assertEqual(set(jobs), {"preflight", "build-macos", "build-linux", "attest-macos", "attest-linux", "release-package", "release-draft"})
         self.assertEqual(jobs["release-package"].get("environment"), "release")
         self.assertEqual(jobs["release-draft"].get("environment"), "release")
+        self.assertNotIn("environment", jobs["attest-macos"])
+        self.assertNotIn("environment", jobs["attest-linux"])
+        self.assertNotIn("environment", jobs["build-macos"])
+        self.assertNotIn("environment", jobs["build-linux"])
         self.assertEqual(
             jobs["release-draft"].get("permissions"),
             {"contents": "write", "actions": "read", "attestations": "read"},
@@ -110,8 +114,30 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         )
         self.assertEqual(
             jobs["build-macos"].get("permissions"),
+            {"contents": "read"},
+        )
+        self.assertEqual(
+            jobs["build-linux"].get("permissions"),
+            {"contents": "read"},
+        )
+        self.assertEqual(
+            jobs["attest-macos"].get("permissions"),
             {"contents": "read", "id-token": "write", "attestations": "write"},
         )
+        self.assertEqual(
+            jobs["attest-linux"].get("permissions"),
+            {"contents": "read", "id-token": "write", "attestations": "write"},
+        )
+        # R3 needs chain and build outputs.
+        self.assertEqual(jobs["attest-macos"].get("needs"), "build-macos")
+        self.assertEqual(jobs["attest-linux"].get("needs"), "build-linux")
+        self.assertEqual(
+            set(jobs["release-package"].get("needs")),
+            {"build-macos", "build-linux", "attest-macos", "attest-linux"},
+        )
+        self.assertIn("binary_sha256", jobs["build-macos"].get("outputs"))
+        self.assertIn("rustc_version", jobs["build-macos"].get("outputs"))
+        self.assertIn("cargo_version", jobs["build-macos"].get("outputs"))
 
     def test_release_hash_mismatch_fails(self) -> None:
         mutated = self.real_text + "\n# benign reviewed-comment probe\n"
@@ -178,11 +204,9 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
     def test_contents_write_outside_release_draft_fails(self) -> None:
         mutated = self.real_text.replace(
             "  build-linux:\n    name: Build Linux x86_64 binary\n    needs: preflight\n"
-            "    runs-on: ubuntu-24.04\n    timeout-minutes: 60\n    permissions:\n      contents: read\n"
-            "      id-token: write\n      attestations: write",
+            "    runs-on: ubuntu-24.04\n    timeout-minutes: 60\n    permissions:\n      contents: read\n",
             "  build-linux:\n    name: Build Linux x86_64 binary\n    needs: preflight\n"
-            "    runs-on: ubuntu-24.04\n    timeout-minutes: 60\n    permissions:\n      contents: write\n"
-            "      id-token: write\n      attestations: write",
+            "    runs-on: ubuntu-24.04\n    timeout-minutes: 60\n    permissions:\n      contents: write\n",
             1,
         )
         self.assertReleaseFails(mutated, "must be exactly")
@@ -624,8 +648,8 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         )
         # Directly mutate the existing package permissions block instead
         mutated2 = self.real_text.replace(
-            "  release-package:\n    name: Package and attest release bundle\n    needs:\n      - build-macos\n      - build-linux\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    environment: release\n    permissions:\n      contents: read",
-            "  release-package:\n    name: Package and attest release bundle\n    needs:\n      - build-macos\n      - build-linux\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    environment: release\n    permissions:\n      contents: write",
+            "  release-package:\n    name: Package and attest release bundle\n    needs:\n      - build-macos\n      - build-linux\n      - attest-macos\n      - attest-linux\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    environment: release\n    permissions:\n      contents: read",
+            "  release-package:\n    name: Package and attest release bundle\n    needs:\n      - build-macos\n      - build-linux\n      - attest-macos\n      - attest-linux\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    environment: release\n    permissions:\n      contents: write",
             1,
         )
         # Use whichever mutation actually changes the file
@@ -733,6 +757,251 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         # Removing the gh api tag-ref lookup must fail.
         mutated = self.real_text.replace('gh api "repos/$repo/git/ref/tags/$tag"', 'echo no-tag-check', 1)
         self.assertReleaseFails(mutated, "gh api")
+
+    def test_build_macos_oidc_write_rejected(self) -> None:
+        # R3: build jobs are read-only; OIDC/attestations write rejected.
+        mutated = self.real_text.replace(
+            "  build-macos:\n    name: Build macOS arm64 binary\n    needs: preflight\n"
+            "    runs-on: macos-15\n    timeout-minutes: 60\n    permissions:\n      contents: read\n",
+            "  build-macos:\n    name: Build macOS arm64 binary\n    needs: preflight\n"
+            "    runs-on: macos-15\n    timeout-minutes: 60\n    permissions:\n      contents: read\n"
+            "      id-token: write\n",
+            1,
+        )
+        self.assertIn("id-token: write", mutated)
+        self.assertReleaseFails(mutated, "id-token")
+
+    def test_build_linux_attestations_write_rejected(self) -> None:
+        # R3: build jobs must not request attestations write.
+        mutated = self.real_text.replace(
+            "  build-linux:\n    name: Build Linux x86_64 binary\n    needs: preflight\n"
+            "    runs-on: ubuntu-24.04\n    timeout-minutes: 60\n    permissions:\n      contents: read\n",
+            "  build-linux:\n    name: Build Linux x86_64 binary\n    needs: preflight\n"
+            "    runs-on: ubuntu-24.04\n    timeout-minutes: 60\n    permissions:\n      contents: read\n"
+            "      attestations: write\n",
+            1,
+        )
+        self.assertIn("attestations: write", mutated)
+        self.assertReleaseFails(mutated, "attestations")
+
+    def test_build_job_direct_attest_rejected(self) -> None:
+        # R3 split: builds must not attest target/release directly.
+        mutated = self.real_text.replace(
+            "subject-path: ${{ runner.temp }}/attest/macos/astatine",
+            "subject-path: target/release/astatine",
+            1,
+        )
+        self.assertReleaseFails(mutated, "must not attest target/release")
+
+    def test_attest_job_checkout_rejected(self) -> None:
+        # R3: attest jobs must not checkout.
+        mutated = self.real_text.replace(
+            "      - name: Download macOS binary",
+            "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n      - name: Download macOS binary",
+            1,
+        )
+        self.assertReleaseFails(mutated, "checkout")
+
+    def test_attest_job_candidate_execution_rejected(self) -> None:
+        # R3: attest jobs must not execute the candidate.
+        mutated = self.real_text.replace(
+            'echo "macOS binary hash verified against build output"',
+            'echo "macOS binary hash verified against build output"\n          ./target/release/astatine --version',
+            1,
+        )
+        self.assertReleaseFails(mutated, "candidate execution")
+
+    def test_attest_job_repo_script_rejected(self) -> None:
+        # R3: attest jobs must not run repo scripts.
+        mutated = self.real_text.replace(
+            'echo "Linux binary hash verified against build output"',
+            'echo "Linux binary hash verified against build output"\n          python3 -B support/release/build-release.py --help',
+            1,
+        )
+        self.assertReleaseFails(mutated, "repo scripts")
+
+    def test_step_name_cannot_truncate_attest_job(self) -> None:
+        # Structural YAML checks must not be bypassed by a step name that looks
+        # like a job key in raw text.
+        mutated = self.real_text.replace(
+            "    steps:\n      - name: Download macOS binary",
+            "    steps:\n      - name: \"release-package:\"\n"
+            "      - name: candidate\n"
+            "        run: ./target/release/astatine --version\n"
+            "      - name: Download macOS binary",
+            1,
+        )
+        self.assertReleaseFails(mutated, "candidate execution")
+
+    def test_attest_binary_assignment_substitution_rejected(self) -> None:
+        mutated = self.real_text.replace(
+            "      - name: Download macOS binary",
+            "      - name: injected\n"
+            "        run: |\n"
+            "          binary=\"$(python3 support/evil.py)\"\n"
+            "      - name: Download macOS binary",
+            1,
+        )
+        self.assertReleaseFails(mutated, "attest allowlist")
+
+    def test_bare_run_step_rejected(self) -> None:
+        mutated = self.real_text.replace(
+            "      - name: Download macOS binary",
+            "      - run: |\n"
+            "          echo injected\n"
+            "      - name: Download macOS binary",
+            1,
+        )
+        self.assertReleaseFails(mutated, "attest allowlist")
+
+    def test_build_echo_cannot_satisfy_toolchain_observation(self) -> None:
+        mutated = self.real_text.replace(
+            '          rustc_line="$(rustc --version)"',
+            '          echo \'rustc_line="$(rustc --version)"\'',
+            1,
+        )
+        self.assertReleaseFails(mutated, "toolchain observation")
+
+    def test_preflight_comment_cannot_satisfy_gate(self) -> None:
+        mutated = self.real_text.replace(
+            '          python3 -B support/verify-fixture-provenance.py > "$RUNNER_TEMP/fixture-provenance.json"',
+            '          # python3 -B support/verify-fixture-provenance.py > "$RUNNER_TEMP/fixture-provenance.json"',
+            1,
+        )
+        self.assertReleaseFails(mutated, "release-intent gate")
+
+    def test_package_echo_cannot_satisfy_hash_compare(self) -> None:
+        mutated = self.real_text.replace(
+            '          if [ "$actual_macos" != "$EXPECTED_MACOS_SHA256" ]; then',
+            '          echo \'if [ "$actual_macos" != "$EXPECTED_MACOS_SHA256" ]; then\'',
+            1,
+        )
+        self.assertReleaseFails(mutated, "hash/toolchain")
+
+    def test_missing_build_attest_hash_chain_rejected(self) -> None:
+        # R3: build->attest hash chain via needs outputs.
+        mutated = self.real_text.replace(
+            "needs.build-macos.outputs.binary_sha256", "XXX-REMOVED-HASH-CHAIN", 1
+        )
+        mutated = mutated.replace("needs.build-macos.outputs.binary_sha256", "XXX-REMOVED-HASH-CHAIN")
+        self.assertReleaseFails(mutated, "binary_sha256")
+
+    def test_package_missing_attest_needs_rejected(self) -> None:
+        # R3: release-package must need attest jobs.
+        mutated = self.real_text.replace("      - attest-macos\n", "", 1)
+        self.assertReleaseFails(mutated, "attest-macos")
+
+    def test_package_missing_attestation_verification_rejected(self) -> None:
+        mutated = self.real_text.replace(
+            "Verify binary build attestations before packaging", "XXX-REMOVED", 1
+        )
+        self.assertReleaseFails(mutated, "binary")
+
+    def test_blocked_v1_fixture_verifier_output_rejected(self) -> None:
+        # R5: blocked v1 fixture output must fail the JSON gate (static marker).
+        mutated = self.real_text.replace(
+            "astatine-fixture-provenance/v3", "astatine-fixture-provenance/v1", 1
+        )
+        mutated = mutated.replace(
+            "astatine-fixture-provenance/v3", "astatine-fixture-provenance/v1"
+        )
+        self.assertReleaseFails(mutated, "astatine-fixture-provenance/v3")
+
+    def test_blocked_v1_distribution_verifier_output_rejected(self) -> None:
+        # R5: blocked v1 distribution output must fail the JSON gate.
+        mutated = self.real_text.replace(
+            "astatine-distribution-inventory/v3", "astatine-distribution-inventory/v1", 1
+        )
+        mutated = mutated.replace(
+            "astatine-distribution-inventory/v3", "astatine-distribution-inventory/v1"
+        )
+        self.assertReleaseFails(mutated, "astatine-distribution-inventory/v3")
+
+    def test_preflight_json_gate_requires_intent_fields(self) -> None:
+        # R5: preflight JSON gate must require intent booleans for both verifiers.
+        mutated = self.real_text.replace(
+            'data.get("release_intent_authorized") is not True', 'data.get("release_intent_authorized") is True', 1
+        )
+        mutated = mutated.replace(
+            'data.get("release_intent_authorized") is not True', 'data.get("release_intent_authorizedXXX', 1
+        )
+        self.assertReleaseFails(mutated, "release_intent_authorized")
+
+    def test_missing_toolchain_exact_lines_rejected(self) -> None:
+        # R3: exact toolchain observation lines required.
+        mutated = self.real_text.replace(
+            "rustc 1.94.1 (e408947bf 2026-03-25)", "XXX-REMOVED-TOOLCHAIN", 1
+        )
+        mutated = mutated.replace(
+            "rustc 1.94.1 (e408947bf 2026-03-25)", "XXX-REMOVED-TOOLCHAIN"
+        )
+        self.assertReleaseFails(mutated, "rustc 1.94.1")
+
+    def test_hardcoded_toolchain_without_observation_rejected(self) -> None:
+        # R6: build jobs must execute rustc/cargo, not hardcode output.
+        mutated = self.real_text.replace(
+            'rustc_line="$(rustc --version)"',
+            'rustc_line="rustc 1.94.1 (e408947bf 2026-03-25)"',
+            1,
+        )
+        self.assertReleaseFails(mutated, "rustc --version")
+
+    def test_missing_toolchain_args_rejected(self) -> None:
+        # R3: package must pass observed toolchain to builder.
+        mutated = self.real_text.replace("--rustc-version", "XXX-REMOVED-ARG", 1)
+        mutated = mutated.replace("--rustc-version", "XXX-REMOVED-ARG")
+        self.assertReleaseFails(mutated, "--rustc-version")
+
+    def test_missing_cargo_exact_line_rejected(self) -> None:
+        mutated = self.real_text.replace(
+            "cargo 1.94.1 (29ea6fb6a 2026-03-24)", "XXX-REMOVED-TOOLCHAIN", 1
+        )
+        mutated = mutated.replace(
+            "cargo 1.94.1 (29ea6fb6a 2026-03-24)", "XXX-REMOVED-TOOLCHAIN"
+        )
+        self.assertReleaseFails(mutated, "cargo 1.94.1")
+
+    def test_preflight_v3_gate_markers_present(self) -> None:
+        for marker in (
+            'support/verify-fixture-provenance.py > "$RUNNER_TEMP/fixture-provenance.json"',
+            'support/verify-distribution-inventory.py > "$RUNNER_TEMP/distribution-inventory.json"',
+            "astatine-fixture-provenance/v3",
+            "astatine-distribution-inventory/v3",
+            "blocked v1 rejected",
+            "fixture provenance release intent authorized",
+            "distribution inventory release intent authorized",
+        ):
+            self.assertIn(marker, self.real_text)
+
+    def test_build_attest_split_markers_present(self) -> None:
+        for marker in (
+            "attest-macos",
+            "attest-linux",
+            "astatine-macos-arm64",
+            "astatine-linux-x86_64",
+            "astatine-release-bundle",
+            "Observe pinned toolchain versions",
+            "Record binary SHA-256",
+            "Verify macOS binary hash matches build output",
+            "Verify Linux binary hash matches build output",
+            "hash verified against build output",
+            "hash mismatch against build output",
+            "binaries verified against build outputs",
+            "subject-path: ${{ runner.temp }}/attest/macos/astatine",
+            "subject-path: ${{ runner.temp }}/attest/linux/astatine",
+            "needs.build-macos.outputs.binary_sha256",
+            "needs.build-linux.outputs.binary_sha256",
+            "needs.build-macos.outputs.rustc_version",
+            "needs.build-macos.outputs.cargo_version",
+            "--rustc-version",
+            "--cargo-version",
+            "rustc 1.94.1 (e408947bf 2026-03-25)",
+            "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+        ):
+            self.assertIn(marker, self.real_text)
+        self.assertNotIn("subject-path: target/release/astatine", self.real_text)
+        self.assertEqual(self.real_text.count("Assert exact tag identity"), 4)
+        self.assertEqual(self.real_text.count("actions/checkout@"), 4)
 
     def test_print_sha_documents_recompute(self) -> None:
         self.assertEqual(

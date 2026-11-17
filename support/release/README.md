@@ -118,7 +118,9 @@ candidate code, wallets, mining, or the network. Low-10 limitation:
 identity and source linkage are established by the workflow build jobs plus
 GitHub build provenance, verified again by the protected draft after safe
 archive-member validation, a target-format check, and extraction, not by this
-offline packager.
+offline packager. Read-only build jobs run the candidate smoke checks; separate
+pinned attestation jobs receive OIDC/attestation-write, verify the build-output
+hash, and attest the raw binary without executing it.
 
 The release workflow creates and verifies a **draft only** and never publishes
 from automation. It gates draft creation, not the manual publish action:
@@ -202,8 +204,14 @@ Example:
 ```sh
 python3 -B support/release/build-release.py --tag v0.1.0-testnet.1 \
   --repository-id 123456789 --macos-binary /tmp/macos-astatine \
-  --linux-binary /tmp/linux-astatine --output-dir /tmp/astatine-release-out
+  --linux-binary /tmp/linux-astatine --output-dir /tmp/astatine-release-out \
+  --rustc-version "rustc 1.94.1 (e408947bf 2026-03-25)" \
+  --cargo-version "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
 ```
+
+The `--rustc-version`/`--cargo-version` values are the exact full lines observed
+in the read-only CI build jobs and are asserted again by the packager before any
+archive is written.
 
 ## Review history (superseded)
 

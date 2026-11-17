@@ -7,13 +7,18 @@
 # reviewer and a tag deployment rule. The workflow must fail closed when that
 # gate is absent and never weakens the gate. This file does not create the
 # gate. No stored credential is used beyond the default token where noted.
-# Candidate binaries are never executed in packaging; the builder only packs.
+# Candidate binaries are never executed in packaging or attestation; the builder
+# only packs and attest jobs only hash and attest the downloaded binary.
 # Manual owner publication remains outside this workflow because immutable
 # release administration requires a token the default token lacks.
-# Build binary attestations occur before environment approval but are
-# non-release build provenance; archive attestations and draft are
-# environment-gated in release-package/release-draft. Release-package verifies
-# binary attestations, so archive and draft are bound to compiled binaries;
+# Build jobs are read-only candidate execution (no OIDC/attestation write);
+# separate attest jobs hold OIDC/attestation write, download the raw binary,
+# verify its SHA-256 equals the build output, then attest without executing
+# the candidate or running repo scripts. Build binary attestations occur before
+# environment approval but are non-release build provenance; archive
+# attestations and draft are environment-gated in release-package/release-draft.
+# Release-package verifies binary attestations and build-output hashes, so
+# archive and draft are bound to compiled binaries;
 # archive attestation alone does not prove compilation.
 # Provenance records owner-authorized release intent with final controls
 # outstanding; it does not authorize final publication.
@@ -126,11 +131,51 @@ jobs:
       - name: Verify fixture provenance
         run: |
           set -euo pipefail
-          python3 -B support/verify-fixture-provenance.py
+          python3 -B support/verify-fixture-provenance.py > "$RUNNER_TEMP/fixture-provenance.json"
+          python3 - "$RUNNER_TEMP/fixture-provenance.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+          path = pathlib.Path(sys.argv[1])
+          data = json.loads(path.read_text(encoding="utf-8"))
+          if data.get("schema") != "astatine-fixture-provenance/v3":
+              print("fixture provenance schema must be astatine-fixture-provenance/v3 (blocked v1 rejected)", file=sys.stderr)
+              sys.exit(1)
+          if data.get("release_intent_authorized") is not True:
+              print("fixture provenance release_intent_authorized must be exactly true", file=sys.stderr)
+              sys.exit(1)
+          if data.get("publication_authorized") is not False:
+              print("fixture provenance publication_authorized must be exactly false", file=sys.stderr)
+              sys.exit(1)
+          if data.get("final_release_controls_complete") is not False:
+              print("fixture provenance final_release_controls_complete must be exactly false", file=sys.stderr)
+              sys.exit(1)
+          print("fixture provenance release intent authorized; final publication not authorized")
+          PY
       - name: Verify distribution inventory
         run: |
           set -euo pipefail
-          python3 -B support/verify-distribution-inventory.py
+          python3 -B support/verify-distribution-inventory.py > "$RUNNER_TEMP/distribution-inventory.json"
+          python3 - "$RUNNER_TEMP/distribution-inventory.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+          path = pathlib.Path(sys.argv[1])
+          data = json.loads(path.read_text(encoding="utf-8"))
+          if data.get("schema") != "astatine-distribution-inventory/v3":
+              print("distribution inventory schema must be astatine-distribution-inventory/v3 (blocked v1 rejected)", file=sys.stderr)
+              sys.exit(1)
+          if data.get("release_intent_authorized") is not True:
+              print("distribution inventory release_intent_authorized must be exactly true", file=sys.stderr)
+              sys.exit(1)
+          if data.get("publication_authorized") is not False:
+              print("distribution inventory publication_authorized must be exactly false", file=sys.stderr)
+              sys.exit(1)
+          if data.get("final_release_controls_complete") is not False:
+              print("distribution inventory final_release_controls_complete must be exactly false", file=sys.stderr)
+              sys.exit(1)
+          print("distribution inventory release intent authorized; final publication not authorized")
+          PY
       - name: Verify exact-commit hosted checks
         env:
           GH_TOKEN: ${{ github.token }}
@@ -188,8 +233,10 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-      id-token: write
-      attestations: write
+    outputs:
+      binary_sha256: ${{ steps.record-hash.outputs.binary_sha256 }}
+      rustc_version: ${{ steps.observe-toolchain.outputs.rustc_version }}
+      cargo_version: ${{ steps.observe-toolchain.outputs.cargo_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -209,6 +256,16 @@ jobs:
           set -euo pipefail
           rustup toolchain install 1.94.1 --profile minimal
           test "$(rustc --version | awk '{print $2}')" = "1.94.1"
+      - name: Observe pinned toolchain versions
+        id: observe-toolchain
+        run: |
+          set -euo pipefail
+          rustc_line="$(rustc --version)"
+          cargo_line="$(cargo --version)"
+          test "$rustc_line" = "rustc 1.94.1 (e408947bf 2026-03-25)"
+          test "$cargo_line" = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
+          printf 'rustc_version=%s\n' "$rustc_line" >> "$GITHUB_OUTPUT"
+          printf 'cargo_version=%s\n' "$cargo_line" >> "$GITHUB_OUTPUT"
       - name: Build locked release binary
         run: cargo build --locked --release
       - name: Smoke test release binary
@@ -223,13 +280,14 @@ jobs:
           codesign --verify --strict --verbose=4 ./target/release/astatine
           file ./target/release/astatine
           otool -L ./target/release/astatine
-      # Build-provenance attestation for the raw compiled binary (pre-approval;
-      # not a release archive asset). Release archives are attested only after
-      # environment approval in release-draft.
-      - name: Attest raw macOS binary
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: target/release/astatine
+      - name: Record binary SHA-256
+        id: record-hash
+        run: |
+          set -euo pipefail
+          sha="$(shasum -a 256 target/release/astatine | cut -d' ' -f1)"
+          test -n "$sha"
+          printf 'binary_sha256=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          echo "binary sha256 recorded"
       - name: Upload macOS binary
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -245,8 +303,10 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-      id-token: write
-      attestations: write
+    outputs:
+      binary_sha256: ${{ steps.record-hash.outputs.binary_sha256 }}
+      rustc_version: ${{ steps.observe-toolchain.outputs.rustc_version }}
+      cargo_version: ${{ steps.observe-toolchain.outputs.cargo_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -267,6 +327,16 @@ jobs:
           rustup toolchain install 1.94.1 --profile minimal
           test "$(rustc --version | awk '{print $2}')" = "1.94.1"
           test "$(rustc -vV | awk '$1 == "host:" {print $2}')" = "x86_64-unknown-linux-gnu"
+      - name: Observe pinned toolchain versions
+        id: observe-toolchain
+        run: |
+          set -euo pipefail
+          rustc_line="$(rustc --version)"
+          cargo_line="$(cargo --version)"
+          test "$rustc_line" = "rustc 1.94.1 (e408947bf 2026-03-25)"
+          test "$cargo_line" = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
+          printf 'rustc_version=%s\n' "$rustc_line" >> "$GITHUB_OUTPUT"
+          printf 'cargo_version=%s\n' "$cargo_line" >> "$GITHUB_OUTPUT"
       - name: Build locked release binary
         run: cargo build --locked --release
       - name: Smoke test release binary
@@ -280,13 +350,14 @@ jobs:
           set -euo pipefail
           file ./target/release/astatine
           ldd ./target/release/astatine
-      # Build-provenance attestation for the raw compiled binary (pre-approval;
-      # not a release archive asset). Release archives are attested only after
-      # environment approval in release-draft.
-      - name: Attest raw Linux binary
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: target/release/astatine
+      - name: Record binary SHA-256
+        id: record-hash
+        run: |
+          set -euo pipefail
+          sha="$(sha256sum target/release/astatine | cut -d' ' -f1)"
+          test -n "$sha"
+          printf 'binary_sha256=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          echo "binary sha256 recorded"
       - name: Upload Linux binary
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -295,11 +366,87 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  attest-macos:
+    name: Attest macOS binary provenance
+    needs: build-macos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download macOS binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: astatine-macos-arm64
+          path: ${{ runner.temp }}/attest/macos
+      - name: Verify macOS binary hash matches build output
+        env:
+          EXPECTED_SHA256: ${{ needs.build-macos.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SHA256"
+          binary="$RUNNER_TEMP/attest/macos/astatine"
+          test -f "$binary"
+          actual="$(sha256sum "$binary" | cut -d' ' -f1)"
+          if [ "$actual" != "$EXPECTED_SHA256" ]; then
+            echo "macOS binary hash mismatch against build output" >&2
+            exit 1
+          fi
+          echo "macOS binary hash verified against build output"
+      # Build-provenance attestation for the raw compiled binary (pre-approval;
+      # not a release archive asset). Release archives are attested only after
+      # environment approval in release-draft.
+      - name: Attest raw macOS binary
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest/macos/astatine
+
+  attest-linux:
+    name: Attest Linux binary provenance
+    needs: build-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download Linux binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: astatine-linux-x86_64
+          path: ${{ runner.temp }}/attest/linux
+      - name: Verify Linux binary hash matches build output
+        env:
+          EXPECTED_SHA256: ${{ needs.build-linux.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SHA256"
+          binary="$RUNNER_TEMP/attest/linux/astatine"
+          test -f "$binary"
+          actual="$(sha256sum "$binary" | cut -d' ' -f1)"
+          if [ "$actual" != "$EXPECTED_SHA256" ]; then
+            echo "Linux binary hash mismatch against build output" >&2
+            exit 1
+          fi
+          echo "Linux binary hash verified against build output"
+      # Build-provenance attestation for the raw compiled binary (pre-approval;
+      # not a release archive asset). Release archives are attested only after
+      # environment approval in release-draft.
+      - name: Attest raw Linux binary
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest/linux/astatine
+
   release-package:
     name: Package and attest release bundle
     needs:
       - build-macos
       - build-linux
+      - attest-macos
+      - attest-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release
@@ -332,6 +479,29 @@ jobs:
         with:
           name: astatine-linux-x86_64
           path: ${{ runner.temp }}/retrieved/linux
+      - name: Verify binaries match build outputs
+        env:
+          EXPECTED_MACOS_SHA256: ${{ needs.build-macos.outputs.binary_sha256 }}
+          EXPECTED_LINUX_SHA256: ${{ needs.build-linux.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_MACOS_SHA256"
+          test -n "$EXPECTED_LINUX_SHA256"
+          macos_binary="$RUNNER_TEMP/retrieved/macos/astatine"
+          linux_binary="$RUNNER_TEMP/retrieved/linux/astatine"
+          test -f "$macos_binary"
+          test -f "$linux_binary"
+          actual_macos="$(sha256sum "$macos_binary" | cut -d' ' -f1)"
+          actual_linux="$(sha256sum "$linux_binary" | cut -d' ' -f1)"
+          if [ "$actual_macos" != "$EXPECTED_MACOS_SHA256" ]; then
+            echo "macOS binary hash mismatch against build output" >&2
+            exit 1
+          fi
+          if [ "$actual_linux" != "$EXPECTED_LINUX_SHA256" ]; then
+            echo "Linux binary hash mismatch against build output" >&2
+            exit 1
+          fi
+          echo "binaries verified against build outputs"
       - name: Re-verify protected environment before mutation
         env:
           RELEASE_TAG: ${{ inputs.tag }}
@@ -360,14 +530,20 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
           REPOSITORY_ID: ${{ github.repository_id }}
+          RUSTC_VERSION: ${{ needs.build-macos.outputs.rustc_version }}
+          CARGO_VERSION: ${{ needs.build-macos.outputs.cargo_version }}
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
           repo_id="$REPOSITORY_ID"
+          test -n "$RUSTC_VERSION"
+          test -n "$CARGO_VERSION"
+          test "$RUSTC_VERSION" = "rustc 1.94.1 (e408947bf 2026-03-25)"
+          test "$CARGO_VERSION" = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
           out="$RUNNER_TEMP/bundle-out"
           rm -rf "$out"
           mkdir -p "$out"
-          python3 -B support/release/build-release.py --tag "$tag" --repository-id "$repo_id" --macos-binary "$RUNNER_TEMP/retrieved/macos/astatine" --linux-binary "$RUNNER_TEMP/retrieved/linux/astatine" --output-dir "$out"
+          python3 -B support/release/build-release.py --tag "$tag" --repository-id "$repo_id" --macos-binary "$RUNNER_TEMP/retrieved/macos/astatine" --linux-binary "$RUNNER_TEMP/retrieved/linux/astatine" --output-dir "$out" --rustc-version "$RUSTC_VERSION" --cargo-version "$CARGO_VERSION"
           test -f "$out/astatine-$tag-macos-arm64.tar.gz"
           test -f "$out/astatine-$tag-linux-x86_64.tar.gz"
           test -f "$out/SHA256SUMS"

@@ -109,7 +109,7 @@ EXPECTED_PUSH_STATUS_SUPERSEDED_V3 = "SUPERSEDED \u2014 OWNER-AUTHORIZED RELEASE
 EXPECTED_PUSH_SUPERSEDED_BY_V3 = "release_intent_authorization"
 EXPECTED_PUSH_SUPERSEDED_ON = "2026-11-17"
 EXPECTED_COPYRIGHT_EMY = "Copyright (c) 2026 emyrinj"
-EXPECTED_SCRUB_PATHS = frozenset(
+EXPECTED_SCRUB_PATHS_V1 = frozenset(
     {
         "README.md",
         "MACOS_ARM64.md",
@@ -118,6 +118,28 @@ EXPECTED_SCRUB_PATHS = frozenset(
         "tests/fixtures/README.md",
     }
 )
+EXPECTED_SCRUB_PATHS_V3 = frozenset(
+    {
+        "README.md",
+        "MACOS_ARM64.md",
+        "src/protocol.rs",
+        "support/update-evm-test-fixtures.py",
+        "support/update-genesis-coordinator-fixture.py",
+        "tests/fixtures/README.md",
+    }
+)
+# Backwards-compatible alias: blocked v1 inventory uses V1; live v3 uses V3.
+EXPECTED_SCRUB_PATHS = EXPECTED_SCRUB_PATHS_V1
+EXPECTED_REGENERATION_SCRIPTS = frozenset(
+    {
+        "support/update-evm-test-fixtures.py",
+        "support/update-genesis-coordinator-fixture.py",
+    }
+)
+EXPECTED_REGENERATION_SCRIPT_BY_ID = {
+    "FIX-01": "support/update-evm-test-fixtures.py",
+    "FIX-02": "support/update-genesis-coordinator-fixture.py",
+}
 
 ATTESTED_RIGHTS = "OWNER-ATTESTED — not independently verified"
 EXPECTED_PUBLICATION_DECISION = (
@@ -655,6 +677,41 @@ def verify_fixture(root: Path, entry: dict) -> None:
         raise VerificationError(f"unknown fixture kind: {entry['kind']}")
 
 
+def verify_regeneration_script(root: Path, entry: dict) -> None:
+    """Verify a scripted regeneration entry against its recorded script hash.
+
+    Authorized v3 path only. The script must exist under the source root as a
+    regular confined file and its SHA-256 must equal the recorded
+    ``script_sha256``. Missing, non-regular, or mismatched scripts fail closed.
+    Blocked v1 behavior is unchanged (this helper is never called for v1).
+    """
+    regeneration = entry.get("regeneration", {})
+    require(isinstance(regeneration, dict), f"{entry.get('id', '?')} regeneration must be an object")
+    require(
+        regeneration.get("status") == "scripted",
+        f"{entry.get('id', '?')} regeneration status is not scripted",
+    )
+    script = regeneration.get("script")
+    expected_digest = regeneration.get("script_sha256")
+    require_string(script, f"{entry.get('id', '?')} regeneration script")
+    require_sha256(expected_digest, f"{entry.get('id', '?')} regeneration script_sha256")
+    require(
+        script in EXPECTED_REGENERATION_SCRIPTS,
+        f"{entry.get('id', '?')} regeneration script is not expected: {script}",
+    )
+    fixture_id = require_string(entry.get("id"), "regeneration fixture id")
+    require(
+        EXPECTED_REGENERATION_SCRIPT_BY_ID.get(fixture_id) == script,
+        f"{fixture_id} regeneration script mapping changed; expected "
+        f"{EXPECTED_REGENERATION_SCRIPT_BY_ID.get(fixture_id)!r}",
+    )
+    _, data = read_confined_bytes(root, script, f"regeneration script {entry.get('id', '?')}")
+    require(
+        sha256_hex(data) == expected_digest,
+        f"regeneration script SHA-256 changed for {entry.get('id', '?')}: {script}",
+    )
+
+
 def verify_inventory(root: Path) -> dict:
     _, inventory_bytes = read_confined_bytes(
         root, INVENTORY_PATH, "inventory", frozenset({INVENTORY_PATH})
@@ -849,6 +906,20 @@ def verify_inventory(root: Path) -> dict:
 
     for entry in entries:
         verify_fixture(root, entry)
+
+    if is_authorized:
+        # R7: every scripted regeneration entry must resolve to a regular
+        # confined file whose SHA-256 equals the recorded script_sha256.
+        scripted_ids = set()
+        for entry in entries:
+            regeneration = entry.get("regeneration", {})
+            if isinstance(regeneration, dict) and regeneration.get("status") == "scripted":
+                verify_regeneration_script(root, entry)
+                scripted_ids.add(require_string(entry.get("id"), "regeneration fixture id"))
+        require(
+            scripted_ids == set(EXPECTED_REGENERATION_SCRIPT_BY_ID),
+            "scripted regeneration coverage must include FIX-01 and FIX-02 with their expected scripts",
+        )
 
     documents = require_list(inventory.get("documents"), "documents")
     require(documents, "documents must not be empty")
@@ -1643,13 +1714,14 @@ def verify_inventory(root: Path) -> dict:
     marker_set = set(markers)
     scrub_paths = require_list(scrub["paths"], "scrub path list")
     require(scrub_paths, "scrub path list is empty")
+    expected_scrub_paths = EXPECTED_SCRUB_PATHS_V3 if is_authorized else EXPECTED_SCRUB_PATHS_V1
     checked_paths = []
     for index, relative in enumerate(scrub_paths):
         path = validate_relative_path(relative, f"scrub_policy paths[{index}]")
-        require(path in EXPECTED_SCRUB_PATHS, f"scrub path is not expected: {path}")
+        require(path in expected_scrub_paths, f"scrub path is not expected: {path}")
         checked_paths.append(path)
     require(len(set(checked_paths)) == len(checked_paths), "duplicate scrub paths")
-    require(set(checked_paths) == EXPECTED_SCRUB_PATHS, "scrub path inventory changed")
+    require(set(checked_paths) == expected_scrub_paths, "scrub path inventory changed")
     retained = require_object(
         scrub["retained_private_origin_reference"], "scrub_policy retained_private_origin_reference"
     )
@@ -1663,6 +1735,31 @@ def verify_inventory(root: Path) -> dict:
     )
     require_string(retained["status"], "retained_private_origin_reference status")
     require_string(retained["reason"], "retained_private_origin_reference reason")
+    if is_authorized:
+        # R8: the test-module private-origin comment was genericized; no
+        # production code changed. Blocked v1 retains the old status/reason.
+        require(
+            retained["status"] == "genericized",
+            "retained_private_origin_reference status must be genericized for v3",
+        )
+        _retained_reason = " ".join(str(retained["reason"]).lower().split())
+        require(
+            "genericized" in _retained_reason,
+            "retained_private_origin_reference reason must state the comment was genericized",
+        )
+        require(
+            "test" in _retained_reason,
+            "retained_private_origin_reference reason must reference the test-module comment",
+        )
+        require(
+            "no production code" in _retained_reason,
+            "retained_private_origin_reference reason must state no production code changed",
+        )
+        _scrub_note = " ".join(str(scrub["note"]).lower().split())
+        require(
+            "protocol" in _scrub_note and "test" in _scrub_note,
+            "scrub note must cover source/protocol test comments for v3",
+        )
 
     for relative in checked_paths:
         _, data = read_confined_bytes(root, relative, f"scrub path {relative}")

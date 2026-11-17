@@ -35,6 +35,8 @@ jobs and GitHub build provenance, not by this offline packager.
 Usage:
     python3 -B support/release/build-release.py --tag v0.1.0-testnet.1 \\
         --repository-id <digits> --macos-binary <path> --linux-binary <path> \\
+        --rustc-version "rustc 1.94.1 (e408947bf 2026-03-25)" \\
+        --cargo-version "cargo 1.94.1 (29ea6fb6a 2026-03-24)" \\
         --output-dir <new-or-empty-dir-outside-source>
 """
 
@@ -388,6 +390,8 @@ def generate_build_info(
     target: str,
     binary_sha256: str,
     binary_bytes: int,
+    rustc_version: str,
+    cargo_version: str,
     gate: dict,
 ) -> bytes:
     how_to_obtain = f"git clone https://github.com/{repository}.git && git checkout {tag}"
@@ -413,11 +417,19 @@ def generate_build_info(
             "command": EXPECTED_CARGO_COMMAND,
             "command_is_documented": True,
             "verified_by_this_script": False,
-            "rustc_version": EXPECTED_RUSTC_VERSION_LINE,
-            "cargo_version": EXPECTED_CARGO_VERSION_LINE,
+            "rustc_version": rustc_version,
+            "cargo_version": cargo_version,
             "cargo_lock_sha256": cargo_lock_sha256,
             "pinned_toolchain": EXPECTED_TOOLCHAIN,
-            "toolchain_observation": "pinned expected lines; CI build jobs install and assert Rust/Cargo 1.94.1; this offline packager does not independently re-observe the toolchain",
+            "toolchain_observation": "exact version lines observed in the CI build jobs and asserted again by this offline packager against the pinned 1.94.1 lines; the packager did not independently execute rustc or cargo",
+        },
+        "toolchain": {
+            "rustc": rustc_version,
+            "cargo": cargo_version,
+            "pinned": EXPECTED_TOOLCHAIN,
+            "rustc_version": rustc_version,
+            "cargo_version": cargo_version,
+            "pinned_toolchain": EXPECTED_TOOLCHAIN,
         },
         "corresponding_source": {
             "repository": repository,
@@ -612,6 +624,12 @@ not been independently verified.
     return text.encode("utf-8")
 
 
+def require_toolchain_line(value: object, label: str, expected: str) -> str:
+    line = require_string(value, label)
+    require(line == expected, f"{label} must be exactly {expected!r}")
+    return line
+
+
 def run(
     *,
     source_root: Path,
@@ -620,11 +638,15 @@ def run(
     repository_id: str,
     macos_binary: Path,
     linux_binary: Path,
+    rustc_version: str | None = None,
+    cargo_version: str | None = None,
 ) -> dict:
     require_string(tag, "--tag")
     require_string(repository_id, "--repository-id")
     require(re.fullmatch(r"[0-9]+", repository_id) is not None, "--repository-id must be digits")
     require(tag == RELEASE_NOTES_TAG, f"--tag must be exactly {RELEASE_NOTES_TAG}")
+    rustc_version = require_toolchain_line(rustc_version, "--rustc-version", EXPECTED_RUSTC_VERSION_LINE)
+    cargo_version = require_toolchain_line(cargo_version, "--cargo-version", EXPECTED_CARGO_VERSION_LINE)
     try:
         resolved_root = source_root.resolve(strict=False)
     except (OSError, ValueError, RuntimeError):
@@ -711,6 +733,8 @@ def run(
             target=target,
             binary_sha256=sha256_hex(binary_data),
             binary_bytes=len(binary_data),
+            rustc_version=rustc_version,
+            cargo_version=cargo_version,
             gate=gate,
         )
         install_md = generate_install_md(
@@ -807,6 +831,14 @@ def run(
         "package_name": EXPECTED_PACKAGE_NAME,
         "package_version": package_version,
         "cargo_lock_sha256": lock_sha,
+        "toolchain": {
+            "rustc": rustc_version,
+            "cargo": cargo_version,
+            "pinned": EXPECTED_TOOLCHAIN,
+            "rustc_version": rustc_version,
+            "cargo_version": cargo_version,
+            "pinned_toolchain": EXPECTED_TOOLCHAIN,
+        },
         "targets": [MACOS_TARGET, LINUX_TARGET],
         "archives": outputs,
         "gate": {
@@ -865,6 +897,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repository-id", required=True, help="numeric GitHub repository id")
     parser.add_argument("--macos-binary", required=True, type=Path, help="path to prebuilt macOS ARM64 binary")
     parser.add_argument("--linux-binary", required=True, type=Path, help="path to prebuilt Linux x86_64 binary")
+    parser.add_argument("--rustc-version", required=True, help="exact `rustc --version` line observed in the CI build jobs")
+    parser.add_argument("--cargo-version", required=True, help="exact `cargo --version` line observed in the CI build jobs")
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -876,6 +910,8 @@ def main(argv: list[str] | None = None) -> int:
             repository_id=args.repository_id,
             macos_binary=args.macos_binary,
             linux_binary=args.linux_binary,
+            rustc_version=args.rustc_version,
+            cargo_version=args.cargo_version,
         )
     except ReleaseError as error:
         print(json.dumps({"status": "FAIL", "error": str(error)}, indent=2), file=sys.stderr)

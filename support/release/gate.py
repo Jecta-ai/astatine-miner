@@ -33,6 +33,10 @@ from pathlib import Path, PurePosixPath
 PROVENANCE_REL = "tests/fixtures/PROVENANCE.json"
 INVENTORY_REL = "support/release/distribution-inventory.json"
 CARGO_TOML_REL = "Cargo.toml"
+EXPECTED_REGENERATION_SCRIPTS = {
+    "FIX-01": "support/update-evm-test-fixtures.py",
+    "FIX-02": "support/update-genesis-coordinator-fixture.py",
+}
 REPOSITORY_REL = "support/release-repository.txt"
 
 # ---------------------------------------------------------------------------
@@ -665,6 +669,55 @@ def _validate_blocked(
     }
 
 
+def _verify_regeneration_scripts(root: Path, provenance: dict) -> None:
+    """R7: scripted fixture entries must resolve to the expected script and hash.
+
+    The packager and distribution gate must fail closed if a recorded
+    regeneration script is missing, swapped, or changed after its SHA-256 was
+    recorded. Blocked-v1 behavior is handled by the separate blocked validator.
+    """
+    fixtures = require_list(provenance.get("fixtures"), "provenance fixtures")
+    seen: dict[str, str] = {}
+    for index, entry in enumerate(fixtures):
+        entry = require_object(entry, f"provenance fixtures[{index}]")
+        fixture_id = require_string(entry.get("id"), f"provenance fixtures[{index}] id")
+        if fixture_id not in EXPECTED_REGENERATION_SCRIPTS:
+            continue
+        regeneration = require_object(
+            entry.get("regeneration"), f"provenance fixtures[{index}] regeneration"
+        )
+        require(
+            regeneration.get("status") == "scripted",
+            f"{fixture_id} regeneration status must be scripted",
+        )
+        script = require_string(
+            regeneration.get("script"), f"provenance fixtures[{index}] regeneration script"
+        )
+        require(
+            script == EXPECTED_REGENERATION_SCRIPTS[fixture_id],
+            f"{fixture_id} regeneration script changed; expected {EXPECTED_REGENERATION_SCRIPTS[fixture_id]}",
+        )
+        digest = require_string(
+            regeneration.get("script_sha256"),
+            f"provenance fixtures[{index}] regeneration script_sha256",
+        )
+        require(
+            re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
+            f"{fixture_id} regeneration script_sha256 must be lowercase hex",
+        )
+        data = read_confined_bytes(root, script, f"regeneration script {fixture_id}")
+        require(
+            hashlib.sha256(data).hexdigest() == digest,
+            f"regeneration script SHA-256 changed for {fixture_id}: {script}",
+        )
+        seen[fixture_id] = script
+    require(
+        set(seen) == set(EXPECTED_REGENERATION_SCRIPTS)
+        and set(seen.values()) == set(EXPECTED_REGENERATION_SCRIPTS.values()),
+        "scripted regeneration coverage must include FIX-01 and FIX-02 with their expected scripts",
+    )
+
+
 def _validate_release_intent(
     root: Path, provenance: dict, inventory: dict
 ) -> dict:
@@ -850,6 +903,7 @@ def _validate_release_intent(
             require(license_text in AUTHORIZED_LEGAL_ARTIFACT_PATHS, f"provenance fixtures[{index}] license_text is not an authorized legal artifact: {license_text}")
             require_string(license_info.get("copyright"), f"provenance fixtures[{index}] license copyright")
     require(set(provenance_paths) == set(AUTHORIZED_FIXTURE_PATHS), "fixture set in PROVENANCE.json changed; refusing to authorize against a moved gate")
+    _verify_regeneration_scripts(root, provenance)
     require(set(fixture_strings) == set(provenance_paths), "inventory fixture_paths do not match the fixture set in tests/fixtures/PROVENANCE.json")
 
     # Legal artifacts: all four must exist, match hashes, and carry markers.
