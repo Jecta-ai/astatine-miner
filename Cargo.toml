@@ -45,6 +45,7 @@ quircs = "=0.10.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"
+signal-hook = "=0.3.18"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "=3.6.3", default-features = false, features = ["crypto-rust", "sync-secret-service", "vendored"] }
