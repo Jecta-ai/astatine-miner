@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import pathlib
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -392,8 +395,8 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
 
     def test_auto_publish_draft_false_rejected(self) -> None:
         mutated = self.real_text.replace(
-            "Draft verified; manual owner publication remains required",
-            "Draft verified; manual owner publication remains required --draft=false",
+            "Draft verified; owner self-approval publication remains required",
+            "Draft verified; owner self-approval publication remains required --draft=false",
             1,
         )
         self.assertReleaseFails(mutated, "draft")
@@ -512,11 +515,13 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertReleaseFails(mutated, "protected-environment")
 
     def test_tag_policy_safe_forms_required(self) -> None:
-        # M2: validator in preflight/package + inline series/exact in draft; no broad v*.
+        # M2: validator in preflight/package + inline exact-tag in draft; no wildcard.
         self.assertIn("support/release/verify-protected-environment.py", self.real_text)
-        self.assertIn('"v0.1.0-testnet.*"', self.real_text)
+        self.assertIn('"v0.1.0-testnet.2"', self.real_text)
+        self.assertNotIn('"v0.1.0-testnet.*"', self.real_text)
         self.assertNotIn('"v*",', self.real_text)
         self.assertIn("deployment-branch-policies", self.real_text)
+        self.assertIn("total_count", self.real_text)
 
     def test_broad_tag_policy_star_rejected(self) -> None:
         # Adding a broad v* policy inline must fail closed.
@@ -704,17 +709,17 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
     def test_m2_unknown_type_second_policy_rejected(self) -> None:
         # OR policies: a second entry with unknown/missing type must fail closed.
         # Simulate by duplicating the single policy with an unknown-type sibling.
-        anchor = 'allowed_names = {"v0.1.0-testnet.*", tag}'
+        anchor = "if total_count != 1:"
         assert anchor in self.real_text
         mutated = self.real_text.replace(
-            "if len(policies) != 1:",
-            'policies = policies + [{"type": "unknown"}]\n          if len(policies) != 1:',
+            anchor,
+            'policies = policies + [{"type": "unknown"}]\n          if total_count != 1:',
             1,
         )
-        # The workflow itself is unchanged in allowlist, but the test documents the
-        # exact-count requirement: any second entry must be rejected by len==1.
-        # Directly assert the workflow enforces exact count.
-        self.assertIn("if len(policies) != 1:", self.real_text)
+        # The workflow itself is unchanged in the exact-tag policy, but the test
+        # documents the exact-count requirement: any second entry must be
+        # rejected by the total_count/len check.
+        self.assertIn(anchor, self.real_text)
         # Mutating to allow two policies must fail (hash mismatch at minimum, policy ideally).
         try:
             CHECKER.validate_release_workflow(mutated, self.temp_copy(mutated))
@@ -1009,6 +1014,288 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             CHECKER.RELEASE_WORKFLOW_SHA256,
         )
         self.assertIn("--print-release-sha256", pathlib.Path(CHECKER_PATH).read_text(encoding="utf-8"))
+
+    def _draft_env_inline_script(self) -> str:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        steps = parsed["jobs"]["release-draft"]["steps"]
+        run = next(
+            step["run"]
+            for step in steps
+            if step.get("name") == "Re-verify protected environment before mutation"
+        )
+        marker = "<<'PY'\n"
+        self.assertIn(marker, run)
+        return run.split(marker, 1)[1].rsplit("\nPY\n", 1)[0]
+
+    def _run_draft_env_inline(self, env: dict, policies: dict) -> subprocess.CompletedProcess:
+        tag = "v0.1.0-testnet.2"
+        env_path = self.tmp / "inline-env.json"
+        policies_path = self.tmp / "inline-policies.json"
+        env_path.write_text(json.dumps(env), encoding="utf-8")
+        policies_path.write_text(json.dumps(policies), encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, "-", str(env_path), str(policies_path), tag],
+            input=self._draft_env_inline_script(),
+            capture_output=True,
+            text=True,
+        )
+
+    @staticmethod
+    def _valid_inline_env() -> dict:
+        return {
+            "name": "release",
+            "can_admins_bypass": False,
+            "prevent_self_review": False,
+            "protection_rules": [
+                {
+                    "type": "required_reviewers",
+                    "prevent_self_review": False,
+                    "reviewers": [
+                        {"type": "User", "reviewer": {"login": "emyrinj", "id": 86115037}}
+                    ],
+                }
+            ],
+            "deployment_branch_policy": {
+                "protected_branches": False,
+                "custom_branch_policies": True,
+            },
+        }
+
+    @staticmethod
+    def _valid_inline_policies() -> dict:
+        return {
+            "total_count": 1,
+            "branch_policies": [{"type": "tag", "name": "v0.1.0-testnet.2"}],
+        }
+
+    def test_draft_inline_env_accepts_owner_self_approval(self) -> None:
+        result = self._run_draft_env_inline(self._valid_inline_env(), self._valid_inline_policies())
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_draft_inline_env_rejects_non_owner_reviewer(self) -> None:
+        env = self._valid_inline_env()
+        env["protection_rules"][0]["reviewers"][0]["reviewer"]["id"] = 25130814
+        result = self._run_draft_env_inline(env, self._valid_inline_policies())
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_env_rejects_prevent_self_review_true(self) -> None:
+        env = self._valid_inline_env()
+        env["protection_rules"][0]["prevent_self_review"] = True
+        result = self._run_draft_env_inline(env, self._valid_inline_policies())
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_env_rejects_wildcard_policy(self) -> None:
+        policies = {
+            "total_count": 1,
+            "branch_policies": [{"type": "tag", "name": "v0.1.0-testnet.*"}],
+        }
+        result = self._run_draft_env_inline(self._valid_inline_env(), policies)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_env_rejects_pagination_mismatch(self) -> None:
+        policies = self._valid_inline_policies()
+        policies["total_count"] = 2
+        result = self._run_draft_env_inline(self._valid_inline_env(), policies)
+        self.assertNotEqual(result.returncode, 0)
+
+    def _draft_ruleset_inline_script(self) -> str:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        steps = parsed["jobs"]["release-draft"]["steps"]
+        run = next(
+            step["run"]
+            for step in steps
+            if step.get("name") == "Re-verify split tag rulesets before draft"
+        )
+        marker = 'python3 - "$creation_out" "$immutability_out" "$repo" "$tag" <<\'PY\'\n'
+        self.assertIn(marker, run)
+        return run.split(marker, 1)[1].rsplit("\nPY\n", 1)[0]
+
+    @staticmethod
+    def _valid_creation_ruleset() -> dict:
+        return {
+            "name": "astatine-release-tag-creation",
+            "target": "tag",
+            "source_type": "Repository",
+            "source": "Jecta-ai/astatine-miner",
+            "enforcement": "active",
+            "conditions": {
+                "ref_name": {"include": ["refs/tags/v0.1.0-testnet.2"], "exclude": []}
+            },
+            "rules": [{"type": "creation"}],
+            "bypass_actors": [
+                {"actor_id": 86115037, "actor_type": "User", "bypass_mode": "always"}
+            ],
+        }
+
+    @staticmethod
+    def _valid_immutability_ruleset() -> dict:
+        return {
+            "name": "astatine-release-tags",
+            "target": "tag",
+            "source_type": "Repository",
+            "source": "Jecta-ai/astatine-miner",
+            "enforcement": "active",
+            "conditions": {
+                "ref_name": {
+                    "include": [
+                        "refs/tags/v0.1.0-testnet.0",
+                        "refs/tags/v0.1.0-testnet.1",
+                        "refs/tags/v0.1.0-testnet.2",
+                    ],
+                    "exclude": [],
+                }
+            },
+            "rules": [
+                {"type": "update"},
+                {"type": "deletion"},
+                {"type": "non_fast_forward"},
+            ],
+            "bypass_actors": [],
+        }
+
+    def _run_draft_ruleset_inline(self, creation: dict, immutability: dict) -> subprocess.CompletedProcess:
+        creation_path = self.tmp / "inline-creation.json"
+        immutability_path = self.tmp / "inline-immutability.json"
+        creation_path.write_text(json.dumps(creation), encoding="utf-8")
+        immutability_path.write_text(json.dumps(immutability), encoding="utf-8")
+        return subprocess.run(
+            [
+                sys.executable,
+                "-",
+                str(creation_path),
+                str(immutability_path),
+                "Jecta-ai/astatine-miner",
+                "v0.1.0-testnet.2",
+            ],
+            input=self._draft_ruleset_inline_script(),
+            capture_output=True,
+            text=True,
+        )
+
+    def test_draft_inline_rulesets_accept_split_owner_model(self) -> None:
+        result = self._run_draft_ruleset_inline(
+            self._valid_creation_ruleset(), self._valid_immutability_ruleset()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_draft_inline_rulesets_accept_creation_never_caller_bypass(self) -> None:
+        creation = self._valid_creation_ruleset()
+        creation["current_user_can_bypass"] = "never"
+        result = self._run_draft_ruleset_inline(
+            creation, self._valid_immutability_ruleset()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_draft_inline_rulesets_reject_creation_bypass_removal(self) -> None:
+        creation = self._valid_creation_ruleset()
+        creation["bypass_actors"] = []
+        result = self._run_draft_ruleset_inline(
+            creation, self._valid_immutability_ruleset()
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_rulesets_reject_2_only_immutability_scope(self) -> None:
+        immutability = self._valid_immutability_ruleset()
+        immutability["conditions"]["ref_name"]["include"] = [
+            "refs/tags/v0.1.0-testnet.2"
+        ]
+        result = self._run_draft_ruleset_inline(
+            self._valid_creation_ruleset(), immutability
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def _draft_body_inline_script(self) -> str:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        steps = parsed["jobs"]["release-draft"]["steps"]
+        run = next(
+            step["run"]
+            for step in steps
+            if step.get("name") == "Create draft release with assets"
+        )
+        marker = 'python3 - "$RUNNER_TEMP/draft-release.json" "$tag" bundle/release-notes.md <<\'PY\'\n'
+        self.assertIn(marker, run)
+        return run.split(marker, 1)[1].split("\nPY\n", 1)[0]
+
+    def _run_draft_body_inline(self, body: str, is_draft: bool = True) -> subprocess.CompletedProcess:
+        data_path = self.tmp / "draft-release.json"
+        notes_path = self.tmp / "release-notes.md"
+        notes_path.write_text(body, encoding="utf-8")
+        data_path.write_text(
+            json.dumps(
+                {
+                    "isDraft": is_draft,
+                    "tagName": "v0.1.0-testnet.2",
+                    "body": body,
+                    "assets": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                "-",
+                str(data_path),
+                "v0.1.0-testnet.2",
+                str(notes_path),
+            ],
+            input=self._draft_body_inline_script(),
+            capture_output=True,
+            text=True,
+        )
+
+    def test_draft_inline_body_accepts_exact_match(self) -> None:
+        result = self._run_draft_body_inline("reviewed notes\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_draft_inline_body_rejects_mismatch(self) -> None:
+        notes_path = self.tmp / "release-notes.md"
+        notes_path.write_text("reviewed notes\n", encoding="utf-8")
+        data_path = self.tmp / "draft-release.json"
+        data_path.write_text(
+            json.dumps(
+                {
+                    "isDraft": True,
+                    "tagName": "v0.1.0-testnet.2",
+                    "body": "tampered notes\n",
+                    "assets": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-",
+                str(data_path),
+                "v0.1.0-testnet.2",
+                str(notes_path),
+            ],
+            input=self._draft_body_inline_script(),
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_body_rejects_non_draft(self) -> None:
+        result = self._run_draft_body_inline("reviewed notes\n", is_draft=False)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_rulesets_reject_immutability_bypass(self) -> None:
+        immutability = self._valid_immutability_ruleset()
+        immutability["bypass_actors"] = [
+            {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+        ]
+        result = self._run_draft_ruleset_inline(
+            self._valid_creation_ruleset(), immutability
+        )
+        self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

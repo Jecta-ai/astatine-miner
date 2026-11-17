@@ -23,7 +23,7 @@ DRY_RUN_WORKFLOW_FILENAME = "linux-release-dry-run.yml"
 RELEASE_WORKFLOW_FILENAME = "release.yml"
 # Pinned SHA-256 of .github/workflows/release.yml. Update only after review.
 # Recompute with: python3 -B support/check_workflow_pins.py --print-release-sha256
-RELEASE_WORKFLOW_SHA256 = "2b66efa3b33a0722ccbea5dea57012d72fd869336ba16ad9b30afa88ef3b01f3"
+RELEASE_WORKFLOW_SHA256 = "41ab7c95e6f9753d8a0a67f60b522d90027f06afa7d05932c8b354acc5d93d57"
 PINNED_RELEASE_ACTIONS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
@@ -1078,8 +1078,13 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         raise AssertionError(f"{workflow}: gh release create must contain --draft (draft-only)")
     if "--draft --verify-tag" not in raw and "--verify-tag" not in raw:
         raise AssertionError(f"{workflow}: gh release create must contain --verify-tag")
-    if "cp support/release/RELEASE_NOTES-v0.1.0-testnet.1.md" not in raw:
-        raise AssertionError(f"{workflow}: release package must copy the reviewed testnet notes into the bundle")
+    if (
+        'git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.2.md"' not in raw
+        or 'cp "$tagged_notes" "$out/release-notes.md"' not in raw
+    ):
+        raise AssertionError(
+            f"{workflow}: release package must copy the reviewed .2 notes from the exact tag into the bundle"
+        )
     if "--notes-file bundle/release-notes.md" not in raw:
         raise AssertionError(f"{workflow}: release draft must use bundle/release-notes.md for draft notes")
     if re.search(r"\bgh\s+release\s+create\b[^\n]*\bgit\b", raw, re.IGNORECASE):
@@ -1184,29 +1189,64 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     ):
         if required not in raw:
             raise AssertionError(f"{workflow}: release workflow must contain protected-environment marker {required!r}")
-    # M2: validator in preflight/package enforces series/exact; draft inline enforces
-    # series/exact with no broad v*. Broad *, **, empty, and other broader patterns rejected.
-    if '"v*"' in raw and '"v0.1.0-testnet.*"' not in raw.replace('"v*"', ''):
-        # Allow series pattern but forbid bare broad v* (exact string with comma or brace context)
-        pass
-    # Forbid bare broad v* allowlist entry (exact "v*" as a standalone policy name)
+    # M2: the .2 policy is exact-tag only. The environment deployment policy,
+    # the inline draft check, and the offline validator must all reject
+    # wildcards and require the exact current tag.
     if '"v*", ' in raw or '{"v*"' in raw or ', "v*"' in raw:
-        raise AssertionError(f"{workflow}: release workflow must not accept broad v* tag policy (M2: series/exact only)")
-    if 'allowed_names = {"v0.1.0-testnet.*", tag}' not in raw:
-        raise AssertionError(f"{workflow}: release-draft inline check must require series/exact allowlist (M2)")
-    # M2 OR policy: exactly one tag policy, no second tag or branch (policies are OR).
+        raise AssertionError(f"{workflow}: release workflow must not accept broad v* tag policy (M2: exact tag only)")
+    if '"v0.1.0-testnet.*"' in raw:
+        raise AssertionError(f"{workflow}: release workflow must not accept a series wildcard tag policy for .2 (M2: exact tag only)")
     for required in (
         "tag policies must be exactly one",
         "branch policies must be empty",
-        "tag policy name not in series/exact allowlist",
         "tag policy entry must be an object",
         "tag policy type must be exactly tag",
         "tag policy name missing",
-        "allowed_names",
-        '"v0.1.0-testnet.*"',
+        "tag policy must be the exact tag, not a wildcard",
+        "tag policy name must be exactly the release tag",
+        "total_count",
+        "policies total_count does not match the returned list",
+        "policies JSON must contain exactly one policy array field",
     ):
         if required not in raw:
-            raise AssertionError(f"{workflow}: release workflow must enforce single-tag OR policy {required!r} (M2)")
+            raise AssertionError(f"{workflow}: release workflow must enforce exact-tag and pagination policy {required!r} (M2)")
+    for required in (
+        "EXPECTED_RELEASE_TAG: \"v0.1.0-testnet.2\"",
+        "EXPECTED_RELEASE_VERSION: \"0.1.0-testnet.2\"",
+        "owner self-approval",
+        "no independent review",
+        "must record accepted residual risk",
+        "must record the compromised-owner tradeoff",
+        "must be owner-attested",
+        "must not claim independent verification",
+        "prevent_self_review must be exactly false",
+        "reviewer id must be the immutable owner id 86115037",
+        "reviewer login must be the owner login",
+        "environment name must be exactly release",
+        "total_count must be an integer",
+        "rulesets?includes_parents=true&per_page=100",
+        "verify-tag-ruleset.py",
+        "creation-ruleset-json",
+        "immutability-ruleset-json",
+        "astatine-release-tag-creation",
+        "astatine-release-tags",
+        "exactly the two active split tag rulesets",
+        "creation ruleset must retain exactly the creation rule",
+        "immutability ruleset must use exactly update/deletion/non-fast-forward",
+        "Creation protection is never removed",
+        "GitHub returns bypass_actors only to callers with write access",
+        "a draft or release already exists",
+        "created release is not a draft",
+        "created draft body does not exactly match the reviewed release notes",
+        "tagged-release-notes.md",
+        "git show \"refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.2.md\"",
+        'test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"',
+        "head_repository",
+        "does not belong to the canonical repository",
+        "exact-commit run total_count",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must enforce owner/exact-tag/immutability marker {required!r}")
     # Canonical repository enforcement (fail closed on forks).
     for required in (
         '"Jecta-ai/astatine-miner"',
@@ -1262,7 +1302,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "must not claim publication authorization or a release approver",
         '["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]',
         "provenance archive sha256 mismatch",
-        "Draft verified; manual owner publication remains required",
+        "Draft verified; owner self-approval publication remains required",
         "owner-authorized release intent",
         "final controls",
     ):
@@ -1300,6 +1340,10 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     # B1: per-job exact tag identity immediately after every checkout.
     # preflight + 2 builds + release-package each assert HEAD, tag^{}, describe.
     # Attest jobs have no checkout and must not assert tag identity.
+    if re.search(r"remove\s+(?:the\s+)?creation\s+rule", raw, re.IGNORECASE):
+        raise AssertionError(
+            f"{workflow}: release workflow must not remove tag creation protection; creation is a separate restricted ruleset"
+        )
     if raw.count("Assert exact tag identity") != 4:
         raise AssertionError(f"{workflow}: release workflow must assert exact tag identity after every checkout exactly 4x (B1: preflight+2 builds+package, none in attest/draft), got {raw.count('Assert exact tag identity')}")
     for required in (

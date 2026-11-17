@@ -2,12 +2,20 @@
 """Offline bounded validator for the release environment and tag policies.
 
 Validates actual GitHub environment/tag-protection JSON snapshots against the
-fail-closed release requirements without network access. GitHub deployment
-branch and tag policies combine with OR, so the policies snapshot must contain
-exactly one policy and that policy must be the narrow release tag rule;
-anything broader fails closed. Reads only the two JSON files given on the
-command line, prints only safe booleans and field names (never reviewer
-identities or full JSON), and exits 0 on PASS or 1 on any failure.
+fail-closed, version-scoped owner self-approval requirements without network
+access. GitHub deployment branch and tag policies combine with OR, so the
+policies snapshot must contain exactly one policy and that policy must be the
+exact current release tag; anything broader fails closed. The deployment-policy
+response must include a ``total_count`` that equals the number of returned
+policies so a paginated response cannot hide a second, broadening policy.
+
+The required reviewer is pinned to the owner's immutable numeric GitHub user id
+(86115037) and login. ``prevent_self_review`` must be exactly false because the
+owner explicitly authorized owner self-approval; this is a documented reduction
+in separation of duties, not independent review. Admin bypass must be false and
+the environment must use custom tag policies. Reads only the two JSON files
+given on the command line, prints only safe booleans and field names (never
+reviewer identities or full JSON), and exits 0 on PASS or 1 on any failure.
 Stdlib-only and offline.
 
 Usage:
@@ -18,13 +26,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import json
+import re
 import sys
 from pathlib import Path
 
-ALLOWED_TAG_PATTERN = "v0.1.0-testnet.*"
-REJECTED_TAG_POLICIES = frozenset({"v*", "*", "**"})
+EXPECTED_RELEASE_TAG = "v0.1.0-testnet.2"
+EXPECTED_REVIEWER_ID = 86115037
+EXPECTED_REVIEWER_LOGIN = "emyrinj"
+RELEASE_TAG_PATTERN = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+-testnet\.[0-9]+$")
 
 
 class ProtectedEnvironmentError(Exception):
@@ -55,9 +65,15 @@ def _is_nonempty_string(value: object) -> bool:
     return isinstance(value, str) and bool(value)
 
 
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def validate_environment(data: object) -> dict:
     require(isinstance(data, dict), "environment JSON must be an object")
     env = data
+    require("name" in env, "environment JSON is missing field: name")
+    require(env["name"] == "release", "environment name must be exactly release")
     require("can_admins_bypass" in env, "environment JSON is missing field: can_admins_bypass")
     require(env["can_admins_bypass"] is False, "can_admins_bypass must be false")
     require(
@@ -98,61 +114,106 @@ def validate_environment(data: object) -> dict:
     require("reviewers" in rule, "required_reviewers rule is missing field: reviewers")
     reviewers = rule["reviewers"]
     require(isinstance(reviewers, list) and reviewers, "reviewers must be a non-empty list")
-    def valid_reviewer(item: object) -> bool:
-        if _is_nonempty_string(item):
-            return True
-        if not isinstance(item, dict):
-            return False
-        if item.get("type") not in ("User", "Team"):
-            return False
-        reviewer = item.get("reviewer")
-        return isinstance(reviewer, (dict, str)) and bool(reviewer)
-
     require(
-        all(valid_reviewer(item) for item in reviewers),
-        "reviewers must be non-empty GitHub reviewer objects",
+        len(reviewers) == 1,
+        "reviewers must contain exactly the owner reviewer; team or additional reviewers are not accepted for owner self-approval",
     )
+    reviewer = reviewers[0]
+    require(isinstance(reviewer, dict), "reviewer entry must be an object")
+    require(reviewer.get("type") == "User", "reviewer type must be exactly User")
+    nested = reviewer.get("reviewer")
+    require(isinstance(nested, dict), "reviewer.reviewer must be an object")
+    reviewer_id = nested.get("id")
+    require(_is_int(reviewer_id), "reviewer id must be an integer")
+    require(
+        reviewer_id == EXPECTED_REVIEWER_ID,
+        "reviewer id must be the immutable owner id 86115037",
+    )
+    reviewer_login = nested.get("login")
+    require(_is_nonempty_string(reviewer_login), "reviewer login must be a non-empty string")
+    require(
+        reviewer_login == EXPECTED_REVIEWER_LOGIN,
+        "reviewer login must be the owner login",
+    )
+    # The owner model intentionally disables self-review prevention. Any True
+    # value at either level is rejected so the approval policy cannot drift.
     top_level = env.get("prevent_self_review")
-    rule_level = rule.get("prevent_self_review")
+    if top_level is not None:
+        require(
+            top_level is False,
+            "environment prevent_self_review must be false for the owner self-approval policy",
+        )
     require(
-        top_level is True or rule_level is True,
-        "prevent_self_review must be true",
+        "prevent_self_review" in rule,
+        "required_reviewers rule is missing field: prevent_self_review",
     )
-    return {"reviewer_rule_count": 1, "reviewer_count": len(reviewers)}
-
-
-def _policy_list(data: object) -> list:
-    """Extract the single deployment policy; fail closed on any broadening.
-
-    GitHub deployment branch and tag policies combine with OR, so any second
-    policy widens the gate. Exactly one policy must remain after parsing the
-    supported shapes (bare list, ``branch_policies`` mapping, or ``policies``
-    mapping).
-    """
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        for key in ("branch_policies", "policies"):
-            if key in data:
-                items = data[key]
-                require(isinstance(items, list), f"{key} must be a list")
-                break
-        else:
-            raise ProtectedEnvironmentError(
-                "policies JSON is missing field: branch_policies or policies"
-            )
-    else:
-        raise ProtectedEnvironmentError("policies JSON must be an object or a list")
     require(
-        len(items) == 1,
+        rule["prevent_self_review"] is False,
+        "required_reviewers prevent_self_review must be exactly false for owner self-approval",
+    )
+    return {
+        "reviewer_rule_count": 1,
+        "reviewer_count": 1,
+        "owner_reviewer_id_matched": True,
+        "prevent_self_review": False,
+        "owner_self_approval": True,
+        "independent_review": False,
+    }
+
+
+def _policy_list(data: object) -> tuple[list, int]:
+    """Extract the single deployment policy with a verified total count.
+
+    GitHub returns ``{"total_count": N, "branch_policies": [...]}``. The
+    pagination total is required: accepting a page without it could hide a
+    second policy on another page, and GitHub policies combine with OR.
+    """
+    require(isinstance(data, dict), "policies JSON must be an object")
+    require("total_count" in data, "policies JSON is missing field: total_count")
+    total_count = data["total_count"]
+    require(_is_int(total_count), "policies total_count must be an integer")
+    require(total_count >= 0, "policies total_count must not be negative")
+    present_keys = [
+        key
+        for key in ("branch_policies", "policies", "deployment_branch_policies")
+        if key in data
+    ]
+    require(
+        len(present_keys) == 1,
+        "policies JSON must contain exactly one policy array field; ambiguous shapes are rejected",
+    )
+    require(
+        set(data) == {"total_count", present_keys[0]},
+        "policies JSON contains unexpected fields; refusing an ambiguous shape",
+    )
+    items = data[present_keys[0]]
+    require(isinstance(items, list), "policies list must be a list")
+    require(
+        total_count == len(items),
+        "policies total_count does not match the returned policy list; refusing a partial paginated response",
+    )
+    require(
+        total_count == 1,
         "policies list must contain exactly one policy; branch and tag policies combine with OR",
     )
-    return items
+    require(
+        total_count <= 100,
+        "policies total_count exceeds the bounded per-page request; refusing ambiguous pagination",
+    )
+    return items, total_count
 
 
 def validate_policies(data: object, tag: str) -> dict:
     require(_is_nonempty_string(tag), "--tag must be a non-empty string")
-    items = _policy_list(data)
+    require(
+        tag == EXPECTED_RELEASE_TAG,
+        "release tag must be exactly the current candidate v0.1.0-testnet.2",
+    )
+    require(
+        RELEASE_TAG_PATTERN.fullmatch(tag) is not None,
+        "release tag does not match the required release-tag pattern",
+    )
+    items, total_count = _policy_list(data)
     policy = items[0]
     require(isinstance(policy, dict), "policies[0] must be an object")
     require(
@@ -162,18 +223,18 @@ def validate_policies(data: object, tag: str) -> dict:
     require(_is_nonempty_string(policy.get("name")), "policies[0] is missing field: name")
     name = policy["name"]
     require(
-        name not in REJECTED_TAG_POLICIES,
-        "policies[0] tag policy is overbroad and rejected",
+        not any(character in name for character in ("*", "?", "[", "]")),
+        "policies[0] tag policy must be the exact tag, not a wildcard pattern",
     )
     require(
-        name == ALLOWED_TAG_PATTERN or name == tag,
-        "policies[0] tag policy name must be exactly the allowed pattern or the exact release tag",
+        name == tag,
+        "policies[0] tag policy name must be exactly the release tag v0.1.0-testnet.2",
     )
-    require(
-        fnmatch.fnmatch(tag, ALLOWED_TAG_PATTERN),
-        "release tag does not match the allowed tag pattern",
-    )
-    return {"tag_policy_count": 1, "tag_policy_matched": name}
+    return {
+        "tag_policy_count": 1,
+        "tag_policy_matched": name,
+        "pagination_total_count": total_count,
+    }
 
 
 def verify(environment_path: Path, policies_path: Path, tag: str) -> dict:
@@ -186,18 +247,23 @@ def verify(environment_path: Path, policies_path: Path, tag: str) -> dict:
         "tag": tag,
         "environment_protected": True,
         "can_admins_bypass": False,
-        "prevent_self_review": True,
+        "prevent_self_review": False,
+        "owner_self_approval": True,
+        "independent_review": False,
+        "owner_reviewer_id_matched": True,
         "custom_branch_policies": True,
         "protected_branches": False,
         "reviewer_rule_count": env_summary["reviewer_rule_count"],
         "reviewer_count": env_summary["reviewer_count"],
         "tag_policy_matched": policy_summary["tag_policy_matched"],
+        "pagination_total_count_verified": True,
+        "pagination_total_count": policy_summary["pagination_total_count"],
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Offline validator for release environment and tag policies."
+        description="Offline validator for the owner self-approval release environment and exact tag policies."
     )
     parser.add_argument("--environment-json", required=True, type=Path)
     parser.add_argument("--policies-json", required=True, type=Path)

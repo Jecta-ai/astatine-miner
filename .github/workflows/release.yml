@@ -1,16 +1,39 @@
 # Release pipeline (manual dispatch only).
 #
-# Dispatch against the exact tag ref refs/tags/<tag> via workflow_dispatch.
-# Tag-protection ruleset verification is an independent external prerequisite;
-# this workflow never claims ruleset/tag protection is verified by its steps.
-# External prerequisite: the protected release gate must require a non-self
-# reviewer and a tag deployment rule. The workflow must fail closed when that
-# gate is absent and never weakens the gate. This file does not create the
-# gate. No stored credential is used beyond the default token where noted.
+# Dispatch against the exact tag ref refs/tags/v0.1.0-testnet.2 via
+# workflow_dispatch. The release is version-scoped: preflight rejects any other
+# tag so an older `.1` candidate cannot run under this owner self-approval
+# policy.
+#
+# Policy change: the protected `release` environment uses explicit owner
+# self-approval, not independent review. The owner reviewer is pinned by
+# immutable numeric GitHub user id 86115037 and login; prevent_self_review is
+# intentionally false; can_admins_bypass must be false; and the environment
+# deployment policy must be the exact tag, not a wildcard. This reduces
+# separation of duties and is documented as a security tradeoff in the release
+# notes and inventories; no independent review is claimed.
+#
+# Tag policy is enforced by two composable repository rulesets:
+# `astatine-release-tag-creation` (exactly the creation rule, exact .2 scope,
+# with one designated owner-user or repository-admin bypass for the controlled
+# owner/admin creation path) and `astatine-release-tags` (exactly
+# update/deletion/non-fast-forward with zero bypass actors, covering the
+# existing .0, .1 and .2 tags). Both must be active.
+# Creation protection is never removed or broadened. Immutable releases must
+# still be enabled by the owner/admin; this workflow does not verify that
+# repository setting.
+# The historical non-self reviewer requirement is superseded for .2 by the
+# explicit owner self-approval policy. The exact tag deployment policy remains
+# mandatory. Tag-ruleset verification is an external prerequisite enforced by
+# preflight; this file does not create or modify the gate. The workflow must
+# fail closed when the gate is absent and never weaken it. No stored credential
+# is used beyond the default token where noted.
 # Candidate binaries are never executed in packaging or attestation; the builder
 # only packs and attest jobs only hash and attest the downloaded binary.
 # Manual owner publication remains outside this workflow because immutable
-# release administration requires a token the default token lacks.
+# release administration may require a token beyond the default token. The draft
+# is mutable by any repository writer; pre-publication asset verification and
+# writer restriction are required to address draft asset substitution.
 # Build jobs are read-only candidate execution (no OIDC/attestation write);
 # separate attest jobs hold OIDC/attestation write, download the raw binary,
 # verify its SHA-256 equals the build output, then attest without executing
@@ -29,7 +52,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag for the exact tag ref (for example v0.1.0-testnet.1)
+        description: Exact release tag; must be v0.1.0-testnet.2 for this revision
         required: true
         type: string
 
@@ -43,6 +66,8 @@ concurrency:
 env:
   RUSTUP_TOOLCHAIN: "1.94.1"
   RELEASE_TAG: ${{ inputs.tag }}
+  EXPECTED_RELEASE_TAG: "v0.1.0-testnet.2"
+  EXPECTED_RELEASE_VERSION: "0.1.0-testnet.2"
 
 jobs:
   preflight:
@@ -75,6 +100,7 @@ jobs:
           test "$GITHUB_REPOSITORY" = "Jecta-ai/astatine-miner"
           test "$REPOSITORY_ID" = "1454137135"
           test -n "$RELEASE_TAG"
+          test "$RELEASE_TAG" = "$EXPECTED_RELEASE_TAG"
           test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
       - name: Verify protected release environment
         env:
@@ -87,8 +113,57 @@ jobs:
           env_out="$RUNNER_TEMP/release-env.json"
           policies_out="$RUNNER_TEMP/release-branch-policies.json"
           gh api "repos/$repo/environments/release" > "$env_out"
-          gh api "repos/$repo/environments/release/deployment-branch-policies" > "$policies_out"
+          gh api "repos/$repo/environments/release/deployment-branch-policies?per_page=100" > "$policies_out"
           python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag"
+      - name: Verify split tag rulesets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          tag="$EXPECTED_RELEASE_TAG"
+          rulesets_out="$RUNNER_TEMP/rulesets.json"
+          ids_out="$RUNNER_TEMP/tag-ruleset-ids.txt"
+          creation_out="$RUNNER_TEMP/tag-creation-ruleset.json"
+          immutability_out="$RUNNER_TEMP/tag-immutability-ruleset.json"
+          # GitHub returns bypass_actors only to callers with write access to the
+          # ruleset. Whether the default GITHUB_TOKEN has that access is not
+          # established by this revision; if the field is absent, the validator
+          # fails closed. No stored token/secret is added.
+          gh api "repos/$repo/rulesets?includes_parents=true&per_page=100" > "$rulesets_out"
+          python3 - "$rulesets_out" "$ids_out" <<'PY'
+          import json
+          import sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          if not isinstance(data, list) or len(data) >= 100:
+              print("rulesets response must be a bounded list", file=sys.stderr)
+              sys.exit(1)
+          expected = {"astatine-release-tag-creation", "astatine-release-tags"}
+          active_tag = [
+              item for item in data
+              if isinstance(item, dict)
+              and item.get("target") == "tag"
+              and item.get("enforcement") == "active"
+          ]
+          names = [item.get("name") for item in active_tag]
+          if sorted(names) != sorted(expected):
+              print("expected exactly the two active split tag rulesets; missing, extra, combined or broadened rulesets fail closed", file=sys.stderr)
+              sys.exit(1)
+          ids = {item["name"]: item.get("id") for item in active_tag}
+          for name, value in ids.items():
+              if not isinstance(value, int) or isinstance(value, bool):
+                  print("ruleset id must be an integer for " + name, file=sys.stderr)
+                  sys.exit(1)
+          with open(sys.argv[2], "w", encoding="utf-8") as handle:
+              handle.write("%s\n%s\n" % (ids["astatine-release-tag-creation"], ids["astatine-release-tags"]))
+          PY
+          { read -r creation_id; read -r immutability_id; } < "$ids_out"
+          test -n "$creation_id"
+          test -n "$immutability_id"
+          gh api "repos/$repo/rulesets/$creation_id" > "$creation_out"
+          gh api "repos/$repo/rulesets/$immutability_id" > "$immutability_out"
+          python3 -B support/release/verify-tag-ruleset.py --creation-ruleset-json "$creation_out" --immutability-ruleset-json "$immutability_out" --repository "$repo" --tag "$tag"
+
       - name: Validate release tag format
         env:
           RELEASE_TAG: ${{ inputs.tag }}
@@ -109,6 +184,10 @@ jobs:
             echo "release tag does not match required pattern" >&2
             exit 1
           fi
+          if [ "$tag" != "$EXPECTED_RELEASE_TAG" ]; then
+            echo "release tag must be exactly the current candidate $EXPECTED_RELEASE_TAG" >&2
+            exit 1
+          fi
       - name: Verify tag matches checkout
         env:
           RELEASE_TAG: ${{ inputs.tag }}
@@ -118,6 +197,7 @@ jobs:
           test "$(git describe --tags --exact-match)" = "$tag"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git fetch origin main --no-tags
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
           git merge-base --is-ancestor HEAD origin/main
       - name: Verify tag matches package version
         env:
@@ -127,7 +207,29 @@ jobs:
           tag="$RELEASE_TAG"
           version="$(grep -E '^version *= *"' Cargo.toml | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')"
           test -n "$version"
+          test "$version" = "$EXPECTED_RELEASE_VERSION"
           test "$tag" = "v$version"
+      - name: Verify no existing release for exact tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          repo="$GITHUB_REPOSITORY"
+          set +e
+          release_out="$(gh release view "$tag" --repo "$repo" --json databaseId,isDraft 2>&1)"
+          release_rc=$?
+          set -e
+          if [ "$release_rc" -eq 0 ]; then
+            echo "a draft or release already exists for $tag; refusing to attach or replace assets" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$release_out" | grep -qi 'release not found'; then
+            echo "cannot establish that no release exists for $tag; refusing to continue" >&2
+            exit 1
+          fi
+          echo "no existing release for the exact tag"
+
       - name: Verify fixture provenance
         run: |
           set -euo pipefail
@@ -192,6 +294,16 @@ jobs:
           expected = sys.argv[2]
           data = json.load(open(path, encoding="utf-8"))
           runs = data.get("workflow_runs", [])
+          total_count = data.get("total_count")
+          if not isinstance(total_count, int) or isinstance(total_count, bool):
+              print("exact-commit run total_count must be an integer", file=sys.stderr)
+              sys.exit(1)
+          if total_count != len(runs):
+              print("exact-commit run total_count does not match the returned page; refusing partial pagination", file=sys.stderr)
+              sys.exit(1)
+          if total_count > 100:
+              print("exact-commit run list exceeds the bounded per-page request", file=sys.stderr)
+              sys.exit(1)
           required = {
               "Rust CI": ".github/workflows/ci.yml",
               "Linux native qualification": ".github/workflows/linux-native-qualification.yml",
@@ -211,6 +323,14 @@ jobs:
               def run_key(r):
                   return (r.get("run_started_at") or r.get("created_at") or "", r.get("id") or 0)
               latest = max(candidates, key=run_key)
+              head_repository = latest.get("head_repository")
+              if not isinstance(head_repository, dict) or head_repository.get("id") != 1454137135:
+                  print("exact-commit run for %r is not from the canonical repository id 1454137135" % name, file=sys.stderr)
+                  sys.exit(1)
+              repository = latest.get("repository")
+              if not isinstance(repository, dict) or repository.get("id") != 1454137135:
+                  print("exact-commit run for %r does not belong to the canonical repository id 1454137135" % name, file=sys.stderr)
+                  sys.exit(1)
               if latest.get("event") in ("pull_request", "pull_request_target", "workflow_dispatch"):
                   print("pull request or dispatch event not accepted for %r" % name, file=sys.stderr)
                   sys.exit(1)
@@ -513,8 +633,53 @@ jobs:
           env_out="$RUNNER_TEMP/package-env.json"
           policies_out="$RUNNER_TEMP/package-branch-policies.json"
           gh api "repos/$repo/environments/release" > "$env_out"
-          gh api "repos/$repo/environments/release/deployment-branch-policies" > "$policies_out"
+          gh api "repos/$repo/environments/release/deployment-branch-policies?per_page=100" > "$policies_out"
           python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag"
+      - name: Re-verify split tag rulesets before packaging
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          tag="$EXPECTED_RELEASE_TAG"
+          rulesets_out="$RUNNER_TEMP/package-rulesets.json"
+          ids_out="$RUNNER_TEMP/package-tag-ruleset-ids.txt"
+          creation_out="$RUNNER_TEMP/package-tag-creation-ruleset.json"
+          immutability_out="$RUNNER_TEMP/package-tag-immutability-ruleset.json"
+          gh api "repos/$repo/rulesets?includes_parents=true&per_page=100" > "$rulesets_out"
+          python3 - "$rulesets_out" "$ids_out" <<'PY'
+          import json
+          import sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          if not isinstance(data, list) or len(data) >= 100:
+              print("rulesets response must be a bounded list", file=sys.stderr)
+              sys.exit(1)
+          expected = {"astatine-release-tag-creation", "astatine-release-tags"}
+          active_tag = [
+              item for item in data
+              if isinstance(item, dict)
+              and item.get("target") == "tag"
+              and item.get("enforcement") == "active"
+          ]
+          names = [item.get("name") for item in active_tag]
+          if sorted(names) != sorted(expected):
+              print("expected exactly the two active split tag rulesets; missing, extra, combined or broadened rulesets fail closed", file=sys.stderr)
+              sys.exit(1)
+          ids = {item["name"]: item.get("id") for item in active_tag}
+          for name, value in ids.items():
+              if not isinstance(value, int) or isinstance(value, bool):
+                  print("ruleset id must be an integer for " + name, file=sys.stderr)
+                  sys.exit(1)
+          with open(sys.argv[2], "w", encoding="utf-8") as handle:
+              handle.write("%s\n%s\n" % (ids["astatine-release-tag-creation"], ids["astatine-release-tags"]))
+          PY
+          { read -r creation_id; read -r immutability_id; } < "$ids_out"
+          test -n "$creation_id"
+          test -n "$immutability_id"
+          gh api "repos/$repo/rulesets/$creation_id" > "$creation_out"
+          gh api "repos/$repo/rulesets/$immutability_id" > "$immutability_out"
+          python3 -B support/release/verify-tag-ruleset.py --creation-ruleset-json "$creation_out" --immutability-ruleset-json "$immutability_out" --repository "$repo" --tag "$tag"
+
       - name: Verify binary build attestations before packaging
         env:
           RELEASE_TAG: ${{ inputs.tag }}
@@ -548,7 +713,10 @@ jobs:
           test -f "$out/astatine-$tag-linux-x86_64.tar.gz"
           test -f "$out/SHA256SUMS"
           test -f "$out/release-provenance.json"
-          cp support/release/RELEASE_NOTES-v0.1.0-testnet.1.md "$out/release-notes.md"
+          tagged_notes="$RUNNER_TEMP/tagged-release-notes.md"
+          git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.2.md" > "$tagged_notes"
+          cmp support/release/RELEASE_NOTES-v0.1.0-testnet.2.md "$tagged_notes"
+          cp "$tagged_notes" "$out/release-notes.md"
           test -f "$out/release-notes.md"
           if ls "$out" | grep -Ei 'fixture|provenance\.json'; then
             if ! ls "$out" | grep -Eq '^release-provenance\.json$'; then
@@ -626,6 +794,42 @@ jobs:
           prov = json.loads(prov_path.read_text(encoding="utf-8"))
           if prov.get("tag") != exp_tag:
               print("provenance field tag mismatch", file=sys.stderr)
+              sys.exit(1)
+          release_meta = prov.get("release")
+          if not isinstance(release_meta, dict):
+              print("provenance field release identity missing", file=sys.stderr)
+              sys.exit(1)
+          if release_meta.get("tag") != exp_tag or release_meta.get("exact_tag_required") is not True:
+              print("provenance field release identity mismatch", file=sys.stderr)
+              sys.exit(1)
+          if release_meta.get("tag_policy") != "refs/tags/" + exp_tag:
+              print("provenance field exact tag policy mismatch", file=sys.stderr)
+              sys.exit(1)
+          owner_policy = prov.get("owner_self_approval")
+          if not isinstance(owner_policy, dict):
+              print("provenance field owner_self_approval missing", file=sys.stderr)
+              sys.exit(1)
+          if owner_policy.get("independent_reviewer") is not False:
+              print("provenance field owner self-approval must not claim an independent reviewer", file=sys.stderr)
+              sys.exit(1)
+          if owner_policy.get("owner_attested") is not True:
+              print("provenance field owner self-approval must be owner-attested", file=sys.stderr)
+              sys.exit(1)
+          if owner_policy.get("independent_verification") is not False:
+              print("provenance field owner self-approval must not claim independent verification", file=sys.stderr)
+              sys.exit(1)
+          if owner_policy.get("separation_of_duties") is None or not str(owner_policy.get("separation_of_duties")).startswith("NONE"):
+              print("provenance field owner self-approval must record no separation of duties", file=sys.stderr)
+              sys.exit(1)
+          if owner_policy.get("residual_risk_accepted") is not True:
+              print("provenance field owner self-approval must record accepted residual risk", file=sys.stderr)
+              sys.exit(1)
+          if "compromised" not in str(owner_policy.get("security_tradeoff", "")).lower():
+              print("provenance field owner self-approval must record the compromised-owner tradeoff", file=sys.stderr)
+              sys.exit(1)
+          historical = prov.get("historical_release_intent")
+          if not isinstance(historical, dict) or historical.get("tag") != "v0.1.0-testnet.1":
+              print("provenance field historical .1 intent missing", file=sys.stderr)
               sys.exit(1)
           if prov.get("commit") != exp_sha:
               print("provenance field commit mismatch", file=sys.stderr)
@@ -748,15 +952,24 @@ jobs:
           env_out="$RUNNER_TEMP/draft-env.json"
           policies_out="$RUNNER_TEMP/draft-branch-policies.json"
           gh api "repos/$repo/environments/release" > "$env_out"
-          gh api "repos/$repo/environments/release/deployment-branch-policies" > "$policies_out"
+          gh api "repos/$repo/environments/release/deployment-branch-policies?per_page=100" > "$policies_out"
           python3 - "$env_out" "$policies_out" "$tag" <<'PY'
-          import fnmatch
           import json
           import sys
           env_path, policies_path, tag = sys.argv[1], sys.argv[2], sys.argv[3]
+          if tag != "v0.1.0-testnet.2":
+              print("draft tag must be exactly v0.1.0-testnet.2", file=sys.stderr)
+              sys.exit(1)
           env_data = json.load(open(env_path, encoding="utf-8"))
+          if env_data.get("name") != "release":
+              print("protection field environment name must be exactly release", file=sys.stderr)
+              sys.exit(1)
           if env_data.get("can_admins_bypass") is not False:
               print("protection field can_admins_bypass must be exactly false", file=sys.stderr)
+              sys.exit(1)
+          top_self_review = env_data.get("prevent_self_review")
+          if top_self_review is not None and top_self_review is not False:
+              print("protection field prevent_self_review must be false for owner self-approval", file=sys.stderr)
               sys.exit(1)
           rules = env_data.get("protection_rules")
           if not isinstance(rules, list):
@@ -767,16 +980,26 @@ jobs:
               print("protection field required_reviewers count must be exactly one", file=sys.stderr)
               sys.exit(1)
           rule = reviewer_rules[0]
-          reviewers = rule.get("reviewers")
-          if reviewers is None:
-              nested = rule.get("required_reviewers")
-              if isinstance(nested, dict):
-                  reviewers = nested.get("reviewers", nested.get("users", nested.get("teams")))
-          if not isinstance(reviewers, list) or len(reviewers) == 0:
-              print("protection field reviewers must be a non-empty list", file=sys.stderr)
+          if rule.get("prevent_self_review") is not False:
+              print("protection field required_reviewers prevent_self_review must be exactly false", file=sys.stderr)
               sys.exit(1)
-          if rule.get("prevent_self_review") is not True and env_data.get("prevent_self_review") is not True:
-              print("protection field prevent_self_review must be exactly true", file=sys.stderr)
+          reviewers = rule.get("reviewers")
+          if not isinstance(reviewers, list) or len(reviewers) != 1:
+              print("protection field reviewers must contain exactly the owner reviewer", file=sys.stderr)
+              sys.exit(1)
+          reviewer = reviewers[0]
+          if not isinstance(reviewer, dict) or reviewer.get("type") != "User":
+              print("protection field reviewer must be a User object", file=sys.stderr)
+              sys.exit(1)
+          nested = reviewer.get("reviewer")
+          if not isinstance(nested, dict):
+              print("protection field reviewer.reviewer must be an object", file=sys.stderr)
+              sys.exit(1)
+          if nested.get("id") != 86115037 or isinstance(nested.get("id"), bool):
+              print("protection field reviewer id must be the immutable owner id 86115037", file=sys.stderr)
+              sys.exit(1)
+          if nested.get("login") != "emyrinj":
+              print("protection field reviewer login must be the owner login", file=sys.stderr)
               sys.exit(1)
           branch_policy = env_data.get("deployment_branch_policy")
           if not isinstance(branch_policy, dict):
@@ -788,15 +1011,30 @@ jobs:
           if branch_policy.get("protected_branches") is not False:
               print("protection field protected_branches must be exactly false", file=sys.stderr)
               sys.exit(1)
-          print("protected environment re-verified before mutation")
+          print("owner self-approval environment re-verified before mutation")
           policies_data = json.load(open(policies_path, encoding="utf-8"))
-          policies = policies_data.get("branch_policies", policies_data.get("policies", policies_data.get("deployment_branch_policies")))
-          if policies is None and isinstance(policies_data, list):
-              policies = policies_data
-          if not isinstance(policies, list) or len(policies) == 0:
-              print("protection field branch_policies must be a non-empty list", file=sys.stderr)
+          if not isinstance(policies_data, dict):
+              print("protection field policies JSON must be an object", file=sys.stderr)
               sys.exit(1)
-          if len(policies) != 1:
+          total_count = policies_data.get("total_count")
+          if not isinstance(total_count, int) or isinstance(total_count, bool):
+              print("protection field policies total_count must be an integer", file=sys.stderr)
+              sys.exit(1)
+          present_keys = [key for key in ("branch_policies", "policies", "deployment_branch_policies") if key in policies_data]
+          if len(present_keys) != 1:
+              print("protection field policies JSON must contain exactly one policy array field", file=sys.stderr)
+              sys.exit(1)
+          if set(policies_data) != {"total_count", present_keys[0]}:
+              print("protection field policies JSON contains unexpected fields", file=sys.stderr)
+              sys.exit(1)
+          policies = policies_data[present_keys[0]]
+          if not isinstance(policies, list):
+              print("protection field branch_policies must be a list", file=sys.stderr)
+              sys.exit(1)
+          if total_count != len(policies):
+              print("protection field policies total_count does not match the returned list; refusing partial pagination", file=sys.stderr)
+              sys.exit(1)
+          if total_count != 1:
               print("protection field tag policies must be exactly one", file=sys.stderr)
               sys.exit(1)
           entry = policies[0]
@@ -809,18 +1047,17 @@ jobs:
               else:
                   print("protection field tag policy type must be exactly tag", file=sys.stderr)
               sys.exit(1)
-          allowed_names = {"v0.1.0-testnet.*", tag}
           name = entry.get("name", entry.get("pattern", ""))
           if not isinstance(name, str) or not name:
               print("protection field tag policy name missing", file=sys.stderr)
               sys.exit(1)
-          if name not in allowed_names:
-              print("tag policy name not in series/exact allowlist", file=sys.stderr)
+          if any(character in name for character in ("*", "?", "[", "]")):
+              print("tag policy must be the exact tag, not a wildcard", file=sys.stderr)
               sys.exit(1)
-          if not fnmatch.fnmatch(tag, name):
-              print("no tag-type branch policy matches release tag", file=sys.stderr)
+          if name != tag:
+              print("tag policy name must be exactly the release tag", file=sys.stderr)
               sys.exit(1)
-          print("tag deployment policy re-verified before mutation")
+          print("exact tag deployment policy re-verified before mutation")
           PY
       - name: Verify bundle checksums
         run: |
@@ -849,12 +1086,12 @@ jobs:
           expected_tag = sys.argv[4]
 
           expected = {
-              "astatine-v0.1.0-testnet.1-macos-arm64.tar.gz": (
-                  "astatine-v0.1.0-testnet.1-macos-arm64",
+              "astatine-v0.1.0-testnet.2-macos-arm64.tar.gz": (
+                  "astatine-v0.1.0-testnet.2-macos-arm64",
                   "aarch64-apple-darwin",
               ),
-              "astatine-v0.1.0-testnet.1-linux-x86_64.tar.gz": (
-                  "astatine-v0.1.0-testnet.1-linux-x86_64",
+              "astatine-v0.1.0-testnet.2-linux-x86_64.tar.gz": (
+                  "astatine-v0.1.0-testnet.2-linux-x86_64",
                   "x86_64-unknown-linux-gnu",
               ),
           }
@@ -1059,6 +1296,42 @@ jobs:
           if prov.get("tag") != exp_tag:
               print("provenance field tag mismatch", file=sys.stderr)
               sys.exit(1)
+          release_meta = prov.get("release")
+          if not isinstance(release_meta, dict):
+              print("provenance field release identity missing", file=sys.stderr)
+              sys.exit(1)
+          if release_meta.get("tag") != exp_tag or release_meta.get("exact_tag_required") is not True:
+              print("provenance field release identity mismatch", file=sys.stderr)
+              sys.exit(1)
+          if release_meta.get("tag_policy") != "refs/tags/" + exp_tag:
+              print("provenance field exact tag policy mismatch", file=sys.stderr)
+              sys.exit(1)
+          owner_policy = prov.get("owner_self_approval")
+          if not isinstance(owner_policy, dict):
+              print("provenance field owner_self_approval missing", file=sys.stderr)
+              sys.exit(1)
+          if owner_policy.get("independent_reviewer") is not False:
+              print("provenance field owner self-approval must not claim an independent reviewer", file=sys.stderr)
+              sys.exit(1)
+          if owner_policy.get("owner_attested") is not True:
+              print("provenance field owner self-approval must be owner-attested", file=sys.stderr)
+              sys.exit(1)
+          if owner_policy.get("independent_verification") is not False:
+              print("provenance field owner self-approval must not claim independent verification", file=sys.stderr)
+              sys.exit(1)
+          if owner_policy.get("separation_of_duties") is None or not str(owner_policy.get("separation_of_duties")).startswith("NONE"):
+              print("provenance field owner self-approval must record no separation of duties", file=sys.stderr)
+              sys.exit(1)
+          if owner_policy.get("residual_risk_accepted") is not True:
+              print("provenance field owner self-approval must record accepted residual risk", file=sys.stderr)
+              sys.exit(1)
+          if "compromised" not in str(owner_policy.get("security_tradeoff", "")).lower():
+              print("provenance field owner self-approval must record the compromised-owner tradeoff", file=sys.stderr)
+              sys.exit(1)
+          historical = prov.get("historical_release_intent")
+          if not isinstance(historical, dict) or historical.get("tag") != "v0.1.0-testnet.1":
+              print("provenance field historical .1 intent missing", file=sys.stderr)
+              sys.exit(1)
           if prov.get("commit") != exp_sha:
               print("provenance field commit mismatch", file=sys.stderr)
               sys.exit(1)
@@ -1126,6 +1399,109 @@ jobs:
                   sys.exit(1)
           print("release provenance semantics verified")
           PY
+      - name: Re-verify split tag rulesets before draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          tag="$EXPECTED_RELEASE_TAG"
+          rulesets_out="$RUNNER_TEMP/draft-rulesets.json"
+          ids_out="$RUNNER_TEMP/draft-tag-ruleset-ids.txt"
+          creation_out="$RUNNER_TEMP/draft-tag-creation-ruleset.json"
+          immutability_out="$RUNNER_TEMP/draft-tag-immutability-ruleset.json"
+          gh api "repos/$repo/rulesets?includes_parents=true&per_page=100" > "$rulesets_out"
+          python3 - "$rulesets_out" "$ids_out" <<'PY'
+          import json
+          import sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          if not isinstance(data, list) or len(data) >= 100:
+              print("rulesets response must be a bounded list", file=sys.stderr)
+              sys.exit(1)
+          expected = {"astatine-release-tag-creation", "astatine-release-tags"}
+          active_tag = [
+              item for item in data
+              if isinstance(item, dict)
+              and item.get("target") == "tag"
+              and item.get("enforcement") == "active"
+          ]
+          names = [item.get("name") for item in active_tag]
+          if sorted(names) != sorted(expected):
+              print("expected exactly the two active split tag rulesets; missing, extra, combined or broadened rulesets fail closed", file=sys.stderr)
+              sys.exit(1)
+          ids = {item["name"]: item.get("id") for item in active_tag}
+          for name, value in ids.items():
+              if not isinstance(value, int) or isinstance(value, bool):
+                  print("ruleset id must be an integer for " + name, file=sys.stderr)
+                  sys.exit(1)
+          with open(sys.argv[2], "w", encoding="utf-8") as handle:
+              handle.write("%s\n%s\n" % (ids["astatine-release-tag-creation"], ids["astatine-release-tags"]))
+          PY
+          { read -r creation_id; read -r immutability_id; } < "$ids_out"
+          test -n "$creation_id"
+          test -n "$immutability_id"
+          gh api "repos/$repo/rulesets/$creation_id" > "$creation_out"
+          gh api "repos/$repo/rulesets/$immutability_id" > "$immutability_out"
+          python3 - "$creation_out" "$immutability_out" "$repo" "$tag" <<'PY'
+          import json
+          import sys
+          creation_path, immutability_path, repository, tag = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          creation = json.load(open(creation_path, encoding="utf-8"))
+          immutability = json.load(open(immutability_path, encoding="utf-8"))
+          allowed_bypasses = [
+              {"actor_id": 86115037, "actor_type": "User", "bypass_mode": "always"},
+              {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"},
+          ]
+
+          def common(data, name, expected_include):
+              if not isinstance(data, dict) or data.get("name") != name:
+                  print("split ruleset identity mismatch: " + name, file=sys.stderr)
+                  sys.exit(1)
+              if data.get("target") != "tag" or data.get("source_type") != "Repository" or data.get("source") != repository:
+                  print("split ruleset target/source mismatch: " + name, file=sys.stderr)
+                  sys.exit(1)
+              if data.get("enforcement") != "active":
+                  print("split ruleset must be active: " + name, file=sys.stderr)
+                  sys.exit(1)
+              refs = data.get("conditions", {}).get("ref_name", {})
+              if refs.get("include") != expected_include or refs.get("exclude") != []:
+                  print("split ruleset scope mismatch: " + name, file=sys.stderr)
+                  sys.exit(1)
+              rules = data.get("rules")
+              if not isinstance(rules, list):
+                  print("split ruleset rules must be a list: " + name, file=sys.stderr)
+                  sys.exit(1)
+              types = [rule.get("type") for rule in rules if isinstance(rule, dict)]
+              if len(types) != len(rules) or len(set(types)) != len(types):
+                  print("split ruleset rules must be unique objects: " + name, file=sys.stderr)
+                  sys.exit(1)
+              bypass = data.get("bypass_actors")
+              if not isinstance(bypass, list):
+                  print("split ruleset bypass_actors must be a list: " + name, file=sys.stderr)
+                  sys.exit(1)
+              return set(types), bypass
+
+          creation_rules, creation_bypass = common(creation, "astatine-release-tag-creation", ["refs/tags/" + tag])
+          if creation_rules != {"creation"} or len(creation_bypass) != 1 or creation_bypass[0] not in allowed_bypasses:
+              print("creation ruleset must retain exactly the creation rule and one designated owner-user or repository-admin bypass", file=sys.stderr)
+              sys.exit(1)
+          if creation.get("current_user_can_bypass") not in (None, "always", "exempt", "never"):
+              print("creation ruleset designated bypass is not effective", file=sys.stderr)
+              sys.exit(1)
+          immutability_rules, immutability_bypass = common(
+              immutability,
+              "astatine-release-tags",
+              ["refs/tags/" + release_tag for release_tag in ("v0.1.0-testnet.0", "v0.1.0-testnet.1", "v0.1.0-testnet.2")],
+          )
+          if immutability_rules != {"update", "deletion", "non_fast_forward"} or immutability_bypass != []:
+              print("immutability ruleset must use exactly update/deletion/non-fast-forward with zero bypass actors", file=sys.stderr)
+              sys.exit(1)
+          if immutability.get("current_user_can_bypass") in ("always", "exempt"):
+              print("immutability ruleset must not allow the current user to bypass", file=sys.stderr)
+              sys.exit(1)
+          print("split tag rulesets re-verified before draft")
+          PY
+
       - name: Create draft release with assets
         env:
           RELEASE_TAG: ${{ inputs.tag }}
@@ -1175,7 +1551,39 @@ jobs:
             exit 1
           fi
           echo "remote tag verified at expected commit"
+          set +e
+          existing_out="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json databaseId,isDraft 2>&1)"
+          existing_rc=$?
+          set -e
+          if [ "$existing_rc" -eq 0 ]; then
+            echo "a draft or release already exists for $tag; refusing to attach, replace or clobber assets" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$existing_out" | grep -qi 'release not found'; then
+            echo "cannot establish that no release exists for $tag; refusing draft creation" >&2
+            exit 1
+          fi
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$tag" --notes-file bundle/release-notes.md bundle/astatine-*-macos-arm64.tar.gz bundle/astatine-*-linux-x86_64.tar.gz bundle/SHA256SUMS bundle/release-provenance.json
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,tagName,body,assets > "$RUNNER_TEMP/draft-release.json"
+          python3 - "$RUNNER_TEMP/draft-release.json" "$tag" bundle/release-notes.md <<'PY'
+          import json
+          import pathlib
+          import sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          expected_tag = sys.argv[2]
+          expected_notes = pathlib.Path(sys.argv[3]).read_bytes()
+          if data.get("isDraft") is not True:
+              print("created release is not a draft", file=sys.stderr)
+              sys.exit(1)
+          if data.get("tagName") != expected_tag:
+              print("created draft tagName mismatch", file=sys.stderr)
+              sys.exit(1)
+          body = data.get("body")
+          if not isinstance(body, str) or body.encode("utf-8") != expected_notes:
+              print("created draft body does not exactly match the reviewed release notes", file=sys.stderr)
+              sys.exit(1)
+          print("created draft identity and body verified")
+          PY
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.name) \(.size)"' > "$RUNNER_TEMP/published-assets.txt"
           cat "$RUNNER_TEMP/published-assets.txt"
           python3 - bundle/SHA256SUMS "$RUNNER_TEMP/published-assets.txt" <<'PY'
@@ -1271,4 +1679,4 @@ jobs:
       - name: Draft verified
         run: |
           set -euo pipefail
-          echo "Draft verified; manual owner publication remains required after an admin verifies immutable releases are enabled and all assets/release notes are approved."
+          echo "Draft verified; owner self-approval publication remains required after the owner re-verifies immutable releases, the exact tag, the split tag creation/immutability rulesets, and every draft asset digest immediately before publication. The draft is mutable by repository writers; do not treat draft creation as final."

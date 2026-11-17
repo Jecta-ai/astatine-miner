@@ -45,6 +45,8 @@ NEEDED_FILES = [
     "support/release-repository.txt",
     "support/update-evm-test-fixtures.py",
     "support/update-genesis-coordinator-fixture.py",
+    "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
+    "support/release/RELEASE_NOTES-v0.1.0-testnet.2.md",
 ]
 
 
@@ -115,9 +117,10 @@ class DistributionInventoryTests(unittest.TestCase):
         self.assertEqual(
             result["rights_decision"],
             "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party "
-            "source and binary distribution intent for v0.1.0-testnet.1; technical "
-            "NOTICE review recorded; final release controls outstanding; not a legal "
-            "conclusion or separate approval.",
+            "source and binary distribution intent for v0.1.0-testnet.2 under the "
+            "explicitly documented owner self-approval policy; technical NOTICE review "
+            "recorded; final release controls outstanding; not a legal conclusion, not "
+            "independent review, and not a separate approval.",
         )
         self.assertEqual(
             result["notice_applicability"],
@@ -130,12 +133,12 @@ class DistributionInventoryTests(unittest.TestCase):
         self.assertEqual(result["blocking_open"], [])
         self.assertEqual(
             result["notice_checklist_status"],
-            "TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent; "
-            "final release controls outstanding",
+            "TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent under the "
+            "explicit owner self-approval policy; final release controls outstanding",
         )
         self.assertEqual(
             result["release_intent_authorization"],
-            "OWNER-AUTHORIZED RELEASE INTENT \u2014 FINAL CONTROLS OUTSTANDING",
+            "OWNER-AUTHORIZED RELEASE INTENT \u2014 FINAL CONTROLS OUTSTANDING \u2014 OWNER SELF-APPROVAL",
         )
         self.assertIn(
             "repository technical review", result["technical_notice_review"].lower()
@@ -146,7 +149,7 @@ class DistributionInventoryTests(unittest.TestCase):
         )
         self.assertEqual(
             result["release_controls"],
-            "DRAFT-ONLY \u2014 MANUAL PUBLICATION AFTER EXTERNAL IMMUTABLE-SETTING VERIFICATION",
+            "DRAFT-ONLY \u2014 OWNER SELF-APPROVAL AFTER IMMUTABLE TAG/RELEASE VERIFICATION",
         )
         self.assertEqual(result["archive_members_checked"], 5)
         self.assertEqual(result["source_members_checked"], 3)
@@ -388,7 +391,7 @@ class DistributionInventoryTests(unittest.TestCase):
         controls = gate["release_controls"]
         self.assertEqual(
             controls["status"],
-            "DRAFT-ONLY \u2014 MANUAL PUBLICATION AFTER EXTERNAL IMMUTABLE-SETTING VERIFICATION",
+            "DRAFT-ONLY \u2014 OWNER SELF-APPROVAL AFTER IMMUTABLE TAG/RELEASE VERIFICATION",
         )
         self.assertEqual(controls["publication_mode"], "draft-only-manual-publish")
         self.assertTrue(controls["manual_publish_required"])
@@ -525,6 +528,20 @@ class DistributionInventoryTests(unittest.TestCase):
             dest = root / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dest)
+
+    def test_historical_release_intent_rewrite_rejected(self) -> None:
+        inventory = self.inventory()
+        inventory["historical_release_intent"]["tag"] = "v0.1.0-testnet.2"
+        self.write_inventory(inventory)
+        with self.assertRaises(VERIFIER.VerificationError):
+            VERIFIER.verify(self.root)
+
+    def test_historical_release_intent_omission_rejected(self) -> None:
+        inventory = self.inventory()
+        del inventory["historical_release_intent"]
+        self.write_inventory(inventory)
+        with self.assertRaises(VERIFIER.VerificationError):
+            VERIFIER.verify(self.root)
 
     def test_cli_failure_returns_structured_json(self) -> None:
         import contextlib

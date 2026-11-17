@@ -23,10 +23,10 @@ from pathlib import Path
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 BUILDER_PATH = SOURCE_ROOT / "support" / "release" / "build-release.py"
 
-MACOS_ROOT = "astatine-v0.1.0-testnet.1-macos-arm64"
-LINUX_ROOT = "astatine-v0.1.0-testnet.1-linux-x86_64"
-MACOS_ARCHIVE = "astatine-v0.1.0-testnet.1-macos-arm64.tar.gz"
-LINUX_ARCHIVE = "astatine-v0.1.0-testnet.1-linux-x86_64.tar.gz"
+MACOS_ROOT = "astatine-v0.1.0-testnet.2-macos-arm64"
+LINUX_ROOT = "astatine-v0.1.0-testnet.2-linux-x86_64"
+MACOS_ARCHIVE = "astatine-v0.1.0-testnet.2-macos-arm64.tar.gz"
+LINUX_ARCHIVE = "astatine-v0.1.0-testnet.2-linux-x86_64.tar.gz"
 EXPECTED_MACOS_MEMBERS = sorted([
     f"{MACOS_ROOT}/astatine",
     f"{MACOS_ROOT}/LICENSE-MIT",
@@ -41,7 +41,7 @@ EXPECTED_LINUX_MEMBERS = sorted([
     f"{LINUX_ROOT}/BUILD-INFO.json",
     f"{LINUX_ROOT}/INSTALL.md",
 ])
-TAG = "v0.1.0-testnet.1"
+TAG = "v0.1.0-testnet.2"
 LEGIT_RUSTC_LINE = "rustc 1.94.1 (e408947bf 2026-03-25)"
 LEGIT_CARGO_LINE = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
 
@@ -103,6 +103,8 @@ class ReleaseBuilderTests(unittest.TestCase):
             "rust-toolchain.toml",
             "support/update-evm-test-fixtures.py",
             "support/update-genesis-coordinator-fixture.py",
+            "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
+            "support/release/RELEASE_NOTES-v0.1.0-testnet.2.md",
         ):
             src = SOURCE_ROOT / rel
             if not src.is_file():
@@ -448,8 +450,11 @@ class ReleaseBuilderTests(unittest.TestCase):
         prov = json.loads((self.out / "release-provenance.json").read_text(encoding="utf-8"))
         self.assertEqual(
             prov["gate"]["release_controls"],
-            "DRAFT-ONLY \u2014 MANUAL PUBLICATION AFTER EXTERNAL IMMUTABLE-SETTING VERIFICATION",
+            "DRAFT-ONLY \u2014 OWNER SELF-APPROVAL AFTER IMMUTABLE TAG/RELEASE VERIFICATION",
         )
+        self.assertFalse(prov["owner_self_approval"]["independent_reviewer"])
+        self.assertTrue(prov["owner_self_approval"]["residual_risk_accepted"])
+        self.assertEqual(prov["historical_release_intent"]["tag"], "v0.1.0-testnet.1")
         for e in result["archives"]:
             root = MACOS_ROOT if "macos" in e["filename"] else LINUX_ROOT
             with tarfile.open(self.out / e["filename"], mode="r") as tar:
@@ -458,6 +463,50 @@ class ReleaseBuilderTests(unittest.TestCase):
             self.assertTrue(info["release_controls"]["manual_publish_required"])
             self.assertTrue(info["release_controls"]["immutable_setting_admin_verification_required"])
             self.assertTrue(info["release_controls"]["immutable_release"])
+            self.assertTrue(info["release_controls"]["owner_self_approval"])
+            self.assertFalse(info["release_controls"]["environment_prevent_self_review"])
+            self.assertFalse(info["release_controls"]["independent_environment_review"])
+            self.assertEqual(info["release_controls"]["environment_reviewer_owner_id"], 86115037)
+            self.assertEqual(info["release_controls"]["tag_policy"], "refs/tags/v0.1.0-testnet.2")
+            self.assertEqual(
+                info["release_controls"]["tag_ruleset_exact_scope"],
+                "refs/tags/v0.1.0-testnet.2",
+            )
+            self.assertTrue(info["release_controls"]["tag_creation_rule_required"])
+            self.assertEqual(
+                info["release_controls"]["tag_creation_ruleset_name"],
+                "astatine-release-tag-creation",
+            )
+            self.assertEqual(
+                info["release_controls"]["tag_creation_bypass_actors_allowed"],
+                [
+                    {
+                        "actor_id": 86115037,
+                        "actor_type": "User",
+                        "bypass_mode": "always",
+                    },
+                    {
+                        "actor_id": 5,
+                        "actor_type": "RepositoryRole",
+                        "bypass_mode": "always",
+                    },
+                ],
+            )
+            self.assertEqual(
+                info["release_controls"]["tag_immutability_ruleset_name"],
+                "astatine-release-tags",
+            )
+            self.assertEqual(
+                info["release_controls"]["tag_immutability_scope"],
+                [
+                    "refs/tags/v0.1.0-testnet.0",
+                    "refs/tags/v0.1.0-testnet.1",
+                    "refs/tags/v0.1.0-testnet.2",
+                ],
+            )
+            self.assertEqual(
+                info["release_controls"]["tag_immutability_bypass_actors_allowed"], 0
+            )
 
     def test_external_blockers_cover_writer_restriction_and_rechecks(self) -> None:
         import importlib.util as _ilu
@@ -477,17 +526,33 @@ class ReleaseBuilderTests(unittest.TestCase):
             blockers,
         )
         self.assertIn(
-            "release tag is rechecked immediately before manual publication",
+            "release tag and draft assets are rechecked immediately before manual publication",
+            blockers,
+        )
+        self.assertIn(
+            "owner self-approval reduces separation of duties; no independent review is claimed",
+            blockers,
+        )
+        self.assertIn(
+            "separate active astatine-release-tag-creation ruleset restricted to the exact tag with exactly one designated owner-user or repository-admin creation bypass",
+            blockers,
+        )
+        self.assertIn(
+            "separate active astatine-release-tags ruleset limited to update, deletion and non-fast-forward for the existing .0, .1 and .2 tags with zero bypass actors",
+            blockers,
+        )
+        self.assertIn(
+            "tag creation protection is retained; no broader bypass or removal of the creation rule is authorized",
             blockers,
         )
 
     def test_wrong_tag_rejected(self) -> None:
         with self.assertRaises(BUILDER.ReleaseError):
-            self.run_builder(tag="v0.1.0-testnet.2")
+            self.run_builder(tag="v0.1.0-testnet.3")
 
     def test_tag_version_mismatch_rejected(self) -> None:
         (self.root / "Cargo.toml").write_text(
-            (self.root / "Cargo.toml").read_text().replace("0.1.0-testnet.1", "0.1.0-testnet.9"),
+            (self.root / "Cargo.toml").read_text().replace("0.1.0-testnet.2", "0.1.0-testnet.9"),
             encoding="utf-8",
         )
         subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)

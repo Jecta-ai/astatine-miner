@@ -66,10 +66,15 @@ EXPECTED_SCHEMA_V1 = "astatine-fixture-provenance/v1"
 EXPECTED_SCHEMA_V2 = "astatine-fixture-provenance/v2"
 EXPECTED_SCHEMA_V3 = "astatine-fixture-provenance/v3"
 EXPECTED_VERIFICATION_DATE_V3 = "2026-11-17"
+EXPECTED_RELEASE_VERSION = "0.1.0-testnet.2"
+EXPECTED_RELEASE_TAG = "v0.1.0-testnet.2"
+EXPECTED_RELEASE_TAG_POLICY = "refs/tags/v0.1.0-testnet.2"
+EXPECTED_RELEASE_REVIEWER_ID = 86115037
+EXPECTED_RELEASE_REVIEWER_LOGIN = "emyrinj"
 EXPECTED_RIGHTS_DECISION_V3 = (
     "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent "
-    "for v0.1.0-testnet.1; technical NOTICE review recorded; final release controls outstanding; "
-    "not a legal conclusion or separate approval."
+    "for v0.1.0-testnet.2 under the explicitly documented owner self-approval policy; technical NOTICE review recorded; "
+    "final release controls outstanding; not a legal conclusion, not independent review, and not a separate approval."
 )
 EXPECTED_NOTICE_APPLICABILITY_V3 = (
     "TECHNICALLY REVIEWED \u2014 no separate upstream NOTICE file was found in the pinned contract fixture "
@@ -77,18 +82,104 @@ EXPECTED_NOTICE_APPLICABILITY_V3 = (
     "NOTICE are included. This is an evidence-based technical review, not a legal conclusion or separate approval."
 )
 EXPECTED_CHECKLIST_STATUS_V3 = (
-    "TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent; final release controls outstanding"
+    "TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent under the explicit owner self-approval policy; "
+    "final release controls outstanding"
 )
-EXPECTED_RELEASE_INTENT_STATUS = "OWNER-AUTHORIZED RELEASE INTENT \u2014 FINAL CONTROLS OUTSTANDING"
+EXPECTED_RELEASE_INTENT_STATUS = (
+    "OWNER-AUTHORIZED RELEASE INTENT \u2014 FINAL CONTROLS OUTSTANDING \u2014 OWNER SELF-APPROVAL"
+)
 EXPECTED_RELEASE_INTENT_BY = "project owner"
 EXPECTED_RELEASE_INTENT_ON = "2026-11-17"
 EXPECTED_RELEASE_INTENT_SCOPE = (
-    "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.1 on macOS ARM64 and "
-    "Linux x86_64; final release controls remain outstanding."
+    "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.2 on macOS ARM64 and "
+    "Linux x86_64 under an explicit owner self-approval policy; no independent reviewer or separate approver; "
+    "final release controls remain outstanding."
 )
 EXPECTED_RELEASE_INTENT_ROLES = (
-    "Project owner only; no separate release approver was appointed, consulted, or asserted."
+    "Project owner only; the owner explicitly authorized owner self-approval for the protected release environment. "
+    "No independent reviewer and no separate release approver was appointed, consulted, or asserted; separation of "
+    "duties is explicitly reduced and recorded as a security tradeoff."
 )
+EXPECTED_OWNER_SELF_APPROVAL_POLICY = {
+    "status": "ACTIVE \u2014 OWNER SELF-APPROVAL",
+    "approved_by": "project owner",
+    "approved_on": "2026-11-17",
+    "authorization_source": (
+        "Project owner directive in the release implementation task: sustainable owner-controlled release without "
+        "any external human reviewer; the owner expressly authorized the new version and the owner "
+        "self-approval model."
+    ),
+    "scope": (
+        "The owner account emyrinj (immutable numeric GitHub user id 86115037) is the sole required reviewer for the "
+        "protected release environment and may approve a deployment initiated by the same account. The owner also "
+        "manually publishes the verified draft."
+    ),
+    "independent_reviewer": False,
+    "separation_of_duties": (
+        "NONE \u2014 the same owner account initiates the workflow, approves the protected environment, and performs "
+        "manual publication; no independent human approval is required or claimed."
+    ),
+    "security_tradeoff": (
+        "Removes independent separation of duties and a second-person review. A compromised, malicious, or mistaken "
+        "owner account can approve and publish without another human check."
+    ),
+    "residual_risk_accepted": True,
+    "owner_attested": True,
+    "independent_verification": False,
+    "compensating_controls": [
+        "exact release tag pinned to v0.1.0-testnet.2 and an exact-tag environment deployment policy",
+        "environment cannot be bypassed by administrators (can_admins_bypass: false)",
+        "separate tag creation ruleset must be active with the creation rule and exactly one designated owner-user or repository-admin bypass for the exact tag",
+        "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering the existing .0, .1 and .2 tags",
+        "tag creation protection must be retained; it must not be removed or broadened",
+        "immutable releases must be enabled before dispatch and rechecked before publication",
+        "exact-commit green main CI for Rust CI and Linux native qualification",
+        "binary and archive build-provenance attestations bound to the exact tag and source digest",
+        "draft-only creation; no automated publication",
+        "owner-only repository write authority and post-publication verification",
+        "all release records explicitly state that review is not independent",
+    ],
+    "not_claimed": [
+        "independent review",
+        "separation of duties",
+        "a separate release approver",
+        "legal conclusion",
+        "immunity from owner-account compromise",
+    ],
+}
+EXPECTED_HISTORICAL_RELEASE_INTENT = {
+    "tag": "v0.1.0-testnet.1",
+    "commit": "99a8630a7ae7f5c5950031dfba8c3b0c3f132cbc",
+    "status": (
+        "SUPERSEDED \u2014 UNPUBLISHED; historical tag and pending draft workflow retained; no publication occurred"
+    ),
+    "rights_decision": (
+        "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution "
+        "intent for v0.1.0-testnet.1; technical NOTICE review recorded; final release controls outstanding; "
+        "not a legal conclusion or separate approval."
+    ),
+    "scope": (
+        "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.1 on macOS ARM64 and "
+        "Linux x86_64; final release controls remain outstanding."
+    ),
+    "approval_roles": (
+        "Project owner only; no separate release approver was appointed, consulted, or asserted."
+    ),
+    "release_notes_path": "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
+    "release_notes_sha256": "12d7605b5e48c80f1c838a95d245c08da8cd5c831d008da3bb3dea420bdc31b9",
+    "note": (
+        "The .1 rights decision, scope and approval roles are preserved verbatim; the tag, commit, "
+        "release-notes hash and status metadata are added to identify the historical record. The .1 tag is "
+        "not moved; its workflow run is not cancelled or deleted; no .1 release was published. The current "
+        ".2 authorization does not alter the preserved .1 fields."
+    ),
+}
+EXPECTED_RELEASE_IDENTITY = {
+    "version": EXPECTED_RELEASE_VERSION,
+    "tag": EXPECTED_RELEASE_TAG,
+    "tag_policy": EXPECTED_RELEASE_TAG_POLICY,
+    "exact_tag_required": True,
+}
 EXPECTED_TECHNICAL_REVIEWED_BY = (
     "Repository technical review; not the project owner and not a separate release approver."
 )
@@ -730,6 +821,18 @@ def verify_inventory(root: Path) -> dict:
     )
     validate_inventory_metadata(inventory)
     if is_authorized:
+        require(
+            inventory.get("release") == EXPECTED_RELEASE_IDENTITY,
+            "fixture provenance release identity must be exactly v0.1.0-testnet.2",
+        )
+        require(
+            inventory.get("historical_release_intent") == EXPECTED_HISTORICAL_RELEASE_INTENT,
+            "fixture provenance must preserve the historical .1 release intent record exactly",
+        )
+        require_sha256(
+            EXPECTED_HISTORICAL_RELEASE_INTENT["release_notes_sha256"],
+            "historical .1 release notes sha256",
+        )
         # Fail closed on invented approver / final-publication language in live schema.
         _raw_lower = json.dumps(inventory, sort_keys=True).lower()
         require(
@@ -1383,7 +1486,7 @@ def verify_inventory(root: Path) -> dict:
         )
         require_fields(
             release_auth,
-            ("status", "authorized_by", "authorized_on", "scope", "approval_roles", "evidence", "technical_notice_review", "final_release_controls_complete", "not_authorized", "independent_verification"),
+            ("status", "authorized_by", "authorized_on", "scope", "approval_roles", "evidence", "technical_notice_review", "final_release_controls_complete", "not_authorized", "independent_verification", "owner_self_approval", "independent_reviewer", "separation_of_duties"),
             "rights_review release_intent_authorization",
         )
         require(
@@ -1410,6 +1513,27 @@ def verify_inventory(root: Path) -> dict:
         require(
             release_auth.get("independent_verification") is False,
             "release_intent_authorization must not claim independent verification",
+        )
+        require(
+            release_auth.get("owner_self_approval") == EXPECTED_OWNER_SELF_APPROVAL_POLICY,
+            "release_intent_authorization must record the explicit owner self-approval policy",
+        )
+        require(
+            release_auth.get("independent_reviewer") is False,
+            "release_intent_authorization must not claim an independent reviewer",
+        )
+        require(
+            release_auth.get("separation_of_duties")
+            == EXPECTED_OWNER_SELF_APPROVAL_POLICY["separation_of_duties"],
+            "release_intent_authorization must not claim separation of duties",
+        )
+        require(
+            rights.get("owner_self_approval") == EXPECTED_OWNER_SELF_APPROVAL_POLICY,
+            "rights_review must record the explicit owner self-approval policy",
+        )
+        require(
+            rights.get("historical_release_intent") == EXPECTED_HISTORICAL_RELEASE_INTENT,
+            "rights_review must preserve the historical .1 release intent",
         )
         require(
             release_auth.get("final_release_controls_complete") is False,
