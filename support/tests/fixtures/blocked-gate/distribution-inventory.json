@@ -1,0 +1,81 @@
+{
+  "schema": "astatine-distribution-inventory/v1",
+  "scope": "Fail-closed source and binary distribution inventory for the Astatine miner. No release archive exists or was produced; both source and binary distribution are BLOCKED pending rights/notice review.",
+  "rights_gate": {
+    "source": "tests/fixtures/PROVENANCE.json",
+    "publication_decision": "BLOCKED pending review of rights and notice applicability; first-party ownership is owner-attested and not independently verified.",
+    "notice_applicability": "UNRESOLVED",
+    "blocking_open": [
+      "RIGHTS-02",
+      "RIGHTS-03",
+      "RIGHTS-04",
+      "RIGHTS-05"
+    ],
+    "fail_closed": true,
+    "rule": "Distribution stays BLOCKED while any blocking rights item is OPEN. A PASS from support/verify-distribution-inventory.py only confirms the blocked state is truthfully recorded; it does not authorize publication. Moving to an authorized state requires reviewed code changes, not data-only edits.",
+    "review_ci_branch_push_authorization": {
+      "status": "AUTHORIZED — REVIEW/CI ONLY",
+      "authorized_by": "project owner",
+      "authorized_on": "2026-11-16",
+      "scope": "Push the fix/phase-e-e02-e07 remediation branch to the already-public repository solely for review and CI.",
+      "public_repository_visibility": "The repository is already public. That visibility does not authorize a source archive, binary archive or release, tag or release publication, or workflow attestation dispatch.",
+      "not_authorized": [
+        "source archive distribution",
+        "binary archive or release distribution",
+        "tag or public release publication",
+        "workflow attestation dispatch",
+        "broader license grant or legal clearance",
+        "resolution of RIGHTS-02 through RIGHTS-05"
+      ],
+      "rights_gate_unchanged": "RIGHTS-02 through RIGHTS-05 remain OPEN and blocking; source_distribution and binary_distribution remain BLOCKED."
+    }
+  },
+  "source_distribution": {
+    "status": "BLOCKED",
+    "reason": "Source redistribution is BLOCKED: RIGHTS-02 through RIGHTS-05 remain OPEN and blocking, NOTICE applicability is UNRESOLVED, and first-party rights are owner-attested rather than independently verified per tests/fixtures/PROVENANCE.json. No authorized release decision exists."
+  },
+  "binary_distribution": {
+    "status": "BLOCKED",
+    "reason": "Binary distribution is BLOCKED by the same rights gate. No release archive exists or was produced, no publication is authorized, and no fixture may enter a release archive.",
+    "target": "x86_64-unknown-linux-gnu",
+    "archive_members": [
+      {
+        "source": "target/release/astatine",
+        "archive_path": "astatine",
+        "required": true
+      },
+      {
+        "source": "LICENSE-MIT",
+        "archive_path": "LICENSE-MIT",
+        "required": true
+      },
+      {
+        "source": "THIRD_PARTY_LICENSES.md",
+        "archive_path": "THIRD_PARTY_LICENSES.md",
+        "required": true
+      }
+    ],
+    "generated_members": [
+      {
+        "archive_path": "BUILD-INFO.json",
+        "generator": "support/release/build-dry-run.py",
+        "required": true
+      },
+      {
+        "archive_path": "INSTALL.md",
+        "generator": "support/release/build-dry-run.py",
+        "required": true
+      }
+    ],
+    "forbidden_globs": [
+      "tests/fixtures/**",
+      "**/PROVENANCE.json"
+    ],
+    "fixture_paths": [
+      "tests/fixtures/AstatineMiner.json",
+      "tests/fixtures/AstatineGenesisCoordinator.json",
+      "tests/fixtures/MockAST.json",
+      "tests/fixtures/synthetic-injective-virtual-receipt.json"
+    ]
+  }
+}

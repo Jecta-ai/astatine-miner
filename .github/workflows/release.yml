@@ -1,0 +1,1098 @@
+# Release pipeline (manual dispatch only).
+#
+# Dispatch against the exact tag ref refs/tags/<tag> via workflow_dispatch.
+# Tag-protection ruleset verification is an independent external prerequisite;
+# this workflow never claims ruleset/tag protection is verified by its steps.
+# External prerequisite: the protected release gate must require a non-self
+# reviewer and a tag deployment rule. The workflow must fail closed when that
+# gate is absent and never weakens the gate. This file does not create the
+# gate. No stored credential is used beyond the default token where noted.
+# Candidate binaries are never executed in packaging; the builder only packs.
+# Manual owner publication remains outside this workflow because immutable
+# release administration requires a token the default token lacks.
+# Build binary attestations occur before environment approval but are
+# non-release build provenance; archive attestations and draft are
+# environment-gated in release-package/release-draft. Release-package verifies
+# binary attestations, so archive and draft are bound to compiled binaries;
+# archive attestation alone does not prove compilation.
+# Provenance records owner-authorized release intent with final controls
+# outstanding; it does not authorize final publication.
+# Tag-protection ruleset verification is an independent external prerequisite.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag for the exact tag ref (for example v0.1.0-testnet.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  RUSTUP_TOOLCHAIN: "1.94.1"
+  RELEASE_TAG: ${{ inputs.tag }}
+
+jobs:
+  preflight:
+    name: Preflight tag and exact-commit checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert exact tag identity
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "$RELEASE_TAG^{}")" = "$GITHUB_SHA"
+          test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
+      - name: Enforce canonical repository and tag ref
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "Jecta-ai/astatine-miner"
+          test "$REPOSITORY_ID" = "1454137135"
+          test -n "$RELEASE_TAG"
+          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
+      - name: Verify protected release environment
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          repo="$GITHUB_REPOSITORY"
+          env_out="$RUNNER_TEMP/release-env.json"
+          policies_out="$RUNNER_TEMP/release-branch-policies.json"
+          gh api "repos/$repo/environments/release" > "$env_out"
+          gh api "repos/$repo/environments/release/deployment-branch-policies" > "$policies_out"
+          python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag"
+      - name: Validate release tag format
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          case "$tag" in
+            *$'\n'*|*$'\r'*|*$'\t'*)
+              echo "release tag contains newline or tab" >&2
+              exit 1
+              ;;
+          esac
+          if printf '%s' "$tag" | LC_ALL=C grep -q '[^ -~]'; then
+            echo "release tag contains non-printable characters" >&2
+            exit 1
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-testnet\.[0-9]+$'; then
+            echo "release tag does not match required pattern" >&2
+            exit 1
+          fi
+      - name: Verify tag matches checkout
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          test "$(git describe --tags --exact-match)" = "$tag"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch origin main --no-tags
+          git merge-base --is-ancestor HEAD origin/main
+      - name: Verify tag matches package version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          version="$(grep -E '^version *= *"' Cargo.toml | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          test -n "$version"
+          test "$tag" = "v$version"
+      - name: Verify fixture provenance
+        run: |
+          set -euo pipefail
+          python3 -B support/verify-fixture-provenance.py
+      - name: Verify distribution inventory
+        run: |
+          set -euo pipefail
+          python3 -B support/verify-distribution-inventory.py
+      - name: Verify exact-commit hosted checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$GITHUB_SHA"
+          repo="$GITHUB_REPOSITORY"
+          out="$RUNNER_TEMP/exact-runs.json"
+          gh api "repos/$repo/actions/runs?head_sha=$sha&per_page=100" > "$out"
+          python3 - "$out" "$sha" <<'PY'
+          import json
+          import sys
+          path = sys.argv[1]
+          expected = sys.argv[2]
+          data = json.load(open(path, encoding="utf-8"))
+          runs = data.get("workflow_runs", [])
+          required = {
+              "Rust CI": ".github/workflows/ci.yml",
+              "Linux native qualification": ".github/workflows/linux-native-qualification.yml",
+          }
+          for name, expected_path in required.items():
+              candidates = [
+                  r for r in runs
+                  if r.get("name") == name
+                  and r.get("path") == expected_path
+                  and r.get("head_sha") == expected
+                  and r.get("event") == "push"
+                  and r.get("head_branch") == "main"
+              ]
+              if len(candidates) == 0:
+                  print("missing push run for %r at %s with path %r on main" % (name, expected, expected_path), file=sys.stderr)
+                  sys.exit(1)
+              def run_key(r):
+                  return (r.get("run_started_at") or r.get("created_at") or "", r.get("id") or 0)
+              latest = max(candidates, key=run_key)
+              if latest.get("event") in ("pull_request", "pull_request_target", "workflow_dispatch"):
+                  print("pull request or dispatch event not accepted for %r" % name, file=sys.stderr)
+                  sys.exit(1)
+              if latest.get("event") != "push" or latest.get("head_branch") != "main":
+                  print("release gate needs the exact main push run for %r (workflow_dispatch is not a substitute)" % name, file=sys.stderr)
+                  sys.exit(1)
+              if latest.get("status") != "completed" or latest.get("conclusion") != "success":
+                  print("latest push run for %r is not successful: id=%s name=%s path=%s status=%s conclusion=%s event=%s head_branch=%s url=%s" % (name, latest.get("id"), latest.get("name"), latest.get("path"), latest.get("status"), latest.get("conclusion"), latest.get("event"), latest.get("head_branch"), latest.get("html_url")), file=sys.stderr)
+                  sys.exit(1)
+              if latest.get("head_sha") != expected:
+                  print("exact head SHA mismatch for %r" % name, file=sys.stderr)
+                  sys.exit(1)
+          print("exact-commit checks verified")
+          PY
+
+  build-macos:
+    name: Build macOS arm64 binary
+    needs: preflight
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert exact tag identity
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "$RELEASE_TAG^{}")" = "$GITHUB_SHA"
+          test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.1 --profile minimal
+          test "$(rustc --version | awk '{print $2}')" = "1.94.1"
+      - name: Build locked release binary
+        run: cargo build --locked --release
+      - name: Smoke test release binary
+        run: |
+          set -euo pipefail
+          ./target/release/astatine --version
+          ./target/release/astatine --help >/dev/null
+          ./target/release/astatine mine --help >/dev/null
+      - name: Inspect macOS binary
+        run: |
+          set -euo pipefail
+          codesign --verify --strict --verbose=4 ./target/release/astatine
+          file ./target/release/astatine
+          otool -L ./target/release/astatine
+      # Build-provenance attestation for the raw compiled binary (pre-approval;
+      # not a release archive asset). Release archives are attested only after
+      # environment approval in release-draft.
+      - name: Attest raw macOS binary
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: target/release/astatine
+      - name: Upload macOS binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: astatine-macos-arm64
+          path: target/release/astatine
+          if-no-files-found: error
+          retention-days: 7
+
+  build-linux:
+    name: Build Linux x86_64 binary
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert exact tag identity
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "$RELEASE_TAG^{}")" = "$GITHUB_SHA"
+          test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.1 --profile minimal
+          test "$(rustc --version | awk '{print $2}')" = "1.94.1"
+          test "$(rustc -vV | awk '$1 == "host:" {print $2}')" = "x86_64-unknown-linux-gnu"
+      - name: Build locked release binary
+        run: cargo build --locked --release
+      - name: Smoke test release binary
+        run: |
+          set -euo pipefail
+          ./target/release/astatine --version
+          ./target/release/astatine --help >/dev/null
+          ./target/release/astatine mine --help >/dev/null
+      - name: Inspect Linux binary
+        run: |
+          set -euo pipefail
+          file ./target/release/astatine
+          ldd ./target/release/astatine
+      # Build-provenance attestation for the raw compiled binary (pre-approval;
+      # not a release archive asset). Release archives are attested only after
+      # environment approval in release-draft.
+      - name: Attest raw Linux binary
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: target/release/astatine
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: astatine-linux-x86_64
+          path: target/release/astatine
+          if-no-files-found: error
+          retention-days: 7
+
+  release-package:
+    name: Package and attest release bundle
+    needs:
+      - build-macos
+      - build-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert exact tag identity
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "$RELEASE_TAG^{}")" = "$GITHUB_SHA"
+          test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
+      - name: Download macOS binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: astatine-macos-arm64
+          path: ${{ runner.temp }}/retrieved/macos
+      - name: Download Linux binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: astatine-linux-x86_64
+          path: ${{ runner.temp }}/retrieved/linux
+      - name: Re-verify protected environment before mutation
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          repo="$GITHUB_REPOSITORY"
+          env_out="$RUNNER_TEMP/package-env.json"
+          policies_out="$RUNNER_TEMP/package-branch-policies.json"
+          gh api "repos/$repo/environments/release" > "$env_out"
+          gh api "repos/$repo/environments/release/deployment-branch-policies" > "$policies_out"
+          python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag"
+      - name: Verify binary build attestations before packaging
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          for binary in "$RUNNER_TEMP/retrieved/macos/astatine" "$RUNNER_TEMP/retrieved/linux/astatine"; do
+            test -f "$binary"
+            gh attestation verify "$binary" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$tag"
+          done
+      - name: Build release bundle without executing binaries
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          repo_id="$REPOSITORY_ID"
+          out="$RUNNER_TEMP/bundle-out"
+          rm -rf "$out"
+          mkdir -p "$out"
+          python3 -B support/release/build-release.py --tag "$tag" --repository-id "$repo_id" --macos-binary "$RUNNER_TEMP/retrieved/macos/astatine" --linux-binary "$RUNNER_TEMP/retrieved/linux/astatine" --output-dir "$out"
+          test -f "$out/astatine-$tag-macos-arm64.tar.gz"
+          test -f "$out/astatine-$tag-linux-x86_64.tar.gz"
+          test -f "$out/SHA256SUMS"
+          test -f "$out/release-provenance.json"
+          cp support/release/RELEASE_NOTES-v0.1.0-testnet.1.md "$out/release-notes.md"
+          test -f "$out/release-notes.md"
+          if ls "$out" | grep -Ei 'fixture|provenance\.json'; then
+            if ! ls "$out" | grep -Eq '^release-provenance\.json$'; then
+              echo "unexpected provenance file" >&2
+              exit 1
+            fi
+            extra="$(ls "$out" | grep -Ei 'fixture' || true)"
+            test -z "$extra"
+          fi
+          for archive in "$out"/astatine-*.tar.gz; do
+            if tar -tzf "$archive" | grep -Ei 'fixture|PROVENANCE'; then
+              echo "forbidden member present" >&2
+              exit 1
+            fi
+          done
+          (cd "$out" && sha256sum -c SHA256SUMS)
+      - name: Verify remote tag and provenance before archive attestation
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          sha="$GITHUB_SHA"
+          repo_id="$REPOSITORY_ID"
+          out="$RUNNER_TEMP/bundle-out"
+          remote_info="$(git ls-remote origin "refs/tags/$tag")"
+          test -n "$remote_info"
+          python3 - "$remote_info" "$tag" "$sha" <<'PY'
+          import sys
+          info, tag, expected = sys.argv[1], sys.argv[2], sys.argv[3]
+          wanted = "refs/tags/" + tag
+          peeled_ref = wanted + "^{}"
+          peeled = None
+          direct = None
+          lines = [line for line in info.splitlines() if line.strip()]
+          if not lines:
+              print("remote tag missing", file=sys.stderr)
+              sys.exit(1)
+          for line in lines:
+              parts = line.strip().split()
+              if len(parts) != 2:
+                  print("ambiguous ls-remote output", file=sys.stderr)
+                  sys.exit(1)
+              obj, ref = parts
+              if ref == peeled_ref:
+                  if peeled is not None:
+                      print("multiple peeled refs", file=sys.stderr)
+                      sys.exit(1)
+                  peeled = obj
+              elif ref == wanted:
+                  if direct is not None:
+                      print("multiple tag refs", file=sys.stderr)
+                      sys.exit(1)
+                  direct = obj
+              else:
+                  print("unexpected ref in ls-remote: %s" % ref, file=sys.stderr)
+                  sys.exit(1)
+          commit = peeled if peeled is not None else direct
+          if commit is None:
+              print("remote tag ref missing", file=sys.stderr)
+              sys.exit(1)
+          if commit != expected:
+              print("remote tag moved: expected %s got %s" % (expected, commit), file=sys.stderr)
+              sys.exit(1)
+          print("remote tag verified at expected commit")
+          PY
+          python3 - "$out/release-provenance.json" "$out/SHA256SUMS" "$tag" "$sha" "$repo_id" <<'PY'
+          import json
+          import pathlib
+          import sys
+          prov_path = pathlib.Path(sys.argv[1])
+          sums_path = pathlib.Path(sys.argv[2])
+          exp_tag, exp_sha, exp_repo_id = sys.argv[3], sys.argv[4], sys.argv[5]
+          prov = json.loads(prov_path.read_text(encoding="utf-8"))
+          if prov.get("tag") != exp_tag:
+              print("provenance field tag mismatch", file=sys.stderr)
+              sys.exit(1)
+          if prov.get("commit") != exp_sha:
+              print("provenance field commit mismatch", file=sys.stderr)
+              sys.exit(1)
+          if prov.get("repository") != "Jecta-ai/astatine-miner":
+              print("provenance field repository mismatch", file=sys.stderr)
+              sys.exit(1)
+          if str(prov.get("repository_id")) != str(exp_repo_id):
+              print("provenance field repository_id mismatch", file=sys.stderr)
+              sys.exit(1)
+          if prov.get("release_intent_authorized") is not True:
+              print("provenance field release_intent_authorized must be exactly true", file=sys.stderr)
+              sys.exit(1)
+          if prov.get("publication_authorized") is not False:
+              print("provenance field publication_authorized must be exactly false", file=sys.stderr)
+              sys.exit(1)
+          if prov.get("final_release_controls_complete") is not False:
+              print("provenance field final_release_controls_complete must be exactly false", file=sys.stderr)
+              sys.exit(1)
+          decision = prov.get("rights_decision")
+          if not isinstance(decision, str) or not decision.strip():
+              print("provenance field rights_decision missing or empty", file=sys.stderr)
+              sys.exit(1)
+          decision_lower = decision.lower()
+          if "owner-authorized release intent" not in decision_lower:
+              print("provenance field rights_decision must record owner-authorized release intent", file=sys.stderr)
+              sys.exit(1)
+          if "final release controls outstanding" not in decision_lower:
+              print("provenance field rights_decision must record final controls outstanding", file=sys.stderr)
+              sys.exit(1)
+          if "publication authorized" in decision_lower or "release approver" in decision_lower:
+              print("provenance field rights_decision must not claim publication authorization or a release approver", file=sys.stderr)
+              sys.exit(1)
+          if prov.get("targets") != ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]:
+              print("provenance field targets mismatch", file=sys.stderr)
+              sys.exit(1)
+          sums = {}
+          for line in sums_path.read_text(encoding="utf-8").splitlines():
+              stripped = line.strip()
+              if not stripped:
+                  continue
+              parts = stripped.split()
+              if len(parts) != 2:
+                  print("malformed SHA256SUMS", file=sys.stderr)
+                  sys.exit(1)
+              sums[parts[1]] = parts[0].lower()
+          archives = prov.get("archives")
+          if not isinstance(archives, list) or len(archives) == 0:
+              print("provenance field archives must be a non-empty list", file=sys.stderr)
+              sys.exit(1)
+          for entry in archives:
+              if not isinstance(entry, dict):
+                  print("provenance field archives entry must be an object", file=sys.stderr)
+                  sys.exit(1)
+              fname = entry.get("filename")
+              fsha = entry.get("sha256")
+              if not isinstance(fname, str) or not isinstance(fsha, str):
+                  print("provenance field archives filename/sha256 missing", file=sys.stderr)
+                  sys.exit(1)
+              expected_hex = sums.get(fname)
+              if expected_hex is None:
+                  print("provenance archive filename not in SHA256SUMS: %s" % fname, file=sys.stderr)
+                  sys.exit(1)
+              if fsha.lower() != expected_hex:
+                  print("provenance archive sha256 mismatch for %s" % fname, file=sys.stderr)
+                  sys.exit(1)
+          print("release provenance semantics verified")
+          PY
+      - name: Attest macOS archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/bundle-out/astatine-*-macos-arm64.tar.gz
+      - name: Attest Linux archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/bundle-out/astatine-*-linux-x86_64.tar.gz
+      - name: Verify archive attestations
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          for archive in "$RUNNER_TEMP"/bundle-out/astatine-*-macos-arm64.tar.gz "$RUNNER_TEMP"/bundle-out/astatine-*-linux-x86_64.tar.gz; do
+            test -f "$archive"
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$tag"
+          done
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: astatine-release-bundle
+          path: ${{ runner.temp }}/bundle-out/
+          if-no-files-found: error
+          retention-days: 7
+
+  release-draft:
+    name: Create and verify draft release
+    needs: release-package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    steps:
+      - name: Download bundle artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: astatine-release-bundle
+          path: bundle
+      - name: Re-verify protected environment before mutation
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          repo="$GITHUB_REPOSITORY"
+          env_out="$RUNNER_TEMP/draft-env.json"
+          policies_out="$RUNNER_TEMP/draft-branch-policies.json"
+          gh api "repos/$repo/environments/release" > "$env_out"
+          gh api "repos/$repo/environments/release/deployment-branch-policies" > "$policies_out"
+          python3 - "$env_out" "$policies_out" "$tag" <<'PY'
+          import fnmatch
+          import json
+          import sys
+          env_path, policies_path, tag = sys.argv[1], sys.argv[2], sys.argv[3]
+          env_data = json.load(open(env_path, encoding="utf-8"))
+          if env_data.get("can_admins_bypass") is not False:
+              print("protection field can_admins_bypass must be exactly false", file=sys.stderr)
+              sys.exit(1)
+          rules = env_data.get("protection_rules")
+          if not isinstance(rules, list):
+              print("protection field protection_rules must be a list", file=sys.stderr)
+              sys.exit(1)
+          reviewer_rules = [r for r in rules if isinstance(r, dict) and r.get("type") == "required_reviewers"]
+          if len(reviewer_rules) != 1:
+              print("protection field required_reviewers count must be exactly one", file=sys.stderr)
+              sys.exit(1)
+          rule = reviewer_rules[0]
+          reviewers = rule.get("reviewers")
+          if reviewers is None:
+              nested = rule.get("required_reviewers")
+              if isinstance(nested, dict):
+                  reviewers = nested.get("reviewers", nested.get("users", nested.get("teams")))
+          if not isinstance(reviewers, list) or len(reviewers) == 0:
+              print("protection field reviewers must be a non-empty list", file=sys.stderr)
+              sys.exit(1)
+          if rule.get("prevent_self_review") is not True and env_data.get("prevent_self_review") is not True:
+              print("protection field prevent_self_review must be exactly true", file=sys.stderr)
+              sys.exit(1)
+          branch_policy = env_data.get("deployment_branch_policy")
+          if not isinstance(branch_policy, dict):
+              print("protection field deployment_branch_policy must be an object", file=sys.stderr)
+              sys.exit(1)
+          if branch_policy.get("custom_branch_policies") is not True:
+              print("protection field custom_branch_policies must be exactly true", file=sys.stderr)
+              sys.exit(1)
+          if branch_policy.get("protected_branches") is not False:
+              print("protection field protected_branches must be exactly false", file=sys.stderr)
+              sys.exit(1)
+          print("protected environment re-verified before mutation")
+          policies_data = json.load(open(policies_path, encoding="utf-8"))
+          policies = policies_data.get("branch_policies", policies_data.get("policies", policies_data.get("deployment_branch_policies")))
+          if policies is None and isinstance(policies_data, list):
+              policies = policies_data
+          if not isinstance(policies, list) or len(policies) == 0:
+              print("protection field branch_policies must be a non-empty list", file=sys.stderr)
+              sys.exit(1)
+          if len(policies) != 1:
+              print("protection field tag policies must be exactly one", file=sys.stderr)
+              sys.exit(1)
+          entry = policies[0]
+          if not isinstance(entry, dict):
+              print("protection field tag policy entry must be an object", file=sys.stderr)
+              sys.exit(1)
+          if entry.get("type") != "tag":
+              if entry.get("type") == "branch":
+                  print("protection field branch policies must be empty when tag policies are used", file=sys.stderr)
+              else:
+                  print("protection field tag policy type must be exactly tag", file=sys.stderr)
+              sys.exit(1)
+          allowed_names = {"v0.1.0-testnet.*", tag}
+          name = entry.get("name", entry.get("pattern", ""))
+          if not isinstance(name, str) or not name:
+              print("protection field tag policy name missing", file=sys.stderr)
+              sys.exit(1)
+          if name not in allowed_names:
+              print("tag policy name not in series/exact allowlist", file=sys.stderr)
+              sys.exit(1)
+          if not fnmatch.fnmatch(tag, name):
+              print("no tag-type branch policy matches release tag", file=sys.stderr)
+              sys.exit(1)
+          print("tag deployment policy re-verified before mutation")
+          PY
+      - name: Verify bundle checksums
+        run: |
+          set -euo pipefail
+          (cd bundle && sha256sum -c SHA256SUMS)
+      - name: Verify packaged binaries match attested compiled binaries
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          extract_dir="$RUNNER_TEMP/attested-binaries"
+          rm -rf "$extract_dir"
+          mkdir -p "$extract_dir"
+          python3 - bundle "$extract_dir" "$GITHUB_SHA" "$tag" <<'PY'
+          import hashlib
+          import io
+          import json
+          import pathlib
+          import sys
+          import tarfile
+
+          bundle_dir = pathlib.Path(sys.argv[1])
+          extract_dir = pathlib.Path(sys.argv[2])
+          expected_commit = sys.argv[3]
+          expected_tag = sys.argv[4]
+
+          expected = {
+              "astatine-v0.1.0-testnet.1-macos-arm64.tar.gz": (
+                  "astatine-v0.1.0-testnet.1-macos-arm64",
+                  "aarch64-apple-darwin",
+              ),
+              "astatine-v0.1.0-testnet.1-linux-x86_64.tar.gz": (
+                  "astatine-v0.1.0-testnet.1-linux-x86_64",
+                  "x86_64-unknown-linux-gnu",
+              ),
+          }
+          basenames = {
+              "astatine": 0o755,
+              "BUILD-INFO.json": 0o644,
+              "INSTALL.md": 0o644,
+              "LICENSE-MIT": 0o644,
+              "THIRD_PARTY_LICENSES.md": 0o644,
+          }
+
+          def fail(message):
+              print(message, file=sys.stderr)
+              sys.exit(1)
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+          prov = json.loads((bundle_dir / "release-provenance.json").read_text(encoding="utf-8"))
+          if prov.get("commit") != expected_commit:
+              fail("provenance commit does not match GITHUB_SHA")
+          if prov.get("tag") != expected_tag:
+              fail("provenance tag does not match RELEASE_TAG")
+          entries = prov.get("archives")
+          if not isinstance(entries, list) or len(entries) != len(expected):
+              fail("provenance must contain exactly two archives")
+          by_name = {}
+          for entry in entries:
+              if not isinstance(entry, dict):
+                  fail("provenance archive entry must be an object")
+              name = entry.get("filename")
+              if not isinstance(name, str) or name in by_name:
+                  fail("provenance archive filename missing or duplicated")
+              by_name[name] = entry
+          if set(by_name) != set(expected):
+              fail("provenance archive allowlist mismatch")
+
+          sums = {}
+          for line in (bundle_dir / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+              stripped = line.strip()
+              if not stripped:
+                  continue
+              parts = stripped.split()
+              if len(parts) != 2:
+                  fail("malformed SHA256SUMS")
+              sums[parts[1]] = parts[0].lower()
+          if set(sums) != set(expected):
+              fail("SHA256SUMS archive allowlist mismatch")
+
+          manifest = {"commit": expected_commit, "tag": expected_tag}
+          manifest["binaries"] = {}
+          for filename, (root, target) in expected.items():
+              entry = by_name[filename]
+              if entry.get("target") != target:
+                  fail("provenance target mismatch for " + filename)
+              if entry.get("sha256", "").lower() != sums[filename]:
+                  fail("provenance archive sha256 does not match SHA256SUMS for " + filename)
+              archive_path = bundle_dir / filename
+              archive_bytes = archive_path.read_bytes()
+              if sha256(archive_bytes) != sums[filename]:
+                  fail("archive sha256 does not match SHA256SUMS for " + filename)
+
+              expected_paths = {f"{root}/{basename}" for basename in basenames}
+              members = {}
+              with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                  for member in tar.getmembers():
+                      name = member.name
+                      if name in members:
+                          fail("duplicate archive member: " + name)
+                      if member.type != tarfile.REGTYPE or not member.isreg():
+                          fail("archive member must be a regular file: " + name)
+                      pure = pathlib.PurePosixPath(name)
+                      if pure.is_absolute() or ".." in pure.parts or len(pure.parts) != 2:
+                          fail("archive member path is unsafe: " + name)
+                      if name not in expected_paths:
+                          fail("archive member is outside the allowlist: " + name)
+                      if member.mode != basenames[pure.name]:
+                          fail("archive member mode mismatch: " + name)
+                      data = tar.extractfile(member)
+                      if data is None:
+                          fail("archive member is not readable: " + name)
+                      members[name] = data.read()
+              if set(members) != expected_paths:
+                  fail("archive member set mismatch for " + filename)
+
+              provenance_members = entry.get("members")
+              if not isinstance(provenance_members, list) or len(provenance_members) != len(basenames):
+                  fail("provenance member allowlist mismatch for " + filename)
+              provenance_by_path = {}
+              for member_entry in provenance_members:
+                  if not isinstance(member_entry, dict):
+                      fail("provenance member entry must be an object")
+                  member_path = member_entry.get("archive_path")
+                  if not isinstance(member_path, str) or member_path in provenance_by_path:
+                      fail("provenance member path missing or duplicated")
+                  provenance_by_path[member_path] = member_entry
+              if set(provenance_by_path) != expected_paths:
+                  fail("provenance member set does not match archive allowlist for " + filename)
+              for name, data in members.items():
+                  member_entry = provenance_by_path[name]
+                  if member_entry.get("sha256", "").lower() != sha256(data):
+                      fail("archive member sha256 does not match provenance: " + name)
+                  if member_entry.get("bytes") != len(data):
+                      fail("archive member size does not match provenance: " + name)
+                  if member_entry.get("mode") != oct(basenames[pathlib.PurePosixPath(name).name]):
+                      fail("archive member mode does not match provenance: " + name)
+
+              binary_name = f"{root}/astatine"
+              binary = members[binary_name]
+              binary_hash = sha256(binary)
+              if entry.get("binary_sha256", "").lower() != binary_hash:
+                  fail("packaged binary sha256 does not match provenance for " + target)
+              if entry.get("binary_bytes") != len(binary):
+                  fail("packaged binary size does not match provenance for " + target)
+              if target == "aarch64-apple-darwin":
+                  if len(binary) < 32 or binary[0:4] != b"\xcf\xfa\xed\xfe":
+                      fail("macOS binary format mismatch: not a 64-bit Mach-O object")
+                  if int.from_bytes(binary[4:8], "little") != 0x0100000C:
+                      fail("macOS binary format mismatch: not an ARM64 Mach-O object")
+                  if int.from_bytes(binary[12:16], "little") != 2:
+                      fail("macOS binary format mismatch: not an executable Mach-O object")
+              elif target == "x86_64-unknown-linux-gnu":
+                  if len(binary) < 64 or binary[0:4] != b"\x7fELF":
+                      fail("Linux binary format mismatch: not an ELF executable")
+                  if binary[4] != 2 or binary[5] != 1:
+                      fail("Linux binary format mismatch: not 64-bit little-endian ELF")
+                  if int.from_bytes(binary[18:20], "little") != 62:
+                      fail("Linux binary format mismatch: not x86-64 ELF")
+              else:
+                  fail("unsupported attested binary target")
+              destination = extract_dir / target / "astatine"
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              destination.write_bytes(binary)
+              destination.chmod(0o700)
+              manifest["binaries"][target] = {
+                  "sha256": binary_hash,
+                  "archive": filename,
+                  "archive_sha256": sums[filename],
+              }
+
+          if set(manifest["binaries"]) != {"aarch64-apple-darwin", "x86_64-unknown-linux-gnu"}:
+              fail("attested binary target set mismatch")
+          (extract_dir / "manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          print("packaged binaries match archive and provenance allowlists; binaries extracted")
+          PY
+      - name: Verify extracted binaries against build attestations
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          manifest="$RUNNER_TEMP/attested-binaries/manifest.json"
+          test -f "$manifest"
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu; do
+            binary="$RUNNER_TEMP/attested-binaries/$target/astatine"
+            test -f "$binary"
+            expected="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["binaries"][sys.argv[2]]["sha256"])' "$manifest" "$target")"
+            test -n "$expected"
+            actual="$(sha256sum "$binary" | cut -d' ' -f1)"
+            test "$actual" = "$expected"
+            gh attestation verify "$binary" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$tag"
+            test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$expected"
+          done
+          test "$(find "$RUNNER_TEMP/attested-binaries" -mindepth 2 -maxdepth 2 -type f -name astatine | wc -l)" = "2"
+          echo "packaged binaries verified against separately attested compiled binaries"
+      - name: Verify archive attestations
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          for archive in bundle/astatine-*-macos-arm64.tar.gz bundle/astatine-*-linux-x86_64.tar.gz; do
+            test -f "$archive"
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$tag"
+          done
+      - name: Verify release provenance semantics
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          sha="$GITHUB_SHA"
+          repo_id="$REPOSITORY_ID"
+          python3 - bundle/release-provenance.json bundle/SHA256SUMS bundle/release-notes.md "$tag" "$sha" "$repo_id" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+          prov_path = pathlib.Path(sys.argv[1])
+          sums_path = pathlib.Path(sys.argv[2])
+          notes_path = pathlib.Path(sys.argv[3])
+          exp_tag, exp_sha, exp_repo_id = sys.argv[4], sys.argv[5], sys.argv[6]
+          if not notes_path.is_file() or notes_path.stat().st_size == 0:
+              print("provenance field release notes missing", file=sys.stderr)
+              sys.exit(1)
+          prov = json.loads(prov_path.read_text(encoding="utf-8"))
+          if prov.get("tag") != exp_tag:
+              print("provenance field tag mismatch", file=sys.stderr)
+              sys.exit(1)
+          if prov.get("commit") != exp_sha:
+              print("provenance field commit mismatch", file=sys.stderr)
+              sys.exit(1)
+          if prov.get("repository") != "Jecta-ai/astatine-miner":
+              print("provenance field repository mismatch", file=sys.stderr)
+              sys.exit(1)
+          if str(prov.get("repository_id")) != str(exp_repo_id):
+              print("provenance field repository_id mismatch", file=sys.stderr)
+              sys.exit(1)
+          if prov.get("release_intent_authorized") is not True:
+              print("provenance field release_intent_authorized must be exactly true", file=sys.stderr)
+              sys.exit(1)
+          if prov.get("publication_authorized") is not False:
+              print("provenance field publication_authorized must be exactly false", file=sys.stderr)
+              sys.exit(1)
+          if prov.get("final_release_controls_complete") is not False:
+              print("provenance field final_release_controls_complete must be exactly false", file=sys.stderr)
+              sys.exit(1)
+          decision = prov.get("rights_decision")
+          if not isinstance(decision, str) or not decision.strip():
+              print("provenance field rights_decision missing or empty", file=sys.stderr)
+              sys.exit(1)
+          decision_lower = decision.lower()
+          if "owner-authorized release intent" not in decision_lower:
+              print("provenance field rights_decision must record owner-authorized release intent", file=sys.stderr)
+              sys.exit(1)
+          if "final release controls outstanding" not in decision_lower:
+              print("provenance field rights_decision must record final controls outstanding", file=sys.stderr)
+              sys.exit(1)
+          if "publication authorized" in decision_lower or "release approver" in decision_lower:
+              print("provenance field rights_decision must not claim publication authorization or a release approver", file=sys.stderr)
+              sys.exit(1)
+          if prov.get("targets") != ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]:
+              print("provenance field targets mismatch", file=sys.stderr)
+              sys.exit(1)
+          sums = {}
+          for line in sums_path.read_text(encoding="utf-8").splitlines():
+              stripped = line.strip()
+              if not stripped:
+                  continue
+              parts = stripped.split()
+              if len(parts) != 2:
+                  print("malformed SHA256SUMS", file=sys.stderr)
+                  sys.exit(1)
+              sums[parts[1]] = parts[0].lower()
+          archives = prov.get("archives")
+          if not isinstance(archives, list) or len(archives) == 0:
+              print("provenance field archives must be a non-empty list", file=sys.stderr)
+              sys.exit(1)
+          for entry in archives:
+              if not isinstance(entry, dict):
+                  print("provenance field archives entry must be an object", file=sys.stderr)
+                  sys.exit(1)
+              fname = entry.get("filename")
+              fsha = entry.get("sha256")
+              if not isinstance(fname, str) or not isinstance(fsha, str):
+                  print("provenance field archives filename/sha256 missing", file=sys.stderr)
+                  sys.exit(1)
+              expected_hex = sums.get(fname)
+              if expected_hex is None:
+                  print("provenance archive filename not in SHA256SUMS: %s" % fname, file=sys.stderr)
+                  sys.exit(1)
+              if fsha.lower() != expected_hex:
+                  print("provenance archive sha256 mismatch for %s" % fname, file=sys.stderr)
+                  sys.exit(1)
+          print("release provenance semantics verified")
+          PY
+      - name: Create draft release with assets
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          sha="$GITHUB_SHA"
+          repo="$GITHUB_REPOSITORY"
+          ref_out="$RUNNER_TEMP/draft-tag-ref.json"
+          tag_out="$RUNNER_TEMP/draft-tag-object.json"
+          gh api "repos/$repo/git/ref/tags/$tag" > "$ref_out"
+          python3 - "$ref_out" <<'PY'
+          import json
+          import sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          obj = data.get("object")
+          if not isinstance(obj, dict):
+              print("remote tag ref missing object", file=sys.stderr)
+              sys.exit(1)
+          obj_type = obj.get("type")
+          obj_sha = obj.get("sha")
+          if obj_type not in ("tag", "commit"):
+              print("unsupported tag object type", file=sys.stderr)
+              sys.exit(1)
+          if not isinstance(obj_sha, str) or not obj_sha:
+              print("remote tag ref missing sha", file=sys.stderr)
+              sys.exit(1)
+          print("remote tag ref resolved")
+          PY
+          obj_type="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("object", {}).get("type", ""))' "$ref_out")"
+          obj_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("object", {}).get("sha", ""))' "$ref_out")"
+          test -n "$obj_type"
+          test -n "$obj_sha"
+          if [ "$obj_type" = "tag" ]; then
+            gh api "repos/$repo/git/tags/$obj_sha" > "$tag_out"
+            commit_sha="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); o=d.get("object", {}); print(o.get("sha", ""))' "$tag_out")"
+          elif [ "$obj_type" = "commit" ]; then
+            commit_sha="$obj_sha"
+          else
+            echo "unsupported tag object type" >&2
+            exit 1
+          fi
+          test -n "$commit_sha"
+          if [ "$commit_sha" != "$sha" ]; then
+            echo "remote tag moved" >&2
+            exit 1
+          fi
+          echo "remote tag verified at expected commit"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$tag" --notes-file bundle/release-notes.md bundle/astatine-*-macos-arm64.tar.gz bundle/astatine-*-linux-x86_64.tar.gz bundle/SHA256SUMS bundle/release-provenance.json
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.name) \(.size)"' > "$RUNNER_TEMP/published-assets.txt"
+          cat "$RUNNER_TEMP/published-assets.txt"
+          python3 - bundle/SHA256SUMS "$RUNNER_TEMP/published-assets.txt" <<'PY'
+          import pathlib
+          import sys
+          checks = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          listed = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+          expected = []
+          for line in checks.splitlines():
+              parts = line.strip().split()
+              if len(parts) == 2:
+                  expected.append(parts[1])
+          for name in expected:
+              if name not in listed:
+                  print("asset missing from release: %s" % name, file=sys.stderr)
+                  sys.exit(1)
+          print("all assets attached and listed")
+          PY
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets > "$RUNNER_TEMP/published-assets.json"
+          python3 - bundle/SHA256SUMS "$RUNNER_TEMP/published-assets.json" bundle <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+          sums_path = pathlib.Path(sys.argv[1])
+          remote_path = pathlib.Path(sys.argv[2])
+          bundle_dir = pathlib.Path(sys.argv[3])
+          sums = {}
+          for line in sums_path.read_text(encoding="utf-8").splitlines():
+              stripped = line.strip()
+              if not stripped:
+                  continue
+              parts = stripped.split()
+              if len(parts) != 2:
+                  print("malformed SHA256SUMS", file=sys.stderr)
+                  sys.exit(1)
+              hexval, fname = parts
+              if "/" in fname or fname in ("", ".", ".."):
+                  print("unexpected filename in SHA256SUMS: %s" % fname, file=sys.stderr)
+                  sys.exit(1)
+              sums[fname] = hexval.lower()
+          expected_names = sorted(set(sums) | {"SHA256SUMS", "release-provenance.json"})
+          local = {}
+          for name in expected_names:
+              target = bundle_dir / name
+              if not target.is_file():
+                  print("missing local bundle file: %s" % name, file=sys.stderr)
+                  sys.exit(1)
+              data = target.read_bytes()
+              local[name] = (hashlib.sha256(data).hexdigest().lower(), len(data))
+          for name, hexval in sums.items():
+              if local[name][0] != hexval:
+                  print("local hash mismatch for %s" % name, file=sys.stderr)
+                  sys.exit(1)
+          remote_raw = json.loads(remote_path.read_text(encoding="utf-8"))
+          assets = remote_raw.get("assets", remote_raw) if isinstance(remote_raw, dict) else remote_raw
+          if isinstance(assets, dict) and "assets" in assets:
+              assets = assets["assets"]
+          remote_by_name = {}
+          for entry in assets:
+              rname = entry.get("name")
+              rsize = entry.get("size")
+              rdigest = entry.get("digest")
+              if rname is None or rsize is None or rdigest is None:
+                  print("remote asset missing fields: %r" % (entry,), file=sys.stderr)
+                  sys.exit(1)
+              dhex = rdigest
+              if isinstance(dhex, str) and dhex.lower().startswith("sha256:"):
+                  dhex = dhex.split(":", 1)[1]
+              dhex = str(dhex).lower()
+              if rname in remote_by_name:
+                  print("duplicate remote asset: %s" % rname, file=sys.stderr)
+                  sys.exit(1)
+              remote_by_name[rname] = (dhex, int(rsize))
+          for name in expected_names:
+              if name not in remote_by_name:
+                  print("asset missing from release: %s" % name, file=sys.stderr)
+                  sys.exit(1)
+          for name in expected_names:
+              exp_hex, exp_size = local[name]
+              rem_hex, rem_size = remote_by_name[name]
+              if rem_size != exp_size:
+                  print("size mismatch for %s: remote %s != local %s" % (name, rem_size, exp_size), file=sys.stderr)
+                  sys.exit(1)
+              if rem_hex != exp_hex:
+                  print("digest mismatch for %s" % name, file=sys.stderr)
+                  sys.exit(1)
+          if set(remote_by_name) != set(expected_names):
+              print("unexpected remote assets: %s" % sorted(set(remote_by_name) - set(expected_names)), file=sys.stderr)
+              sys.exit(1)
+          print("all assets verified with matching digest and size")
+          PY
+      - name: Draft verified
+        run: |
+          set -euo pipefail
+          echo "Draft verified; manual owner publication remains required after an admin verifies immutable releases are enabled and all assets/release notes are approved."

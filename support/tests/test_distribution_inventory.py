@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Safe offline tests for support/verify-distribution-inventory.py.
 
-The tests copy the distribution inventory and fixture provenance into a
-temporary directory and mutate only that copy. They never touch the real
+These are the original 49 blocked-state regression tests, retained unchanged in
+behavior. They copy frozen blocked v1 inventory/provenance fixtures into a
+temporary directory and mutate only that copy; the authorized v3 state is
+covered separately in test_distribution_inventory_authorized.py. They never touch the real
 source tree, network, wallet, build, or production runtime. Run with
 ``python3 -B`` so no ``__pycache__`` directories are written.
 """
@@ -27,6 +29,7 @@ VERIFIER_PATH = Path(
 ).resolve()
 INVENTORY_REL = Path("support/release/distribution-inventory.json")
 PROVENANCE_REL = Path("tests/fixtures/PROVENANCE.json")
+BLOCKED_ROOT = Path(__file__).resolve().parent / "fixtures" / "blocked-gate"
 
 EXPECTED_BLOCKING_OPEN = ["RIGHTS-02", "RIGHTS-03", "RIGHTS-04", "RIGHTS-05"]
 
@@ -52,7 +55,7 @@ class DistributionInventoryTests(unittest.TestCase):
         for relative in (INVENTORY_REL, PROVENANCE_REL):
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(SOURCE_ROOT / relative, destination)
+            shutil.copy2(BLOCKED_ROOT / relative.name, destination)
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()

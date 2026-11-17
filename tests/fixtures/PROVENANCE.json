@@ -1,6 +1,6 @@
 {
-  "schema": "astatine-fixture-provenance/v1",
-  "scope": "Offline inventory for tests/fixtures only. No upstream source is copied here and no upstream build was performed for this inventory.",
+  "schema": "astatine-fixture-provenance/v3",
+  "scope": "Offline inventory for tests/fixtures only. No upstream source is copied here and no upstream build was performed for this inventory. Offline fixture inventory (fixture bytes and hashes) is unchanged; this revision records owner-authorized release intent and technical NOTICE review.",
   "baseline": {
     "canonical_repository_head": "7ba0ff6136c1ed7d084939cce44b8a7da669b671",
     "canonical_tree": "09b7387d6fb9ddc86ac37f105c5f3dd4ceccc417",
@@ -12,8 +12,8 @@
     "network_required": false,
     "build_required": false,
     "regenerated_in_this_review": false,
-    "change_note": "FIX-04 was replaced in this review by a synthetic receipt authored in this repository; the three contract bytecode fixtures were not regenerated. The rights/notice checklist records the release-blocking actions.",
-    "date_utc": "2026-11-14"
+    "change_note": "FIX-04 was replaced in an earlier review by a synthetic receipt authored in this repository; the three contract bytecode fixtures were not regenerated. Offline fixture inventory is unchanged in this revision; owner-authorized release intent and technical NOTICE review were recorded.",
+    "date_utc": "2026-11-17"
   },
   "fixtures": [
     {
@@ -50,7 +50,9 @@
       "license": {
         "declared_spdx": "Apache-2.0",
         "declaration_evidence": "SPDX header in the pinned source blob d1fc2c6a91c290ce8d4be353a232dc41769f2c51; the file contains no copyright statement.",
-        "rights_status": "unresolved; license identity is declared but redistribution authority and applicable notices are not established"
+        "rights_status": "first-party work owned by the project owner; Apache-2.0 redistribution is authorized by the project owner with copyright Copyright (c) 2026 emyrinj; Apache-2.0 text in tests/fixtures/LICENSE-APACHE-2.0.txt and fixture NOTICE in tests/fixtures/NOTICE are included; OWNER-ATTESTED \u2014 not independently verified",
+        "license_text": "tests/fixtures/LICENSE-APACHE-2.0.txt",
+        "copyright": "Copyright (c) 2026 emyrinj"
       },
       "regeneration": {
         "status": "scripted",
@@ -101,7 +103,9 @@
       "license": {
         "declared_spdx": "Apache-2.0",
         "declaration_evidence": "SPDX header in the pinned source blob abd2ebd9fcefd1c62dc7b17939b3d3f875d09df8; the file contains no copyright statement and has zero direct OpenZeppelin imports.",
-        "rights_status": "unresolved; the pinned source repository tree contains no LICENSE/NOTICE and redistribution authority is not established"
+        "rights_status": "first-party work owned by the project owner; Apache-2.0 redistribution is authorized by the project owner with copyright Copyright (c) 2026 emyrinj; Apache-2.0 text in tests/fixtures/LICENSE-APACHE-2.0.txt and fixture NOTICE in tests/fixtures/NOTICE are included; OWNER-ATTESTED \u2014 not independently verified",
+        "license_text": "tests/fixtures/LICENSE-APACHE-2.0.txt",
+        "copyright": "Copyright (c) 2026 emyrinj"
       },
       "regeneration": {
         "status": "scripted",
@@ -145,7 +149,9 @@
       "license": {
         "declared_spdx": "MIT",
         "declaration_evidence": "SPDX header in the pinned source blob 0a7480c5586ac26897cbadc4db83c5225ad46c58; the file contains no copyright statement and imports one OpenZeppelin component.",
-        "rights_status": "unresolved; authorship and redistribution authority remain for the rights holder to confirm"
+        "rights_status": "MockAST is first-party work owned by the project owner; MIT redistribution is authorized by the project owner with copyright Copyright (c) 2026 emyrinj; OpenZeppelin MIT notice is retained in tests/fixtures/OPENZEPPELIN_LICENSE.txt; OWNER-ATTESTED \u2014 not independently verified",
+        "license_text": "tests/fixtures/LICENSE-MIT.txt",
+        "copyright": "Copyright (c) 2026 emyrinj"
       },
       "regeneration": {
         "status": "not_scripted",
@@ -201,8 +207,8 @@
   "documents": [
     {
       "path": "tests/fixtures/README.md",
-      "sha256": "3b2322fd6a8b2d2c264fb8b3933ee779bf18322950ddeff5126f48180fd0ba8d",
-      "bytes": 5948
+      "sha256": "cc4436a1df510deb09125bff6597138e5e6bd499e36a1d754a9cc1ebec78ef03",
+      "bytes": 10309
     }
   ],
   "legal_artifacts": [
@@ -214,6 +220,33 @@
       "copyright": "Copyright (c) 2016-2023 zOS Global Limited and contributors",
       "provenance": "OpenZeppelin Contracts LICENSE at commit dbb6104ce834628e473d2173bbc9d47f81a9eec3",
       "evidence": "The staged file is byte-identical to the pinned local submodule LICENSE and the retained exact-pin license evidence."
+    },
+    {
+      "path": "tests/fixtures/LICENSE-APACHE-2.0.txt",
+      "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+      "bytes": 9723,
+      "license": "Apache-2.0",
+      "copyright": "Copyright (c) 2026 emyrinj",
+      "provenance": "Apache License 2.0 canonical text, byte-identical to serde_json 1.0.151 LICENSE-APACHE; copyright Copyright (c) 2026 emyrinj for first-party AstatineMiner and AstatineGenesisCoordinator fixtures is recorded in tests/fixtures/NOTICE and this inventory.",
+      "evidence": "The staged file is byte-identical to the canonical Apache-2.0 text (serde_json 1.0.151 LICENSE-APACHE, SHA-256 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a)."
+    },
+    {
+      "path": "tests/fixtures/LICENSE-MIT.txt",
+      "sha256": "7472688f99a2841cd08d1a66fcf1f6d0ca8d9b7057b79093a9b568f245c6ed2f",
+      "bytes": 1064,
+      "license": "MIT",
+      "copyright": "Copyright (c) 2026 emyrinj",
+      "provenance": "Standard MIT license text for Copyright (c) 2026 emyrinj; byte-identical to the root LICENSE-MIT.",
+      "evidence": "The staged file is byte-identical to the root LICENSE-MIT (SHA-256 7472688f99a2841cd08d1a66fcf1f6d0ca8d9b7057b79093a9b568f245c6ed2f) and covers first-party MockAST."
+    },
+    {
+      "path": "tests/fixtures/NOTICE",
+      "sha256": "8952db21e62803cad6900a1116e43cba3d13459e22cabbc66e83698d6274e32a",
+      "bytes": 2950,
+      "license": "NOTICE",
+      "copyright": "Copyright (c) 2026 emyrinj; Copyright (c) 2016-2023 zOS Global Limited and contributors",
+      "provenance": "Fixture NOTICE authored in this repository recording first-party Apache-2.0/MIT attributions, accurately scoped OpenZeppelin reference (both EVM trees reference commit dbb6104ce834628e473d2173bbc9d47f81a9eec3; MockAST imports one component; GenesisCoordinator zero direct imports; retained for any applicable redistribution without asserting OZ code in every fixture), and technical NOTICE review finding no separate upstream NOTICE file.",
+      "evidence": "The staged NOTICE records AstatineMiner and AstatineGenesisCoordinator as first-party Apache-2.0, MockAST as first-party MIT, retains the OpenZeppelin MIT notice (Copyright (c) 2016-2023 zOS Global Limited and contributors, commit dbb6104ce834628e473d2173bbc9d47f81a9eec3) for any fixture redistribution to which it applies without asserting OpenZeppelin code in every fixture (MockAST imports one component; GenesisCoordinator zero direct imports; no OpenZeppelin code in AstatineMiner asserted), and records repository technical review on 2026-11-17 with citations to PROVENANCE.json, README.md, LICENSE-APACHE-2.0.txt, LICENSE-MIT.txt, OPENZEPPELIN_LICENSE.txt, NOTICE; no legal conclusion or separate approval."
     }
   ],
   "openzeppelin": {
@@ -223,7 +256,7 @@
     "copyright": "Copyright (c) 2016-2023 zOS Global Limited and contributors",
     "license_text": "tests/fixtures/OPENZEPPELIN_LICENSE.txt",
     "verified": true,
-    "evidence_scope": "Exact pinned LICENSE verified locally and against retained upstream license evidence. This resolves license identity only, not first-party rights or notice applicability."
+    "evidence_scope": "Exact pinned LICENSE (MIT, Copyright (c) 2016-2023 zOS Global Limited and contributors) verified locally and against retained upstream license evidence at commit dbb6104ce834628e473d2173bbc9d47f81a9eec3. Both pinned EVM source trees reference this commit; the MockAST pinned source imports one OpenZeppelin component and the AstatineGenesisCoordinator pinned source declares zero direct OpenZeppelin imports. The notice is retained for any fixture redistribution to which it applies and does not assert OpenZeppelin code in every fixture. This resolves license identity only, not first-party rights or notice applicability."
   },
   "rights_review": {
     "first_party_license_identity": "The pinned AstatineMiner and AstatineGenesisCoordinator source files declare Apache-2.0; the pinned MockAST source file declares MIT.",
@@ -231,14 +264,23 @@
     "rights_holder_authority": "OWNER-ATTESTED \u2014 not independently verified",
     "owner_attestation": {
       "status": "OWNER-ATTESTED \u2014 not independently verified",
-      "scope": "The AstatineMiner and AstatineGenesisCoordinator contracts are first-party works developed and owned by the project owner.",
-      "attested_on": "2026-11-15",
-      "attestation_source": "The project owner explicitly confirmed ownership of the first-party ASTATINE mining and genesis coordinator contracts for Phase D; not independently verified.",
-      "independent_verification": false
+      "scope": "The AstatineMiner, AstatineGenesisCoordinator, and MockAST contracts are first-party works developed and owned by the project owner.",
+      "attested_on": "2026-11-17",
+      "attestation_source": "The project owner explicitly confirmed ownership of the first-party AstatineMiner, AstatineGenesisCoordinator, and MockAST contracts and authorized redistribution under Apache-2.0 (AstatineMiner, AstatineGenesisCoordinator) and MIT (MockAST) on 2026-11-17; not independently verified.",
+      "independent_verification": false,
+      "prior_attestations": [
+        {
+          "status": "OWNER-ATTESTED \u2014 not independently verified",
+          "scope": "The AstatineMiner and AstatineGenesisCoordinator contracts are first-party works developed and owned by the project owner.",
+          "attested_on": "2026-11-15",
+          "attestation_source": "The project owner explicitly confirmed ownership of the first-party ASTATINE mining and genesis coordinator contracts for Phase D; not independently verified.",
+          "independent_verification": false
+        }
+      ]
     },
-    "notice_applicability": "UNRESOLVED",
+    "notice_applicability": "TECHNICALLY REVIEWED \u2014 no separate upstream NOTICE file was found in the pinned contract fixture subtrees; the private EVM root NOTICE is scoped to a separate Rust subtree; Apache-2.0 license text and fixture NOTICE are included. This is an evidence-based technical review, not a legal conclusion or separate approval.",
     "notice_checklist": {
-      "status": "OPEN \u2014 publication remains BLOCKED",
+      "status": "TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent; final release controls outstanding",
       "scope": "Manual release gate. No automated check can establish ownership, authority or NOTICE applicability; this list records the exact actions still required before publishing this repository or its release archive.",
       "items": [
         {
@@ -252,41 +294,40 @@
         {
           "id": "RIGHTS-02",
           "action": "Decide whether Apache-2.0 NOTICE propagation applies to each distributed artifact. The contract fixtures are not release-archive members, so any obligation follows source redistribution of the fixtures rather than the miner binary.",
-          "owner": "project owner and release approver",
-          "status": "OPEN",
+          "owner": "repository technical review",
+          "status": "DONE",
           "blocking": true,
-          "evidence": "rights_review.copyright_evidence; fixtures FIX-01 and FIX-02 both set release_archive_member to false."
+          "evidence": "Technically reviewed 2026-11-17 by repository technical review: no separate upstream NOTICE file was found in the pinned contract fixture subtrees (see rights_review.release_intent_authorization.technical_notice_review with citations to PROVENANCE.json, README.md, LICENSE-APACHE-2.0.txt, LICENSE-MIT.txt, OPENZEPPELIN_LICENSE.txt, NOTICE); Apache-2.0 text in tests/fixtures/LICENSE-APACHE-2.0.txt and fixture NOTICE in tests/fixtures/NOTICE are included. Fixtures FIX-01 and FIX-02 remain with release_archive_member false; see rights_review.notice_applicability and release_intent_authorization.technical_notice_review."
         },
         {
           "id": "RIGHTS-03",
           "action": "If the two first-party contract fixtures remain in the public source tree, add the Apache-2.0 license text and a copyright statement for them, or remove those fixtures from the public tree.",
           "owner": "project owner",
-          "status": "OPEN",
+          "status": "DONE",
           "blocking": true,
-          "evidence": "tests/fixtures ships OPENZEPPELIN_LICENSE.txt only; no Apache-2.0 license text accompanies FIX-01 or FIX-02."
+          "evidence": "Resolved 2026-11-17: Apache-2.0 license text added in tests/fixtures/LICENSE-APACHE-2.0.txt with copyright Copyright (c) 2026 emyrinj and fixture NOTICE in tests/fixtures/NOTICE for the first-party AstatineMiner and AstatineGenesisCoordinator fixtures, which remain in the public source tree; owner-authorized by the project owner. See rights_review.release_intent_authorization and its technical_notice_review citations to PROVENANCE.json, README.md, LICENSE-APACHE-2.0.txt, LICENSE-MIT.txt, OPENZEPPELIN_LICENSE.txt, NOTICE."
         },
         {
           "id": "RIGHTS-04",
           "action": "Confirm authorship and redistribution authority for MockAST and keep the OpenZeppelin MIT notice with any redistribution of it.",
           "owner": "project owner",
-          "status": "OPEN",
+          "status": "DONE",
           "blocking": true,
-          "evidence": "FIX-03 license.declaration_evidence; legal_artifacts OPENZEPPELIN_LICENSE.txt."
+          "evidence": "Confirmed 2026-11-17: MockAST is first-party and MIT redistribution reflects owner-authorized release intent by the project owner with copyright Copyright (c) 2026 emyrinj in tests/fixtures/LICENSE-MIT.txt; OpenZeppelin MIT notice retained in tests/fixtures/OPENZEPPELIN_LICENSE.txt for any fixture redistribution to which it applies. See rights_review.release_intent_authorization.technical_notice_review and tests/fixtures/NOTICE; no legal conclusion or separate approval."
         },
         {
           "id": "RIGHTS-05",
           "action": "Record the final rights and notice decision in tests/fixtures/README.md and this inventory before publishing the repository or a release archive.",
-          "owner": "release approver",
-          "status": "OPEN",
+          "owner": "project owner",
+          "status": "DONE",
           "blocking": true,
-          "evidence": "rights_review.publication_decision is BLOCKED."
+          "evidence": "Recorded 2026-11-17 by the project owner: technical NOTICE review recorded in tests/fixtures/README.md and this inventory with citations to PROVENANCE.json, README.md, LICENSE-APACHE-2.0.txt, LICENSE-MIT.txt, OPENZEPPELIN_LICENSE.txt, NOTICE; owner-authorized release intent recorded in rights_review.release_intent_authorization with technical_notice_review; final release controls remain outstanding; no legal conclusion or separate approval."
         }
       ]
     },
-    "publication_decision": "BLOCKED pending review of rights and notice applicability; first-party ownership is owner-attested and not independently verified.",
     "not_inferred": "Repository owner identity, commit-author metadata, a personal handle or the CLI MIT license do not by themselves establish ownership or redistribution authority. The owner attestation is an explicit statement of first-party ownership; it is recorded as OWNER-ATTESTED and is not independently verified.",
     "review_ci_branch_push_authorization": {
-      "status": "AUTHORIZED \u2014 REVIEW/CI ONLY",
+      "status": "SUPERSEDED \u2014 OWNER-AUTHORIZED RELEASE INTENT",
       "authorized_by": "project owner",
       "authorized_on": "2026-11-16",
       "scope": "Push the fix/phase-e-e02-e07 remediation branch to the already-public repository solely for review and CI.",
@@ -299,7 +340,50 @@
         "broader license grant or legal clearance",
         "resolution of RIGHTS-02 through RIGHTS-05"
       ],
-      "rights_gate_unchanged": "RIGHTS-02 through RIGHTS-05 remain OPEN and blocking; source_distribution and binary_distribution remain BLOCKED."
+      "rights_gate_unchanged": "As of 2026-11-16, superseded 2026-11-17: RIGHTS-02 through RIGHTS-05 were OPEN and blocking; source_distribution and binary_distribution were BLOCKED.",
+      "superseded_by": "release_intent_authorization",
+      "superseded_on": "2026-11-17"
+    },
+    "rights_decision": "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.1; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion or separate approval.",
+    "release_intent_authorization": {
+      "status": "OWNER-AUTHORIZED RELEASE INTENT \u2014 FINAL CONTROLS OUTSTANDING",
+      "authorized_by": "project owner",
+      "authorized_on": "2026-11-17",
+      "scope": "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.1 on macOS ARM64 and Linux x86_64; final release controls remain outstanding.",
+      "approval_roles": "Project owner only; no separate release approver was appointed, consulted, or asserted.",
+      "evidence": [
+        "Project owner authorized first-party MockAST MIT redistribution intent (copyright Copyright (c) 2026 emyrinj) on 2026-11-17; see rights_review.owner_attestation and tests/fixtures/LICENSE-MIT.txt.",
+        "Apache-2.0 copyright Copyright (c) 2026 emyrinj for first-party AstatineMiner and AstatineGenesisCoordinator recorded in tests/fixtures/NOTICE and fixture license fields.",
+        "License/notice files included: tests/fixtures/LICENSE-APACHE-2.0.txt (SHA-256 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a), tests/fixtures/LICENSE-MIT.txt (SHA-256 7472688f99a2841cd08d1a66fcf1f6d0ca8d9b7057b79093a9b568f245c6ed2f), tests/fixtures/NOTICE (SHA-256 8952db21e62803cad6900a1116e43cba3d13459e22cabbc66e83698d6274e32a).",
+        "OpenZeppelin MIT notice (Copyright (c) 2016-2023 zOS Global Limited and contributors, commit dbb6104ce834628e473d2173bbc9d47f81a9eec3) retained in tests/fixtures/OPENZEPPELIN_LICENSE.txt for any fixture redistribution to which it applies; MockAST imports one component, GenesisCoordinator zero direct imports, no OpenZeppelin code in AstatineMiner asserted; does not assert OpenZeppelin code in every fixture.",
+        "All fixtures remain excluded from binary archives: FIX-01 through FIX-04 set release_archive_member to false; production binaries never load these files.",
+        "No legal conclusion is made and no separate approval is asserted; technical NOTICE review recorded with citations to PROVENANCE.json, README.md, LICENSE-APACHE-2.0.txt, LICENSE-MIT.txt, OPENZEPPELIN_LICENSE.txt, NOTICE."
+      ],
+      "technical_notice_review": {
+        "reviewed_on": "2026-11-17",
+        "reviewed_by": "Repository technical review; not the project owner and not a separate release approver.",
+        "finding": "No upstream NOTICE file was found in the pinned contract fixture subtrees. The private EVM root contains an Apache NOTICE scoped to a separate Rust subtree; the contract subtrees have no NOTICE. Apache-2.0 license text and fixture NOTICE are included for source redistribution. This is an evidence-based technical review, not a legal conclusion or separate approval.",
+        "citations": [
+          "tests/fixtures/PROVENANCE.json",
+          "tests/fixtures/README.md",
+          "tests/fixtures/LICENSE-APACHE-2.0.txt",
+          "tests/fixtures/LICENSE-MIT.txt",
+          "tests/fixtures/OPENZEPPELIN_LICENSE.txt",
+          "tests/fixtures/NOTICE"
+        ],
+        "legal_conclusion": false,
+        "separate_approval": false
+      },
+      "final_release_controls_complete": false,
+      "not_authorized": [
+        "Any other tag or version beyond v0.1.0-testnet.1.",
+        "Mainnet deployment or paid-operation risk acceptance.",
+        "Independent legal verification, legal advice, legal clearance, or legal conclusion.",
+        "Any assertion that a separate release approver was appointed, consulted, or approved the release.",
+        "Final release without the exact release tag, main-branch CI, protected environment, writer and write-capable app restriction, immutable-release verification, required attestations, and immutable release artifacts.",
+        "Bypass of release controls or workflow attestation dispatch outside the authorized release process."
+      ],
+      "independent_verification": false
     }
   },
   "scrub_policy": {

@@ -1,199 +1,230 @@
-# Linux release dry-run (blocked gate, no publication, no attestation)
+# Release lanes: nonpublishing dry-run vs release-intent dual-platform release (draft-only)
 
-This directory holds the inputs and evidence for the local Linux
-release **dry-run**. The rights lane owns
-`support/release/distribution-inventory.json`; the dry-run lane reads it and
-must never edit it into an authorized state.
+This directory holds the offline release gate and packaging lanes.
+`support/release/gate.py` is the shared fail-closed loader for
+`support/release/distribution-inventory.json` (schema
+`astatine-distribution-inventory/v3`) against
+`tests/fixtures/PROVENANCE.json` (schema `astatine-fixture-provenance/v3`).
+`support/verify-distribution-inventory.py` uses `gate.py` and accepts both
+the blocked v1 and the release-intent v3 states.
 
-This dry-run does **not** satisfy E-06 on its own: E-06 remains open until an
-authorized publisher, an independently verified Linux x86_64 artifact, and
-contemporaneous qualification evidence exist. What follows is a rehearsal
-from the dispatched commit that stays blocked, not publisher authentication.
+Regression preservation: the original blocked-state verifier code remains in
+`support/verify-distribution-inventory.py` and dispatches v3 to `gate.py`. The
+original 49 blocked-state tests remain in
+`support/tests/test_distribution_inventory.py` against frozen blocked fixtures;
+`support/tests/test_distribution_inventory_authorized.py` adds authorized-v3
+coverage. No prior negative test was deleted.
 
-## What the dry-run proves
+Fixture preservation: the original 66 blocked-state fixture tests remain in
+`support/tests/test_fixture_provenance_blocked.py` against the frozen blocked
+fixture tree; the live v3 release-intent fixture suite remains in
+`support/tests/test_fixture_provenance.py`. No prior fixture negative test was
+deleted.
 
-- The workflow builds the locked Linux x86_64 binary from the dispatched
-  checkout (`cargo build --locked --release` with pinned Rust `1.94.1`) and
-  passes CLI smoke checks (`--version`, `--help`). The builder additionally
-  requires the observed `rustc --version` and `cargo --version` output to be
-  exactly the official single-line Rust/Cargo 1.94.1 lines
-  (`rustc 1.94.1 (e408947bf 2026-03-25)` and
-  `cargo 1.94.1 (29ea6fb6a 2026-03-24)`), with at most one trailing LF or
-  CRLF. It captures at most 513 bytes with a bounded timeout and fails closed
-  on extra lines, control characters, oversize output, nonzero exit, or
-  timeout. This is a strict format check, not toolchain or publisher
-  authentication. The bounded capture path uses POSIX pipe `select`; it is
-  verified on macOS and intended for the Linux x86_64 dry-run, and is not
-  supported for Windows execution. The builder records the `Cargo.lock`
-  SHA-256 and requires the archived binary to be an ELF64 little-endian
-  x86_64 object before it is archived. The packaged scope is the `astatine`
-  native binary from the `astatine-cli-rust` package (release profile) — not
-  an npm package.
+Licensing for candidate `v0.1.0-testnet.1` (macOS ARM64 and Linux x86_64 only)
+is owner-authorized first-party source/binary distribution **intent**
+(`release_intent_authorization` dated 2026-11-17); repository technical NOTICE
+review recorded with citations; no legal conclusion and no separate release
+approver appointed/consulted; final release controls outstanding.
+Apache-2.0/MIT texts and fixture NOTICE included; all fixtures remain with
+`release_archive_member: false`. Release execution
+remains externally gated and draft-only: the exact tag, protected `release`
+environment with non-self reviewer (required reviewer, prevent self-review, no
+admin bypass, custom tag deployment policy), exact-commit main CI (Rust CI +
+Linux native qualification), and build-provenance attestations are enforced by
+`.github/workflows/release.yml` preflight/build jobs; immutable-release
+verification and manual publication are owner/admin steps. Neither is performed
+by any offline script.
+Offline checks cannot establish environment, tag, CI, or immutable-setting
+state. The workflow creates and verifies a **draft only**; it does not
+publish.
+
+## Nonpublishing Linux x86_64 dry-run (`build-dry-run.py`)
+
+The dry-run is a local rehearsal that never becomes a release path. It accepts
+either the blocked or the owner-authorized release-intent licensing gate via
+`gate.py` (so it keeps working after release-intent authorization) but always
+records `publication_authorized: false` and `mode: dry-run`, claims no final
+publication, creates only a local `.dry-run.tar.gz` archive plus `SHA256SUMS`
+and `release-provenance.json`, and performs no OIDC, no attestation, no upload,
+no tag, and no GitHub release. `--mode release` always fails in this script;
+the release-intent dual-platform release is built only by `build-release.py`.
+
+What the dry-run proves:
+
+- The locked Linux x86_64 binary shape (`cargo build --locked --release` with
+  pinned Rust `1.94.1`; observed `rustc`/`cargo --version` must be exactly the
+  official single-line `1.94.1` lines with at most one trailing LF/CRLF,
+  bounded to 513 bytes) and `Cargo.lock` SHA-256 are recorded; the archived
+  binary must be an ELF64 little-endian x86_64 object before archiving.
 - `support/verify-fixture-provenance.py` and
-  `support/verify-distribution-inventory.py` independently confirm the
-  recorded gate before anything is archived.
-- `support/release/build-dry-run.py` reads **only** the canonical
-  `tests/fixtures/PROVENANCE.json` and
-  `support/release/distribution-inventory.json` (no path overrides exist),
-  matches the gate against the **exact canonical blocked text** (not
-  prefixes): the full publication-decision sentence, the checklist status
-  `OPEN — publication remains BLOCKED`, `UNRESOLVED` notice applicability,
-  and the byte-for-byte RIGHTS-02..RIGHTS-05 action/owner/evidence records.
-  Every provenance fixture must declare `release_archive_member: false`.
-- The builder requires the **full source tree**, including both gate files,
-  to be clean at `HEAD` (staged and unstaged tracked changes rejected, as are
-  non-ignored untracked files; every archive document must additionally be
-  tracked and clean) and records `source_clean_at_head` plus explicit
-  gate-file cleanliness. Git-ignored files are generally not inspected by this
-  Git check; `target/` is the expected build output and the only explicitly
-  allowed untracked path. A clean tree does **not** prove the archived
-  binary was built from `HEAD`; that linkage is workflow-build-only (fresh
-  checkout, then build) and is recorded as unverified in
-  `binary_build_linkage`.
-- The workflow builds a **deterministic** `tar.gz` from exactly five members:
-  the explicit source allowlist (`astatine` + `LICENSE-MIT` +
-  `THIRD_PARTY_LICENSES.md`) plus two deterministically generated members
-  (`BUILD-INFO.json` and `INSTALL.md`, produced in memory by the builder and
-  never written to the source tree). The generated members carry the exact
-  source identity (repository/commit/tree/commit-timestamp date), the package
-  version, the corresponding-source recipe, dependency hashes, install and
-  upgrade notes, and the unverified-linkage statement. No fixture, provenance
-  file, source file, or forbidden path can enter the archive.
-- No attestation is recorded or verified. The workflow performs no
-  attestation dispatch, requests no OIDC identity, stores no attestation
-  record, and uploads no release asset of any kind (no upload-artifact step,
-  no tag, no branch, no push, no GitHub release, no `cargo publish`, and no
-  external release binary is signed). This absence is intentional: the
-  distribution inventory explicitly records workflow attestation dispatch as
-  not authorized.
-- `release-provenance.json` records the canonical gate paths, commit/tree,
-  `source_clean_at_head`, gate-file cleanliness, `git_verified` status,
-  package/binary/profile/target, Cargo command and versions, lock hash,
-  binary install info, artifact and member hashes, gate state, and
-  `publication_authorized: false`. It records no absolute checkout path and
-  no raw invocation, to avoid identifying data in artifacts that operators
-  might copy; legitimate provenance (commit, tree, source date, toolchain,
-  lock hash, artifact and member hashes, gate state) is preserved.
+  `support/verify-distribution-inventory.py` confirm the recorded gate. The
+  release workflow runs both verifiers in preflight; the offline packager
+  relies on `gate.py` plus the fixture-verifier contract (it does not
+  re-execute the fixture verifier itself). `build-dry-run.py` reads only the
+  canonical gate paths (no overrides), requires the full source tree clean at
+  `HEAD`, and builds a deterministic `tar.gz` from exactly five members
+  (`astatine` + `LICENSE-MIT` + `THIRD_PARTY_LICENSES.md` plus generated
+  `BUILD-INFO.json` and `INSTALL.md` in memory). No fixture, provenance, or
+  forbidden path can enter the archive. A clean tree does NOT prove the binary
+  was built from `HEAD` (workflow-build-only linkage, recorded as unverified).
+- No attestation is recorded or verified; no OIDC identity is requested
+  (`contents: read` only). `release-provenance.json` records gate state,
+  commit/tree/source-date, toolchain, lock hash, artifact/member hashes, and
+  `publication_authorized: false` with no absolute checkout path and no raw
+  invocation.
 
-## What the dry-run does NOT prove
+What the dry-run does NOT prove:
 
-- It does not authorize publication. The rights gate stays **BLOCKED**:
-  the exact publication-decision sentence above, NOTICE applicability
-  `UNRESOLVED`, and `RIGHTS-02` through `RIGHTS-05` remain OPEN and
-  blocking. Any move to an authorized state needs reviewed code changes,
-  not data-only edits. No legal approval is inferred from any of these
-  checks.
-- No attestation exists to authenticate. No attestation is dispatched,
-  stored, or verified by this lane; the absence of attestation is required
-  by the blocked gate. The dry-run therefore authenticates no publisher and
-  no legal approval, and it is not release evidence.
-- Bit-for-bit reproducibility across hosts is **not** claimed. The tarball
-  is deterministic given identical inputs (sorted members, zeroed
-  timestamps/ownership, fixed modes, `gzip -n` equivalent, commit-timestamp
-  source date instead of the wall clock), but toolchain,
-  host, and dependency differences are out of scope.
-- Build-from-HEAD linkage is **not** proven by this script (see
-  `binary_build_linkage`): the workflow builds after checkout, but the
-  script only verifies the tree is clean and the binary has the expected
-  shape — it cannot prove the binary bytes came from that source.
-- No installer, updater, deployment credential, paid-mining run, public
-  RPC contact, or production wallet operation is involved.
+- It does not authorize publication or establish external execution. Even when
+  release intent is owner-authorized, the dry-run establishes no environment, tag, CI, or
+  attestation; it is not release evidence and authenticates no publisher.
+- Bit-for-bit reproducibility across hosts is not claimed (deterministic given
+  identical inputs only). Build-from-HEAD linkage is not proven. No installer,
+  paid-mining run, wallet, or network operation is involved.
 
-## No publication path
+No publication path: the dry-run writes only to a new-or-empty directory
+outside the source tree (pre-existing files, symlinks, non-empty dirs, and
+in-tree locations refused, files created exclusively). There is intentionally
+no upload, tag, push, release, `cargo publish`, signing, credentials, or OIDC
+grant.
 
-The dry-run creates only local files inside an output directory that must
-be **new or empty and lie outside the source tree** (pre-existing files,
-symlinks, non-empty directories, and in-tree locations are all refused,
-and each output file is created exclusively): the `.dry-run.tar.gz`
-archive, `SHA256SUMS`, and `release-provenance.json`. No attestation is
-added by the workflow. There is intentionally:
+## Release-intent dual-platform release (`build-release.py`, draft-only)
 
-- no artifact or release upload step and no stored attestation record,
-- no tag, branch, push, or GitHub release,
-- no `cargo publish` and no external release binary signing,
-- no stored repository credentials and no OIDC identity request: job
-  permissions are `contents: read` only (see assumptions below).
+`support/release/build-release.py` requires the release-intent gate via `gate.py`
+(blocked gates fail closed; no final publication is authorized) and packages exactly two deterministic archives:
 
-`--mode release` in `build-dry-run.py` always fails closed because no
-authorized publisher exists. `--mode dry-run` also fails if the gate text
-is not exactly canonical, if the tree is not clean, if the toolchain or
-binary shape is wrong, or if a tracked member is dirty, so a changed gate
-or source forces re-review instead of silently passing.
+- `astatine-v0.1.0-testnet.1-macos-arm64.tar.gz` (`aarch64-apple-darwin`)
+- `astatine-v0.1.0-testnet.1-linux-x86_64.tar.gz` (`x86_64-unknown-linux-gnu`)
 
-## Review/CI branch-push authorization (limited)
+Each archive contains exactly five regular files under a single platform
+root directory (`astatine-v0.1.0-testnet.1-macos-arm64/` or
+`astatine-v0.1.0-testnet.1-linux-x86_64/`): `<root>/astatine` (0755),
+`<root>/LICENSE-MIT`, `<root>/THIRD_PARTY_LICENSES.md`,
+`<root>/BUILD-INFO.json`, `<root>/INSTALL.md` (0644), sorted, with zeroed
+timestamps/ownership, fixed modes, and `gzip -n` equivalent. (The
+nonpublishing dry-run remains flat; only the release-intent release uses the
+root prefix.) It verifies the git
+tree clean at `HEAD`, the tag exists and resolves to `HEAD`, the tag matches
+the Cargo package version (`v` + version), the repository is
+`Jecta-ai/astatine-miner`, the repository-id is digits, and the `Cargo.lock`
+hash is recorded. It validates the macOS Mach-O 64-bit ARM64 header and the
+Linux ELF64 little-endian x86_64 header without executing the binaries, and
+refuses fixtures, forbidden globs, symlinks, in-tree or pre-existing output,
+wrong tag/version/commit, dirty trees, wrong binary formats, and
+duplicate/missing members. It is stdlib-only and offline and never executes
+candidate code, wallets, mining, or the network. Low-10 limitation:
+`build-release.py` validates binary format only (Mach-O/ELF headers); binary
+identity and source linkage are established by the workflow build jobs plus
+GitHub build provenance, verified again by the protected draft after safe
+archive-member validation, a target-format check, and extraction, not by this
+offline packager.
 
-- Pushing the `fix/phase-e-e02-e07` remediation branch to the already-public
-  repository **solely for review and CI** is authorized by the project owner
-  on 2026-11-16 (`review_ci_branch_push_authorization`,
-  status `AUTHORIZED \u2014 REVIEW/CI ONLY`, recorded identically in
-  `tests/fixtures/PROVENANCE.json` and the distribution inventory; the
-  dry-run builder exact-matches it and fails closed on any difference).
-- Public repository visibility authorizes nothing beyond that push. It does
-  **not** authorize a source archive, a binary archive or release, tag or
-  public release publication, workflow attestation dispatch, a broader
-  license grant or legal clearance, or resolution of RIGHTS-02 through
-  RIGHTS-05. Do not infer authorization from public visibility.
-- Unchanged and still blocking: RIGHTS-02 through RIGHTS-05 remain OPEN and
-  blocking; `source_distribution` and `binary_distribution` remain BLOCKED;
-  the publication decision remains the exact BLOCKED text. No tag, release,
-  or attestation dispatch is authorized or performed by this lane.
+The release workflow creates and verifies a **draft only** and never publishes
+from automation. It gates draft creation, not the manual publish action:
+repository writers and write-capable apps with contents-write can publish or
+modify the draft outside the protected environment, so release authority must
+be restricted to the owner/admin before dispatch. If that cannot be
+established, draft dispatch remains blocked — do not weaken. Preflight
+verifies the actual protected `release` environment (required reviewer,
+prevent self-review, no admin bypass, custom tag deployment policy) and the
+canonical repository, and fails closed if the environment is absent or
+unprotected; preflight runs both fixture and distribution-inventory verifiers
+and the package step uses the already-validated gate via `gate.py` (it does
+not rerun both verifier scripts). Admin verification that immutable releases
+are enabled is a **pre-dispatch/draft-creation prerequisite**, rechecked
+immediately before manual publication. Manual publication remains owner-only
+after admin immutable-setting verification:
+
+```sh
+# Stop on any failure; run each command individually.
+tag=v0.1.0-testnet.1
+repo=Jecta-ai/astatine-miner
+repo_id='<numeric repository ID from the authenticated release record>'
+source_commit='<exact source commit from the authenticated release record>'
+test "$(gh api "repos/$repo" --jq .id)" = "$repo_id"
+# Pre-dispatch prerequisite (and recheck again immediately before publishing):
+gh api "repos/$repo/immutable-releases" --jq .enabled | grep -q true
+gh release view "$tag" --repo "$repo" --json isDraft --jq .isDraft | grep -q true
+# Only after the draft, attestations, and immutable-setting check pass,
+# recheck the tag immediately before manual publication (handles both
+# annotated tags via the peeled commit and lightweight tags via the direct
+# commit):
+tag_refs="$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}")"
+resolved_tag_commit="$(
+  printf '%s\n' "$tag_refs" |
+    awk -v ref="refs/tags/$tag" '
+      $2 == ref "^{}" { peeled = $1 }
+      $2 == ref { direct = $1 }
+      END {
+        if (peeled != "") print peeled
+        else if (direct != "") print direct
+        else exit 1
+      }
+    '
+)"
+test "$resolved_tag_commit" = "$source_commit"
+# Recheck immutable releases immediately before publishing:
+gh api "repos/$repo/immutable-releases" --jq .enabled | grep -q true
+gh release edit "$tag" --repo "$repo" --draft=false --prerelease
+# Post-publication verification (stop on any failure):
+gh release view "$tag" --repo "$repo" --json isDraft,isPrerelease --jq '[.isDraft, .isPrerelease]'
+```
+
+`BUILD-INFO.json` (schema `astatine-build-info/v1`, deterministic) records
+repository, repository id, tag, commit, tree, package version, target,
+profile, pinned expected toolchain lines, `Cargo.lock` SHA-256, binary/archive hashes, source
+date, `release_intent_authorized: true`, `publication_authorized: false`, and
+`final_release_controls_complete: false`, the workflow-from-tag linkage
+statement (build-provenance attestation required; independent reproducibility
+not claimed), and release-control requirements. `INSTALL.md` is
+platform-specific: macOS is ad-hoc signed only (NOT Developer ID/notarized);
+if Gatekeeper blocks, stop and retain the warning — do NOT disable Gatekeeper,
+strip quarantine, alter system policy, or silently bypass; install only to a
+user-owned path such as `$HOME/.local/bin` (never sudo); single-platform
+operators verify only their archive's row (an operator holding both archives
+verifies each row separately):
+`grep -F "  astatine-v0.1.0-testnet.1-macos-arm64.tar.gz" SHA256SUMS | shasum -a 256 -c -`
+on macOS and
+`grep -F "  astatine-v0.1.0-testnet.1-linux-x86_64.tar.gz" SHA256SUMS | sha256sum -c -`
+on Linux, and always verify GitHub attestations. Linux notes glibc/Ubuntu 24.04,
+unlocked
+Secret Service for paid mining, and CUDA/GPU not qualified. Both state
+Testnet only (no mainnet), and require verifying `SHA256SUMS` and GitHub
+attestations. No false claims are made. `SHA256SUMS` covers both archives;
+`release-provenance.json` (schema `astatine-release-provenance/v1`) is a separate release asset whose digest is checked by the workflow, and records
+both archives/binaries, source identity, lock hash, gate state, and
+`release_intent_authorized: true` with `publication_authorized: false` and
+`final_release_controls_complete: false`, with no absolute paths or raw invocation.
+
+Example:
+
+```sh
+python3 -B support/release/build-release.py --tag v0.1.0-testnet.1 \
+  --repository-id 123456789 --macos-binary /tmp/macos-astatine \
+  --linux-binary /tmp/linux-astatine --output-dir /tmp/astatine-release-out
+```
+
+## Review history (superseded)
+
+Pushing the `fix/phase-e-e02-e07` branch solely for review and CI was
+authorized 2026-11-16 (`AUTHORIZED — REVIEW/CI ONLY`); it authorized no
+archive, release, tag, or attestation. That record is now
+`SUPERSEDED — OWNER-AUTHORIZED RELEASE INTENT` (`superseded_by:
+release_intent_authorization`, `superseded_on: 2026-11-17`) and retained as
+history. Public repository visibility alone authorizes no distribution.
 
 ## Install, upgrade, and corresponding source
 
-`INSTALL.md` (in the archive) is the human-readable operator note;
-`BUILD-INFO.json` is the machine-readable equivalent. Both are generated
-deterministically from the dispatched commit — the source date is the commit
-timestamp, never the wall clock — and both restate that the archive is NOT
-FOR PUBLICATION OR DISTRIBUTION.
-
-- Install: verify `SHA256SUMS` externally, extract, install `astatine` 0755
-  on `PATH`, confirm `--version`.
-- Upgrade: stop the miner, keep configuration/wallets/keystores/credentials/
-  journals, replace only the binary, never overwrite or delete state; see the
-  top-level README.md for platform state locations. Downgrade compatibility
-  is not guaranteed.
-- Corresponding source is **not** in the archive. Obtain it with
-  `git clone https://github.com/Jecta-ai/astatine-miner.git &&
-  git checkout <commit>` using the exact commit recorded in
-  `BUILD-INFO.json`; dependency pins are in `Cargo.lock` (hash recorded),
-  notices in `THIRD_PARTY_LICENSES.md`, license in `LICENSE-MIT`.
-
-## Runner assumptions (no attestation)
-
-- The workflow is `workflow_dispatch` only and runs on GitHub-hosted
-  `ubuntu-24.04` x86_64 with pinned action SHAs and `contents: read`
-  at the top and job level. No `id-token: write` or `attestations: write`
-  grant exists, and no OIDC identity is requested. No `github.token`
-  exposure beyond the default read-only checkout occurs.
-- The following are **unsupported or unverified** and must not be treated
-  as equivalent evidence: fork PR runs, self-hosted runners, offline or
-  third-party mirrors, and any manual copy of the archive.
-- Inspect the hosted workflow result for the exact dispatched commit. A
-  configured workflow file alone is not evidence of execution.
-
-## Prerequisites: green CI for the exact commit (required)
-
-- Do not dispatch the dry-run unless the exact dispatched commit shows
-  green `Rust CI` in the hosted workflow results. Green means the
-  `native-checks`, `linux-safe-tests`, and `dependency-policy` jobs all
-  passed for that commit, including toolchain pin checks, fixture and
-  distribution inventory verifiers, `cargo deny check`, the inactive-graph
-  guard, `cargo audit`, and third-party license notice regeneration checks.
-- A configured workflow file alone is not evidence of execution. Inspect
-  the hosted workflow result for the exact dispatched commit before running
-  the dry-run.
-- Only the three tracked workflows in `.github/workflows/` are authorized:
-  `ci.yml` (push/pull-request only), `linux-native-qualification.yml`, and
-  `linux-release-dry-run.yml` (manual dispatch only). No other workflow,
-  dispatch source, or publish/release path is authorized while the gate is
-  BLOCKED.
-- The dry-run does not replace CI and does not satisfy E-06. E-06 remains
-  open until an authorized publisher, an independently verified Linux
-  x86_64 artifact, and contemporaneous qualification evidence exist.
-- The green-CI prerequisite above is inspected separately in the hosted
-  workflow results for the exact commit; it is not executed by the dry-run
-  steps. The commands under `Local use (offline)` below are the only steps
-  executed by this lane.
+`INSTALL.md` is the human-readable note; `BUILD-INFO.json` is the
+machine-readable equivalent. Both use the commit timestamp as source date
+(never the wall clock). Corresponding source is NOT in the archives; obtain it
+with `git clone https://github.com/Jecta-ai/astatine-miner.git && git checkout
+<tag/commit>` using the exact tag/commit in `BUILD-INFO.json`. Verify
+`SHA256SUMS` externally and the GitHub attestations for the exact tag before
+installing. Upgrade preserves state: stop the miner, keep
+configuration/wallets/keystores/credentials/journals, replace only the binary;
+downgrade compatibility is not guaranteed.
 
 ## Local use (offline)
 
@@ -205,12 +236,9 @@ python3 -B support/release/build-dry-run.py --mode dry-run --output-dir /tmp/ast
 python3 -B -m unittest discover -s support/tests -p 'test_*.py'
 ```
 
-The local build must be on Linux x86_64 with the pinned Rust 1.94.1 toolchain.
-
-The output directory must not exist or must be empty, and must be outside
-the source tree. The source tree itself must be a clean Git checkout at
-HEAD; non-Git roots fail closed, produce no clean-tree record, and cannot
-satisfy the workflow's `git_verified` assertion. The Python checks are offline and stdlib-only; the locked Cargo build uses
-the recorded dependency set and may fetch it if it is not cached. They write
-no `__pycache__` when run with `-B`, never read wallets, and never modify the
-source tree.
+The dry-run build must be on Linux x86_64 with pinned Rust `1.94.1`. The
+release packager needs the two prebuilt binaries plus a clean checkout at the
+exact tag; it never builds or runs them. All Python checks are offline and
+stdlib-only with `-B` (no `__pycache__`), never read wallets, and never modify
+the source tree. Output directories must be new-or-empty and outside the
+source tree; non-Git roots fail closed.

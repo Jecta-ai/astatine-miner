@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Safe offline tests for support/verify-fixture-provenance.py.
+"""Live v3 tests for support/verify-fixture-provenance.py.
 
-The tests copy the staged fixtures into a temporary directory and mutate only
-that copy. They never touch the real source tree, network, wallet, Keychain,
-Anvil, GPU or production runtime.
+The original 66 blocked-state tests remain in
+``test_fixture_provenance_blocked.py`` against frozen blocked fixtures; this
+file is additive and covers the current v3 gate. Tests copy fixture
+copies into a temporary directory and never touch the real source tree,
+network, wallet, Keychain, Anvil, GPU, or production runtime.
 """
 
 from __future__ import annotations
@@ -40,6 +42,9 @@ INVENTORY_REL = Path("tests/fixtures/PROVENANCE.json")
 FIXTURE_REL = Path("tests/fixtures/AstatineMiner.json")
 FIXTURE_README_REL = Path("tests/fixtures/README.md")
 LICENSE_REL = Path("tests/fixtures/OPENZEPPELIN_LICENSE.txt")
+APACHE_REL = Path("tests/fixtures/LICENSE-APACHE-2.0.txt")
+MIT_REL = Path("tests/fixtures/LICENSE-MIT.txt")
+NOTICE_REL = Path("tests/fixtures/NOTICE")
 
 
 def load_verifier():
@@ -100,10 +105,46 @@ class FixtureProvenanceTests(unittest.TestCase):
                 return
         raise AssertionError(f"missing document entry for {relative}")
 
-    def test_real_inventory_passes(self) -> None:
+    def update_legal_entry(self, inventory: dict, relative: Path, data: bytes) -> None:
+        for artifact in inventory["legal_artifacts"]:
+            if artifact["path"] == relative.as_posix():
+                artifact["sha256"] = sha256_hex(data)
+                artifact["bytes"] = len(data)
+                return
+        raise AssertionError(f"missing legal artifact entry for {relative}")
+
+    def test_real_inventory_passes_as_v3(self) -> None:
         result = VERIFIER.verify(self.root)
         self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["schema"], "astatine-fixture-provenance/v3")
         self.assertEqual(result["fixtures_checked"], 4)
+        self.assertEqual(result["documents_checked"], 1)
+        self.assertEqual(result["legal_artifacts_checked"], 4)
+        self.assertEqual(result["scrub_paths_checked"], 5)
+        self.assertTrue(result["release_intent_authorized"])
+        self.assertFalse(result["publication_authorized"])
+        self.assertFalse(result["final_release_controls_complete"])
+        self.assertEqual(
+            result["notice_checklist_status"],
+            "TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent; final release controls outstanding",
+        )
+        self.assertEqual(result["blocking_open"], [])
+        self.assertEqual(result["notice_checklist_blocking_open"], 0)
+        self.assertEqual(
+            result["authorization_status"], "OWNER-AUTHORIZED RELEASE INTENT \u2014 FINAL CONTROLS OUTSTANDING"
+        )
+        self.assertEqual(
+            result["rights_decision"],
+            "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.1; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion or separate approval.",
+        )
+        self.assertEqual(
+            result["review_ci_branch_push_authorization"],
+            "SUPERSEDED \u2014 OWNER-AUTHORIZED RELEASE INTENT",
+        )
+        self.assertEqual(
+            result["notice_applicability"],
+            "TECHNICALLY REVIEWED \u2014 no separate upstream NOTICE file was found in the pinned contract fixture subtrees; the private EVM root NOTICE is scoped to a separate Rust subtree; Apache-2.0 license text and fixture NOTICE are included. This is an evidence-based technical review, not a legal conclusion or separate approval.",
+        )
 
     def test_tampered_fixture_bytes_fail(self) -> None:
         path = self.root / FIXTURE_REL
@@ -146,6 +187,207 @@ class FixtureProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(VERIFIER.VerificationError, "cannot read"):
             VERIFIER.verify(self.root)
 
+    def test_missing_apache_license_fails(self) -> None:
+        (self.root / APACHE_REL).unlink()
+        with self.assertRaises(VERIFIER.VerificationError):
+            VERIFIER.verify(self.root)
+
+    def test_missing_mit_license_fails(self) -> None:
+        (self.root / MIT_REL).unlink()
+        with self.assertRaises(VERIFIER.VerificationError):
+            VERIFIER.verify(self.root)
+
+    def test_missing_notice_fails(self) -> None:
+        (self.root / NOTICE_REL).unlink()
+        with self.assertRaises(VERIFIER.VerificationError):
+            VERIFIER.verify(self.root)
+
+    def test_extra_legal_artifact_file_fails(self) -> None:
+        probe = self.root / "tests" / "fixtures" / "EXTRA-LICENSE.txt"
+        probe.write_text("extra", encoding="utf-8")
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "unexpected file"):
+            VERIFIER.verify(self.root)
+
+    def test_renamed_apache_legal_artifact_fails(self) -> None:
+        inventory = self.inventory()
+        for artifact in inventory["legal_artifacts"]:
+            if artifact["path"] == APACHE_REL.as_posix():
+                artifact["path"] = "tests/fixtures/LICENSE-APACHE-RENAMED.txt"
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "not expected"):
+            VERIFIER.verify(self.root)
+
+    def test_altered_apache_content_fails(self) -> None:
+        path = self.root / APACHE_REL
+        data = path.read_bytes().replace(b"Apache License", b"X License")
+        self.assertNotIn(b"Apache License", data)
+        path.write_bytes(data)
+        inventory = self.inventory()
+        self.update_legal_entry(inventory, APACHE_REL, data)
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "Apache-2.0 license text"):
+            VERIFIER.verify(self.root)
+
+    def test_altered_mit_content_fails(self) -> None:
+        path = self.root / MIT_REL
+        data = path.read_bytes().replace(b"Permission is hereby granted", b"X")
+        self.assertNotIn(b"Permission is hereby granted", data)
+        path.write_bytes(data)
+        inventory = self.inventory()
+        self.update_legal_entry(inventory, MIT_REL, data)
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "MIT license text"):
+            VERIFIER.verify(self.root)
+
+    def test_altered_notice_content_fails(self) -> None:
+        path = self.root / NOTICE_REL
+        text = path.read_text(encoding="utf-8").replace("AstatineMiner", "Redacted")
+        self.assertNotIn("AstatineMiner", text)
+        data = text.encode()
+        path.write_bytes(data)
+        inventory = self.inventory()
+        self.update_legal_entry(inventory, NOTICE_REL, data)
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "missing required marker"):
+            VERIFIER.verify(self.root)
+
+    def test_notice_accurate_oz_scope_passes(self) -> None:
+        # Accurate L9 scope must be present in the temp NOTICE copy.
+        text = (self.root / NOTICE_REL).read_text(encoding="utf-8")
+        lowered = " ".join(text.lower().split())
+        for phrase in (
+            "pinned evm source trees reference",
+            "dbb6104ce834628e473d2173bbc9d47f81a9eec3",
+            "imports one openzeppelin component",
+            "zero direct openzeppelin imports",
+            "for any fixture redistribution to which it applies",
+            "does not assert openzeppelin code in every fixture",
+        ):
+            self.assertIn(phrase, lowered)
+        self.assertNotIn("with any redistribution of mockast", lowered)
+        # Verifier must still pass with the accurate scope.
+        result = VERIFIER.verify(self.root)
+        self.assertEqual(result["status"], "PASS")
+
+    def test_notice_missing_oz_scope_fails(self) -> None:
+        path = self.root / NOTICE_REL
+        text = path.read_text(encoding="utf-8")
+        # Drop the GenesisCoordinator zero-imports sentence to simulate under-claiming.
+        redacted = text.replace("declares zero direct OpenZeppelin", "has OpenZeppelin")
+        self.assertNotIn("zero direct OpenZeppelin", redacted)
+        data = redacted.encode()
+        path.write_bytes(data)
+        inventory = self.inventory()
+        self.update_legal_entry(inventory, NOTICE_REL, data)
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "zero direct OpenZeppelin imports"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_notice_narrow_mockast_only_fails(self) -> None:
+        path = self.root / NOTICE_REL
+        text = path.read_text(encoding="utf-8")
+        narrow = text.replace(
+            "for any fixture redistribution\n  to which it applies",
+            "with any redistribution of MockAST",
+        )
+        # Fall back if line-wrap differs: ensure old narrow phrase present.
+        if "with any redistribution of MockAST" not in narrow:
+            narrow = text + "\nwith any redistribution of MockAST\n"
+        data = narrow.encode()
+        path.write_bytes(data)
+        inventory = self.inventory()
+        self.update_legal_entry(inventory, NOTICE_REL, data)
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must not narrow OZ retention|must retain the OZ notice"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_openzeppelin_evidence_scope_missing_accurate_scope_fails(self) -> None:
+        inventory = self.inventory()
+        inventory["openzeppelin"]["evidence_scope"] = (
+            "Exact pinned LICENSE verified locally and against retained upstream license evidence. "
+            "This resolves license identity only, not first-party rights or notice applicability."
+        )
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "evidence_scope must scope both pinned EVM"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_readme_accurate_oz_scope_present(self) -> None:
+        text = (self.root / FIXTURE_README_REL).read_text(encoding="utf-8")
+        lowered = " ".join(text.lower().split())
+        for phrase in (
+            "both pinned evm source trees reference",
+            "imports one openzeppelin component",
+            "zero direct openzeppelin imports",
+            "for any fixture redistribution to which it applies",
+            "does not assert openzeppelin code in every fixture",
+        ):
+            self.assertIn(phrase, lowered)
+
+    def test_data_only_authorization_without_license_files_fails(self) -> None:
+        inventory = self.inventory()
+        inventory["legal_artifacts"] = [
+            a for a in inventory["legal_artifacts"] if a["path"] == LICENSE_REL.as_posix()
+        ]
+        self.write_inventory(inventory)
+        (self.root / APACHE_REL).unlink()
+        (self.root / MIT_REL).unlink()
+        (self.root / NOTICE_REL).unlink()
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must include the OpenZeppelin|legal artifact path inventory changed"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_checklist_done_without_evidence_fails(self) -> None:
+        inventory = self.inventory()
+        for item in inventory["rights_review"]["notice_checklist"]["items"]:
+            if item["id"] == "RIGHTS-03":
+                item["evidence"] = ""
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must be a non-empty string|DONE without evidence"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_missing_mockast_evidence_fails(self) -> None:
+        inventory = self.inventory()
+        auth = inventory["rights_review"]["release_intent_authorization"]
+        auth["evidence"] = [e for e in auth["evidence"] if "mockast" not in e.lower()]
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "missing MockAST"):
+            VERIFIER.verify(self.root)
+
+    def test_missing_mockast_attestation_scope_fails(self) -> None:
+        inventory = self.inventory()
+        att = inventory["rights_review"]["owner_attestation"]
+        att["scope"] = "The AstatineMiner and AstatineGenesisCoordinator contracts are first-party works."
+        att["attestation_source"] = "The project owner confirmed ownership on 2026-11-17; not independently verified."
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "must include MockAST|missing MockAST"):
+            VERIFIER.verify(self.root)
+
+    def test_independent_verification_claim_fails(self) -> None:
+        inventory = self.inventory()
+        inventory["rights_review"]["owner_attestation"]["independent_verification"] = True
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must not be represented as independent verification"
+        ):
+            VERIFIER.verify(self.root)
+        inventory = self.inventory()
+        inventory["rights_review"]["owner_attestation"]["independent_verification"] = False
+        inventory["rights_review"]["release_intent_authorization"]["independent_verification"] = True
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must not claim independent verification"
+        ):
+            VERIFIER.verify(self.root)
+
     def test_private_origin_marker_in_readme_fails(self) -> None:
         marker = "fixture-test-owner/fixture-test-repo"
         path = self.root / FIXTURE_README_REL
@@ -182,6 +424,13 @@ class FixtureProvenanceTests(unittest.TestCase):
         ):
             VERIFIER.verify(self.root)
 
+    def test_prior_attestation_rewrite_fails(self) -> None:
+        inventory = self.inventory()
+        inventory["rights_review"]["owner_attestation"]["prior_attestations"][0]["attested_on"] = "2026-11-16"
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(VERIFIER.VerificationError, "prior record changed|prior attestation"):
+            VERIFIER.verify(self.root)
+
     def test_notice_checklist_cannot_be_emptied(self) -> None:
         inventory = self.inventory()
         inventory["rights_review"]["notice_checklist"]["items"] = []
@@ -191,7 +440,7 @@ class FixtureProvenanceTests(unittest.TestCase):
         ):
             VERIFIER.verify(self.root)
 
-    def test_blocked_publication_requires_an_open_blocking_item(self) -> None:
+    def test_blocked_publication_requires_blocking_items(self) -> None:
         inventory = self.inventory()
         for item in inventory["rights_review"]["notice_checklist"]["items"]:
             item["blocking"] = False
@@ -202,21 +451,109 @@ class FixtureProvenanceTests(unittest.TestCase):
         ):
             VERIFIER.verify(self.root)
 
-    def test_publication_decision_blocked_but_approved_fails(self) -> None:
+    def test_rights_decision_wrong_fails(self) -> None:
         inventory = self.inventory()
-        inventory["rights_review"]["publication_decision"] = "BLOCKED but approved"
+        inventory["rights_review"]["rights_decision"] = "BLOCKED but approved"
         self.write_inventory(inventory)
         with self.assertRaisesRegex(
-            VERIFIER.VerificationError, "publication decision changed"
+            VERIFIER.VerificationError, "must be the exact v3"
         ):
             VERIFIER.verify(self.root)
 
-    def test_checklist_status_open_approved_fails(self) -> None:
+    def test_old_publication_keys_rejected(self) -> None:
+        inventory = self.inventory()
+        inventory["rights_review"]["publication_decision"] = "AUTHORIZED"
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must not contain publication_decision"
+        ):
+            VERIFIER.verify(self.root)
+        inventory = self.inventory()
+        inventory["rights_review"]["publication_authorization"] = {"status": "X"}
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must not contain publication_authorization"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_release_approver_invention_fails(self) -> None:
+        inventory = self.inventory()
+        inventory["rights_review"]["release_intent_authorization"]["authorized_by"] = "project owner and release approver"
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "project owner only|must be authorized by project owner only|must not invent a release approver"
+        ):
+            VERIFIER.verify(self.root)
+        inventory = self.inventory()
+        for item in inventory["rights_review"]["notice_checklist"]["items"]:
+            if item["id"] == "RIGHTS-02":
+                item["owner"] = "project owner and release approver"
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must be repository technical review|must not invent a release approver"
+        ):
+            VERIFIER.verify(self.root)
+        inventory = self.inventory()
+        inventory["rights_review"]["release_intent_authorization"]["evidence"] = [
+            "Project owner and release approver decided NOTICE."
+        ]
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must not invent a release approver"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_legal_conclusion_claim_fails(self) -> None:
+        inventory = self.inventory()
+        inventory["rights_review"]["release_intent_authorization"]["technical_notice_review"]["legal_conclusion"] = True
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must not claim a legal conclusion"
+        ):
+            VERIFIER.verify(self.root)
+        inventory = self.inventory()
+        inventory["rights_review"]["release_intent_authorization"]["technical_notice_review"]["legal_conclusion"] = False
+        inventory["rights_review"]["release_intent_authorization"]["technical_notice_review"]["separate_approval"] = True
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must not claim a separate approval"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_final_controls_complete_true_fails(self) -> None:
+        inventory = self.inventory()
+        inventory["rights_review"]["release_intent_authorization"]["final_release_controls_complete"] = True
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must remain outstanding|must not claim complete"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_missing_technical_citations_fails(self) -> None:
+        inventory = self.inventory()
+        tech = inventory["rights_review"]["release_intent_authorization"]["technical_notice_review"]
+        tech["citations"] = [c for c in tech["citations"] if c != "tests/fixtures/NOTICE"]
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "citations must list the six"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_v2_schema_rejected(self) -> None:
+        inventory = self.inventory()
+        inventory["schema"] = "astatine-fixture-provenance/v2"
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "unexpected inventory schema|superseded by v3"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_checklist_status_wrong_fails(self) -> None:
         inventory = self.inventory()
         inventory["rights_review"]["notice_checklist"]["status"] = "OPEN \u2014 approved"
         self.write_inventory(inventory)
         with self.assertRaisesRegex(
-            VERIFIER.VerificationError, "notice checklist status changed"
+            VERIFIER.VerificationError, "must be TECHNICAL REVIEW RECORDED"
         ):
             VERIFIER.verify(self.root)
 
@@ -231,14 +568,14 @@ class FixtureProvenanceTests(unittest.TestCase):
         ):
             VERIFIER.verify(self.root)
 
-    def test_blocker_evidence_reword_fails(self) -> None:
+    def test_blocker_evidence_missing_reference_fails(self) -> None:
         inventory = self.inventory()
         for item in inventory["rights_review"]["notice_checklist"]["items"]:
             if item["id"] == "RIGHTS-05":
-                item["evidence"] = "rights_review.publication_decision is APPROVED."
+                item["evidence"] = "Recorded."
         self.write_inventory(inventory)
         with self.assertRaisesRegex(
-            VERIFIER.VerificationError, "item evidence changed: RIGHTS-05"
+            VERIFIER.VerificationError, "missing required reference"
         ):
             VERIFIER.verify(self.root)
 
@@ -260,21 +597,24 @@ class FixtureProvenanceTests(unittest.TestCase):
         ):
             VERIFIER.verify(self.root)
 
-    def test_pass_reports_exact_gate_values(self) -> None:
+    def test_pass_reports_exact_v3_gate_values(self) -> None:
         result = VERIFIER.verify(self.root)
         self.assertEqual(result["status"], "PASS")
         self.assertEqual(
-            result["publication_decision"],
-            "BLOCKED pending review of rights and notice applicability; "
-            "first-party ownership is owner-attested and not independently verified.",
+            result["rights_decision"],
+            "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.1; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion or separate approval.",
         )
         self.assertEqual(
-            result["notice_checklist_status"], "OPEN \u2014 publication remains BLOCKED"
+            result["notice_checklist_status"], "TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent; final release controls outstanding"
         )
         self.assertEqual(
             result["review_ci_branch_push_authorization"],
-            "AUTHORIZED \u2014 REVIEW/CI ONLY",
+            "SUPERSEDED \u2014 OWNER-AUTHORIZED RELEASE INTENT",
         )
+        self.assertTrue(result["release_intent_authorized"])
+        self.assertFalse(result["publication_authorized"])
+        self.assertFalse(result["final_release_controls_complete"])
+        self.assertEqual(result["blocking_open"], [])
 
     def test_review_push_status_release_fails(self) -> None:
         inventory = self.inventory()
@@ -282,7 +622,7 @@ class FixtureProvenanceTests(unittest.TestCase):
         auth["status"] = "AUTHORIZED \u2014 RELEASE"
         self.write_inventory(inventory)
         with self.assertRaisesRegex(
-            VERIFIER.VerificationError, "push authorization status changed"
+            VERIFIER.VerificationError, "must be SUPERSEDED"
         ):
             VERIFIER.verify(self.root)
 
@@ -331,7 +671,16 @@ class FixtureProvenanceTests(unittest.TestCase):
         del inventory["rights_review"]["review_ci_branch_push_authorization"]
         self.write_inventory(inventory)
         with self.assertRaisesRegex(
-            VERIFIER.VerificationError, "must be an object"
+            VERIFIER.VerificationError, "missing required fields|must be an object"
+        ):
+            VERIFIER.verify(self.root)
+
+    def test_openzeppelin_path_must_remain(self) -> None:
+        inventory = self.inventory()
+        inventory["openzeppelin"]["license_text"] = MIT_REL.as_posix()
+        self.write_inventory(inventory)
+        with self.assertRaisesRegex(
+            VERIFIER.VerificationError, "must still point to"
         ):
             VERIFIER.verify(self.root)
 
@@ -682,7 +1031,7 @@ class FixtureProvenanceTests(unittest.TestCase):
         self.assertEqual(result["status"], "PASS")
         self.assertEqual(result["fixtures_checked"], 4)
         self.assertEqual(result["documents_checked"], 1)
-        self.assertEqual(result["legal_artifacts_checked"], 1)
+        self.assertEqual(result["legal_artifacts_checked"], 4)
         self.assertEqual(result["scrub_paths_checked"], 5)
         fixture_dir = self.root / "tests" / "fixtures"
         names = sorted(entry.name for entry in os.scandir(fixture_dir))
@@ -693,6 +1042,9 @@ class FixtureProvenanceTests(unittest.TestCase):
                     "AstatineGenesisCoordinator.json",
                     "AstatineMiner.json",
                     "MockAST.json",
+                    "LICENSE-APACHE-2.0.txt",
+                    "LICENSE-MIT.txt",
+                    "NOTICE",
                     "OPENZEPPELIN_LICENSE.txt",
                     "PROVENANCE.json",
                     "README.md",
@@ -701,11 +1053,13 @@ class FixtureProvenanceTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            result["publication_decision"],
-            "BLOCKED pending review of rights and notice applicability; "
-            "first-party ownership is owner-attested and not independently verified.",
+            result["rights_decision"],
+            "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.1; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion or separate approval.",
         )
-        self.assertEqual(result["notice_applicability"], "UNRESOLVED")
+        self.assertEqual(result["notice_applicability"], "TECHNICALLY REVIEWED \u2014 no separate upstream NOTICE file was found in the pinned contract fixture subtrees; the private EVM root NOTICE is scoped to a separate Rust subtree; Apache-2.0 license text and fixture NOTICE are included. This is an evidence-based technical review, not a legal conclusion or separate approval.")
+        self.assertTrue(result["release_intent_authorized"])
+        self.assertFalse(result["publication_authorized"])
+        self.assertFalse(result["final_release_controls_complete"])
 
     def test_failed_verification_is_read_only(self) -> None:
         probe = self.root / "tests" / "fixtures" / "readonly-probe.txt"
@@ -821,6 +1175,74 @@ class FixtureProvenanceTests(unittest.TestCase):
                 self.assertNotIn("EVIL", message)
                 self.assertNotIn("\n", message)
                 self.assertNotIn("\x1b", message)
+
+    def test_blocked_state_regression_passes_for_blocked_copy(self) -> None:
+        inventory = self.inventory()
+        inventory["schema"] = "astatine-fixture-provenance/v1"
+        inventory["verification"]["date_utc"] = "2026-11-14"
+        inventory["verification"]["change_note"] = "FIX-04 was replaced in this review by a synthetic receipt authored in this repository; the three contract bytecode fixtures were not regenerated. The rights/notice checklist records the release-blocking actions."
+        inventory["legal_artifacts"] = [
+            a for a in inventory["legal_artifacts"] if a["path"] == LICENSE_REL.as_posix()
+        ]
+        for entry in inventory["fixtures"]:
+            lic = entry.get("license", {})
+            lic.pop("license_text", None)
+            lic.pop("copyright", None)
+            if entry["id"] in ("FIX-01", "FIX-02"):
+                lic["rights_status"] = "unresolved; license identity is declared but redistribution authority and applicable notices are not established" if entry["id"] == "FIX-01" else "unresolved; the pinned source repository tree contains no LICENSE/NOTICE and redistribution authority is not established"
+            elif entry["id"] == "FIX-03":
+                lic["rights_status"] = "unresolved; authorship and redistribution authority remain for the rights holder to confirm"
+        rr = inventory["rights_review"]
+        rr["notice_applicability"] = "UNRESOLVED"
+        rr["publication_decision"] = "BLOCKED pending review of rights and notice applicability; first-party ownership is owner-attested and not independently verified."
+        rr.pop("publication_authorization", None)
+        rr.pop("rights_decision", None)
+        rr.pop("release_intent_authorization", None)
+        rr["owner_attestation"] = {
+            "status": "OWNER-ATTESTED \u2014 not independently verified",
+            "scope": "The AstatineMiner and AstatineGenesisCoordinator contracts are first-party works developed and owned by the project owner.",
+            "attested_on": "2026-11-15",
+            "attestation_source": "The project owner explicitly confirmed ownership of the first-party ASTATINE mining and genesis coordinator contracts for Phase D; not independently verified.",
+            "independent_verification": False,
+        }
+        rr["notice_checklist"]["status"] = "OPEN \u2014 publication remains BLOCKED"
+        for item in rr["notice_checklist"]["items"]:
+            if item["id"] == "RIGHTS-02":
+                item["owner"] = "project owner and release approver"
+                item["status"] = "OPEN"
+                item["evidence"] = "rights_review.copyright_evidence; fixtures FIX-01 and FIX-02 both set release_archive_member to false."
+            elif item["id"] == "RIGHTS-03":
+                item["owner"] = "project owner"
+                item["status"] = "OPEN"
+                item["evidence"] = "tests/fixtures ships OPENZEPPELIN_LICENSE.txt only; no Apache-2.0 license text accompanies FIX-01 or FIX-02."
+            elif item["id"] == "RIGHTS-04":
+                item["owner"] = "project owner"
+                item["status"] = "OPEN"
+                item["evidence"] = "FIX-03 license.declaration_evidence; legal_artifacts OPENZEPPELIN_LICENSE.txt."
+            elif item["id"] == "RIGHTS-05":
+                item["owner"] = "release approver"
+                item["status"] = "OPEN"
+                item["evidence"] = "rights_review.publication_decision is BLOCKED."
+        push = rr["review_ci_branch_push_authorization"]
+        push["status"] = "AUTHORIZED \u2014 REVIEW/CI ONLY"
+        push.pop("superseded_by", None)
+        push.pop("superseded_on", None)
+        push["authorized_by"] = "project owner"
+        push["authorized_on"] = "2026-11-16"
+        push["scope"] = "Push the fix/phase-e-e02-e07 remediation branch to the already-public repository solely for review and CI."
+        push["public_repository_visibility"] = "The repository is already public. That visibility does not authorize a source archive, binary archive or release, tag or release publication, or workflow attestation dispatch."
+        push["not_authorized"] = ["source archive distribution", "binary archive or release distribution", "tag or public release publication", "workflow attestation dispatch", "broader license grant or legal clearance", "resolution of RIGHTS-02 through RIGHTS-05"]
+        push["rights_gate_unchanged"] = "RIGHTS-02 through RIGHTS-05 remain OPEN and blocking; source_distribution and binary_distribution remain BLOCKED."
+        self.write_inventory(inventory)
+        (self.root / APACHE_REL).unlink()
+        (self.root / MIT_REL).unlink()
+        (self.root / NOTICE_REL).unlink()
+        result = VERIFIER.verify(self.root)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["schema"], "astatine-fixture-provenance/v1")
+        self.assertFalse(result["publication_authorized"])
+        self.assertEqual(result["notice_checklist_status"], "OPEN \u2014 publication remains BLOCKED")
+        self.assertNotEqual(result["blocking_open"], [])
 
 
 if __name__ == "__main__":

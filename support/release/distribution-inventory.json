@@ -1,20 +1,70 @@
 {
-  "schema": "astatine-distribution-inventory/v1",
-  "scope": "Fail-closed source and binary distribution inventory for the Astatine miner. No release archive exists or was produced; both source and binary distribution are BLOCKED pending rights/notice review.",
+  "schema": "astatine-distribution-inventory/v3",
+  "scope": "Candidate source and binary distribution inventory for Astatine v0.1.0-testnet.1 on macOS ARM64 and Linux x86_64. Owner-authorized release intent with technical NOTICE review recorded (citations included); final release controls remain outstanding; licensing is owner-authorized, release execution remains externally gated draft-only and is not established by this file.",
   "rights_gate": {
     "source": "tests/fixtures/PROVENANCE.json",
-    "publication_decision": "BLOCKED pending review of rights and notice applicability; first-party ownership is owner-attested and not independently verified.",
-    "notice_applicability": "UNRESOLVED",
-    "blocking_open": [
-      "RIGHTS-02",
-      "RIGHTS-03",
-      "RIGHTS-04",
-      "RIGHTS-05"
-    ],
+    "rights_decision": "OWNER-AUTHORIZED RELEASE INTENT — project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.1; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion or separate approval.",
+    "notice_applicability": "TECHNICALLY REVIEWED — no separate upstream NOTICE file was found in the pinned contract fixture subtrees; the private EVM root NOTICE is scoped to a separate Rust subtree; Apache-2.0 license text and fixture NOTICE are included. This is an evidence-based technical review, not a legal conclusion or separate approval.",
+    "blocking_open": [],
     "fail_closed": true,
-    "rule": "Distribution stays BLOCKED while any blocking rights item is OPEN. A PASS from support/verify-distribution-inventory.py only confirms the blocked state is truthfully recorded; it does not authorize publication. Moving to an authorized state requires reviewed code changes, not data-only edits.",
+    "rule": "Distribution intent is owner-authorized only with substantive technical NOTICE review (citations), license evidence (Apache-2.0 and MIT texts, fixture NOTICE, fixture license records), pinned allowlists/targets, and external draft-only release controls with final release controls outstanding; data-only JSON edits without that evidence and controls cannot authorize release intent. A PASS only confirms the release-intent inventory is truthfully recorded and technically reviewed; it does not authorize final publication, establish external environment, tag, or CI controls, or claim legal conclusion or separate approval, which remain outstanding and are enforced by the release workflow and owner manual publication.",
+    "release_intent_authorization": {
+      "status": "OWNER-AUTHORIZED RELEASE INTENT — FINAL CONTROLS OUTSTANDING",
+      "authorized_by": "project owner",
+      "authorized_on": "2026-11-17",
+      "scope": "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.1 on macOS ARM64 and Linux x86_64; final release controls remain outstanding.",
+      "approval_roles": "Project owner only; no separate release approver was appointed, consulted, or asserted.",
+      "evidence": [
+        "Project owner authorized first-party MockAST MIT redistribution intent (copyright Copyright (c) 2026 emyrinj) on 2026-11-17; see rights_review.owner_attestation and tests/fixtures/LICENSE-MIT.txt.",
+        "Apache-2.0 copyright Copyright (c) 2026 emyrinj for first-party AstatineMiner and AstatineGenesisCoordinator recorded in tests/fixtures/NOTICE and fixture license fields.",
+        "License/notice files included: tests/fixtures/LICENSE-APACHE-2.0.txt (SHA-256 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a), tests/fixtures/LICENSE-MIT.txt (SHA-256 7472688f99a2841cd08d1a66fcf1f6d0ca8d9b7057b79093a9b568f245c6ed2f), tests/fixtures/NOTICE (SHA-256 8952db21e62803cad6900a1116e43cba3d13459e22cabbc66e83698d6274e32a).",
+        "OpenZeppelin MIT notice (Copyright (c) 2016-2023 zOS Global Limited and contributors, commit dbb6104ce834628e473d2173bbc9d47f81a9eec3) retained in tests/fixtures/OPENZEPPELIN_LICENSE.txt for any fixture redistribution to which it applies; MockAST imports one component, GenesisCoordinator zero direct imports, no OpenZeppelin code in AstatineMiner asserted; does not assert OpenZeppelin code in every fixture.",
+        "All fixtures remain excluded from binary archives: FIX-01 through FIX-04 set release_archive_member to false; production binaries never load these files.",
+        "No legal conclusion is made and no separate approval is asserted; technical NOTICE review recorded with citations to PROVENANCE.json, README.md, LICENSE-APACHE-2.0.txt, LICENSE-MIT.txt, OPENZEPPELIN_LICENSE.txt, NOTICE."
+      ],
+      "technical_notice_review": {
+        "reviewed_on": "2026-11-17",
+        "reviewed_by": "Repository technical review; not the project owner and not a separate release approver.",
+        "finding": "No upstream NOTICE file was found in the pinned contract fixture subtrees. The private EVM root contains an Apache NOTICE scoped to a separate Rust subtree; the contract subtrees have no NOTICE. Apache-2.0 license text and fixture NOTICE are included for source redistribution. This is an evidence-based technical review, not a legal conclusion or separate approval.",
+        "citations": [
+          "tests/fixtures/PROVENANCE.json",
+          "tests/fixtures/README.md",
+          "tests/fixtures/LICENSE-APACHE-2.0.txt",
+          "tests/fixtures/LICENSE-MIT.txt",
+          "tests/fixtures/OPENZEPPELIN_LICENSE.txt",
+          "tests/fixtures/NOTICE"
+        ],
+        "legal_conclusion": false,
+        "separate_approval": false
+      },
+      "final_release_controls_complete": false,
+      "not_authorized": [
+        "Any other tag or version beyond v0.1.0-testnet.1.",
+        "Mainnet deployment or paid-operation risk acceptance.",
+        "Independent legal verification, legal advice, legal clearance, or legal conclusion.",
+        "Any assertion that a separate release approver was appointed, consulted, or approved the release.",
+        "Final release without the exact release tag, main-branch CI, protected environment, writer and write-capable app restriction, immutable-release verification, required attestations, and immutable release artifacts.",
+        "Bypass of release controls or workflow attestation dispatch outside the authorized release process."
+      ],
+      "independent_verification": false
+    },
+    "technical_notice_review": {
+      "reviewed_on": "2026-11-17",
+      "reviewed_by": "Repository technical review; not the project owner and not a separate release approver.",
+      "finding": "No upstream NOTICE file was found in the pinned contract fixture subtrees. The private EVM root contains an Apache NOTICE scoped to a separate Rust subtree; the contract subtrees have no NOTICE. Apache-2.0 license text and fixture NOTICE are included for source redistribution. This is an evidence-based technical review, not a legal conclusion or separate approval.",
+      "citations": [
+        "tests/fixtures/PROVENANCE.json",
+        "tests/fixtures/README.md",
+        "tests/fixtures/LICENSE-APACHE-2.0.txt",
+        "tests/fixtures/LICENSE-MIT.txt",
+        "tests/fixtures/OPENZEPPELIN_LICENSE.txt",
+        "tests/fixtures/NOTICE"
+      ],
+      "legal_conclusion": false,
+      "separate_approval": false
+    },
     "review_ci_branch_push_authorization": {
-      "status": "AUTHORIZED — REVIEW/CI ONLY",
+      "status": "SUPERSEDED — OWNER-AUTHORIZED RELEASE INTENT",
       "authorized_by": "project owner",
       "authorized_on": "2026-11-16",
       "scope": "Push the fix/phase-e-e02-e07 remediation branch to the already-public repository solely for review and CI.",
@@ -27,17 +77,24 @@
         "broader license grant or legal clearance",
         "resolution of RIGHTS-02 through RIGHTS-05"
       ],
-      "rights_gate_unchanged": "RIGHTS-02 through RIGHTS-05 remain OPEN and blocking; source_distribution and binary_distribution remain BLOCKED."
+      "rights_gate_unchanged": "As of 2026-11-16, superseded 2026-11-17: RIGHTS-02 through RIGHTS-05 were OPEN and blocking; source_distribution and binary_distribution were BLOCKED.",
+      "superseded_by": "release_intent_authorization",
+      "superseded_on": "2026-11-17"
     }
   },
   "source_distribution": {
-    "status": "BLOCKED",
-    "reason": "Source redistribution is BLOCKED: RIGHTS-02 through RIGHTS-05 remain OPEN and blocking, NOTICE applicability is UNRESOLVED, and first-party rights are owner-attested rather than independently verified per tests/fixtures/PROVENANCE.json. No authorized release decision exists."
+    "status": "RELEASE-INTENT-AUTHORIZED",
+    "final_release_controls_complete": false,
+    "reason": "Source distribution intent is owner-authorized (RELEASE-INTENT-AUTHORIZED) for v0.1.0-testnet.1 only: GitHub-generated source archives for the exact tag include tests/fixtures and the Apache-2.0/MIT license texts and fixture NOTICE; final release controls remain outstanding (final_release_controls_complete: false); execution still requires external draft-only release controls."
   },
   "binary_distribution": {
-    "status": "BLOCKED",
-    "reason": "Binary distribution is BLOCKED by the same rights gate. No release archive exists or was produced, no publication is authorized, and no fixture may enter a release archive.",
-    "target": "x86_64-unknown-linux-gnu",
+    "status": "RELEASE-INTENT-AUTHORIZED",
+    "final_release_controls_complete": false,
+    "reason": "Binary distribution intent is owner-authorized (RELEASE-INTENT-AUTHORIZED) for v0.1.0-testnet.1 on macOS ARM64 and Linux x86_64 only: pinned allowlist archives plus generated BUILD-INFO.json and INSTALL.md; no fixture, provenance, or forbidden path may enter a release archive; final release controls remain outstanding (final_release_controls_complete: false); execution still requires external draft-only release controls.",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu"
+    ],
     "archive_members": [
       {
         "source": "target/release/astatine",
@@ -58,12 +115,12 @@
     "generated_members": [
       {
         "archive_path": "BUILD-INFO.json",
-        "generator": "support/release/build-dry-run.py",
+        "generator": "support/release/build-release.py",
         "required": true
       },
       {
         "archive_path": "INSTALL.md",
-        "generator": "support/release/build-dry-run.py",
+        "generator": "support/release/build-release.py",
         "required": true
       }
     ],
@@ -77,5 +134,31 @@
       "tests/fixtures/MockAST.json",
       "tests/fixtures/synthetic-injective-virtual-receipt.json"
     ]
+  },
+  "release_controls": {
+    "status": "DRAFT-ONLY — MANUAL PUBLICATION AFTER EXTERNAL IMMUTABLE-SETTING VERIFICATION",
+    "workflow": ".github/workflows/release.yml",
+    "environment": "release",
+    "environment_required_reviewer": true,
+    "environment_prevent_self_review": true,
+    "publication_mode": "draft-only-manual-publish",
+    "manual_publish_required": true,
+    "final_release_controls_complete": false,
+    "tag_policy": "refs/tags/v0.1.0-testnet.*",
+    "immutable_release": true,
+    "immutable_setting_admin_verification_required": true,
+    "attestations": [
+      "build-provenance"
+    ],
+    "exact_tag_main_ci": true,
+    "external_blockers": [
+      "protected release environment approval by a non-self reviewer (required reviewer, prevent self-review, no admin bypass, custom tag deployment policy)",
+      "exact tag for the exact release commit",
+      "green exact-commit main CI for Rust CI and Linux native qualification",
+      "owner/admin verifies immutable releases are enabled before dispatch and again immediately before manual publication",
+      "repository writers and write-capable apps are restricted so only the release owner/admin can publish or modify the draft",
+      "release tag is rechecked immediately before manual publication"
+    ],
+    "offline_verification": "Offline verification cannot establish GitHub environment protection, tag existence, CI status, or the immutable-release repository setting; these are enforced by the release workflow preflight, build jobs, and owner manual publication steps before any publication."
   }
 }

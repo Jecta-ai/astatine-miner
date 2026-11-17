@@ -1,38 +1,46 @@
 #!/usr/bin/env python3
-"""Offline deterministic Linux release dry-run builder (no publication).
+"""Offline deterministic Linux release dry-run builder (no publication, no release).
 
 Reads exactly tests/fixtures/PROVENANCE.json and
 support/release/distribution-inventory.json (canonical paths only; no
 overrides exist so a caller cannot substitute an old blocked copy after the
-real gate changes), independently re-checks the blocked rights gate against
-exact canonical strings, requires the full source tree (tracked changes and
-non-ignored untracked files) to be clean at HEAD, and builds a deterministic
-tar.gz from the explicit allowlist only:
-the built binary plus LICENSE-MIT, THIRD_PARTY_LICENSES.md, and two
-generated members (BUILD-INFO.json, INSTALL.md) produced deterministically in
-memory. No fixture may enter the archive.
+real gate changes), validates the gate via support/release/gate.py (accepting
+both the blocked v1 and the owner-authorized release-intent v3 licensing
+states), requires the
+full source tree (tracked changes and non-ignored untracked files) to be
+clean at HEAD, and builds a deterministic tar.gz from the explicit allowlist
+only: the built Linux x86_64 binary plus LICENSE-MIT,
+THIRD_PARTY_LICENSES.md, and two generated members (BUILD-INFO.json,
+INSTALL.md) produced deterministically in memory. No fixture may enter the
+archive.
+
+This dry-run is NOT a release path and never becomes one: it creates only a
+local ``.dry-run.tar.gz`` archive, SHA256SUMS, and release-provenance.json;
+it performs no OIDC, no attestation, no upload, no tag, and no GitHub release.
+release-provenance.json always records ``publication_authorized: false`` and
+``mode: dry-run`` even when the licensing gate carries owner-authorized release
+intent, because offline release intent does not authorize final publication and
+does not establish external release execution (environment, tag, CI,
+attestations). The release-intent dual-platform release is
+built only by support/release/build-release.py, which requires the
+release-intent gate plus exact tag/commit controls and packages macOS ARM64 and
+Linux x86_64 archives with SHA256SUMS and release-provenance.json.
 
 The script is offline and stdlib-only. It never uses the network, never
 modifies the source tree, and writes only to the required --output-dir, which
 must be new or empty and lie outside the source tree. Output files are created
 exclusively (no overwrite, no symlink following).
 
-Gate semantics (fail closed):
-  * --mode release always fails: no authorized publisher exists.
-  * --mode dry-run fails unless the gate matches the exact canonical blocked
-    text (publication_decision, checklist status, NOTICE applicability, and
-    the RIGHTS-02..RIGHTS-05 action/owner/evidence records byte-for-byte),
-    both source and binary distribution are BLOCKED, the archive allowlist is
-    exactly the three expected source members plus exactly the two expected
-    generated members, every provenance fixture declares
-    release_archive_member false, the required forbidden globs are present,
-    and no member matches a forbidden glob or fixture path.
-  * The limited review/CI branch-push authorization
-    (review_ci_branch_push_authorization) must match the exact canonical object
-    byte-for-byte in both gate files; public repository visibility authorizes
-    nothing beyond pushing the remediation branch for review and CI. RIGHTS-02
-    through RIGHTS-05 stay OPEN and blocking, source/binary distribution stay
-    BLOCKED, and no tag, release, or attestation dispatch is authorized.
+Gate semantics (fail closed, via gate.py):
+  * --mode release always fails: this script has no release path; use
+    support/release/build-release.py for the release-intent release.
+  * --mode dry-run accepts either the blocked or the owner-authorized
+    release-intent licensing gate as validated by gate.py (exact canonical
+    blocked text or exact release-intent text with substantive technical NOTICE
+    review, pinned allowlists/targets, and external draft-only release controls
+    with final controls outstanding), but still records
+    publication_authorized false and never attests, uploads, tags, or claims
+    final publication.
   * The full tracked source tree (including both gate files) must be clean
     at HEAD; tracked changes and non-ignored untracked files are rejected.
     Git-ignored files are not inspected by this check; target/ is the expected
@@ -54,16 +62,14 @@ Gate semantics (fail closed):
     it is archived.
   * release-provenance.json always records publication_authorized: false.
 
-The GitHub workflow performs no artifact attestation and no attestation
-dispatch occurs. The inventory explicitly records workflow attestation
-dispatch as not authorized, so the dry-run creates only local files and
-requests no OIDC identity. No transparency-log entry is created by this
-script, which itself signs no external release binary and uploads no
-release asset. Local release-provenance.json records no absolute checkout
-path and no raw invocation, to avoid introducing identifying data into
-artifacts that operators might copy; legitimate provenance (commit, tree,
-source date, toolchain, lock hash, artifact and member hashes, gate state)
-is preserved.
+The dry-run workflow performs no artifact attestation and no attestation
+dispatch occurs. The dry-run creates only local files and requests no OIDC
+identity. No transparency-log entry is created by this script, which itself
+signs no external release binary and uploads no release asset. Local
+release-provenance.json records no absolute checkout path and no raw
+invocation, to avoid introducing identifying data into artifacts that
+operators might copy; legitimate provenance (commit, tree, source date,
+toolchain, lock hash, artifact and member hashes, gate state) is preserved.
 
 Usage:
     python3 -B support/release/build-dry-run.py \
@@ -77,6 +83,7 @@ import datetime
 import fnmatch
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import math
@@ -222,6 +229,45 @@ BINARY_BUILD_LINKAGE_NOTE = (
 
 class DryRunError(Exception):
     pass
+
+
+def _load_gate_module():  # type: ignore[no-untyped-def]
+    """Load support/release/gate.py without importing candidate code."""
+    gate_path = Path(__file__).resolve().parent / "gate.py"
+    spec = importlib.util.spec_from_file_location("astatine_release_gate", gate_path)
+    if spec is None or spec.loader is None:
+        raise DryRunError("cannot load release gate module")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception as error:
+        raise DryRunError("cannot load release gate module") from error
+    return module
+
+
+def _load_gate(root: Path) -> dict:
+    """Validate the gate via gate.py, accepting blocked or release-intent licensing.
+
+    The dry-run never becomes a release path: it only checks that the
+    licensing gate is truthfully recorded (blocked or owner-authorized release
+    intent) and that the Linux x86_64 target is present, then builds the local
+    dry-run archive with publication_authorized false. Final publication is
+    never authorized by this script.
+    """
+    module = _load_gate_module()
+    try:
+        gate = module.load_gate(root)
+    except Exception as error:
+        if isinstance(error, DryRunError):
+            raise
+        raise DryRunError(str(error)) from error
+    require(gate.get("state") in ("blocked", "release-intent-authorized"), "release gate state must be blocked or release-intent-authorized")
+    targets = gate.get("targets") or []
+    require(
+        "x86_64-unknown-linux-gnu" in list(targets),
+        "dry-run requires the Linux x86_64 target in the release gate",
+    )
+    return gate
 
 
 def require(condition: bool, message: str) -> None:
@@ -1187,16 +1233,50 @@ def generate_build_info(
             "instructions": "INSTALL.md",
         },
         "build_linkage": BINARY_BUILD_LINKAGE_NOTE,
-        "rights_gate": {
-            "publication_decision": gate["publication_decision"],
-            "notice_applicability": gate["notice_applicability"],
-            "blocking_open": list(gate["blocking_open"]),
-            "review_ci_branch_push_authorization": dict(
-                gate["review_ci_branch_push_authorization"]
-            ),
-        },
+        "rights_gate": _dry_run_rights_gate_record(gate),
     }
     return (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _dry_run_rights_gate_record(gate: dict) -> dict:
+    """State-aware rights-gate record for the dry-run BUILD-INFO.
+
+    Always records publication_authorized false via the outer record; this
+    helper only mirrors the licensing gate truthfully for blocked or
+    release-intent states without implying final publication or execution.
+    """
+    record: dict = {
+        "state": gate.get("state"),
+        "source_status": gate.get("source_status"),
+        "binary_status": gate.get("binary_status"),
+        "publication_authorized": False,
+        "final_release_controls_complete": gate.get("final_release_controls_complete", False),
+        "notice_applicability": gate.get("notice_applicability"),
+        "blocking_open": list(gate.get("blocking_open") or []),
+    }
+    # v3 release-intent keys; blocked gates expose publication_decision.
+    if "rights_decision" in gate:
+        record["rights_decision"] = gate.get("rights_decision")
+    if "publication_decision" in gate:
+        record["publication_decision"] = gate.get("publication_decision")
+    # Backward-compatible blocked key: older gates expose the review/CI
+    # authorization directly.
+    if "review_ci_branch_push_authorization" in gate:
+        record["review_ci_branch_push_authorization"] = dict(
+            gate["review_ci_branch_push_authorization"]
+        )
+    # Gate.py normalized records expose release_intent_authorization,
+    # technical_notice_review, and release_controls for release-intent states;
+    # blocked gates expose the review/CI authorization instead.
+    if isinstance(gate.get("release_intent_authorization"), dict):
+        record["release_intent_authorization"] = dict(gate["release_intent_authorization"])
+    if isinstance(gate.get("technical_notice_review"), dict):
+        record["technical_notice_review"] = dict(gate["technical_notice_review"])
+    if isinstance(gate.get("authorization"), dict):
+        record["review_ci_branch_push_authorization"] = dict(gate["authorization"])
+    if isinstance(gate.get("release_controls"), dict):
+        record["release_controls"] = dict(gate["release_controls"])
+    return record
 
 
 def generate_install_md(
@@ -1213,9 +1293,13 @@ def generate_install_md(
     how_to_obtain = f"git clone https://github.com/{repository}.git && git checkout {commit}"
     text = f"""# Astatine miner {package_version} — Linux x86_64 dry-run install notes
 
-NOT FOR PUBLICATION OR DISTRIBUTION. Dry-run only. The rights gate is
-BLOCKED, and this archive authenticates no publisher and no legal approval.
-See BUILD-INFO.json for the machine-readable record and
+NOT FOR PUBLICATION OR DISTRIBUTION. Dry-run only. This archive is a local
+rehearsal: it authenticates no publisher, performs no attestation, upload, tag,
+or release, and must not be treated as the release-intent dual-platform release
+(built only by support/release/build-release.py for macOS ARM64 and Linux
+x86_64). Licensing may be blocked or owner-authorized release intent; either
+way this dry-run records publication_authorized false, claims no final
+publication, and establishes no external release execution. See BUILD-INFO.json for the machine-readable record and
 release-provenance.json (kept outside this archive) for the dry-run evidence.
 
 - Package: {package_name}
@@ -1383,8 +1467,8 @@ def run(
     require(mode in ("dry-run", "release"), f"unknown mode: {mode!r}")
     require(
         mode != "release",
-        "release mode is not authorized: no authorized publisher exists; "
-        "use --mode dry-run for the blocked-gate rehearsal only",
+        "release mode is not available in this dry-run script: it has no release "
+        "path; use support/release/build-release.py for the release-intent release",
     )
     try:
         resolved_root = source_root.resolve(strict=False)
@@ -1396,13 +1480,11 @@ def run(
     except (OSError, ValueError, RuntimeError) as error:
         raise DryRunError(f"source root is not readable (errno {getattr(error, 'errno', 'unknown')})") from None
 
-    # Canonical gate paths only: no overrides exist, so a caller cannot
-    # substitute an old blocked copy after the real gate changes.
-    provenance_bytes = read_confined_bytes(resolved_root, PROVENANCE_REL, "fixture provenance")
-    provenance = parse_json_object(provenance_bytes, PROVENANCE_REL)
-    inventory_bytes = read_confined_bytes(resolved_root, INVENTORY_REL, "distribution inventory")
-    inventory = parse_json_object(inventory_bytes, INVENTORY_REL)
-    gate = check_gate(provenance, inventory)
+    # Canonical gate paths only via gate.py: no overrides exist, so a caller
+    # cannot substitute an old blocked copy after the real gate changes. Both
+    # blocked and release-intent licensing states are accepted here; the dry-run
+    # still never publishes, attests, uploads, tags, or claims final publication.
+    gate = _load_gate(resolved_root)
 
     observed = observed_toolchain()
     require(
@@ -1609,7 +1691,10 @@ def run(
         "members": [item["archive_path"] for item in member_records],
         "member_hashes": {item["archive_path"]: item["sha256"] for item in member_records},
         "publication_authorized": False,
-        "publication_decision": gate["publication_decision"],
+        "release_intent_authorized": gate.get("release_intent_authorized", False),
+        "final_release_controls_complete": gate.get("final_release_controls_complete", False),
+        "rights_decision": gate.get("rights_decision", gate.get("publication_decision")),
+        "publication_decision": gate.get("publication_decision", gate.get("rights_decision")),
         "notice_applicability": gate["notice_applicability"],
         "blocking_open": gate["blocking_open"],
         "git_verified": git_verified,
@@ -1620,7 +1705,7 @@ def run(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Offline blocked-gate Linux release dry-run builder.")
+    parser = argparse.ArgumentParser(description="Offline nonpublishing Linux release dry-run builder.")
     parser.add_argument("--mode", choices=("dry-run", "release"), default="dry-run")
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -1645,6 +1730,9 @@ def main(argv: list[str] | None = None) -> int:
         "members": result["members"],
         "member_hashes": result["member_hashes"],
         "publication_authorized": result["publication_authorized"],
+        "release_intent_authorized": result["release_intent_authorized"],
+        "final_release_controls_complete": result["final_release_controls_complete"],
+        "rights_decision": result["rights_decision"],
         "publication_decision": result["publication_decision"],
         "notice_applicability": result["notice_applicability"],
         "blocking_open": result["blocking_open"],

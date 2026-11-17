@@ -3,20 +3,19 @@
 # Prerequisite: green Rust CI for the exact dispatched commit (see
 # support/release/README.md). Do not dispatch unless the hosted CI result
 # for that commit is green. Manual dispatch only. Builds the locked Linux x86_64 release binary on a
-# GitHub-hosted Ubuntu 24.04 runner, rechecks the blocked rights gate, builds
+# GitHub-hosted Ubuntu 24.04 runner, rechecks the distribution gate (blocked or authorized licensing), builds
 # a deterministic dry-run archive from the explicit allowlist, and records
 # local dry-run provenance. This workflow never publishes an artifact or
 # GitHub release, never creates a tag, never signs an external release
 # binary, never requests an attestation, and never runs paid mining. No
-# artifact is uploaded and no attestation record is stored. Distribution stays
-# BLOCKED; the dry-run fails closed while any blocking rights item is OPEN.
+# artifact is uploaded and no attestation record is stored. The dry-run remains
+# nonpublishing in either licensing state and fails closed on any gate error.
 # Bit-for-bit reproducibility across hosts is not claimed.
 #
-# Attestation alignment: the distribution inventory explicitly records
-# workflow attestation dispatch as not authorized. This workflow therefore
-# performs no attestation dispatch and requests no OIDC identity. Job
-# permissions are contents: read only. The absence of attestation is
-# intentional and does not satisfy release-evidence requirements.
+# Attestation alignment: the dry-run never dispatches an attestation and never
+# requests an OIDC identity, regardless of the licensing state. Job permissions
+# are contents: read only. The absence of attestation is intentional and does
+# not satisfy release-evidence requirements.
 #
 # Supply-chain notes: pinned actions, the locked dependency graph, and the
 # absence of untrusted workflow inputs reduce but do not eliminate build
@@ -65,7 +64,7 @@ jobs:
           test "$(rustc -vV | awk '$1 == "host:" {print $2}')" = "x86_64-unknown-linux-gnu"
       - name: Verify offline fixture provenance
         run: python3 -B support/verify-fixture-provenance.py
-      - name: Verify blocked distribution inventory
+      - name: Verify distribution inventory
         run: python3 -B support/verify-distribution-inventory.py
       - name: Build locked release binary
         run: cargo build --locked --release

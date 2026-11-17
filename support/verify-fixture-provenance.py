@@ -47,7 +47,68 @@ EXPECTED_FIXTURE_IDENTITIES = {
 }
 EXPECTED_FIXTURE_PATHS = frozenset(EXPECTED_FIXTURE_IDENTITIES)
 EXPECTED_DOCUMENT_PATHS = frozenset({"tests/fixtures/README.md"})
-EXPECTED_LEGAL_ARTIFACT_PATHS = frozenset({"tests/fixtures/OPENZEPPELIN_LICENSE.txt"})
+EXPECTED_LEGAL_ARTIFACT_PATHS_V1 = frozenset({"tests/fixtures/OPENZEPPELIN_LICENSE.txt"})
+EXPECTED_LEGAL_ARTIFACT_PATHS_V2 = frozenset(
+    {
+        "tests/fixtures/OPENZEPPELIN_LICENSE.txt",
+        "tests/fixtures/LICENSE-APACHE-2.0.txt",
+        "tests/fixtures/LICENSE-MIT.txt",
+        "tests/fixtures/NOTICE",
+    }
+)
+# Backwards-compatible alias: the authorized inventory uses V2.
+EXPECTED_LEGAL_ARTIFACT_PATHS = EXPECTED_LEGAL_ARTIFACT_PATHS_V1
+APACHE_LICENSE_PATH = "tests/fixtures/LICENSE-APACHE-2.0.txt"
+MIT_LICENSE_PATH = "tests/fixtures/LICENSE-MIT.txt"
+NOTICE_PATH = "tests/fixtures/NOTICE"
+OPENZEPPELIN_LICENSE_PATH = "tests/fixtures/OPENZEPPELIN_LICENSE.txt"
+EXPECTED_SCHEMA_V1 = "astatine-fixture-provenance/v1"
+EXPECTED_SCHEMA_V2 = "astatine-fixture-provenance/v2"
+EXPECTED_SCHEMA_V3 = "astatine-fixture-provenance/v3"
+EXPECTED_VERIFICATION_DATE_V3 = "2026-11-17"
+EXPECTED_RIGHTS_DECISION_V3 = (
+    "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent "
+    "for v0.1.0-testnet.1; technical NOTICE review recorded; final release controls outstanding; "
+    "not a legal conclusion or separate approval."
+)
+EXPECTED_NOTICE_APPLICABILITY_V3 = (
+    "TECHNICALLY REVIEWED \u2014 no separate upstream NOTICE file was found in the pinned contract fixture "
+    "subtrees; the private EVM root NOTICE is scoped to a separate Rust subtree; Apache-2.0 license text and fixture "
+    "NOTICE are included. This is an evidence-based technical review, not a legal conclusion or separate approval."
+)
+EXPECTED_CHECKLIST_STATUS_V3 = (
+    "TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent; final release controls outstanding"
+)
+EXPECTED_RELEASE_INTENT_STATUS = "OWNER-AUTHORIZED RELEASE INTENT \u2014 FINAL CONTROLS OUTSTANDING"
+EXPECTED_RELEASE_INTENT_BY = "project owner"
+EXPECTED_RELEASE_INTENT_ON = "2026-11-17"
+EXPECTED_RELEASE_INTENT_SCOPE = (
+    "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.1 on macOS ARM64 and "
+    "Linux x86_64; final release controls remain outstanding."
+)
+EXPECTED_RELEASE_INTENT_ROLES = (
+    "Project owner only; no separate release approver was appointed, consulted, or asserted."
+)
+EXPECTED_TECHNICAL_REVIEWED_BY = (
+    "Repository technical review; not the project owner and not a separate release approver."
+)
+EXPECTED_TECHNICAL_FINDING = (
+    "No upstream NOTICE file was found in the pinned contract fixture subtrees. The private EVM root contains an Apache "
+    "NOTICE scoped to a separate Rust subtree; the contract subtrees have no NOTICE. Apache-2.0 license text and fixture "
+    "NOTICE are included for source redistribution. This is an evidence-based technical review, not a legal conclusion or separate approval."
+)
+EXPECTED_TECHNICAL_CITATIONS = [
+    "tests/fixtures/PROVENANCE.json",
+    "tests/fixtures/README.md",
+    "tests/fixtures/LICENSE-APACHE-2.0.txt",
+    "tests/fixtures/LICENSE-MIT.txt",
+    "tests/fixtures/OPENZEPPELIN_LICENSE.txt",
+    "tests/fixtures/NOTICE",
+]
+EXPECTED_PUSH_STATUS_SUPERSEDED_V3 = "SUPERSEDED \u2014 OWNER-AUTHORIZED RELEASE INTENT"
+EXPECTED_PUSH_SUPERSEDED_BY_V3 = "release_intent_authorization"
+EXPECTED_PUSH_SUPERSEDED_ON = "2026-11-17"
+EXPECTED_COPYRIGHT_EMY = "Copyright (c) 2026 emyrinj"
 EXPECTED_SCRUB_PATHS = frozenset(
     {
         "README.md",
@@ -88,6 +149,17 @@ EXPECTED_REVIEW_PUSH_GATE_UNCHANGED = (
     "RIGHTS-02 through RIGHTS-05 remain OPEN and blocking; "
     "source_distribution and binary_distribution remain BLOCKED."
 )
+EXPECTED_INTENT_REVIEW_PUSH_GATE = (
+    "As of 2026-11-16, superseded 2026-11-17: RIGHTS-02 through RIGHTS-05 were OPEN and blocking; "
+    "source_distribution and binary_distribution were BLOCKED."
+)
+EXPECTED_PRIOR_ATTESTATION = {
+    "status": "OWNER-ATTESTED \u2014 not independently verified",
+    "scope": "The AstatineMiner and AstatineGenesisCoordinator contracts are first-party works developed and owned by the project owner.",
+    "attested_on": "2026-11-15",
+    "attestation_source": "The project owner explicitly confirmed ownership of the first-party ASTATINE mining and genesis coordinator contracts for Phase D; not independently verified.",
+    "independent_verification": False,
+}
 EXPECTED_REVIEW_PUSH_AUTH = {
     "status": EXPECTED_REVIEW_PUSH_STATUS,
     "authorized_by": "project owner",
@@ -446,6 +518,88 @@ def validate_fixture_entry(entry: object, index: int) -> None:
         require_string(regeneration["detail"], f"{label} regeneration detail")
 
 
+def validate_fixture_licenses_authorized(entries: list) -> None:
+    by_id = {entry.get("id"): entry for entry in entries if isinstance(entry, dict)}
+    for fid in ("FIX-01", "FIX-02"):
+        require(fid in by_id, f"authorized inventory is missing {fid}")
+        lic = require_object(by_id[fid].get("license"), f"{fid} license")
+        require(
+            lic.get("license_text") == APACHE_LICENSE_PATH,
+            f"{fid} license_text must be {APACHE_LICENSE_PATH} for the authorized inventory",
+        )
+        require(
+            lic.get("copyright") == EXPECTED_COPYRIGHT_EMY,
+            f"{fid} copyright must be {EXPECTED_COPYRIGHT_EMY}",
+        )
+        status = require_string(lic.get("rights_status"), f"{fid} license rights_status")
+        lowered = status.lower()
+        require("first-party" in lowered, f"{fid} rights_status must state first-party ownership")
+        require("apache-2.0" in lowered, f"{fid} rights_status must reference Apache-2.0")
+        require("notice" in lowered, f"{fid} rights_status must reference the fixture NOTICE")
+        require(
+            "owner-attested" in lowered,
+            f"{fid} rights_status must remain owner-attested and not independently verified",
+        )
+        require(
+            "not independently verified" in lowered,
+            f"{fid} rights_status must state it is not independently verified",
+        )
+        require(
+            by_id[fid].get("license", {}).get("declared_spdx") == "Apache-2.0",
+            f"{fid} declared_spdx changed",
+        )
+    require("FIX-03" in by_id, "authorized inventory is missing FIX-03")
+    lic3 = require_object(by_id["FIX-03"].get("license"), "FIX-03 license")
+    require(
+        lic3.get("license_text") == MIT_LICENSE_PATH,
+        f"FIX-03 license_text must be {MIT_LICENSE_PATH} for the authorized inventory",
+    )
+    require(
+        lic3.get("copyright") == EXPECTED_COPYRIGHT_EMY,
+        "FIX-03 copyright must be Copyright (c) 2026 emyrinj",
+    )
+    status3 = require_string(lic3.get("rights_status"), "FIX-03 license rights_status")
+    lowered3 = status3.lower()
+    require("mockast" in lowered3, "FIX-03 rights_status must identify MockAST")
+    require("first-party" in lowered3, "FIX-03 rights_status must state first-party ownership")
+    require("mit" in lowered3, "FIX-03 rights_status must reference MIT redistribution")
+    require(
+        "openzeppelin" in lowered3,
+        "FIX-03 rights_status must retain the OpenZeppelin MIT notice",
+    )
+    require(
+        "owner-attested" in lowered3,
+        "FIX-03 rights_status must remain owner-attested and not independently verified",
+    )
+    require(
+        "not independently verified" in lowered3,
+        "FIX-03 rights_status must state it is not independently verified",
+    )
+    require(
+        "authorized by the project owner" in lowered3,
+        "FIX-03 rights_status must state MIT redistribution is authorized by the project owner",
+    )
+    require(
+        by_id["FIX-03"].get("license", {}).get("declared_spdx") == "MIT",
+        "FIX-03 declared_spdx changed",
+    )
+    require("FIX-04" in by_id, "authorized inventory is missing FIX-04")
+    lic4 = require_object(by_id["FIX-04"].get("license"), "FIX-04 license")
+    require(
+        "license_text" not in lic4,
+        "FIX-04 must remain synthetic and must not invent third-party license_text",
+    )
+    require(
+        "copyright" not in lic4,
+        "FIX-04 must remain synthetic and must not invent third-party copyright",
+    )
+    status4 = require_string(lic4.get("rights_status"), "FIX-04 license rights_status")
+    require(
+        "no third-party" in status4.lower(),
+        "FIX-04 rights_status must remain synthetic with no third-party rights",
+    )
+
+
 def verify_bytecode(entry: dict, document: dict) -> None:
     require("bytecode" in document, f"{entry['path']} is missing bytecode")
     bytecode = document.get("bytecode")
@@ -506,13 +660,83 @@ def verify_inventory(root: Path) -> dict:
         root, INVENTORY_PATH, "inventory", frozenset({INVENTORY_PATH})
     )
     inventory = parse_json_object(inventory_bytes, INVENTORY_PATH)
-    require(inventory.get("schema") == "astatine-fixture-provenance/v1", "unexpected inventory schema")
+    schema = inventory.get("schema")
+    require(
+        schema in (EXPECTED_SCHEMA_V1, EXPECTED_SCHEMA_V3),
+        "unexpected inventory schema",
+    )
+    if schema == EXPECTED_SCHEMA_V2:
+        raise VerificationError("fixture provenance v2 is superseded by v3; live schema must be v3")
+    is_authorized = schema == EXPECTED_SCHEMA_V3
+    expected_legal_paths = (
+        EXPECTED_LEGAL_ARTIFACT_PATHS_V2 if is_authorized else EXPECTED_LEGAL_ARTIFACT_PATHS_V1
+    )
     validate_inventory_metadata(inventory)
+    if is_authorized:
+        # Fail closed on invented approver / final-publication language in live schema.
+        _raw_lower = json.dumps(inventory, sort_keys=True).lower()
+        require(
+            "project owner and release approver" not in _raw_lower,
+            "live schema must not invent a release approver",
+        )
+        require(
+            "publication_authorization" not in _raw_lower,
+            "live schema must not contain publication_authorization; use release_intent_authorization",
+        )
+        require(
+            "publication_decision" not in _raw_lower,
+            "live schema must not contain publication_decision; use rights_decision",
+        )
+        require(
+            "publication authorized" not in _raw_lower,
+            "live schema must not claim final publication authorization",
+        )
+        require(
+            "complete \u2014 publication authorized" not in _raw_lower,
+            "live schema must not claim final publication authorization",
+        )
+        verification = inventory.get("verification")
+        require(isinstance(verification, dict), "verification must be an object")
+        require(
+            verification.get("date_utc") == EXPECTED_VERIFICATION_DATE_V3,
+            "verification date_utc must be 2026-11-17 for the v3 inventory",
+        )
+        scope = inventory.get("scope")
+        require(isinstance(scope, str), "inventory scope must be a non-empty string")
+        lowered_scope = scope.lower()
+        require(
+            "offline fixture inventory" in lowered_scope and "unchanged" in lowered_scope,
+            "v3 inventory scope must note the offline fixture inventory is unchanged",
+        )
+        require(
+            "release intent" in lowered_scope,
+            "v3 inventory scope must note owner-authorized release intent",
+        )
+        require(
+            "technical" in lowered_scope,
+            "v3 inventory scope must note technical NOTICE review",
+        )
+        require(
+            "publication authorization" not in lowered_scope,
+            "v3 inventory scope must not claim publication authorization",
+        )
+        # change_note must not reintroduce final-publication language
+        _change = str(verification.get("change_note", "")).lower()
+        require(
+            "publication authorization" not in _change,
+            "verification change_note must not claim publication authorization",
+        )
+        require(
+            "project owner and release approver" not in _change,
+            "verification change_note must not invent a release approver",
+        )
 
     entries = require_list(inventory.get("fixtures"), "fixtures")
     require(entries, "inventory has no fixtures")
     for index, entry in enumerate(entries):
         validate_fixture_entry(entry, index)
+    if is_authorized:
+        validate_fixture_licenses_authorized(entries)
     entry_paths = [entry["path"] for entry in entries]
     require(len(set(entry_paths)) == len(entry_paths), "inventory contains duplicate fixture paths")
     require(set(entry_paths) == EXPECTED_FIXTURE_PATHS, "fixture path inventory changed")
@@ -527,7 +751,7 @@ def verify_inventory(root: Path) -> dict:
         for path in (
             *EXPECTED_FIXTURE_PATHS,
             *EXPECTED_DOCUMENT_PATHS,
-            *EXPECTED_LEGAL_ARTIFACT_PATHS,
+            *expected_legal_paths,
             INVENTORY_PATH,
         )
         if (rel := fixture_rel_path(path)) is not None
@@ -535,7 +759,7 @@ def verify_inventory(root: Path) -> dict:
     actual_names: set[str] = set()
     # R-02: extension-independent, recursive membership check confined to
     # tests/fixtures. Every entry is examined via lstat (no symlink following,
-    # no extension filter, dotfiles included). Only the seven expected regular
+    # no extension filter, dotfiles included). Only the expected regular
     # files are allowed; any symlink, directory, or other non-regular entry at
     # any depth, any unlisted regular file, and any expected path that is not
     # a regular file fails closed with the offending fixture-relative path.
@@ -647,12 +871,13 @@ def verify_inventory(root: Path) -> dict:
     legal_artifacts = require_list(inventory.get("legal_artifacts"), "legal_artifacts")
     require(legal_artifacts, "legal artifact inventory is empty")
     legal_paths = []
+    legal_by_path: dict[str, tuple[dict, bytes]] = {}
     for index, artifact in enumerate(legal_artifacts):
         label = f"legal_artifacts[{index}]"
         artifact = require_object(artifact, label)
         require_fields(artifact, ("path", "sha256", "bytes", "license", "copyright", "provenance", "evidence"), label)
         path = validate_relative_path(artifact["path"], f"{label} path")
-        require(path in EXPECTED_LEGAL_ARTIFACT_PATHS, f"{label} path is not expected: {path}")
+        require(path in expected_legal_paths, f"{label} path is not expected: {path}")
         require_sha256(artifact["sha256"], f"{label} sha256")
         require_int(artifact["bytes"], f"{label} bytes")
         require_string(artifact["license"], f"{label} license")
@@ -660,12 +885,153 @@ def verify_inventory(root: Path) -> dict:
         require_string(artifact["provenance"], f"{label} provenance")
         require_string(artifact["evidence"], f"{label} evidence")
         legal_paths.append(path)
-        _, data = read_confined_bytes(root, path, label, EXPECTED_LEGAL_ARTIFACT_PATHS)
+        _, data = read_confined_bytes(root, path, label, expected_legal_paths)
         require(len(data) == artifact["bytes"], f"{path} byte length changed")
         require(sha256_hex(data) == artifact["sha256"], f"{path} SHA-256 changed")
-        require(b"The MIT License (MIT)" in data, f"{path} is not the MIT license text")
+        if path == OPENZEPPELIN_LICENSE_PATH:
+            require(b"The MIT License (MIT)" in data, f"{path} is not the MIT license text")
+            require(artifact["license"] == "MIT", f"{label} license must be MIT")
+            require(
+                artifact["copyright"] == "Copyright (c) 2016-2023 zOS Global Limited and contributors",
+                f"{label} copyright changed",
+            )
+        elif path == APACHE_LICENSE_PATH:
+            require(is_authorized, f"{path} is only expected in the authorized inventory")
+            require(artifact["license"] == "Apache-2.0", f"{label} license must be Apache-2.0")
+            require(
+                artifact["copyright"] == EXPECTED_COPYRIGHT_EMY,
+                f"{label} copyright must be {EXPECTED_COPYRIGHT_EMY}",
+            )
+            require(b"Apache License" in data, f"{path} is not the Apache-2.0 license text")
+            require(b"Version 2.0" in data, f"{path} is not the Apache-2.0 license text")
+            require(
+                b"http://www.apache.org/licenses/" in data,
+                f"{path} is not the Apache-2.0 license text",
+            )
+            require(
+                b"END OF TERMS AND CONDITIONS" in data,
+                f"{path} is not the complete Apache-2.0 license text",
+            )
+        elif path == MIT_LICENSE_PATH:
+            require(is_authorized, f"{path} is only expected in the authorized inventory")
+            require(artifact["license"] == "MIT", f"{label} license must be MIT")
+            require(
+                artifact["copyright"] == EXPECTED_COPYRIGHT_EMY,
+                f"{label} copyright must be {EXPECTED_COPYRIGHT_EMY}",
+            )
+            require(b"MIT License" in data, f"{path} is not the MIT license text")
+            require(
+                b"Copyright (c) 2026 emyrinj" in data,
+                f"{path} must carry the first-party MIT copyright",
+            )
+            require(
+                b"Permission is hereby granted" in data,
+                f"{path} is not the MIT license text",
+            )
+        elif path == NOTICE_PATH:
+            require(is_authorized, f"{path} is only expected in the authorized inventory")
+            text = decode_utf8(data, path)
+            for marker in (
+                "AstatineMiner",
+                "AstatineGenesisCoordinator",
+                "MockAST",
+                "Apache-2.0",
+                "MIT",
+                "OPENZEPPELIN_LICENSE.txt",
+                "LICENSE-APACHE-2.0.txt",
+                "LICENSE-MIT.txt",
+                "Copyright (c) 2026 emyrinj",
+            ):
+                require(marker in text, f"{path} NOTICE is missing required marker: {marker}")
+            lowered_notice = text.lower()
+            normalized_notice = " ".join(lowered_notice.split())
+            require(
+                "no separate" in normalized_notice and "upstream notice" in normalized_notice,
+                f"{path} NOTICE must record the no-separate-upstream-NOTICE decision",
+            )
+            require(
+                "not independently verified" in normalized_notice
+                or "not been independently verified" in normalized_notice,
+                f"{path} NOTICE must not claim independent verification",
+            )
+            require(
+                "owner-attested" in normalized_notice or "owner attestation" in normalized_notice,
+                f"{path} NOTICE must state ownership is owner-attested",
+            )
+            # L9 accurately scoped OpenZeppelin attribution: both trees reference
+            # the pinned commit, MockAST imports one component, coordinator has
+            # zero direct imports, retention is for applicable redistribution,
+            # and no OZ code in every fixture (and none asserted for AstatineMiner).
+            require(
+                "pinned evm source trees reference" in normalized_notice,
+                f"{path} NOTICE must scope both pinned EVM source trees referencing OpenZeppelin",
+            )
+            require(
+                "dbb6104ce834628e473d2173bbc9d47f81a9eec3" in normalized_notice,
+                f"{path} NOTICE must reference the pinned OpenZeppelin commit",
+            )
+            require(
+                "imports one openzeppelin component" in normalized_notice,
+                f"{path} NOTICE must state MockAST imports one OpenZeppelin component",
+            )
+            require(
+                "zero direct openzeppelin imports" in normalized_notice,
+                f"{path} NOTICE must state GenesisCoordinator has zero direct OpenZeppelin imports",
+            )
+            require(
+                "for any fixture redistribution to which it applies" in normalized_notice,
+                f"{path} NOTICE must retain the OZ notice for any applicable fixture redistribution",
+            )
+            require(
+                "does not assert openzeppelin code in every fixture" in normalized_notice,
+                f"{path} NOTICE must not assert OpenZeppelin code in every fixture",
+            )
+            require(
+                "with any redistribution of mockast" not in normalized_notice
+                and "included with mockast redistribution" not in normalized_notice,
+                f"{path} NOTICE must not narrow OZ retention to MockAST-only redistribution",
+            )
+            # v3: technical review, no invented approver, no final-publication claim.
+            require(
+                "owner-authorized release intent" in normalized_notice,
+                f"{path} NOTICE must state owner-authorized release intent",
+            )
+            require(
+                "technical notice review" in normalized_notice or "technical review" in normalized_notice,
+                f"{path} NOTICE must record repository technical review",
+            )
+            require(
+                "not a legal conclusion" in normalized_notice,
+                f"{path} NOTICE must state it is not a legal conclusion",
+            )
+            require(
+                "final release controls" in normalized_notice and "outstanding" in normalized_notice,
+                f"{path} NOTICE must state final release controls remain outstanding",
+            )
+            require(
+                "project owner and release approver" not in normalized_notice,
+                f"{path} NOTICE must not invent a release approver",
+            )
+            require(
+                "publication authorized" not in normalized_notice
+                and "publication authorization" not in normalized_notice,
+                f"{path} NOTICE must not claim final publication authorization",
+            )
+        else:
+            raise VerificationError(f"{label} has an unexpected legal artifact path: {path}")
+        legal_by_path[path] = (artifact, data)
     require(len(set(legal_paths)) == len(legal_paths), "duplicate legal artifact paths")
-    require(set(legal_paths) == EXPECTED_LEGAL_ARTIFACT_PATHS, "legal artifact path inventory changed")
+    require(set(legal_paths) == expected_legal_paths, "legal artifact path inventory changed")
+    if is_authorized:
+        require(
+            set(legal_paths) == EXPECTED_LEGAL_ARTIFACT_PATHS_V2,
+            "authorized inventory must include the OpenZeppelin, Apache-2.0, MIT, and NOTICE legal artifacts",
+        )
+    else:
+        require(
+            set(legal_paths) == EXPECTED_LEGAL_ARTIFACT_PATHS_V1,
+            "legal artifact path inventory changed",
+        )
 
     openzeppelin = require_object(inventory.get("openzeppelin"), "openzeppelin")
     require_fields(
@@ -687,24 +1053,99 @@ def verify_inventory(root: Path) -> dict:
     require_bool(openzeppelin["verified"], "openzeppelin verified")
     require(openzeppelin["verified"] is True, "OZ evidence must be marked verified")
     require_string(openzeppelin["evidence_scope"], "openzeppelin evidence_scope")
-    legal_artifact = legal_artifacts[0]
-    require(openzeppelin["license_text"] == legal_artifact["path"], "OZ license path mismatch")
+    if is_authorized:
+        _oz_scope = " ".join(openzeppelin["evidence_scope"].lower().split())
+        require(
+            "both pinned evm source trees reference" in _oz_scope,
+            "openzeppelin evidence_scope must scope both pinned EVM source trees referencing OpenZeppelin",
+        )
+        require(
+            "dbb6104ce834628e473d2173bbc9d47f81a9eec3" in _oz_scope,
+            "openzeppelin evidence_scope must reference the pinned OpenZeppelin commit",
+        )
+        require(
+            "imports one openzeppelin component" in _oz_scope,
+            "openzeppelin evidence_scope must state MockAST imports one OpenZeppelin component",
+        )
+        require(
+            "zero direct openzeppelin imports" in _oz_scope,
+            "openzeppelin evidence_scope must state GenesisCoordinator has zero direct OpenZeppelin imports",
+        )
+        require(
+            "for any fixture redistribution to which it applies" in _oz_scope,
+            "openzeppelin evidence_scope must retain the OZ notice for any applicable fixture redistribution",
+        )
+        require(
+            "does not assert openzeppelin code in every fixture" in _oz_scope,
+            "openzeppelin evidence_scope must not assert OpenZeppelin code in every fixture",
+        )
+    require(
+        openzeppelin["license_text"] == OPENZEPPELIN_LICENSE_PATH,
+        "OZ license path must still point to tests/fixtures/OPENZEPPELIN_LICENSE.txt",
+    )
+    require(
+        OPENZEPPELIN_LICENSE_PATH in legal_by_path,
+        "OZ license path mismatch: OpenZeppelin license artifact is missing",
+    )
+    oz_artifact, _ = legal_by_path[OPENZEPPELIN_LICENSE_PATH]
+    require(
+        openzeppelin["license_text"] == oz_artifact["path"],
+        "OZ license path mismatch",
+    )
 
     rights = require_object(inventory.get("rights_review"), "rights_review")
-    require_fields(
-        rights,
-        (
-            "first_party_license_identity",
-            "copyright_evidence",
-            "rights_holder_authority",
-            "owner_attestation",
-            "notice_applicability",
-            "notice_checklist",
-            "publication_decision",
-            "not_inferred",
-        ),
-        "rights_review",
-    )
+    if is_authorized:
+        require_fields(
+            rights,
+            (
+                "first_party_license_identity",
+                "copyright_evidence",
+                "rights_holder_authority",
+                "owner_attestation",
+                "rights_decision",
+                "notice_applicability",
+                "notice_checklist",
+                "not_inferred",
+                "review_ci_branch_push_authorization",
+                "release_intent_authorization",
+            ),
+            "rights_review",
+        )
+        require(
+            "publication_decision" not in rights,
+            "live v3 schema must not contain publication_decision; use rights_decision",
+        )
+        require(
+            "publication_authorization" not in rights,
+            "live v3 schema must not contain publication_authorization; use release_intent_authorization",
+        )
+    else:
+        require_fields(
+            rights,
+            (
+                "first_party_license_identity",
+                "copyright_evidence",
+                "rights_holder_authority",
+                "owner_attestation",
+                "notice_applicability",
+                "notice_checklist",
+                "publication_decision",
+                "not_inferred",
+            ),
+            "rights_review",
+        )
+        require(
+            "publication_authorization" not in rights,
+            "blocked inventory must not contain publication_authorization",
+        )
+        require(
+            "rights_decision" not in rights,
+            "blocked inventory must not contain rights_decision",
+        )
+        require(
+            "release_intent_authorization" not in rights,
+            "blocked inventory must not contain release_intent_authorization",
+        )
     for field in (
         "first_party_license_identity",
         "copyright_evidence",
@@ -713,7 +1154,6 @@ def verify_inventory(root: Path) -> dict:
         require_string(rights[field], f"rights_review {field}")
     require_string(rights["rights_holder_authority"], "rights_review rights_holder_authority")
     require_string(rights["notice_applicability"], "rights_review notice_applicability")
-    require_string(rights["publication_decision"], "rights_review publication_decision")
     require(rights["rights_holder_authority"] == ATTESTED_RIGHTS, "rights status must remain honest")
     attestation = require_object(rights["owner_attestation"], "rights_review owner_attestation")
     require_fields(
@@ -733,62 +1173,359 @@ def verify_inventory(root: Path) -> dict:
         attestation["independent_verification"] is False,
         "owner attestation must not be represented as independent verification",
     )
-    require(rights["notice_applicability"] == EXPECTED_NOTICE_APPLICABILITY, "NOTICE status must remain honest")
-    require(
-        rights["publication_decision"] == EXPECTED_PUBLICATION_DECISION,
-        "publication decision changed; publication remains blocked",
-    )
+    if is_authorized:
+        lowered_scope = attestation["scope"].lower()
+        require("astatineminer" in lowered_scope, "owner attestation scope must include AstatineMiner")
+        require(
+            "astatinegenesiscoordinator" in lowered_scope.replace(" ", "").replace("-", "").lower()
+            or "genesis" in lowered_scope,
+            "owner attestation scope must include AstatineGenesisCoordinator",
+        )
+        require("mockast" in lowered_scope, "owner attestation scope must include MockAST; missing MockAST authorization")
+        require(
+            attestation["attested_on"] == EXPECTED_RELEASE_INTENT_ON,
+            "owner attestation date must be 2026-11-17 for the v3 inventory",
+        )
+        prior = attestation.get("prior_attestations")
+        require(
+            isinstance(prior, list) and len(prior) == 1,
+            "owner attestation must preserve exactly one prior attestation",
+        )
+        require(
+            prior[0] == EXPECTED_PRIOR_ATTESTATION,
+            "owner attestation prior record changed; the 2026-11-15 Phase-D attestation must be preserved exactly",
+        )
+        source_lower = attestation["attestation_source"].lower()
+        require(
+            "2026-11-17" in attestation["attestation_source"],
+            "owner attestation source must record the 2026-11-17 authorization",
+        )
+        require(
+            "mockast" in source_lower,
+            "owner attestation source must record MockAST authorization; missing MockAST authorization",
+        )
+        require(
+            "authorized" in source_lower,
+            "owner attestation source must record owner authorization",
+        )
+        require(
+            "apache-2.0" in source_lower and "mit" in source_lower,
+            "owner attestation source must record Apache-2.0 and MIT authorization",
+        )
+        require(
+            "project owner and release approver" not in source_lower,
+            "owner attestation source must not invent a release approver",
+        )
+        require(
+            rights["rights_decision"] == EXPECTED_RIGHTS_DECISION_V3,
+            "rights_decision must be the exact v3 owner-authorized release-intent contract",
+        )
+        require(
+            rights["notice_applicability"] == EXPECTED_NOTICE_APPLICABILITY_V3,
+            "NOTICE applicability must be the exact v3 technically-reviewed statement",
+        )
+    else:
+        require(rights["notice_applicability"] == EXPECTED_NOTICE_APPLICABILITY, "NOTICE status must remain honest")
+        require(
+            rights["publication_decision"] == EXPECTED_PUBLICATION_DECISION,
+            "publication decision changed; publication remains blocked",
+        )
     push_auth = require_object(
         rights.get("review_ci_branch_push_authorization"),
         "rights_review review_ci_branch_push_authorization",
     )
-    require(
-        push_auth.get("status") == EXPECTED_REVIEW_PUSH_STATUS,
-        "review/CI branch push authorization status changed",
-    )
-    require(
-        push_auth.get("authorized_by") == "project owner",
-        "review/CI branch push authorization author changed",
-    )
-    require(
-        push_auth.get("authorized_on") == EXPECTED_REVIEW_PUSH_DATE,
-        "review/CI branch push authorization date changed",
-    )
-    require(
-        push_auth.get("scope") == EXPECTED_REVIEW_PUSH_SCOPE,
-        "review/CI branch push authorization scope changed",
-    )
-    require(
-        push_auth.get("public_repository_visibility") == EXPECTED_REVIEW_PUSH_VISIBILITY,
-        "review/CI branch push visibility statement changed",
-    )
-    require(
-        push_auth.get("not_authorized") == EXPECTED_REVIEW_PUSH_NOT_AUTHORIZED,
-        "review/CI branch push blocked list changed; no item may be removed",
-    )
-    require(
-        push_auth.get("rights_gate_unchanged") == EXPECTED_REVIEW_PUSH_GATE_UNCHANGED,
-        "review/CI branch push gate statement changed",
-    )
-    require(
-        push_auth == EXPECTED_REVIEW_PUSH_AUTH,
-        "review/CI branch push authorization changed",
-    )
+    if is_authorized:
+        require(
+            push_auth.get("status") == EXPECTED_PUSH_STATUS_SUPERSEDED_V3,
+            "review/CI branch push authorization must be SUPERSEDED \u2014 OWNER-AUTHORIZED RELEASE INTENT for v3",
+        )
+        require(
+            push_auth.get("superseded_by") == EXPECTED_PUSH_SUPERSEDED_BY_V3,
+            "superseded review/CI authorization must point to release_intent_authorization",
+        )
+        require(
+            push_auth.get("superseded_on") == EXPECTED_PUSH_SUPERSEDED_ON,
+            "superseded review/CI authorization date must be 2026-11-17",
+        )
+        require(
+            push_auth.get("authorized_by") == "project owner",
+            "review/CI branch push authorization author changed",
+        )
+        require(
+            push_auth.get("authorized_on") == EXPECTED_REVIEW_PUSH_DATE,
+            "review/CI branch push authorization date changed",
+        )
+        require(
+            push_auth.get("scope") == EXPECTED_REVIEW_PUSH_SCOPE,
+            "review/CI branch push authorization scope changed",
+        )
+        require(
+            push_auth.get("public_repository_visibility") == EXPECTED_REVIEW_PUSH_VISIBILITY,
+            "review/CI branch push visibility statement changed",
+        )
+        require(
+            push_auth.get("not_authorized") == EXPECTED_REVIEW_PUSH_NOT_AUTHORIZED,
+            "review/CI branch push blocked list changed; no item may be removed",
+        )
+        require(
+            push_auth.get("rights_gate_unchanged") == EXPECTED_INTENT_REVIEW_PUSH_GATE,
+            "review/CI branch push gate statement changed; the historical blocked state must be marked superseded",
+        )
+    else:
+        require(
+            push_auth.get("status") == EXPECTED_REVIEW_PUSH_STATUS,
+            "review/CI branch push authorization status changed",
+        )
+        require(
+            push_auth.get("authorized_by") == "project owner",
+            "review/CI branch push authorization author changed",
+        )
+        require(
+            push_auth.get("authorized_on") == EXPECTED_REVIEW_PUSH_DATE,
+            "review/CI branch push authorization date changed",
+        )
+        require(
+            push_auth.get("scope") == EXPECTED_REVIEW_PUSH_SCOPE,
+            "review/CI branch push authorization scope changed",
+        )
+        require(
+            push_auth.get("public_repository_visibility") == EXPECTED_REVIEW_PUSH_VISIBILITY,
+            "review/CI branch push visibility statement changed",
+        )
+        require(
+            push_auth.get("not_authorized") == EXPECTED_REVIEW_PUSH_NOT_AUTHORIZED,
+            "review/CI branch push blocked list changed; no item may be removed",
+        )
+        require(
+            push_auth.get("rights_gate_unchanged") == EXPECTED_REVIEW_PUSH_GATE_UNCHANGED,
+            "review/CI branch push gate statement changed",
+        )
+        require(
+            push_auth == EXPECTED_REVIEW_PUSH_AUTH,
+            "review/CI branch push authorization changed",
+        )
+
+    if is_authorized:
+        release_auth = require_object(
+            rights.get("release_intent_authorization"),
+            "rights_review release_intent_authorization",
+        )
+        require_fields(
+            release_auth,
+            ("status", "authorized_by", "authorized_on", "scope", "approval_roles", "evidence", "technical_notice_review", "final_release_controls_complete", "not_authorized", "independent_verification"),
+            "rights_review release_intent_authorization",
+        )
+        require(
+            release_auth.get("status") == EXPECTED_RELEASE_INTENT_STATUS,
+            "release_intent_authorization status must be OWNER-AUTHORIZED RELEASE INTENT \u2014 FINAL CONTROLS OUTSTANDING",
+        )
+        require(
+            release_auth.get("authorized_by") == EXPECTED_RELEASE_INTENT_BY,
+            "release_intent_authorization must be authorized by project owner only",
+        )
+        require(
+            release_auth.get("authorized_on") == EXPECTED_RELEASE_INTENT_ON,
+            "release_intent_authorization date must be 2026-11-17",
+        )
+        require(
+            release_auth.get("scope") == EXPECTED_RELEASE_INTENT_SCOPE,
+            "release_intent_authorization scope changed",
+        )
+        require(
+            release_auth.get("approval_roles") == EXPECTED_RELEASE_INTENT_ROLES,
+            "release_intent_authorization must state project owner only with no separate approver",
+        )
+        require_bool(release_auth.get("independent_verification"), "release_intent_authorization independent_verification")
+        require(
+            release_auth.get("independent_verification") is False,
+            "release_intent_authorization must not claim independent verification",
+        )
+        require(
+            release_auth.get("final_release_controls_complete") is False,
+            "final release controls must remain outstanding; must not claim complete",
+        )
+        evidence_list = require_list(release_auth.get("evidence"), "release_intent_authorization evidence")
+        require(evidence_list, "release_intent_authorization evidence must not be empty")
+        for value in evidence_list:
+            require_string(value, "release_intent_authorization evidence entry")
+        joined_evidence = "\n".join(evidence_list).lower()
+        require("mockast" in joined_evidence, "release_intent_authorization evidence is missing MockAST authorization")
+        require(
+            "copyright (c) 2026 emyrinj" in joined_evidence or "emyrinj" in joined_evidence,
+            "release_intent_authorization evidence must reference Apache-2.0 copyright emyrinj",
+        )
+        require("apache-2.0" in joined_evidence, "release_intent_authorization evidence must reference Apache-2.0")
+        require(
+            "tests/fixtures/license-apache-2.0.txt" in joined_evidence,
+            "release_intent_authorization evidence must reference the Apache-2.0 license file",
+        )
+        require(
+            "tests/fixtures/license-mit.txt" in joined_evidence,
+            "release_intent_authorization evidence must reference the MIT license file",
+        )
+        require(
+            "tests/fixtures/notice" in joined_evidence,
+            "release_intent_authorization evidence must reference the fixture NOTICE",
+        )
+        require(
+            "openzeppelin" in joined_evidence,
+            "release_intent_authorization evidence must reference the retained OpenZeppelin MIT notice",
+        )
+        require(
+            "release_archive_member" in joined_evidence
+            or "excluded from binary" in joined_evidence
+            or "remain excluded" in joined_evidence,
+            "release_intent_authorization evidence must note fixtures remain excluded from binary archives",
+        )
+        require(
+            "no legal conclusion" in joined_evidence,
+            "release_intent_authorization evidence must state no legal conclusion",
+        )
+        require(
+            "project owner and release approver" not in joined_evidence,
+            "release_intent_authorization evidence must not invent a release approver",
+        )
+        require(
+            "publication authorized" not in joined_evidence,
+            "release_intent_authorization evidence must not claim final publication",
+        )
+        tech = require_object(release_auth.get("technical_notice_review"), "technical_notice_review")
+        require_fields(
+            tech,
+            ("reviewed_on", "reviewed_by", "finding", "citations", "legal_conclusion", "separate_approval"),
+            "technical_notice_review",
+        )
+        require(
+            tech.get("reviewed_on") == EXPECTED_RELEASE_INTENT_ON,
+            "technical_notice_review reviewed_on must be 2026-11-17",
+        )
+        require(
+            tech.get("reviewed_by") == EXPECTED_TECHNICAL_REVIEWED_BY,
+            "technical_notice_review reviewed_by must be repository technical review, not owner or separate approver",
+        )
+        require(
+            tech.get("finding") == EXPECTED_TECHNICAL_FINDING,
+            "technical_notice_review finding must be the exact evidence-based technical finding",
+        )
+        require(
+            list(tech.get("citations", [])) == EXPECTED_TECHNICAL_CITATIONS,
+            "technical_notice_review citations must list the six license/notice/provenance files",
+        )
+        require(
+            tech.get("legal_conclusion") is False,
+            "technical_notice_review must not claim a legal conclusion",
+        )
+        require(
+            tech.get("separate_approval") is False,
+            "technical_notice_review must not claim a separate approval",
+        )
+        not_auth_list = require_list(release_auth.get("not_authorized"), "release_intent_authorization not_authorized")
+        require(not_auth_list, "release_intent_authorization not_authorized must not be empty")
+        for value in not_auth_list:
+            require_string(value, "release_intent_authorization not_authorized entry")
+        joined_not = "\n".join(not_auth_list).lower()
+        require(
+            "other tag" in joined_not or "any other" in joined_not,
+            "release_intent_authorization not_authorized must exclude any other tag/version",
+        )
+        require("mainnet" in joined_not, "release_intent_authorization not_authorized must exclude mainnet risk acceptance")
+        require(
+            "independent" in joined_not,
+            "release_intent_authorization not_authorized must exclude independent legal verification",
+        )
+        require(
+            "legal advice" in joined_not or "legal clearance" in joined_not or "legal conclusion" in joined_not,
+            "release_intent_authorization not_authorized must exclude legal advice/clearance/conclusion",
+        )
+        require(
+            "separate release approver" in joined_not,
+            "release_intent_authorization not_authorized must exclude any separate approver assertion",
+        )
+        require(
+            "protected environment" in joined_not,
+            "release_intent_authorization not_authorized must require protected environment controls",
+        )
+        require(
+            "writer" in joined_not,
+            "release_intent_authorization not_authorized must require writer/app restriction",
+        )
+        require(
+            "immutable" in joined_not,
+            "release_intent_authorization not_authorized must require immutable verification/artifacts",
+        )
+        require(
+            "attestation" in joined_not,
+            "release_intent_authorization not_authorized must require attestations",
+        )
+        require(
+            "bypass" in joined_not,
+            "release_intent_authorization not_authorized must exclude bypass of controls",
+        )
+        require(
+            "exact release tag" in joined_not or "exact tag" in joined_not,
+            "release_intent_authorization not_authorized must require exact tag controls",
+        )
+        require(
+            "main" in joined_not,
+            "release_intent_authorization not_authorized must require main CI controls",
+        )
+    else:
+        release_auth = None
 
     checklist = require_object(rights["notice_checklist"], "rights_review notice_checklist")
     require_fields(checklist, ("status", "scope", "items"), "rights_review notice_checklist")
     require_string(checklist["status"], "notice_checklist status")
     require_string(checklist["scope"], "notice_checklist scope")
-    require(
-        checklist["status"] == EXPECTED_CHECKLIST_STATUS,
-        "notice checklist status changed; the gate must stay exactly "
-        "OPEN — publication remains BLOCKED",
-    )
+    if is_authorized:
+        require(
+            checklist["status"] == EXPECTED_CHECKLIST_STATUS_V3,
+            "notice checklist status must be TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent; final release controls outstanding",
+        )
+    else:
+        require(
+            checklist["status"] == EXPECTED_CHECKLIST_STATUS,
+            "notice checklist status changed; the gate must stay exactly "
+            "OPEN \u2014 publication remains BLOCKED",
+        )
     items = require_list(checklist["items"], "notice_checklist items")
     require(items, "notice_checklist items must not be empty")
     item_ids = []
     blocking_open = 0
+    blocking_open_ids: list[str] = []
     seen_blockers: set[str] = set()
+    _EXPECTED_OWNERS_V3 = {
+        "RIGHTS-01": "project owner",
+        "RIGHTS-02": "repository technical review",
+        "RIGHTS-03": "project owner",
+        "RIGHTS-04": "project owner",
+        "RIGHTS-05": "project owner",
+    }
+    _EXPECTED_EVIDENCE_SUBSTRINGS_V3 = {
+        "RIGHTS-02": (
+            "release_intent_authorization",
+            "technical_notice_review",
+            "tests/fixtures/license-apache-2.0.txt",
+            "no separate upstream notice",
+        ),
+        "RIGHTS-03": (
+            "release_intent_authorization",
+            "technical_notice_review",
+            "tests/fixtures/license-apache-2.0.txt",
+            "copyright (c) 2026 emyrinj",
+        ),
+        "RIGHTS-04": (
+            "release_intent_authorization",
+            "technical_notice_review",
+            "tests/fixtures/license-mit.txt",
+            "for any fixture redistribution",
+        ),
+        "RIGHTS-05": (
+            "release_intent_authorization",
+            "technical_notice_review",
+            "final release controls",
+            "no legal conclusion",
+        ),
+    }
     for index, item in enumerate(items):
         label = f"notice_checklist items[{index}]"
         item = require_object(item, label)
@@ -812,34 +1549,76 @@ def verify_inventory(root: Path) -> dict:
                 f"rights gate item is not blocking: {item_ids[-1]}",
             )
             require(
-                item_status == "OPEN",
-                f"rights gate blocking item is not OPEN: {item_ids[-1]}",
-            )
-            require(
                 action == expected_detail["action"],
                 f"rights gate item action changed: {item_ids[-1]}; rewording the "
                 "checklist cannot imply approval",
             )
-            require(
-                owner == expected_detail["owner"],
-                f"rights gate item owner changed: {item_ids[-1]}",
-            )
-            require(
-                evidence == expected_detail["evidence"],
-                f"rights gate item evidence changed: {item_ids[-1]}",
-            )
+            if is_authorized:
+                require(
+                    owner == _EXPECTED_OWNERS_V3[item_ids[-1]],
+                    f"rights gate item owner must be {_EXPECTED_OWNERS_V3[item_ids[-1]]} for v3: {item_ids[-1]}",
+                )
+                require(
+                    item_status == "DONE",
+                    f"rights gate blocking item is not DONE for v3: {item_ids[-1]}",
+                )
+                require(
+                    evidence and evidence.strip(),
+                    f"rights gate item DONE without evidence: {item_ids[-1]}",
+                )
+                for substring in _EXPECTED_EVIDENCE_SUBSTRINGS_V3[item_ids[-1]]:
+                    require(
+                        substring in evidence.lower(),
+                        f"rights gate item evidence is missing required reference '{substring}': {item_ids[-1]}",
+                    )
+                require(
+                    "project owner and release approver" not in evidence.lower(),
+                    f"rights gate item evidence must not invent a release approver: {item_ids[-1]}",
+                )
+                require(
+                    "publication authorized" not in evidence.lower()
+                    and "publication_authorization" not in evidence.lower(),
+                    f"rights gate item evidence must not claim final publication: {item_ids[-1]}",
+                )
+            else:
+                require(
+                    owner == expected_detail["owner"],
+                    f"rights gate item owner changed: {item_ids[-1]}",
+                )
+                require(
+                    item_status == "OPEN",
+                    f"rights gate blocking item is not OPEN: {item_ids[-1]}",
+                )
+                require(
+                    evidence == expected_detail["evidence"],
+                    f"rights gate item evidence changed: {item_ids[-1]}",
+                )
         if blocking and item_status == "OPEN":
             blocking_open += 1
+            blocking_open_ids.append(item_ids[-1])
     require(len(set(item_ids)) == len(item_ids), "notice_checklist contains duplicate ids")
     require(
         seen_blockers == set(EXPECTED_BLOCKER_DETAILS),
         "rights gate is missing a blocking checklist item; expected "
         f"{sorted(EXPECTED_BLOCKER_DETAILS)}, got {sorted(seen_blockers)}",
     )
-    require(
-        blocking_open > 0,
-        "publication is BLOCKED but no blocking notice-checklist item is open",
-    )
+    if is_authorized:
+        require(
+            blocking_open == 0,
+            "v3 inventory must have no open blocking checklist items",
+        )
+        # RIGHTS-01 owner must remain project owner for v3 as well
+        for _id in item_ids:
+            pass
+        require(
+            "RIGHTS-01" in item_ids,
+            "v3 rights gate is missing RIGHTS-01",
+        )
+    else:
+        require(
+            blocking_open > 0,
+            "publication is BLOCKED but no blocking notice-checklist item is open",
+        )
 
     scrub = require_object(inventory.get("scrub_policy"), "scrub_policy")
     require_fields(
@@ -892,6 +1671,93 @@ def verify_inventory(root: Path) -> dict:
             digest = sha256_hex(token.lower().encode())
             require(digest not in marker_set, f"private-origin marker remains in {relative}")
 
+    if is_authorized:
+        # v3 README must reflect owner-authorized intent + technical review, with no invented approver.
+        _, readme_data = read_confined_bytes(root, "tests/fixtures/README.md", "readme", EXPECTED_DOCUMENT_PATHS)
+        readme_text = decode_utf8(readme_data, "tests/fixtures/README.md")
+        _readme_norm = " ".join(readme_text.lower().split())
+        require(
+            "owner-authorized release intent" in _readme_norm,
+            "fixture README must state owner-authorized release intent",
+        )
+        require(
+            "technical" in _readme_norm and "notice" in _readme_norm,
+            "fixture README must record technical NOTICE review",
+        )
+        require(
+            "not a legal conclusion" in _readme_norm,
+            "fixture README must state it is not a legal conclusion",
+        )
+        require(
+            "final release controls" in _readme_norm and "outstanding" in _readme_norm,
+            "fixture README must state final release controls remain outstanding",
+        )
+        require(
+            "project owner and release approver" not in _readme_norm,
+            "fixture README must not invent a release approver",
+        )
+        require(
+            "publication authorized" not in _readme_norm
+            and "publication_authorization" not in _readme_norm,
+            "fixture README must not claim final publication authorization",
+        )
+        # Legal artifact NOTICE provenance/evidence must use technical wording for v3.
+        _notice_prov = legal_by_path[NOTICE_PATH][0]
+        _prov_norm = " ".join(str(_notice_prov.get("provenance", "")).lower().split())
+        _evi_norm = " ".join(str(_notice_prov.get("evidence", "")).lower().split())
+        require(
+            "technical" in _prov_norm,
+            "NOTICE provenance must reference technical NOTICE review",
+        )
+        require(
+            "project owner and release approver" not in _prov_norm
+            and "project owner and release approver" not in _evi_norm,
+            "NOTICE provenance/evidence must not invent a release approver",
+        )
+        require(
+            "publication authorized" not in _evi_norm
+            and "publication_authorization" not in _evi_norm,
+            "NOTICE evidence must not claim final publication",
+        )
+
+    if is_authorized:
+        publication_authorized = False
+        release_intent_authorized = True
+        final_release_controls_complete = False
+        authorization_status = release_auth["status"]
+        blocking_open_list: list[str] = []
+    else:
+        publication_authorized = False
+        release_intent_authorized = False
+        final_release_controls_complete = False
+        authorization_status = push_auth["status"]
+        blocking_open_list = list(blocking_open_ids)
+    if is_authorized:
+        return {
+            "schema": inventory["schema"],
+            "fixtures_checked": len(entries),
+            "documents_checked": len(documents),
+            "legal_artifacts_checked": len(legal_artifacts),
+            "scrub_paths_checked": len(scrub_paths),
+            "openzeppelin_pin": openzeppelin["pinned_commit"],
+            "openzeppelin_license": openzeppelin["license"],
+            "rights_holder_authority": rights["rights_holder_authority"],
+            "owner_attestation_status": attestation["status"],
+            "owner_attestation_independent_verification": attestation["independent_verification"],
+            "notice_applicability": rights["notice_applicability"],
+            "notice_checklist_status": checklist["status"],
+            "notice_checklist_items_checked": len(items),
+            "notice_checklist_blocking_open": blocking_open,
+            "blocking_open": blocking_open_list,
+            "rights_decision": rights["rights_decision"],
+            "review_ci_branch_push_authorization": push_auth["status"],
+            "release_intent_authorization": release_auth["status"],
+            "release_intent_authorized": release_intent_authorized,
+            "publication_authorized": publication_authorized,
+            "final_release_controls_complete": final_release_controls_complete,
+            "authorization_status": authorization_status,
+            "status": "PASS",
+        }
     return {
         "schema": inventory["schema"],
         "fixtures_checked": len(entries),
@@ -907,8 +1773,13 @@ def verify_inventory(root: Path) -> dict:
         "notice_checklist_status": checklist["status"],
         "notice_checklist_items_checked": len(items),
         "notice_checklist_blocking_open": blocking_open,
+        "blocking_open": blocking_open_list,
         "publication_decision": rights["publication_decision"],
         "review_ci_branch_push_authorization": push_auth["status"],
+        "release_intent_authorized": release_intent_authorized,
+        "publication_authorized": publication_authorized,
+        "final_release_controls_complete": final_release_controls_complete,
+        "authorization_status": authorization_status,
         "status": "PASS",
     }
 

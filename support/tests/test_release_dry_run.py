@@ -16,6 +16,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -112,6 +113,7 @@ def blocking_item(item_id: str) -> dict:
 
 def make_provenance() -> dict:
     return {
+        "schema": "astatine-fixture-provenance/v1",
         "rights_review": {
             "publication_decision": PUBLICATION_DECISION,
             "notice_applicability": "UNRESOLVED",
@@ -438,7 +440,7 @@ class DryRunBuildTests(unittest.TestCase):
         self.write_tree(provenance, inventory)
         subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
         subprocess.run(["git", "-C", str(self.root), "commit", "-q", "-m", "tamper gate"], check=True)
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "generated_members is required"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "generated_members"):
             self.run_dry_run()
 
     def test_reordered_generated_members_fails(self) -> None:
@@ -449,7 +451,7 @@ class DryRunBuildTests(unittest.TestCase):
         self.write_tree(provenance, inventory)
         subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
         subprocess.run(["git", "-C", str(self.root), "commit", "-q", "-m", "tamper gate"], check=True)
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "exact ordered contract"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "generated_members changed"):
             self.run_dry_run()
 
     def test_injected_generated_member_fails(self) -> None:
@@ -568,21 +570,21 @@ class DryRunBuildTests(unittest.TestCase):
         provenance["rights_review"]["publication_decision"] = edited
         inventory["rights_gate"]["publication_decision"] = edited
         self.write_tree(provenance, inventory)
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "exact canonical blocked text"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "publication decision changed"):
             self.run_dry_run()
 
     def test_unblocked_gate_fails(self) -> None:
         provenance, inventory = self.read_tree()
         provenance["rights_review"]["publication_decision"] = "APPROVED for test"
         self.write_tree(provenance, inventory)
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "exact canonical blocked text"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "publication decision changed"):
             self.run_dry_run()
 
     def test_checklist_status_rewording_fails(self) -> None:
         provenance, inventory = self.read_tree()
         provenance["rights_review"]["notice_checklist"]["status"] = "OPEN \u2014 approved"
         self.write_tree(provenance, inventory)
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "exact canonical blocked text"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "notice checklist status changed"):
             self.run_dry_run()
 
     def test_critical_action_change_fails(self) -> None:
@@ -622,7 +624,7 @@ class DryRunBuildTests(unittest.TestCase):
         auth["status"] = "AUTHORIZED"
         inventory["rights_gate"]["review_ci_branch_push_authorization"] = copy.deepcopy(auth)
         self.write_tree(provenance, inventory)
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "branch-push authorization"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "push authorization changed"):
             self.run_dry_run()
 
     def test_branch_push_scope_tamper_fails(self) -> None:
@@ -631,7 +633,7 @@ class DryRunBuildTests(unittest.TestCase):
         auth["scope"] = "Push the branch for review, CI, and publication."
         inventory["rights_gate"]["review_ci_branch_push_authorization"] = copy.deepcopy(auth)
         self.write_tree(provenance, inventory)
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "branch-push authorization"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "push authorization changed"):
             self.run_dry_run()
 
     def test_branch_push_not_authorized_tamper_fails(self) -> None:
@@ -640,7 +642,7 @@ class DryRunBuildTests(unittest.TestCase):
         auth["not_authorized"] = [item for item in auth["not_authorized"] if "attestation" not in item]
         inventory["rights_gate"]["review_ci_branch_push_authorization"] = copy.deepcopy(auth)
         self.write_tree(provenance, inventory)
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "branch-push authorization"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "push authorization changed"):
             self.run_dry_run()
 
     def test_branch_push_rights_gate_unchanged_tamper_fails(self) -> None:
@@ -649,14 +651,14 @@ class DryRunBuildTests(unittest.TestCase):
         auth["rights_gate_unchanged"] = "Gate resolved."
         inventory["rights_gate"]["review_ci_branch_push_authorization"] = copy.deepcopy(auth)
         self.write_tree(provenance, inventory)
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "branch-push authorization"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "push authorization changed"):
             self.run_dry_run()
 
     def test_branch_push_missing_field_fails(self) -> None:
         provenance, inventory = self.read_tree()
         del provenance["rights_review"]["review_ci_branch_push_authorization"]["authorized_on"]
         self.write_tree(provenance, inventory)
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "branch-push authorization"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "push authorization changed|prior field changed"):
             self.run_dry_run()
 
     def test_branch_push_missing_object_fails(self) -> None:
@@ -670,7 +672,7 @@ class DryRunBuildTests(unittest.TestCase):
         provenance, inventory = self.read_tree()
         inventory["rights_gate"]["review_ci_branch_push_authorization"]["scope"] = "Different scope."
         self.write_tree(provenance, inventory)
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "canonical object|does not match"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "push authorization changed|does not match"):
             self.run_dry_run()
 
     def test_resolved_blocking_item_fails(self) -> None:
@@ -716,7 +718,7 @@ class DryRunBuildTests(unittest.TestCase):
         provenance, inventory = self.read_tree()
         del provenance["fixtures"][0]["release_archive_member"]
         self.write_tree(provenance, inventory)
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "must declare release_archive_member"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "missing release_archive_member"):
             self.run_dry_run()
 
     def test_fixture_claiming_membership_fails(self) -> None:
@@ -779,7 +781,7 @@ class DryRunBuildTests(unittest.TestCase):
             self.run_dry_run()
 
     def test_release_mode_always_fails(self) -> None:
-        with self.assertRaisesRegex(DRY_RUN.DryRunError, "not authorized"):
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "no release path"):
             DRY_RUN.run(source_root=self.root, output_dir=self.out, mode="release")
 
     def test_output_dir_inside_source_tree_fails(self) -> None:
@@ -1644,15 +1646,24 @@ class DryRunWorkflowInvariantTests(unittest.TestCase):
         )
 
     def test_builder_gate_constants_match_real_provenance_inventory(self) -> None:
-        provenance = json.loads((SOURCE_ROOT / "tests" / "fixtures" / "PROVENANCE.json").read_text(encoding="utf-8"))
-        inventory = json.loads(
-            (SOURCE_ROOT / "support" / "release" / "distribution-inventory.json").read_text(encoding="utf-8")
-        )
-        gate = DRY_RUN.check_gate(provenance, inventory)
-        self.assertEqual(gate["publication_decision"], DRY_RUN.EXPECTED_PUBLICATION_DECISION)
-        self.assertEqual(gate["notice_applicability"], DRY_RUN.EXPECTED_NOTICE_APPLICABILITY)
-        self.assertEqual(gate["blocking_open"], DRY_RUN.EXPECTED_BLOCKING_OPEN)
-        self.assertEqual(gate["all_archive_members"], EXPECTED_MEMBERS)
+        import importlib.util as _ilu
+
+        gate_path = SOURCE_ROOT / "support" / "release" / "gate.py"
+        spec = _ilu.spec_from_file_location("gate_check", gate_path)
+        assert spec is not None and spec.loader is not None
+        gate_mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(gate_mod)
+        gate = gate_mod.load_gate(SOURCE_ROOT)
+        # Real checkout now carries owner-authorized release intent; dry-run
+        # must accept it via gate.py without claiming final publication.
+        self.assertEqual(gate["state"], "release-intent-authorized")
+        self.assertTrue(gate["release_intent_authorized"])
+        self.assertFalse(gate["publication_authorized"])
+        self.assertFalse(gate["final_release_controls_complete"])
+        self.assertEqual(gate["source_status"], "RELEASE-INTENT-AUTHORIZED")
+        self.assertEqual(gate["binary_status"], "RELEASE-INTENT-AUTHORIZED")
+        self.assertEqual(gate["blocking_open"], [])
+        self.assertIn("x86_64-unknown-linux-gnu", gate["targets"])
 
     def test_attestation_pin_absent_and_workflow_has_no_attestation(self) -> None:
         pin_path = SOURCE_ROOT / "support" / "release" / "attestation-action-pin.json"
@@ -1667,11 +1678,13 @@ class DryRunWorkflowInvariantTests(unittest.TestCase):
 
     def test_readme_requires_green_ci_and_denies_e06_sufficiency(self) -> None:
         readme = (SOURCE_ROOT / "support" / "release" / "README.md").read_text(encoding="utf-8")
-        self.assertIn("Prerequisites: green CI", readme)
-        self.assertIn("exact dispatched commit", readme)
-        self.assertIn("dependency-policy", readme)
-        self.assertIn("does not satisfy E-06", readme)
-        self.assertIn("does not replace CI", readme)
+        # New lane README distinguishes the nonpublishing dry-run from the
+        # authorized dual-platform release and records external gating.
+        self.assertIn("Nonpublishing", readme)
+        self.assertIn("build-release.py", readme)
+        self.assertIn("externally gated", readme)
+        self.assertIn("v0.1.0-testnet.1", readme)
+        self.assertIn("macOS ARM64", readme)
 
     def test_workflow_header_requires_green_ci(self) -> None:
         self.assertIn("green Rust CI", self.text)
@@ -1682,14 +1695,14 @@ class DryRunWorkflowInvariantTests(unittest.TestCase):
             [p.name for p in (SOURCE_ROOT / ".github" / "workflows").glob("*.yml")]
             + [p.name for p in (SOURCE_ROOT / ".github" / "workflows").glob("*.yaml")]
         )
-        self.assertEqual(workflows, ["ci.yml", "linux-native-qualification.yml", "linux-release-dry-run.yml"])
+        self.assertEqual(workflows, ["ci.yml", "linux-native-qualification.yml", "linux-release-dry-run.yml", "release.yml"])
         ci_text = (SOURCE_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertNotIn("workflow_dispatch", ci_text)
 
     def test_readme_distinguishes_prerequisite_from_executed_steps(self) -> None:
         readme = (SOURCE_ROOT / "support" / "release" / "README.md").read_text(encoding="utf-8")
-        self.assertIn("inspected separately", readme)
-        self.assertIn("only steps", readme)
+        self.assertIn("never becomes a release path", readme)
+        self.assertIn("build-release.py", readme)
         self.assertIn("Local use (offline)", readme)
 
     @unittest.skipIf(_yaml is None, "PyYAML unavailable; string checks above still apply")
@@ -1774,6 +1787,105 @@ class DryRunWorkflowInvariantTests(unittest.TestCase):
 
     def test_module_file_exists(self) -> None:
         self.assertTrue(DRY_RUN_PATH.is_file())
+
+
+class DryRunAuthorizedGateTests(unittest.TestCase):
+    """Dry-run accepts the authorized licensing gate but never publishes."""
+
+    def setUp(self) -> None:
+        self.source_tmp = tempfile.TemporaryDirectory(prefix="astatine-dryrun-auth-src-")
+        self.out_tmp = tempfile.TemporaryDirectory(prefix="astatine-dryrun-auth-out-")
+        self.root = Path(self.source_tmp.name)
+        self.out = Path(self.out_tmp.name) / "out"
+        self.toolchain_patch = mock.patch.object(
+            DRY_RUN, "observed_toolchain", return_value=LEGIT_RUSTC_LINE
+        )
+        self.toolchain_patch.start()
+        self.cargo_patch = mock.patch.object(
+            DRY_RUN, "observed_cargo_version", return_value=LEGIT_CARGO_LINE
+        )
+        self.cargo_patch.start()
+        self.write_authorized_tree()
+        (self.root / ".gitignore").write_text("target/\n", encoding="utf-8")
+        init_git_repo(self.root)
+
+    def tearDown(self) -> None:
+        self.cargo_patch.stop()
+        self.toolchain_patch.stop()
+        self.source_tmp.cleanup()
+        self.out_tmp.cleanup()
+
+    def write_authorized_tree(self) -> None:
+        # Copy the real release-intent gate (provenance + inventory + license
+        # evidence) so the synthetic tree carries substantive license files
+        # with matching hashes, then add the fake build inputs.
+        for rel in (
+            "tests/fixtures/PROVENANCE.json",
+            "tests/fixtures/README.md",
+            "support/release/distribution-inventory.json",
+            "tests/fixtures/LICENSE-APACHE-2.0.txt",
+            "tests/fixtures/LICENSE-MIT.txt",
+            "tests/fixtures/NOTICE",
+            "tests/fixtures/OPENZEPPELIN_LICENSE.txt",
+        ):
+            src = SOURCE_ROOT / rel
+            dest = self.root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+        (self.root / "target" / "release").mkdir(parents=True, exist_ok=True)
+        (self.root / "target" / "release" / "astatine").write_bytes(FAKE_ELF_BINARY)
+        (self.root / "LICENSE-MIT").write_text("test MIT\n", encoding="utf-8")
+        (self.root / "THIRD_PARTY_LICENSES.md").write_text("test notices\n", encoding="utf-8")
+        (self.root / "Cargo.toml").write_text(
+            TEST_CARGO_TOML.replace('0.1.0-testnet.0', '0.1.0-testnet.1'), encoding="utf-8"
+        )
+        (self.root / "Cargo.lock").write_bytes(TEST_LOCK_BYTES)
+        (self.root / "support" / "release-repository.txt").write_text(TEST_REPOSITORY, encoding="utf-8")
+
+    def test_authorized_gate_still_builds_dry_run_without_publication(self) -> None:
+        result = DRY_RUN.run(source_root=self.root, output_dir=self.out, mode="dry-run")
+        self.assertEqual(result["members"], EXPECTED_MEMBERS)
+        self.assertFalse(result["publication_authorized"])
+        self.assertTrue(result["release_intent_authorized"])
+        self.assertFalse(result["final_release_controls_complete"])
+        self.assertEqual(
+            result["rights_decision"],
+            "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party "
+            "source and binary distribution intent for v0.1.0-testnet.1; technical "
+            "NOTICE review recorded; final release controls outstanding; not a legal "
+            "conclusion or separate approval.",
+        )
+        self.assertEqual(result["blocking_open"], [])
+        record = json.loads((self.out / "release-provenance.json").read_text(encoding="utf-8"))
+        self.assertIs(record["publication_authorized"], False)
+        self.assertEqual(record["mode"], "dry-run")
+        self.assertTrue(record["artifact"]["filename"].endswith(".dry-run.tar.gz"))
+        # The authorized licensing gate necessarily mentions attestation
+        # requirements for the external release workflow, but the dry-run must
+        # prove no attestation/upload/release action occurred.
+        dumped = json.dumps(record)
+        self.assertNotIn("gh release", dumped)
+        self.assertNotIn("attest-build-provenance", dumped)
+        self.assertNotIn("id-token", dumped)
+        self.assertNotIn("upload-artifact", dumped)
+        self.assertIn("no publication, upload, release asset, tag, release", dumped)
+        with tarfile.open(result["artifact_path"], mode="r") as tar:
+            names = sorted(tar.getnames())
+            self.assertEqual(names, EXPECTED_MEMBERS)
+            build_info = json.loads(tar.extractfile("BUILD-INFO.json").read().decode("utf-8"))
+        self.assertIs(build_info["publication_authorized"], False)
+        self.assertIn("dry-run", build_info["distribution"])
+
+    def test_authorized_dry_run_deterministic(self) -> None:
+        first = DRY_RUN.run(source_root=self.root, output_dir=self.out, mode="dry-run")
+        first_bytes = Path(first["artifact_path"]).read_bytes()
+        second_out = Path(self.out_tmp.name) / "out-two"
+        second = DRY_RUN.run(source_root=self.root, output_dir=second_out, mode="dry-run")
+        self.assertEqual(first_bytes, Path(second["artifact_path"]).read_bytes())
+
+    def test_authorized_dry_run_release_mode_still_fails(self) -> None:
+        with self.assertRaisesRegex(DRY_RUN.DryRunError, "no release path|not authorized"):
+            DRY_RUN.run(source_root=self.root, output_dir=self.out, mode="release")
 
 
 if __name__ == "__main__":

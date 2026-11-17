@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """Offline fail-closed verifier for support/release/distribution-inventory.json.
 
-Checks that the distribution inventory truthfully records the current blocked
-rights gate from tests/fixtures/PROVENANCE.json and that no fixture or
-forbidden path can enter a release archive. Performs no network, build,
-wallet, or publication operation and never claims a release archive exists.
+The original blocked-v1 checks are retained unchanged. Schema v3 dispatches to
+support/release/gate.py and requires the substantive release-intent evidence
+(owner-authorized release intent with cited technical NOTICE review,
+license/notice artifacts and hashes, DONE checklist, pinned allowlists/targets,
+and draft-only release controls with final controls outstanding). Performs no
+network, build, wallet, or publication operation and never claims a release
+archive exists.
 
-A PASS result only confirms the blocked state is truthfully recorded; it does
-NOT authorize publication. Moving to an authorized (distributable) state
-requires reviewed code changes, not data-only edits to the JSON files.
+A PASS only confirms the recorded release-intent state is truthful. It does NOT
+authorize final publication, claim a legal conclusion, or assert a separate
+approval; v3 records owner-authorized intent with final release controls
+outstanding and remains draft-only with owner manual publication after admin
+immutable-setting verification. Moving between states requires reviewed code
+changes, not data-only edits to the JSON files.
 
 Usage:
     python3 -B support/verify-distribution-inventory.py [root]
@@ -21,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import importlib.util
 import json
 import stat
 import sys
@@ -139,6 +146,20 @@ EXPECTED_BLOCKER_DETAILS = {
         "evidence": "rights_review.publication_decision is BLOCKED.",
     },
 }
+
+AUTHORIZED_PASS_DISCLAIMER = (
+    "PASS only confirms the release-intent distribution inventory is truthfully "
+    "recorded and technically reviewed (owner-authorized release intent with "
+    "cited technical NOTICE review, Apache-2.0/MIT texts and fixture NOTICE). "
+    "It does NOT authorize final publication, claim a legal conclusion, or "
+    "assert a separate approval. It does NOT establish external release "
+    "execution: GitHub environment protection, exact-commit main CI, tag "
+    "existence, immutable-release setting verification, and attestations are "
+    "enforced by the release workflow preflight, build jobs, and owner manual "
+    "publication steps before any publication, and cannot be established "
+    "offline. Final release controls remain outstanding. The release path is "
+    "draft-only."
+)
 
 PASS_DISCLAIMER = (
     "PASS only confirms the blocked distribution inventory is truthfully "
@@ -300,9 +321,71 @@ def parse_json_object(data: bytes, label: str) -> dict:
     return value
 
 
+
+def _load_gate_module() -> object:
+    gate_path = Path(__file__).resolve().parent / "release" / "gate.py"
+    spec = importlib.util.spec_from_file_location("astatine_release_gate", gate_path)
+    if spec is None or spec.loader is None:
+        raise VerificationError("cannot load release gate module")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception as error:
+        raise VerificationError(f"cannot load release gate module: {error}") from error
+    return module
+
+
+def verify_authorized_via_gate(root: Path) -> dict:
+    gate_module = _load_gate_module()
+    try:
+        gate = gate_module.load_gate(root)  # type: ignore[union-attr]
+    except Exception as error:
+        gate_error = getattr(gate_module, "GateError", None)
+        if gate_error is not None and isinstance(error, gate_error):
+            raise VerificationError(str(error)) from error
+        if isinstance(error, (KeyError, TypeError, ValueError, AttributeError)):
+            raise VerificationError(f"inventory/schema error: {error}") from error
+        raise VerificationError("inventory verification failed") from error
+    if gate.get("state") != "release-intent-authorized":
+        raise VerificationError("release-intent gate dispatch received a non-release-intent state")
+    intent_authorization = gate.get("release_intent_authorization") or {}
+    technical_review = gate.get("technical_notice_review") or {}
+    controls = gate.get("release_controls") or {}
+    archive_members = gate.get("archive_members") or []
+    generated_members = gate.get("generated_members") or []
+    fixture_paths = gate.get("fixture_paths") or []
+    return {
+        "status": "PASS",
+        "schema": "astatine-distribution-inventory/v3",
+        "rights_decision": gate.get("rights_decision"),
+        "release_intent_authorized": True,
+        "publication_authorized": False,
+        "final_release_controls_complete": False,
+        "source_distribution": "RELEASE-INTENT-AUTHORIZED",
+        "binary_distribution": "RELEASE-INTENT-AUTHORIZED",
+        "notice_applicability": gate.get("notice_applicability"),
+        "blocking_open": [],
+        "notice_checklist_status": gate.get("notice_checklist_status"),
+        "release_intent_authorization": intent_authorization.get("status"),
+        "technical_notice_review": technical_review.get("reviewed_by"),
+        "review_ci_branch_push_authorization": "SUPERSEDED \u2014 OWNER-AUTHORIZED RELEASE INTENT",
+        "release_controls": controls.get("status"),
+        "release_workflow": controls.get("workflow"),
+        "release_environment": controls.get("environment"),
+        "targets": list(gate.get("targets") or []),
+        "archive_members_checked": len(archive_members) + len(generated_members),
+        "source_members_checked": len(archive_members),
+        "generated_members_checked": len(generated_members),
+        "fixture_paths_checked": len(fixture_paths),
+        "disclaimer": AUTHORIZED_PASS_DISCLAIMER,
+    }
+
+
 def verify_inventory(root: Path) -> dict:
     inventory_bytes = read_inventory_file(root, INVENTORY_REL, "distribution inventory")
     inventory = parse_json_object(inventory_bytes, INVENTORY_REL)
+    if inventory.get("schema") == "astatine-distribution-inventory/v3":
+        return verify_authorized_via_gate(root)
     require(
         inventory.get("schema") == EXPECTED_SCHEMA,
         f"unexpected distribution inventory schema: {inventory.get('schema')!r}",

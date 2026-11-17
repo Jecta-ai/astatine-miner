@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""Fail if a workflow uses a mutable external action reference."""
+"""Fail if a workflow uses a mutable external action reference.
+
+Release workflow pin: support/check_workflow_pins.py pins the exact
+.github/workflows/release.yml bytes via RELEASE_WORKFLOW_SHA256. Recompute
+after reviewed edits with:
+  python3 -B support/check_workflow_pins.py --print-release-sha256
+"""
 
 from __future__ import annotations
 
+import hashlib
 import pathlib
 import re
 import sys
@@ -13,6 +20,17 @@ USES = re.compile(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)")
 IMMUTABLE_SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 DRY_RUN_WORKFLOW_FILENAME = "linux-release-dry-run.yml"
+RELEASE_WORKFLOW_FILENAME = "release.yml"
+# Pinned SHA-256 of .github/workflows/release.yml. Update only after review.
+# Recompute with: python3 -B support/check_workflow_pins.py --print-release-sha256
+RELEASE_WORKFLOW_SHA256 = "57a0d1f9949883b77a8d64c04a26a8bc18c0499dde024e83b46576c9cebe2caa"
+PINNED_RELEASE_ACTIONS = {
+    "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+    "actions/download-artifact": "9000827ccba6bdab643e8b6fd33ac0654aef8333",
+    "actions/attest-build-provenance": "4d101475d8b20a2381f78447822ac1eab6504dd8",
+}
+RELEASE_TAG_PATTERN = r"^v[0-9]+\.[0-9]+\.[0-9]+-testnet\.[0-9]+$"
 WRITE_KEY_ALTERNATION = (
     "actions|attestations|checks|contents|deployments|discussions|id-token|issues|"
     "packages|pages|pull-requests|repository-projects|security-events|statuses"
@@ -33,6 +51,208 @@ def dry_run_workflow_path() -> pathlib.Path:
         / "workflows"
         / DRY_RUN_WORKFLOW_FILENAME
     )
+
+
+def release_workflow_path() -> pathlib.Path:
+    """Exact repository path of the release workflow."""
+    return (
+        pathlib.Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / RELEASE_WORKFLOW_FILENAME
+    )
+
+
+def compute_release_sha256(contents: bytes) -> str:
+    return hashlib.sha256(contents).hexdigest()
+
+
+def _release_run_blocks(contents: str) -> list[str]:
+    """Extract shell bodies from `run:` steps (inline and block scalars)."""
+    blocks: list[str] = []
+    lines = contents.splitlines()
+    index = 0
+    total = len(lines)
+    while index < total:
+        line = lines[index]
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            index += 1
+            continue
+        match = re.match(r"^(?P<indent>\s*)run\s*:\s*(?P<rest>.*)$", line)
+        if not match:
+            index += 1
+            continue
+        indent = len(match.group("indent"))
+        rest = match.group("rest").strip()
+        if rest in ("|", ">", "|-", "|+", ">-", ">+"):
+            index += 1
+            body: list[str] = []
+            while index < total:
+                nxt = lines[index]
+                if nxt.strip() == "":
+                    body.append("")
+                    index += 1
+                    continue
+                nxt_indent = len(nxt) - len(nxt.lstrip(" "))
+                if nxt_indent <= indent:
+                    break
+                body.append(nxt)
+                index += 1
+            blocks.append("\n".join(body))
+            continue
+        if rest.startswith("|") or rest.startswith(">"):
+            index += 1
+            body = []
+            while index < total:
+                nxt = lines[index]
+                if nxt.strip() == "":
+                    body.append("")
+                    index += 1
+                    continue
+                nxt_indent = len(nxt) - len(nxt.lstrip(" "))
+                if nxt_indent <= indent:
+                    break
+                body.append(nxt)
+                index += 1
+            blocks.append("\n".join(body))
+            continue
+        if rest != "":
+            blocks.append(rest)
+        index += 1
+    return blocks
+
+
+def _release_job_permissions(contents: str) -> dict[str, dict[str, str]]:
+    """Map job name to its plain permissions mapping.
+
+    Raises _AmbiguousWorkflow on non-plain syntax so permission scoping
+    cannot be bypassed with flow maps, quoted keys, or explicit keys.
+    """
+    lines = contents.splitlines()
+    in_jobs = False
+    current_job: str | None = None
+    perms_indent: int | None = None
+    result: dict[str, dict[str, str]] = {}
+    index = 0
+    total = len(lines)
+    while index < total:
+        raw = lines[index]
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            index += 1
+            continue
+        leading = raw[: len(raw) - len(raw.lstrip())]
+        if "\t" in leading:
+            raise _AmbiguousWorkflow(f"line {index + 1}: tab indentation")
+        indent = len(leading)
+        if indent == 0:
+            top = re.match(r"([^:]+?)\s*:\s*(.*)$", stripped)
+            if top and top.group(1).strip() == "jobs":
+                rest = top.group(2).strip()
+                if rest not in ("", "#"):
+                    # jobs must be a block mapping, not inline
+                    raise _AmbiguousWorkflow(f"line {index + 1}: inline jobs value")
+                in_jobs = True
+                current_job = None
+                perms_indent = None
+            elif top:
+                in_jobs = False
+                current_job = None
+                perms_indent = None
+            index += 1
+            continue
+        if not in_jobs:
+            index += 1
+            continue
+        if perms_indent is not None:
+            if indent <= perms_indent:
+                perms_indent = None
+            else:
+                if stripped.startswith("?") or re.match(r"<<\s*:", stripped):
+                    raise _AmbiguousWorkflow(f"line {index + 1}: non-plain permissions entry")
+                match = re.match(r"([^:]+?)\s*:\s*(.*)$", stripped)
+                if not match:
+                    raise _AmbiguousWorkflow(f"line {index + 1}: unparseable permissions entry")
+                key, value = match.group(1), match.group(2)
+                if not _PLAIN_PERMISSION_KEY.fullmatch(key):
+                    raise _AmbiguousWorkflow(f"line {index + 1}: non-plain permission key {key!r}")
+                if re.search(r"[{}\[\]*&!|>;]", value):
+                    raise _AmbiguousWorkflow(f"line {index + 1}: non-plain permission value {value!r}")
+                plain = _PLAIN_PERMISSION_VALUE.fullmatch(value)
+                if not plain:
+                    raise _AmbiguousWorkflow(f"line {index + 1}: ambiguous permission value {value!r}")
+                if current_job is None:
+                    raise _AmbiguousWorkflow(f"line {index + 1}: permissions outside job")
+                result.setdefault(current_job, {})[key] = plain.group(1)
+                index += 1
+                continue
+        if indent == 2:
+            job_match = re.match(r"([A-Za-z0-9_-]+)\s*:\s*(.*)$", stripped)
+            if job_match:
+                rest = job_match.group(2).strip()
+                if rest != "" and not rest.startswith("#"):
+                    raise _AmbiguousWorkflow(f"line {index + 1}: inline job value")
+                current_job = job_match.group(1)
+                result.setdefault(current_job, {})
+                index += 1
+                continue
+        if indent == 4 and current_job is not None:
+            perm_match = re.match(r"^permissions\s*:\s*(.*)$", stripped)
+            if perm_match:
+                rest = perm_match.group(1).strip()
+                if rest != "" and not rest.startswith("#"):
+                    raise _AmbiguousWorkflow(f"line {index + 1}: inline permissions value {rest!r}")
+                perms_indent = indent
+                index += 1
+                continue
+        # Detect ambiguous permission constructs inside jobs
+        if re.match(r"^\?\s*['\"]?permissions['\"]?\s*(?::|$)", stripped):
+            raise _AmbiguousWorkflow(f"line {index + 1}: explicit permissions key")
+        if re.match(r"^['\"]permissions['\"]\s*:", stripped):
+            raise _AmbiguousWorkflow(f"line {index + 1}: quoted permissions key")
+        if re.match(r"^permissions\s+:", stripped):
+            raise _AmbiguousWorkflow(f"line {index + 1}: spaced permissions key")
+        index += 1
+    return result
+
+
+def _release_job_environments(contents: str) -> list[tuple[str, str, int]]:
+    """Return (job, environment value, lineno) for each `environment:` key."""
+    lines = contents.splitlines()
+    in_jobs = False
+    current_job: str | None = None
+    found: list[tuple[str, str, int]] = []
+    for lineno, raw in enumerate(lines, 1):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        leading = raw[: len(raw) - len(raw.lstrip())]
+        indent = len(leading)
+        if indent == 0:
+            top = re.match(r"([^:]+?)\s*:\s*(.*)$", stripped)
+            if top and top.group(1).strip() == "jobs":
+                in_jobs = True
+                current_job = None
+            elif top:
+                in_jobs = False
+                current_job = None
+            continue
+        if not in_jobs:
+            continue
+        if indent == 2:
+            job_match = re.match(r"([A-Za-z0-9_-]+)\s*:\s*(?:#.*)?$", stripped)
+            if job_match:
+                current_job = job_match.group(1)
+            continue
+        env_match = re.match(r"^environment\s*:\s*(.*)$", stripped)
+        if env_match:
+            rest = env_match.group(1).strip()
+            if rest == "" or rest.startswith("#"):
+                raise _AmbiguousWorkflow(f"line {lineno}: block environment is ambiguous")
+            value = re.sub(r"\s*(?:#.*)?$", "", rest).strip().strip("'\"")
+            found.append((current_job or "", value, lineno))
+    return found
 
 
 ALWAYS_PRIVILEGED_WORKFLOW_PATTERNS = (
@@ -242,6 +462,589 @@ def validate_signing_isolation(contents: str, workflow: pathlib.Path) -> None:
         )
 
 
+def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
+    """Tightly reviewed release profile for release.yml only.
+
+    Strict non-release workflows keep the no-write/no-secrets isolation above.
+    release.yml is allowed only with: workflow_dispatch-only with a required
+    string tag input, job-level least privilege (contents:write plus
+    attestations:read only on publish, id-token/attestations:write only on
+    package, environment only on publish), pinned actions, no secrets,
+    no tag creation, no PR triggers, no git push, no registry publication,
+    no mutable refs, and no persist-credentials:true. The exact bytes are
+    additionally pinned via RELEASE_WORKFLOW_SHA256; edits must deliberately
+    update the pin.
+    """
+    raw = contents.lstrip("\ufeff")
+    # Structural ambiguity must fail closed even for release.
+    for description, pattern in ALWAYS_PRIVILEGED_WORKFLOW_PATTERNS:
+        if description in (
+            "contents write permission",
+            "gh release operation",
+            "upload/release action",
+        ):
+            continue
+        if pattern.search(raw):
+            raise AssertionError(
+                f"{workflow}: release workflow contains forbidden pattern ({description})"
+            )
+    try:
+        permission_block_entries(raw)
+    except _AmbiguousWorkflow as error:
+        raise AssertionError(f"{workflow}: release workflow ambiguous syntax ({error})")
+    try:
+        job_perms = _release_job_permissions(raw)
+    except _AmbiguousWorkflow as error:
+        raise AssertionError(f"{workflow}: release workflow ambiguous job permissions ({error})")
+
+    # Trigger profile: workflow_dispatch only, exact tag input.
+    if re.search(r"(?mi)^\s*push\s*:", raw):
+        raise AssertionError(f"{workflow}: release workflow must not define a push trigger")
+    if re.search(r"(?mi)^\s*pull_request\s*:", raw):
+        raise AssertionError(f"{workflow}: release workflow must not define a pull_request trigger")
+    if re.search(r"(?mi)^\s*pull_request_target\s*:", raw):
+        raise AssertionError(f"{workflow}: release workflow must not use pull_request_target")
+    if "workflow_dispatch" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must be workflow_dispatch only")
+    tag_block = re.search(
+        r"(?ms)^\s*tag\s*:\s*\n(?:^\s*.*\n)*?",
+        raw,
+    )
+    if not tag_block or "required: true" not in raw or "type: string" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must declare a required string tag input")
+    if re.search(r"(?mi)^\s*default\s*:", raw):
+        raise AssertionError(f"{workflow}: release tag input must not define a default substitute")
+
+    # Top-level least privilege and identity.
+    if not re.search(r"(?m)^permissions:\s*\n\s*contents:\s*read\s*(?:#.*)?$", raw):
+        raise AssertionError(f"{workflow}: release workflow top-level permissions must be contents: read")
+    if "concurrency:" not in raw or "cancel-in-progress: false" not in raw:
+        raise AssertionError(f"{workflow}: release workflow concurrency must disable cancel-in-progress")
+    if "release-${{ inputs.tag }}" not in raw:
+        raise AssertionError(f"{workflow}: release concurrency must be keyed by the release tag")
+    if 'RUSTUP_TOOLCHAIN: "1.94.1"' not in raw:
+        raise AssertionError(f"{workflow}: release workflow must pin RUSTUP_TOOLCHAIN 1.94.1")
+    if "RELEASE_TAG: ${{ inputs.tag }}" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must expose RELEASE_TAG from inputs.tag")
+
+    # Job set and job-level least privilege.
+    # M1: packaging/attestation and draft creation occur only in protected
+    # release-draft; builds are unprivileged except binary build attestations.
+    expected_jobs = {"preflight", "build-macos", "build-linux", "release-package", "release-draft"}
+    if set(job_perms) != expected_jobs:
+        raise AssertionError(
+            f"{workflow}: release jobs must be exactly {sorted(expected_jobs)}, got {sorted(job_perms)}"
+        )
+    expected_perms: dict[str, dict[str, str]] = {
+        "preflight": {"contents": "read", "actions": "read"},
+        "build-macos": {"contents": "read", "id-token": "write", "attestations": "write"},
+        "build-linux": {"contents": "read", "id-token": "write", "attestations": "write"},
+        "release-package": {
+            "contents": "read",
+            "id-token": "write",
+            "attestations": "write",
+            "actions": "read",
+        },
+        "release-draft": {"contents": "write", "actions": "read", "attestations": "read"},
+    }
+    for job, expected in expected_perms.items():
+        actual = job_perms.get(job, {})
+        if actual != expected:
+            raise AssertionError(
+                f"{workflow}: job {job} permissions must be exactly {expected}, got {actual}"
+            )
+    # Explicit scoped assertions for clear errors (B2 split).
+    # release-package: protected build (no contents:write); release-draft: protected draft-only.
+    for job, perms in job_perms.items():
+        if perms.get("attestations") == "read" and job != "release-draft":
+            raise AssertionError(
+                f"{workflow}: attestations: read is allowed only on release-draft (found in {job})"
+            )
+        if perms.get("actions") == "read" and job not in ("preflight", "release-package", "release-draft"):
+            raise AssertionError(
+                f"{workflow}: actions: read is allowed only on preflight and protected jobs (found in {job})"
+            )
+        for key, value in perms.items():
+            if value != "write":
+                continue
+            if key == "contents" and job != "release-draft":
+                raise AssertionError(f"{workflow}: contents: write is allowed only on release-draft (found in {job})")
+            if key in ("id-token", "attestations") and job not in (
+                "build-macos",
+                "build-linux",
+                "release-package",
+            ):
+                raise AssertionError(
+                    f"{workflow}: {key}: write is allowed only on builds and release-package (found in {job})"
+                )
+            if key not in ("contents", "id-token", "attestations", "actions"):
+                raise AssertionError(f"{workflow}: unexpected write permission {key} in {job}")
+        if perms.get("checks") == "read":
+            raise AssertionError(
+                f"{workflow}: checks: read is not used by the release profile (found in {job})"
+            )
+
+    # Both protected jobs are environment-gated (B2); no pre-approval package job.
+    try:
+        envs = _release_job_environments(raw)
+    except _AmbiguousWorkflow as error:
+        raise AssertionError(f"{workflow}: release workflow ambiguous environment ({error})")
+    if len(envs) != 2:
+        raise AssertionError(f"{workflow}: release workflow must define exactly two protected environments, got {envs}")
+    env_jobs = sorted([job for job, _, _ in envs])
+    if env_jobs != ["release-draft", "release-package"]:
+        raise AssertionError(
+            f"{workflow}: environment must be `release` only on release-package and release-draft, got {envs}"
+        )
+    for _, value, lineno in envs:
+        if value != "release":
+            raise AssertionError(
+                f"{workflow}:{lineno}: environment must be `release`, got {value!r}"
+            )
+
+    # Runners and needs.
+    for runner_need in (
+        ("preflight", "ubuntu-24.04"),
+        ("build-macos", "macos-15"),
+        ("build-linux", "ubuntu-24.04"),
+        ("release-package", "ubuntu-24.04"),
+        ("release-draft", "ubuntu-24.04"),
+    ):
+        job, runner = runner_need
+        if runner not in raw:
+            raise AssertionError(f"{workflow}: job {job} must run on {runner}")
+    if "needs:" not in raw:
+        raise AssertionError(f"{workflow}: release jobs must declare needs dependencies")
+
+    # Pinned actions with exact allowlist (L3): only the four pinned actions, no other uses even if pinned.
+    for number, line in enumerate(raw.splitlines(), 1):
+        reference = reference_for_line(line)
+        if reference is None:
+            continue
+        if not is_pinned(reference):
+            raise AssertionError(
+                f"{workflow}:{number}: release action is not pinned to a full commit SHA: {reference}"
+            )
+        if reference.startswith("./"):
+            raise AssertionError(
+                f"{workflow}:{number}: local actions are not allowed in the release workflow: {reference}"
+            )
+        if "@" in reference:
+            repo, sha = reference.rsplit("@", 1)
+            if repo not in PINNED_RELEASE_ACTIONS:
+                raise AssertionError(
+                    f"{workflow}:{number}: unexpected external action {repo} in release workflow; exact allowlist only"
+                )
+            if sha != PINNED_RELEASE_ACTIONS[repo]:
+                raise AssertionError(
+                    f"{workflow}:{number}: {repo} must be pinned to {PINNED_RELEASE_ACTIONS[repo]}, got {sha}"
+                )
+    for repo, sha in PINNED_RELEASE_ACTIONS.items():
+        if f"{repo}@{sha}" not in raw:
+            raise AssertionError(f"{workflow}: release workflow must pin {repo}@{sha}")
+    # Forbid other release/publish actions even when pinned.
+    if re.search(r"upload-release-action|action-gh-release|release-action|automatic-releases", raw, re.IGNORECASE):
+        raise AssertionError(f"{workflow}: release workflow uses a forbidden release action")
+
+    # No tag creation, no pushes, no registry publication.
+    if re.search(r"\bgit\s+tag\b", raw, re.IGNORECASE):
+        raise AssertionError(f"{workflow}: release workflow must not create tags")
+    if re.search(r"\bgh\s+api\b[^\n]*?(?:git/refs|refs/tags)", raw, re.IGNORECASE):
+        # Tag re-verification uses read-only git ls-remote, never gh api tag refs.
+        raise AssertionError(f"{workflow}: release workflow must not manage tags via gh api")
+    if "persist-credentials: true" in raw:
+        raise AssertionError(f"{workflow}: release workflow must not set persist-credentials: true")
+    # Top-level permissions must be exactly contents: read (no extra top-level write).
+    top_block = re.search(r"(?m)^permissions:\s*\n((?:[ \t]+[^\n]*\n)*)", raw)
+    if not top_block:
+        raise AssertionError(f"{workflow}: release workflow top-level permissions missing")
+    top_lines = [ln.strip() for ln in top_block.group(1).splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if top_lines != ["contents: read"]:
+        raise AssertionError(
+            f"{workflow}: release workflow top-level permissions must be exactly contents: read, got {top_lines}"
+        )
+    # Every checkout must use the exact tag ref with fetch-depth 0 and no credentials.
+    checkout_refs = re.findall(r"(?m)^\s*ref\s*:\s*(.+?)\s*(?:#.*)?$", raw)
+    if not checkout_refs:
+        raise AssertionError(f"{workflow}: release workflow checkouts must declare ref")
+    for ref_value in checkout_refs:
+        if ref_value.strip() != "refs/tags/${{ inputs.tag }}":
+            raise AssertionError(
+                f"{workflow}: every checkout ref must be refs/tags/${{{{ inputs.tag }}}}, got {ref_value!r}"
+            )
+    checkout_count = raw.count("actions/checkout@")
+    persist_false = raw.count("persist-credentials: false")
+    if checkout_count == 0 or persist_false < checkout_count:
+        raise AssertionError(
+            f"{workflow}: every checkout must set persist-credentials: false "
+            f"(checkouts={checkout_count}, false={persist_false})"
+        )
+    fetch_count = raw.count("fetch-depth: 0")
+    if fetch_count < checkout_count:
+        raise AssertionError(
+            f"{workflow}: every checkout must set fetch-depth: 0 "
+            f"(checkouts={checkout_count}, fetch-depth={fetch_count})"
+        )
+    if re.search(r"(?mi)^\s*(?:-\s*)?uses\s*:\s*\{", raw):
+        raise AssertionError(f"{workflow}: release workflow must not use flow-style uses:")
+    if "refs/tags/${{ inputs.tag }}" not in raw:
+        raise AssertionError(f"{workflow}: release checkouts must use refs/tags/${{{{ inputs.tag }}}}")
+    if "GH_TOKEN: ${{ github.token }}" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must use GH_TOKEN: ${{{{ github.token }}}}")
+
+    # gh release allowlist (draft-only): create with --draft, view, attestation verify.
+    # Never edit/publish from the workflow; manual owner publication is outside.
+    for match in re.finditer(r"\bgh\s+release\s+([A-Za-z-]+)", raw):
+        sub = match.group(1)
+        if sub not in ("create", "view"):
+            raise AssertionError(
+                f"{workflow}: forbidden gh release subcommand {sub!r}; "
+                "allowed: create, view (draft-only; no edit/verify/publish)"
+            )
+    if "gh release edit" in raw:
+        raise AssertionError(f"{workflow}: release workflow must not execute gh release edit (draft-only)")
+    if "--draft=false" in raw:
+        raise AssertionError(f"{workflow}: release workflow must not clear draft (no --draft=false)")
+    if "--prerelease" in raw:
+        raise AssertionError(f"{workflow}: release workflow must not mark prerelease from the workflow (draft-only)")
+    if re.search(r"\bgh\s+release\s+verify\b", raw):
+        raise AssertionError(f"{workflow}: release workflow must not auto-verify/publish releases")
+    if "gh release verify-asset" in raw:
+        raise AssertionError(f"{workflow}: release workflow must not auto-verify release assets")
+    for required in (
+        "gh release create",
+        "gh release view",
+        "--json assets",
+        "--verify-tag",
+        "--draft",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must contain {required!r}")
+    if not re.search(r"gh\s+release\s+create\b[^\n]*--draft\b", raw):
+        raise AssertionError(f"{workflow}: gh release create must contain --draft (draft-only)")
+    if "--draft --verify-tag" not in raw and "--verify-tag" not in raw:
+        raise AssertionError(f"{workflow}: gh release create must contain --verify-tag")
+    if "cp support/release/RELEASE_NOTES-v0.1.0-testnet.1.md" not in raw:
+        raise AssertionError(f"{workflow}: release package must copy the reviewed testnet notes into the bundle")
+    if "--notes-file bundle/release-notes.md" not in raw:
+        raise AssertionError(f"{workflow}: release draft must use bundle/release-notes.md for draft notes")
+    if re.search(r"\bgh\s+release\s+create\b[^\n]*\bgit\b", raw, re.IGNORECASE):
+        raise AssertionError(f"{workflow}: release creation must not shell out to git tag creation")
+
+    # Attestation constraints must all be present and exact.
+    for required in (
+        "gh attestation verify",
+        "--repo",
+        "--signer-workflow",
+        "--source-digest",
+        "--source-ref",
+        ".github/workflows/release.yml",
+        'refs/tags/$tag"',
+        '"$GITHUB_REPOSITORY"',
+        '"$GITHUB_SHA"',
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release attestation verification must contain {required!r}")
+    for required in ("subject-path", "SHA256SUMS", "release-provenance.json"):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release bundle verification must contain {required!r}")
+    if "sha256sum -c SHA256SUMS" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must verify SHA256SUMS")
+    if "actions/attest-build-provenance@" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must attest archives with attest-build-provenance")
+
+    # Tag input must never be interpolated directly into shell; use env and quote.
+    for block in _release_run_blocks(raw):
+        if "inputs.tag" in block:
+            raise AssertionError(
+                f"{workflow}: release tag input must not be interpolated in run scripts; use $RELEASE_TAG"
+            )
+        if "${{" in block:
+            raise AssertionError(
+                f"{workflow}: run scripts must not contain template interpolation; pass values via env"
+            )
+    if '"$RELEASE_TAG"' not in raw and '"$tag"' not in raw:
+        raise AssertionError(f"{workflow}: release scripts must use the quoted tag variable")
+    if RELEASE_TAG_PATTERN.strip("^$") not in raw and "^v[0-9]+" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must enforce the tag regex")
+    if "$'\\n'" not in raw or "[^ -~]" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must reject newline/control characters")
+    if "git describe --tags --exact-match" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must verify git describe --tags --exact-match")
+    if "git rev-parse HEAD" not in raw or "$GITHUB_SHA" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must verify HEAD equals GITHUB_SHA")
+    if "git merge-base --is-ancestor HEAD origin/main" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must verify ancestry from origin/main")
+    if "Rust CI" not in raw or "Linux native qualification" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must require both hosted check suites")
+    if ".github/workflows/ci.yml" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must require the exact Rust CI workflow path")
+    if ".github/workflows/linux-native-qualification.yml" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must require the exact qualification workflow path")
+    if "head_branch" not in raw or '"main"' not in raw:
+        raise AssertionError(f"{workflow}: release workflow must require head_branch == main for push runs")
+    if "workflow_dispatch is not a substitute" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must not treat workflow_dispatch as a substitute for the main push run")
+    if "actions/runs?head_sha=" not in raw and "actions/runs" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must query exact-commit workflow runs via gh api")
+    if "pull_request" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must explicitly exclude pull-request events")
+    if 'git ls-remote origin "refs/tags/$tag"' not in raw:
+        raise AssertionError(f"{workflow}: release workflow must re-verify the remote tag with git ls-remote")
+    if "remote tag moved" not in raw or "remote tag verified at expected commit" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must fail closed on a moved tag")
+    if '"$RUNNER_TEMP/published-assets.json"' not in raw and "published-assets.json" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must capture gh release view JSON for digest verification")
+    if "digest mismatch" not in raw or "size mismatch" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must fail closed on digest/size mismatch")
+    if "all assets verified with matching digest and size" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must verify digests and sizes for every expected asset")
+    for marker in ("codesign --verify", "otool -L", "file ", "ldd "):
+        if marker not in raw:
+            raise AssertionError(f"{workflow}: release workflow must contain binary inspection {marker!r}")
+    if "--version" not in raw or "mine --help" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must smoke test version/help/mine help")
+    if "protected" not in raw.lower() or "fail closed" not in raw.lower():
+        raise AssertionError(f"{workflow}: release workflow must document the protected-gate fail-closed prerequisite")
+    if "external prerequisite" not in raw.lower():
+        raise AssertionError(f"{workflow}: release workflow must document the external prerequisite")
+    if "non-self" not in raw.lower():
+        raise AssertionError(f"{workflow}: release workflow must document the non-self reviewer gate")
+    if "tag deployment" not in raw.lower():
+        raise AssertionError(f"{workflow}: release workflow must document the tag deployment policy")
+    # Protected environment fail-closed verification via bounded validator (L2).
+    # Preflight + re-verify before mutation in release-draft; no inline env python,
+    # no reviewer identities printed. Validator enforces M2 series/exact allowlist.
+    validator_cli = 'python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag"'
+    if validator_cli not in raw:
+        raise AssertionError(
+            f"{workflow}: release workflow must call the protected-environment validator with {validator_cli!r}"
+        )
+    if raw.count(validator_cli) < 2:
+        raise AssertionError(
+            f"{workflow}: release workflow must call the protected-environment validator in preflight and re-verify before mutation"
+        )
+    for required in (
+        'environments/release"',
+        "deployment-branch-policies",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must contain protected-environment marker {required!r}")
+    # M2: validator in preflight/package enforces series/exact; draft inline enforces
+    # series/exact with no broad v*. Broad *, **, empty, and other broader patterns rejected.
+    if '"v*"' in raw and '"v0.1.0-testnet.*"' not in raw.replace('"v*"', ''):
+        # Allow series pattern but forbid bare broad v* (exact string with comma or brace context)
+        pass
+    # Forbid bare broad v* allowlist entry (exact "v*" as a standalone policy name)
+    if '"v*", ' in raw or '{"v*"' in raw or ', "v*"' in raw:
+        raise AssertionError(f"{workflow}: release workflow must not accept broad v* tag policy (M2: series/exact only)")
+    if 'allowed_names = {"v0.1.0-testnet.*", tag}' not in raw:
+        raise AssertionError(f"{workflow}: release-draft inline check must require series/exact allowlist (M2)")
+    # M2 OR policy: exactly one tag policy, no second tag or branch (policies are OR).
+    for required in (
+        "tag policies must be exactly one",
+        "branch policies must be empty",
+        "tag policy name not in series/exact allowlist",
+        "tag policy entry must be an object",
+        "tag policy type must be exactly tag",
+        "tag policy name missing",
+        "allowed_names",
+        '"v0.1.0-testnet.*"',
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must enforce single-tag OR policy {required!r} (M2)")
+    # Canonical repository enforcement (fail closed on forks).
+    for required in (
+        '"Jecta-ai/astatine-miner"',
+        "1454137135",
+        "REPOSITORY_ID",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must enforce canonical repository marker {required!r}")
+    # Stronger gate verifiers in preflight.
+    for required in (
+        "python3 -B support/verify-fixture-provenance.py",
+        "python3 -B support/verify-distribution-inventory.py",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must run gate verifier {required!r}")
+    # Provenance semantic verification before ending at draft.
+    # Owner-authorized release intent (not final publication): release_intent true,
+    # publication_authorized false, final controls false; prefer rights_decision.
+    for required in (
+        "release provenance semantics verified",
+        "provenance field tag mismatch",
+        "provenance field commit mismatch",
+        "provenance field repository mismatch",
+        "provenance field repository_id mismatch",
+        "provenance field release_intent_authorized must be exactly true",
+        "provenance field publication_authorized must be exactly false",
+        "provenance field final_release_controls_complete must be exactly false",
+        "provenance field rights_decision missing or empty",
+        "must record owner-authorized release intent",
+        "must not claim publication authorization or a release approver",
+        '["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]',
+        "provenance archive sha256 mismatch",
+        "Draft verified; manual owner publication remains required",
+        "owner-authorized release intent",
+        "final controls",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must contain provenance semantic marker {required!r}")
+    if "rights_decision" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must read rights_decision instead of publication_decision")
+    if raw.count("provenance field rights_decision missing or empty") < 2:
+        raise AssertionError(
+            f"{workflow}: release workflow must enforce the rights_decision fail-closed check in both "
+            "the package and draft provenance validators"
+        )
+    if "provenance field publication_authorized must be exactly true" in raw:
+        raise AssertionError(f"{workflow}: release workflow must not require final-publication publication_authorized true")
+    # Safe failure logging: only safe fields, never the full run object.
+    if "html_url" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must log only safe run fields including html_url")
+    if 'is not successful: %r" % (name, run)' in raw or "is not successful: %r' % (name, run)" in raw:
+        raise AssertionError(f"{workflow}: release workflow must not print the full run object on failure")
+    # L4: tag-ref dispatch and GITHUB_REF binding.
+    if 'test "$GITHUB_REF" = "refs/tags/$' not in raw:
+        raise AssertionError(f"{workflow}: release workflow must assert GITHUB_REF == refs/tags/$tag (L4)")
+    if "refs/tags/<tag> via workflow_dispatch" not in raw and "exact tag ref" not in raw.lower():
+        raise AssertionError(f"{workflow}: release workflow must document tag-ref dispatch (L4)")
+    # L5: safe latest-push-run selection (tolerates reruns, rejects PR/dispatch).
+    for required in (
+        "run_started_at",
+        "created_at",
+        "latest = max",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must select latest push run via {required!r} (L5)")
+    if "len(matching) != 1" in raw:
+        raise AssertionError(f"{workflow}: release workflow must not use exact-one run matching (L5: use latest safe selection)")
+    # B1: per-job exact tag identity immediately after every checkout.
+    # preflight + 2 builds + release-package each assert HEAD, tag^{}, describe.
+    if raw.count("Assert exact tag identity") < 4:
+        raise AssertionError(f"{workflow}: release workflow must assert exact tag identity after every checkout (B1)")
+    for required in (
+        'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+        'test "$(git rev-parse "$RELEASE_TAG^{}")" = "$GITHUB_SHA"',
+        'test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"',
+        "remote tag moved",
+        "remote tag verified at expected commit",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must contain B1 tag-identity marker {required!r}")
+    # Package uses checkout-bound ls-remote before archive attest; draft (no checkout)
+    # must use authenticated gh api tag-ref lookup with peeling before draft.
+    if raw.count('git ls-remote origin "refs/tags/$tag"') < 1:
+        raise AssertionError(f"{workflow}: release-package must re-verify remote tag with git ls-remote before archive attest (B1)")
+    for required in (
+        'gh api "repos/$repo/git/ref/tags/$tag"',
+        'gh api "repos/$repo/git/tags/$obj_sha"',
+        "unsupported tag object type",
+        "remote tag ref missing",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release-draft must verify remote tag via no-checkout gh api with peeling (B1)")
+    _draft_section = raw.split("release-draft:", 1)[-1] if "release-draft:" in raw else ""
+    if 'git ls-remote origin' in _draft_section:
+        raise AssertionError(f"{workflow}: release-draft must not use git ls-remote (no checkout/no origin); use gh api tag ref (B1)")
+    _draft_binary_verify = (
+        'gh attestation verify "$binary" --repo "$GITHUB_REPOSITORY" '
+        '--signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" '
+        '--source-digest "$GITHUB_SHA" --source-ref "refs/tags/$tag"'
+    )
+    if _draft_binary_verify not in _draft_section:
+        raise AssertionError(
+            f"{workflow}: release-draft must verify each extracted packaged binary with exact repo, "
+            "signer workflow, source digest, and tag flags"
+        )
+    # L7: compilation binding via binary attestations.
+    for required in (
+        "Attest raw macOS binary",
+        "Attest raw Linux binary",
+        "subject-path: target/release/astatine",
+        "Verify binary build attestations before packaging",
+        'gh attestation verify "$binary"',
+        "bound to compiled binaries",
+        "archive attestation alone does not",
+        "release-notes.md",
+        "bundle/release-notes.md",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must contain compilation-binding marker {required!r} (L7)")
+    # Draft-side binding: the packaged archive member must be the separately
+    # attested compiled binary, not merely covered by an archive attestation.
+    for required in (
+        "Verify packaged binaries match attested compiled binaries",
+        "Verify extracted binaries against build attestations",
+        "archive member must be a regular file",
+        "archive member path is unsafe",
+        "archive member mode mismatch",
+        "packaged binary sha256 does not match provenance",
+        "macOS binary format mismatch",
+        "Linux binary format mismatch",
+        "0x0100000C",
+        'int.from_bytes(binary[18:20], "little") != 62',
+        "binary[4] != 2 or binary[5] != 1",
+        "packaged binaries match archive and provenance allowlists",
+        "packaged binaries verified against separately attested compiled binaries",
+    ):
+        if required not in raw:
+            raise AssertionError(
+                f"{workflow}: release-draft must bind packaged binaries to build attestations with marker {required!r}"
+            )
+    if "extractall(" in raw:
+        raise AssertionError(
+            f"{workflow}: release workflow must not use tar extractall; extract only validated regular-file members"
+        )
+    if raw.count('gh attestation verify "$binary"') < 2:
+        raise AssertionError(
+            f"{workflow}: release workflow must verify binary attestations in both release-package and release-draft"
+        )
+    # B2/M1: bundle artifact only between protected jobs; no unprotected package job.
+    # release-package uploads, release-draft downloads; both are environment-gated.
+    if "astatine-release-bundle" not in raw:
+        raise AssertionError(f"{workflow}: release workflow must use the protected bundle artifact path (B2)")
+    if re.search(r"(?m)^\s*package\s*:", raw):
+        raise AssertionError(f"{workflow}: release workflow must not define an unprotected package job (B2/M1)")
+    if raw.count("astatine-release-bundle") < 2:
+        raise AssertionError(f"{workflow}: bundle artifact must be uploaded by release-package and downloaded by release-draft (B2)")
+    # B2: per-job isolation — package builds (no contents:write, no draft mutation);
+    # draft creates draft only (no checkout, no repo scripts/build).
+    # Checkout count must be exactly preflight+2 builds+package (draft has none).
+    _checkout_total = raw.count("actions/checkout@")
+    if _checkout_total != 4:
+        raise AssertionError(f"{workflow}: release workflow must have exactly 4 checkouts (preflight+builds+package, none in draft), got {_checkout_total} (B2)")
+    # Validator script only in preflight + package (draft uses inline, no repo script).
+    if raw.count('python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag"') != 2:
+        raise AssertionError(f"{workflow}: protected-environment validator must run in preflight and package only (2x), inline in draft (B2/L2)")
+    # Builder only in package.
+    if raw.count("support/release/build-release.py") != 1:
+        raise AssertionError(f"{workflow}: release builder must run exactly once in release-package (B2)")
+    # Draft must create the draft exactly once; package must not.
+    if raw.count("gh release create") != 1:
+        raise AssertionError(f"{workflow}: gh release create must appear exactly once in release-draft (B2 draft-only)")
+    if "Assert exact tag identity" not in raw or raw.count("Assert exact tag identity") < 4:
+        raise AssertionError(f"{workflow}: release workflow must assert tag identity after every checkout (B1: preflight+builds+package)")
+    # Draft inline env check markers (no validator script in draft).
+    for _m in (
+        "Re-verify protected environment before mutation",
+        "tag policies must be exactly one",
+        "branch policies must be empty",
+    ):
+        if _m not in raw:
+            raise AssertionError(f"{workflow}: release-draft must contain inline env marker {_m!r} (B2)")
+
+    # Exact-bytes pin: any edit must deliberately update the pin after review.
+    digest = compute_release_sha256(contents.encode("utf-8"))
+    if digest != RELEASE_WORKFLOW_SHA256:
+        raise AssertionError(
+            f"{workflow}: release workflow hash mismatch: got {digest}, "
+            f"pinned {RELEASE_WORKFLOW_SHA256}; recompute with "
+            "`python3 -B support/check_workflow_pins.py --print-release-sha256` after review"
+        )
+
+
 def self_test() -> None:
     fixtures = {
         "  - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567": True,
@@ -400,14 +1203,30 @@ def self_test() -> None:
 
 
 def main() -> None:
+    if "--print-release-sha256" in sys.argv:
+        path = release_workflow_path()
+        digest = compute_release_sha256(path.read_bytes())
+        print(digest)
+        return
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(
+            "Usage: python3 -B support/check_workflow_pins.py [workflow-dir]\n"
+            "       python3 -B support/check_workflow_pins.py --print-release-sha256\n"
+            "Recompute the pinned release.yml SHA-256 after reviewed edits with --print-release-sha256."
+        )
+        return
     self_test()
-    root = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(".github/workflows")
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    root = pathlib.Path(args[0]) if args else pathlib.Path(".github/workflows")
     errors: list[str] = []
     scanned = 0
     workflows = sorted({*root.glob("*.yml"), *root.glob("*.yaml")})
     for workflow in workflows:
         contents = workflow.read_text(encoding="utf-8")
-        validate_signing_isolation(contents, workflow)
+        if workflow.name == RELEASE_WORKFLOW_FILENAME:
+            validate_release_workflow(contents, workflow)
+        else:
+            validate_signing_isolation(contents, workflow)
         for number, line in enumerate(contents.splitlines(), 1):
             reference = reference_for_line(line)
             if reference is None:
