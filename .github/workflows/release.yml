@@ -1,6 +1,6 @@
 # Release pipeline (manual dispatch only).
 #
-# Dispatch against the exact tag ref refs/tags/v0.1.0-testnet.3 via
+# Dispatch against the exact tag ref refs/tags/v0.1.0-testnet.4 via
 # workflow_dispatch. The release is version-scoped: preflight rejects any other
 # tag so an older `.1` candidate cannot run under this owner self-approval
 # policy.
@@ -24,7 +24,7 @@
 # no independent review claimed. The policy pins the owner reviewer by
 # immutable numeric GitHub user id 86115037 and login; prevent_self_review
 # must be exactly false; can_admins_bypass must be false; and the environment
-# deployment policy must be the exact tag v0.1.0-testnet.3, not a wildcard.
+# deployment policy must be the exact tag v0.1.0-testnet.4, not a wildcard.
 # This reduces separation of duties and is documented as a security tradeoff
 # in the release notes and inventories: the provenance must record accepted
 # residual risk, must record the compromised-owner tradeoff, must be
@@ -44,12 +44,12 @@
 # always) for owner-only creation) and `astatine-release-tags` (exactly
 # update/deletion/non-fast-forward with zero bypass actors, covering exactly
 # refs/tags/v*). Both must be active.
-# Narrowing either ruleset to the single .3 tag or the historical .0/.1/.2/.3
+# Narrowing either ruleset to the single .4 tag or the historical .0/.1/.2/.3
 # list weakens protection for all other v* tags and fails closed.
 # Creation protection is never removed or broadened. Immutable releases must
 # still be enabled by the owner; this workflow does not verify that
 # repository setting.
-# The historical non-self reviewer requirement is superseded for .3 by the
+# The historical non-self reviewer requirement is superseded for .4 by the
 # explicit owner self-approval policy. The exact tag deployment policy remains
 # mandatory for the release environment. Tag-ruleset verification is an
 # independent external prerequisite enforced structurally by preflight; this
@@ -82,7 +82,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Exact release tag; must be v0.1.0-testnet.3 for this revision
+        description: Exact release tag; must be v0.1.0-testnet.4 for this revision
         required: true
         type: string
 
@@ -96,8 +96,8 @@ concurrency:
 env:
   RUSTUP_TOOLCHAIN: "1.94.1"
   RELEASE_TAG: ${{ inputs.tag }}
-  EXPECTED_RELEASE_TAG: "v0.1.0-testnet.3"
-  EXPECTED_RELEASE_VERSION: "0.1.0-testnet.3"
+  EXPECTED_RELEASE_TAG: "v0.1.0-testnet.4"
+  EXPECTED_RELEASE_VERSION: "0.1.0-testnet.4"
 
 jobs:
   preflight:
@@ -214,8 +214,8 @@ jobs:
           if repository != "Jecta-ai/astatine-miner":
               print("split ruleset source must be the canonical repository", file=sys.stderr)
               sys.exit(1)
-          if tag != "v0.1.0-testnet.3":
-              print("preflight tag must be exactly v0.1.0-testnet.3", file=sys.stderr)
+          if tag != "v0.1.0-testnet.4":
+              print("preflight tag must be exactly v0.1.0-testnet.4", file=sys.stderr)
               sys.exit(1)
           creation = json.load(open(creation_path, encoding="utf-8"))
           immutability = json.load(open(immutability_path, encoding="utf-8"))
@@ -606,6 +606,89 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-windows:
+    name: Build Windows x86_64 binary
+    needs: preflight
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      binary_sha256: ${{ steps.record-hash.outputs.binary_sha256 }}
+      rustc_version: ${{ steps.observe-toolchain.outputs.rustc_version }}
+      cargo_version: ${{ steps.observe-toolchain.outputs.cargo_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert exact tag identity
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "$RELEASE_TAG^{}")" = "$GITHUB_SHA"
+          test "$(git describe --tags --exact-match)" = "$RELEASE_TAG"
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.1 --profile minimal
+          test "$(rustc --version | awk '{print $2}')" = "1.94.1"
+          test "$(rustc -vV | awk '$1 == "host:" {print $2}')" = "x86_64-pc-windows-msvc"
+      - name: Observe pinned toolchain versions
+        id: observe-toolchain
+        run: |
+          set -euo pipefail
+          rustc_line="$(rustc --version)"
+          cargo_line="$(cargo --version)"
+          test "$rustc_line" = "rustc 1.94.1 (e408947bf 2026-03-25)"
+          test "$cargo_line" = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
+          printf 'rustc_version=%s\n' "$rustc_line" >> "$GITHUB_OUTPUT"
+          printf 'cargo_version=%s\n' "$cargo_line" >> "$GITHUB_OUTPUT"
+      - name: Build locked release binary
+        run: cargo build --locked --release
+      - name: Smoke test release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/astatine.exe --version
+          ./target/release/astatine.exe --help >/dev/null
+          ./target/release/astatine.exe mine --help >/dev/null
+      - name: Inspect Windows binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = 'target/release/astatine.exe'
+          if (-not (Test-Path $binary)) { throw 'Windows binary missing' }
+          Get-Item $binary | Format-List *
+          $bytes = [System.IO.File]::ReadAllBytes($binary)
+          if ($bytes.Length -lt 64) { throw 'Windows binary too small' }
+          if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw 'Windows binary is not MZ' }
+          $e_lfanew = [BitConverter]::ToInt32($bytes, 0x3C)
+          if ($e_lfanew -lt 0 -or ($e_lfanew + 6) -gt $bytes.Length) { throw 'Windows binary has invalid PE offset' }
+          if ($bytes[$e_lfanew] -ne 0x50 -or $bytes[$e_lfanew+1] -ne 0x45 -or $bytes[$e_lfanew+2] -ne 0x00 -or $bytes[$e_lfanew+3] -ne 0x00) { throw 'Windows binary missing PE signature' }
+          $machine = [BitConverter]::ToUInt16($bytes, $e_lfanew + 4)
+          if ($machine -ne 0x8664) { throw 'Windows binary is not x86-64' }
+          Write-Host 'Windows PE x86-64 header verified'
+      - name: Record binary SHA-256
+        id: record-hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(sha256sum target/release/astatine.exe | cut -d' ' -f1)"
+          test -n "$sha"
+          printf 'binary_sha256=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          echo "binary sha256 recorded"
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: astatine-windows-x86_64
+          path: target/release/astatine.exe
+          if-no-files-found: error
+          retention-days: 7
+
   attest-macos:
     name: Attest macOS binary provenance
     needs: build-macos
@@ -680,13 +763,52 @@ jobs:
         with:
           subject-path: ${{ runner.temp }}/attest/linux/astatine
 
+  attest-windows:
+    name: Attest Windows binary provenance
+    needs: build-windows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download Windows binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: astatine-windows-x86_64
+          path: ${{ runner.temp }}/attest/windows
+      - name: Verify Windows binary hash matches build output
+        env:
+          EXPECTED_SHA256: ${{ needs.build-windows.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SHA256"
+          binary="$RUNNER_TEMP/attest/windows/astatine.exe"
+          test -f "$binary"
+          actual="$(sha256sum "$binary" | cut -d' ' -f1)"
+          if [ "$actual" != "$EXPECTED_SHA256" ]; then
+            echo "Windows binary hash mismatch against build output" >&2
+            exit 1
+          fi
+          echo "Windows binary hash verified against build output"
+      # Build-provenance attestation for the raw compiled binary (pre-approval;
+      # not a release archive asset). Release archives are attested only after
+      # environment approval in release-draft.
+      - name: Attest raw Windows binary
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attest/windows/astatine.exe
+
   release-package:
     name: Package and attest release bundle
     needs:
       - build-macos
       - build-linux
+      - build-windows
       - attest-macos
       - attest-linux
+      - attest-windows
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release
@@ -719,26 +841,40 @@ jobs:
         with:
           name: astatine-linux-x86_64
           path: ${{ runner.temp }}/retrieved/linux
+      - name: Download Windows binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: astatine-windows-x86_64
+          path: ${{ runner.temp }}/retrieved/windows
       - name: Verify binaries match build outputs
         env:
           EXPECTED_MACOS_SHA256: ${{ needs.build-macos.outputs.binary_sha256 }}
           EXPECTED_LINUX_SHA256: ${{ needs.build-linux.outputs.binary_sha256 }}
+          EXPECTED_WINDOWS_SHA256: ${{ needs.build-windows.outputs.binary_sha256 }}
         run: |
           set -euo pipefail
           test -n "$EXPECTED_MACOS_SHA256"
           test -n "$EXPECTED_LINUX_SHA256"
+          test -n "$EXPECTED_WINDOWS_SHA256"
           macos_binary="$RUNNER_TEMP/retrieved/macos/astatine"
           linux_binary="$RUNNER_TEMP/retrieved/linux/astatine"
+          windows_binary="$RUNNER_TEMP/retrieved/windows/astatine.exe"
           test -f "$macos_binary"
           test -f "$linux_binary"
+          test -f "$windows_binary"
           actual_macos="$(sha256sum "$macos_binary" | cut -d' ' -f1)"
           actual_linux="$(sha256sum "$linux_binary" | cut -d' ' -f1)"
+          actual_windows="$(sha256sum "$windows_binary" | cut -d' ' -f1)"
           if [ "$actual_macos" != "$EXPECTED_MACOS_SHA256" ]; then
             echo "macOS binary hash mismatch against build output" >&2
             exit 1
           fi
           if [ "$actual_linux" != "$EXPECTED_LINUX_SHA256" ]; then
             echo "Linux binary hash mismatch against build output" >&2
+            exit 1
+          fi
+          if [ "$actual_windows" != "$EXPECTED_WINDOWS_SHA256" ]; then
+            echo "Windows binary hash mismatch against build output" >&2
             exit 1
           fi
           echo "binaries verified against build outputs"
@@ -775,7 +911,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
-          for binary in "$RUNNER_TEMP/retrieved/macos/astatine" "$RUNNER_TEMP/retrieved/linux/astatine"; do
+          for binary in "$RUNNER_TEMP/retrieved/macos/astatine" "$RUNNER_TEMP/retrieved/linux/astatine" "$RUNNER_TEMP/retrieved/windows/astatine.exe"; do
             test -f "$binary"
             gh attestation verify "$binary" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$tag"
           done
@@ -796,14 +932,15 @@ jobs:
           out="$RUNNER_TEMP/bundle-out"
           rm -rf "$out"
           mkdir -p "$out"
-          python3 -B support/release/build-release.py --tag "$tag" --repository-id "$repo_id" --macos-binary "$RUNNER_TEMP/retrieved/macos/astatine" --linux-binary "$RUNNER_TEMP/retrieved/linux/astatine" --output-dir "$out" --rustc-version "$RUSTC_VERSION" --cargo-version "$CARGO_VERSION"
+          python3 -B support/release/build-release.py --tag "$tag" --repository-id "$repo_id" --macos-binary "$RUNNER_TEMP/retrieved/macos/astatine" --linux-binary "$RUNNER_TEMP/retrieved/linux/astatine" --windows-binary "$RUNNER_TEMP/retrieved/windows/astatine.exe" --output-dir "$out" --rustc-version "$RUSTC_VERSION" --cargo-version "$CARGO_VERSION"
           test -f "$out/astatine-$tag-macos-arm64.tar.gz"
           test -f "$out/astatine-$tag-linux-x86_64.tar.gz"
+          test -f "$out/astatine-$tag-windows-x86_64.zip"
           test -f "$out/SHA256SUMS"
           test -f "$out/release-provenance.json"
           tagged_notes="$RUNNER_TEMP/tagged-release-notes.md"
-          git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.3.md" > "$tagged_notes"
-          cmp support/release/RELEASE_NOTES-v0.1.0-testnet.3.md "$tagged_notes"
+          git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.4.md" > "$tagged_notes"
+          cmp support/release/RELEASE_NOTES-v0.1.0-testnet.4.md "$tagged_notes"
           cp "$tagged_notes" "$out/release-notes.md"
           test -f "$out/release-notes.md"
           if ls "$out" | grep -Ei 'fixture|provenance\.json'; then
@@ -814,10 +951,18 @@ jobs:
             extra="$(ls "$out" | grep -Ei 'fixture' || true)"
             test -z "$extra"
           fi
-          for archive in "$out"/astatine-*.tar.gz; do
-            if tar -tzf "$archive" | grep -Ei 'fixture|PROVENANCE'; then
-              echo "forbidden member present" >&2
-              exit 1
+          for archive in "$out"/astatine-*.tar.gz "$out"/astatine-*.zip; do
+            test -f "$archive"
+            if echo "$archive" | grep -q '\.tar\.gz$'; then
+              if tar -tzf "$archive" | grep -Ei 'fixture|PROVENANCE'; then
+                echo "forbidden member present" >&2
+                exit 1
+              fi
+            else
+              if unzip -l "$archive" | grep -Ei 'fixture|PROVENANCE'; then
+                echo "forbidden member present" >&2
+                exit 1
+              fi
             fi
           done
           (cd "$out" && sha256sum -c SHA256SUMS)
@@ -951,7 +1096,7 @@ jobs:
           if "publication authorized" in decision_lower or "release approver" in decision_lower:
               print("provenance field rights_decision must not claim publication authorization or a release approver", file=sys.stderr)
               sys.exit(1)
-          if prov.get("targets") != ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]:
+          if prov.get("targets") != ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]:
               print("provenance field targets mismatch", file=sys.stderr)
               sys.exit(1)
           sums = {}
@@ -994,6 +1139,10 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: ${{ runner.temp }}/bundle-out/astatine-*-linux-x86_64.tar.gz
+      - name: Attest Windows archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/bundle-out/astatine-*-windows-x86_64.zip
       - name: Verify archive attestations
         env:
           RELEASE_TAG: ${{ inputs.tag }}
@@ -1001,7 +1150,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
-          for archive in "$RUNNER_TEMP"/bundle-out/astatine-*-macos-arm64.tar.gz "$RUNNER_TEMP"/bundle-out/astatine-*-linux-x86_64.tar.gz; do
+          for archive in "$RUNNER_TEMP"/bundle-out/astatine-*-macos-arm64.tar.gz "$RUNNER_TEMP"/bundle-out/astatine-*-linux-x86_64.tar.gz "$RUNNER_TEMP"/bundle-out/astatine-*-windows-x86_64.zip; do
             test -f "$archive"
             gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$tag"
           done
@@ -1013,9 +1162,87 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  windows-archive-smoke:
+    name: Smoke test packaged Windows archive
+    needs: release-package
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: astatine-release-bundle
+          path: bundle
+      - name: Verify bundle checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd bundle && sha256sum -c SHA256SUMS)
+      - name: Verify Windows archive attestation before extraction
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          gh attestation verify "bundle/astatine-$tag-windows-x86_64.zip" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$tag"
+      - name: Extract Windows archive to sandbox
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Get-Item "bundle/astatine-*-windows-x86_64.zip"
+          if (@($archive).Count -ne 1) { throw 'expected exactly one Windows archive in the bundle' }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($archive.FullName)
+          try {
+            $names = @($zip.Entries | ForEach-Object { $_.FullName })
+          } finally { $zip.Dispose() }
+          $root = "astatine-$env:RELEASE_TAG-windows-x86_64/"
+          $expected = @(
+            "$root/astatine.exe",
+            "$root/LICENSE-MIT",
+            "$root/THIRD_PARTY_LICENSES.md",
+            "$root/BUILD-INFO.json",
+            "$root/INSTALL.md"
+          )
+          foreach ($name in $expected) {
+            if ($names -notcontains $name) { throw "archive member missing: $name" }
+          }
+          foreach ($name in $names) {
+            if ($expected -notcontains $name) { throw "unexpected archive member: $name" }
+          }
+          $sandbox = Join-Path $env:RUNNER_TEMP 'win-archive-smoke'
+          if (Test-Path $sandbox) { Remove-Item $sandbox -Recurse -Force }
+          New-Item -ItemType Directory -Path $sandbox | Out-Null
+          Expand-Archive -Path $archive.FullName -DestinationPath $sandbox -Force
+      - name: Smoke test packaged Windows executable (no wallet, no network)
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:RUNNER_TEMP "win-archive-smoke/astatine-$env:RELEASE_TAG-windows-x86_64/astatine.exe"
+          if (-not (Test-Path $exe)) { throw 'packaged executable missing after extraction' }
+          $env:APPDATA = Join-Path $env:RUNNER_TEMP 'win-archive-smoke-profile'
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'win-archive-smoke-profile'
+          New-Item -ItemType Directory -Force -Path $env:APPDATA | Out-Null
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "packaged --version failed ($LASTEXITCODE)" }
+          & $exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "packaged --help failed ($LASTEXITCODE)" }
+          & $exe mine --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "packaged mine --help failed ($LASTEXITCODE)" }
+
   release-draft:
     name: Create and verify draft release
-    needs: release-package
+    needs:
+      - release-package
+      - windows-archive-smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release
@@ -1045,8 +1272,8 @@ jobs:
           import json
           import sys
           env_path, policies_path, tag = sys.argv[1], sys.argv[2], sys.argv[3]
-          if tag != "v0.1.0-testnet.3":
-              print("draft tag must be exactly v0.1.0-testnet.3", file=sys.stderr)
+          if tag != "v0.1.0-testnet.4":
+              print("draft tag must be exactly v0.1.0-testnet.4", file=sys.stderr)
               sys.exit(1)
           env_data = json.load(open(env_path, encoding="utf-8"))
           if env_data.get("name") != "release":
@@ -1174,17 +1401,34 @@ jobs:
           expected_tag = sys.argv[4]
 
           expected = {
-              "astatine-v0.1.0-testnet.3-macos-arm64.tar.gz": (
-                  "astatine-v0.1.0-testnet.3-macos-arm64",
+              "astatine-v0.1.0-testnet.4-macos-arm64.tar.gz": (
+                  "astatine-v0.1.0-testnet.4-macos-arm64",
                   "aarch64-apple-darwin",
+                  "astatine",
+                  False,
               ),
-              "astatine-v0.1.0-testnet.3-linux-x86_64.tar.gz": (
-                  "astatine-v0.1.0-testnet.3-linux-x86_64",
+              "astatine-v0.1.0-testnet.4-linux-x86_64.tar.gz": (
+                  "astatine-v0.1.0-testnet.4-linux-x86_64",
                   "x86_64-unknown-linux-gnu",
+                  "astatine",
+                  False,
+              ),
+              "astatine-v0.1.0-testnet.4-windows-x86_64.zip": (
+                  "astatine-v0.1.0-testnet.4-windows-x86_64",
+                  "x86_64-pc-windows-msvc",
+                  "astatine.exe",
+                  True,
               ),
           }
-          basenames = {
+          basenames_unix = {
               "astatine": 0o755,
+              "BUILD-INFO.json": 0o644,
+              "INSTALL.md": 0o644,
+              "LICENSE-MIT": 0o644,
+              "THIRD_PARTY_LICENSES.md": 0o644,
+          }
+          basenames_windows = {
+              "astatine.exe": 0o755,
               "BUILD-INFO.json": 0o644,
               "INSTALL.md": 0o644,
               "LICENSE-MIT": 0o644,
@@ -1205,7 +1449,7 @@ jobs:
               fail("provenance tag does not match RELEASE_TAG")
           entries = prov.get("archives")
           if not isinstance(entries, list) or len(entries) != len(expected):
-              fail("provenance must contain exactly two archives")
+              fail("provenance must contain exactly three archives")
           by_name = {}
           for entry in entries:
               if not isinstance(entry, dict):
@@ -1231,7 +1475,7 @@ jobs:
 
           manifest = {"commit": expected_commit, "tag": expected_tag}
           manifest["binaries"] = {}
-          for filename, (root, target) in expected.items():
+          for filename, (root, target, binary_basename, is_zip) in expected.items():
               entry = by_name[filename]
               if entry.get("target") != target:
                   fail("provenance target mismatch for " + filename)
@@ -1241,27 +1485,61 @@ jobs:
               archive_bytes = archive_path.read_bytes()
               if sha256(archive_bytes) != sums[filename]:
                   fail("archive sha256 does not match SHA256SUMS for " + filename)
-
+              basenames = basenames_windows if is_zip else basenames_unix
               expected_paths = {f"{root}/{basename}" for basename in basenames}
               members = {}
-              with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-                  for member in tar.getmembers():
-                      name = member.name
-                      if name in members:
-                          fail("duplicate archive member: " + name)
-                      if member.type != tarfile.REGTYPE or not member.isreg():
-                          fail("archive member must be a regular file: " + name)
-                      pure = pathlib.PurePosixPath(name)
-                      if pure.is_absolute() or ".." in pure.parts or len(pure.parts) != 2:
-                          fail("archive member path is unsafe: " + name)
-                      if name not in expected_paths:
-                          fail("archive member is outside the allowlist: " + name)
-                      if member.mode != basenames[pure.name]:
-                          fail("archive member mode mismatch: " + name)
-                      data = tar.extractfile(member)
-                      if data is None:
-                          fail("archive member is not readable: " + name)
-                      members[name] = data.read()
+              if is_zip:
+                  import zipfile
+                  with zipfile.ZipFile(io.BytesIO(archive_bytes), mode="r") as zf:
+                      if zf.comment:
+                          fail("archive comment must be empty: " + filename)
+                      infos = zf.infolist()
+                      if len(infos) != len(expected_paths):
+                          fail("archive member count mismatch for " + filename)
+                      seen = set()
+                      for info in infos:
+                          name = info.filename
+                          if name in seen:
+                              fail("duplicate archive member: " + name)
+                          seen.add(name)
+                          if "\\" in name:
+                              fail("archive member must not contain backslash: " + name)
+                          pure = pathlib.PurePosixPath(name)
+                          if pure.is_absolute() or ".." in pure.parts or len(pure.parts) != 2:
+                              fail("archive member path is unsafe: " + name)
+                          if name not in expected_paths:
+                              fail("archive member is outside the allowlist: " + name)
+                          if (info.flag_bits & 0x1) != 0:
+                              fail("archive must not be encrypted: " + name)
+                          mode = (info.external_attr >> 16) & 0o777
+                          # ZIP may store 0 when creator is Windows; require exact Unix modes set by the packager.
+                          if mode != basenames[pure.name]:
+                              fail("archive member mode mismatch: " + name)
+                          if info.is_dir():
+                              fail("archive member must be a regular file: " + name)
+                          data = zf.read(name)
+                          members[name] = data
+              else:
+                  with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                      for member in tar.getmembers():
+                          name = member.name
+                          if name in members:
+                              fail("duplicate archive member: " + name)
+                          if member.type != tarfile.REGTYPE or not member.isreg():
+                              fail("archive member must be a regular file: " + name)
+                          pure = pathlib.PurePosixPath(name)
+                          if pure.is_absolute() or ".." in pure.parts or len(pure.parts) != 2:
+                              fail("archive member path is unsafe: " + name)
+                          if "\\" in name:
+                              fail("archive member must not contain backslash: " + name)
+                          if name not in expected_paths:
+                              fail("archive member is outside the allowlist: " + name)
+                          if member.mode != basenames[pure.name]:
+                              fail("archive member mode mismatch: " + name)
+                          data = tar.extractfile(member)
+                          if data is None:
+                              fail("archive member is not readable: " + name)
+                          members[name] = data.read()
               if set(members) != expected_paths:
                   fail("archive member set mismatch for " + filename)
 
@@ -1287,7 +1565,7 @@ jobs:
                   if member_entry.get("mode") != oct(basenames[pathlib.PurePosixPath(name).name]):
                       fail("archive member mode does not match provenance: " + name)
 
-              binary_name = f"{root}/astatine"
+              binary_name = f"{root}/{binary_basename}"
               binary = members[binary_name]
               binary_hash = sha256(binary)
               if entry.get("binary_sha256", "").lower() != binary_hash:
@@ -1308,9 +1586,20 @@ jobs:
                       fail("Linux binary format mismatch: not 64-bit little-endian ELF")
                   if int.from_bytes(binary[18:20], "little") != 62:
                       fail("Linux binary format mismatch: not x86-64 ELF")
+              elif target == "x86_64-pc-windows-msvc":
+                  if len(binary) < 64 or binary[0:2] != b"MZ":
+                      fail("Windows binary format mismatch: not a PE executable")
+                  e_lfanew = int.from_bytes(binary[0x3C:0x40], "little")
+                  if e_lfanew < 0 or e_lfanew + 6 > len(binary):
+                      fail("Windows binary format mismatch: invalid PE offset")
+                  if binary[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
+                      fail("Windows binary format mismatch: missing PE signature")
+                  if int.from_bytes(binary[e_lfanew + 4:e_lfanew + 6], "little") != 0x8664:
+                      fail("Windows binary format mismatch: not x86-64 PE")
               else:
                   fail("unsupported attested binary target")
-              destination = extract_dir / target / "astatine"
+              dest_name = "astatine.exe" if is_zip else "astatine"
+              destination = extract_dir / target / dest_name
               destination.parent.mkdir(parents=True, exist_ok=True)
               destination.write_bytes(binary)
               destination.chmod(0o700)
@@ -1320,7 +1609,7 @@ jobs:
                   "archive_sha256": sums[filename],
               }
 
-          if set(manifest["binaries"]) != {"aarch64-apple-darwin", "x86_64-unknown-linux-gnu"}:
+          if set(manifest["binaries"]) != {"aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"}:
               fail("attested binary target set mismatch")
           (extract_dir / "manifest.json").write_text(
               json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -1346,7 +1635,15 @@ jobs:
             gh attestation verify "$binary" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$tag"
             test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$expected"
           done
-          test "$(find "$RUNNER_TEMP/attested-binaries" -mindepth 2 -maxdepth 2 -type f -name astatine | wc -l)" = "2"
+          binary="$RUNNER_TEMP/attested-binaries/x86_64-pc-windows-msvc/astatine.exe"
+          test -f "$binary"
+          expected="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["binaries"]["x86_64-pc-windows-msvc"]["sha256"])' "$manifest")"
+          test -n "$expected"
+          actual="$(sha256sum "$binary" | cut -d' ' -f1)"
+          test "$actual" = "$expected"
+          gh attestation verify "$binary" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$tag"
+          test "$(sha256sum "$binary" | cut -d' ' -f1)" = "$expected"
+          test "$(find "$RUNNER_TEMP/attested-binaries" -mindepth 2 -maxdepth 2 -type f \( -name astatine -o -name 'astatine.exe' \) | wc -l)" = "3"
           echo "packaged binaries verified against separately attested compiled binaries"
       - name: Verify archive attestations
         env:
@@ -1355,7 +1652,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="$RELEASE_TAG"
-          for archive in bundle/astatine-*-macos-arm64.tar.gz bundle/astatine-*-linux-x86_64.tar.gz; do
+          for archive in bundle/astatine-*-macos-arm64.tar.gz bundle/astatine-*-linux-x86_64.tar.gz bundle/astatine-*-windows-x86_64.zip; do
             test -f "$archive"
             gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$tag"
           done
@@ -1452,7 +1749,7 @@ jobs:
           if "publication authorized" in decision_lower or "release approver" in decision_lower:
               print("provenance field rights_decision must not claim publication authorization or a release approver", file=sys.stderr)
               sys.exit(1)
-          if prov.get("targets") != ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]:
+          if prov.get("targets") != ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]:
               print("provenance field targets mismatch", file=sys.stderr)
               sys.exit(1)
           sums = {}
@@ -1556,7 +1853,7 @@ jobs:
             echo "cannot establish that no release exists for $tag; refusing draft creation" >&2
             exit 1
           fi
-          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --draft --prerelease --verify-tag --title "$tag" --notes-file bundle/release-notes.md bundle/astatine-*-macos-arm64.tar.gz bundle/astatine-*-linux-x86_64.tar.gz bundle/SHA256SUMS bundle/release-provenance.json
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --draft --prerelease --verify-tag --title "$tag" --notes-file bundle/release-notes.md bundle/astatine-*-macos-arm64.tar.gz bundle/astatine-*-linux-x86_64.tar.gz bundle/astatine-*-windows-x86_64.zip bundle/SHA256SUMS bundle/release-provenance.json
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,tagName,body,assets > "$RUNNER_TEMP/draft-release.json"
           python3 - "$RUNNER_TEMP/draft-release.json" "$tag" bundle/release-notes.md <<'PY'
           import json

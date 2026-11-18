@@ -1,4 +1,4 @@
-# Release lanes: nonpublishing dry-run vs release-intent dual-platform release (draft-only)
+# Release lanes: nonpublishing dry-run vs release-intent triple-platform release (draft-only)
 
 This directory holds the offline release gate and packaging lanes.
 `support/release/gate.py` is the shared fail-closed loader for
@@ -21,7 +21,7 @@ fixture tree; the live v3 release-intent fixture suite remains in
 `support/tests/test_fixture_provenance.py`. No prior fixture negative test was
 deleted.
 
-Licensing for candidate `v0.1.0-testnet.3` (macOS ARM64 and Linux x86_64 only)
+Licensing for candidate `v0.1.0-testnet.4` (macOS ARM64, Linux x86_64, and Windows x86_64)
 is owner-authorized first-party source/binary distribution **intent**
 (`release_intent_authorization` dated 2026-11-17); repository technical NOTICE
 review recorded with citations; no legal conclusion and no separate release
@@ -110,7 +110,7 @@ mutation).
 Manual owner checks (run each command; stop on any failure):
 
 ```sh
-tag=v0.1.0-testnet.3
+tag=v0.1.0-testnet.4
 repo=Jecta-ai/astatine-miner
 # List split tag rulesets and identify the two ids by name.
 gh api "repos/$repo/rulesets?includes_parents=true&per_page=100" --jq '.[] | {id, name, target, source_type, source, enforcement}'
@@ -156,7 +156,7 @@ records `publication_authorized: false` and `mode: dry-run`, claims no final
 publication, creates only a local `.dry-run.tar.gz` archive plus `SHA256SUMS`
 and `release-provenance.json`, and performs no OIDC, no attestation, no upload,
 no tag, and no GitHub release. `--mode release` always fails in this script;
-the release-intent dual-platform release is built only by `build-release.py`.
+the release-intent triple-platform release is built only by `build-release.py`.
 
 What the dry-run proves:
 
@@ -197,32 +197,33 @@ in-tree locations refused, files created exclusively). There is intentionally
 no upload, tag, push, release, `cargo publish`, signing, credentials, or OIDC
 grant.
 
-## Release-intent dual-platform release (`build-release.py`, draft-only)
+## Release-intent triple-platform release (`build-release.py`, draft-only)
 
 `support/release/build-release.py` requires the release-intent gate via `gate.py`
-(blocked gates fail closed; no final publication is authorized) and packages exactly two deterministic archives:
+(blocked gates fail closed; no final publication is authorized) and packages exactly three deterministic archives:
 
-- `astatine-v0.1.0-testnet.3-macos-arm64.tar.gz` (`aarch64-apple-darwin`)
-- `astatine-v0.1.0-testnet.3-linux-x86_64.tar.gz` (`x86_64-unknown-linux-gnu`)
+- `astatine-v0.1.0-testnet.4-macos-arm64.tar.gz` (`aarch64-apple-darwin`)
+- `astatine-v0.1.0-testnet.4-linux-x86_64.tar.gz` (`x86_64-unknown-linux-gnu`)
+- `astatine-v0.1.0-testnet.4-windows-x86_64.zip` (`x86_64-pc-windows-msvc`)
 
 Each archive contains exactly five regular files under a single platform
-root directory (`astatine-v0.1.0-testnet.3-macos-arm64/` or
-`astatine-v0.1.0-testnet.3-linux-x86_64/`): `<root>/astatine` (0755),
+root directory (`astatine-v0.1.0-testnet.4-macos-arm64/`,
+`astatine-v0.1.0-testnet.4-linux-x86_64/`, or `astatine-v0.1.0-testnet.4-windows-x86_64/`): `<root>/astatine` or `<root>/astatine.exe` (0755, per-target exact; Unix must be `astatine`, Windows must be `astatine.exe`),
 `<root>/LICENSE-MIT`, `<root>/THIRD_PARTY_LICENSES.md`,
 `<root>/BUILD-INFO.json`, `<root>/INSTALL.md` (0644), sorted, with zeroed
-timestamps/ownership, fixed modes, and `gzip -n` equivalent. (The
+timestamps/ownership, fixed modes, and `gzip -n` equivalent for tar.gz; deterministic ZIP (sorted, fixed DOS timestamp 1980-01-01, ZIP_DEFLATED, Unix mode bits) for Windows. (The
 nonpublishing dry-run remains flat; only the release-intent release uses the
 root prefix.) It verifies the git
 tree clean at `HEAD`, the tag exists and resolves to `HEAD`, the tag matches
 the Cargo package version (`v` + version), the repository is
 `Jecta-ai/astatine-miner`, the repository-id is digits, and the `Cargo.lock`
-hash is recorded. It validates the macOS Mach-O 64-bit ARM64 header and the
-Linux ELF64 little-endian x86_64 header without executing the binaries, and
+hash is recorded. It validates the macOS Mach-O 64-bit ARM64 header, the
+Linux ELF64 little-endian x86_64 header, and the Windows PE x86_64 header (MZ, PE signature, Machine 0x8664) without executing the binaries, and
 refuses fixtures, forbidden globs, symlinks, in-tree or pre-existing output,
 wrong tag/version/commit, dirty trees, wrong binary formats, and
 duplicate/missing members. It is stdlib-only and offline and never executes
 candidate code, wallets, mining, or the network. Low-10 limitation:
-`build-release.py` validates binary format only (Mach-O/ELF headers); binary
+`build-release.py` validates binary format only (Mach-O/ELF/PE headers); binary
 identity and source linkage are established by the workflow build jobs plus
 GitHub build provenance, verified again by the protected draft after safe
 archive-member validation, a target-format check, and extraction, not by this
@@ -250,7 +251,7 @@ after admin immutable-setting verification:
 
 ```sh
 # Stop on any failure; run each command individually.
-tag=v0.1.0-testnet.3
+tag=v0.1.0-testnet.4
 repo=Jecta-ai/astatine-miner
 repo_id='<numeric repository ID from the authenticated release record>'
 source_commit='<exact source commit from the authenticated release record>'
@@ -285,7 +286,7 @@ test "$resolved_tag_commit" = "$source_commit"
 gh release view "$tag" --repo "$repo" --json isDraft,body,assets
 tmpdir="$(mktemp -d)"
 git fetch origin "refs/tags/$tag:refs/tags/$tag"
-git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.3.md" > "$tmpdir/release-notes.md"
+git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.4.md" > "$tmpdir/release-notes.md"
 gh api "repos/$repo/releases/tags/$tag" > "$tmpdir/draft.json"
 python3 - "$tmpdir/draft.json" "$tmpdir/release-notes.md" <<'PY'
 import json
@@ -318,9 +319,9 @@ strip quarantine, alter system policy, or silently bypass; install only to a
 user-owned path such as `$HOME/.local/bin` (never sudo); single-platform
 operators verify only their archive's row (an operator holding both archives
 verifies each row separately):
-`grep -F "  astatine-v0.1.0-testnet.3-macos-arm64.tar.gz" SHA256SUMS | shasum -a 256 -c -`
+`grep -F "  astatine-v0.1.0-testnet.4-macos-arm64.tar.gz" SHA256SUMS | shasum -a 256 -c -`
 on macOS and
-`grep -F "  astatine-v0.1.0-testnet.3-linux-x86_64.tar.gz" SHA256SUMS | sha256sum -c -`
+`grep -F "  astatine-v0.1.0-testnet.4-linux-x86_64.tar.gz" SHA256SUMS | sha256sum -c -`
 on Linux, and always verify GitHub attestations. Linux notes glibc/Ubuntu 24.04,
 unlocked
 Secret Service for paid mining, and CUDA/GPU not qualified. Both state
@@ -334,9 +335,9 @@ both archives/binaries, source identity, lock hash, gate state, and
 Example:
 
 ```sh
-python3 -B support/release/build-release.py --tag v0.1.0-testnet.3 \
+python3 -B support/release/build-release.py --tag v0.1.0-testnet.4 \
   --repository-id 123456789 --macos-binary /tmp/macos-astatine \
-  --linux-binary /tmp/linux-astatine --output-dir /tmp/astatine-release-out \
+  --linux-binary /tmp/linux-astatine --windows-binary /tmp/windows-astatine.exe --output-dir /tmp/astatine-release-out \
   --rustc-version "rustc 1.94.1 (e408947bf 2026-03-25)" \
   --cargo-version "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
 ```

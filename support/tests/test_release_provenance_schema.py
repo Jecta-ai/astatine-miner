@@ -32,7 +32,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 BUILDER_PATH = ROOT / "support" / "release" / "build-release.py"
 
-TAG = "v0.1.0-testnet.3"
+TAG = "v0.1.0-testnet.4"
 COMMIT_PLACEHOLDER = "0123456789abcdef0123456789abcdef01234567"
 LEGIT_RUSTC_LINE = "rustc 1.94.1 (e408947bf 2026-03-25)"
 LEGIT_CARGO_LINE = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
@@ -49,6 +49,10 @@ FAKE_MACHO = (
     + (0).to_bytes(4, "little")
     + (2).to_bytes(4, "little")
     + bytes(20)
+)
+FAKE_PE = (
+    b"MZ" + bytes(58) + (64).to_bytes(4, "little")
+    + b"PE\x00\x00" + (0x8664).to_bytes(2, "little") + bytes(20) + bytes(64)
 )
 
 
@@ -147,7 +151,7 @@ class ReleaseProvenanceSchemaTests(unittest.TestCase):
             "support/update-genesis-coordinator-fixture.py",
             "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
             "support/release/RELEASE_NOTES-v0.1.0-testnet.2.md",
-            "support/release/RELEASE_NOTES-v0.1.0-testnet.3.md",
+            "support/release/RELEASE_NOTES-v0.1.0-testnet.4.md",
         ):
             src = ROOT / rel
             if not src.is_file():
@@ -157,8 +161,10 @@ class ReleaseProvenanceSchemaTests(unittest.TestCase):
             shutil.copy2(src, dest)
         self.macos_bin = pathlib.Path(self.bin_tmp.name) / "macos-astatine"
         self.linux_bin = pathlib.Path(self.bin_tmp.name) / "linux-astatine"
+        self.windows_bin = pathlib.Path(self.bin_tmp.name) / "windows-astatine.exe"
         self.macos_bin.write_bytes(FAKE_MACHO + b"\x00" * 64)
         self.linux_bin.write_bytes(FAKE_ELF)
+        self.windows_bin.write_bytes(FAKE_PE)
         (self.root / ".gitignore").write_text("target/\n", encoding="utf-8")
         self.commit = init_repo(self.root, TAG)
         self.out = pathlib.Path(self.out_tmp.name) / "out"
@@ -176,6 +182,7 @@ class ReleaseProvenanceSchemaTests(unittest.TestCase):
             repository_id=REPO_ID,
             macos_binary=self.macos_bin,
             linux_binary=self.linux_bin,
+            windows_binary=self.windows_bin,
             rustc_version=LEGIT_RUSTC_LINE,
             cargo_version=LEGIT_CARGO_LINE,
         )

@@ -1508,7 +1508,13 @@ def run(
 
     member_inputs: list[tuple[str, bytes, int]] = []
     member_records: list[dict] = []
-    for source, archive_path in gate["archive_members"]:
+    # Dry-run remains Linux-only flat (nonpublishing); Windows ZIP is release-only.
+    # Filter the triple allowlist to the Linux subset (exclude astatine.exe) so the
+    # dry-run never requires the Windows binary and never accepts it.
+    dry_run_members = [(s, a) for s, a in gate["archive_members"] if a != "astatine.exe"]
+    require(len(dry_run_members) == 3, "dry-run requires exactly the Linux-only subset (astatine + 2 docs)")
+    require(set(a for _, a in dry_run_members) == {"astatine", "LICENSE-MIT", "THIRD_PARTY_LICENSES.md"}, "dry-run Linux allowlist changed")
+    for source, archive_path in dry_run_members:
         data = read_confined_bytes(resolved_root, source, f"archive member {archive_path}")
         if archive_path == "astatine":
             require_elf_x86_64(data, f"archive member {archive_path} ({source})")
@@ -1533,7 +1539,7 @@ def run(
         "refusing dry-run",
     )
     git_verified, git_status = verify_git_clean(
-        resolved_root, [source for source, _ in gate["archive_members"]]
+        resolved_root, [source for source, _ in dry_run_members]
     )
     require(
         git_verified,

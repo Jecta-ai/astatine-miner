@@ -11,15 +11,16 @@ automation. Automation uses only the read-only `GITHUB_TOKEN`; the
 authoritative bypass check is an owner manual live check OUTSIDE the workflow.
 The workflow must therefore contain:
 
-* exactly 7 jobs: preflight, build-macos, build-linux, attest-macos,
-  attest-linux, release-package, release-draft (no `tag-ruleset-admin-*`);
+* exactly 10 jobs: preflight, build-macos, build-linux, build-windows, attest-macos,
+  attest-linux, attest-windows, release-package, windows-archive-smoke,
+  release-draft (no `tag-ruleset-admin-*`);
 * exactly 2 `environment: release` bindings (release-package + release-draft);
 * zero `environment: release-admin`, zero `create-github-app-token`, zero
   `RELEASE_ADMIN_APP_ID` / `RELEASE_ADMIN_APP_PRIVATE_KEY`, zero
   `secrets.` context outside `${{ github.token }}`, zero `contents: none`
   admin jobs, zero `permission-administration`, zero `skip-token-revoke`,
   zero `app-token` / `private-key` references;
-* 4 checkouts total (preflight + 2 builds + release-package), none in
+* 5 checkouts total (preflight + 3 builds + release-package), none in
   release-draft; preflight carries no release-admin verification;
 * explicit disclosures: `BYPASS_ACTORS NOT AUTOMATICALLY VERIFIED` (the
   TOCTOU disclosure: absent bypass fields are expected from the default
@@ -29,14 +30,14 @@ The workflow must therefore contain:
   fail-closed-on-absent `bypass_actors must be present as a list`), no
   silent pass (fail-closed `sys.exit(1)` / `exit 1` markers stay);
 * retained release guarantees: owner id 86115037 / login, canonical
-  repository + id, exact tag v0.1.0-testnet.3, `refs/tags/v*` scope,
+  repository + id, exact tag v0.1.0-testnet.4, `refs/tags/v*` scope,
   prevent_self_review false, can_admins_bypass false.
 
 This filename is preserved for history; the old `GithubAppIsolationTest`
 (admin-job) suite is replaced by `NoAppIsolationTest`. The mutating-`gh`
 negative tests from the prior suite are preserved in spirit (reject
 `gh api -X` / `--method`, `gh release delete` / `edit`) but scoped to the
-remaining 7 jobs with job-appropriate strictness: the non-mutation jobs
+remaining 10 jobs with job-appropriate strictness: the non-mutation jobs
 (preflight/builds/attests) stay read-only, while release-package and
 release-draft legitimately run `gh release create --draft` (draft only),
 `gh release view`, and `gh attestation verify`.
@@ -61,9 +62,12 @@ EXPECTED_JOBS = frozenset(
         "preflight",
         "build-macos",
         "build-linux",
+        "build-windows",
         "attest-macos",
         "attest-linux",
+        "attest-windows",
         "release-package",
+        "windows-archive-smoke",
         "release-draft",
     }
 )
@@ -155,13 +159,13 @@ class NoAppIsolationTest(unittest.TestCase):
         self.assertEqual(
             section_job_names(self.text),
             set(EXPECTED_JOBS),
-            "Phase1 workflow must be exactly the 7 no-App jobs",
+            "Phase2 workflow must be exactly the 10 no-App jobs",
         )
         if _yaml is None:
             self.skipTest("yaml module not available")
         parsed = _yaml.safe_load(self.text)
         self.assertEqual(set(parsed["jobs"]), set(EXPECTED_JOBS))
-        self.assertEqual(len(parsed["jobs"]), 7)
+        self.assertEqual(len(parsed["jobs"]), 10)
 
     def test_zero_create_github_app_token(self) -> None:
         self.assertNotIn(
@@ -284,8 +288,8 @@ class NoAppIsolationTest(unittest.TestCase):
     def test_four_checkouts_draft_zero(self) -> None:
         self.assertEqual(
             self.text.count("actions/checkout@"),
-            4,
-            "exactly 4 checkouts total (preflight/builds/package; none in draft/attest)",
+            5,
+            "exactly 5 checkouts total (preflight/builds/package; none in draft/attest/smoke)",
         )
         draft = self.job_block("release-draft")
         self.assertNotIn(
@@ -293,12 +297,44 @@ class NoAppIsolationTest(unittest.TestCase):
             draft,
             "release-draft (no checkout) must verify the remote tag via gh api",
         )
+        for job in ("attest-macos", "attest-linux", "attest-windows", "windows-archive-smoke"):
+            self.assertNotIn(
+                "actions/checkout@",
+                self.job_block(job),
+                "%s executes no candidate build and must not checkout" % job,
+            )
         for job in ("preflight", "build-macos", "build-linux", "release-package"):
             self.assertIn(
                 "actions/checkout@",
                 self.job_block(job),
                 "%s must check out the exact tag ref" % job,
             )
+
+    def test_windows_archive_smoke_no_mutation_no_wallet(self) -> None:
+        smoke = self.job_block("windows-archive-smoke")
+        for pattern in (
+            r"gh\s+api\s+-X\b",
+            r"gh\s+api\s+--method\b",
+            r"gh\s+api\s+[^\n]*\b(PATCH|PUT|DELETE)\b",
+            r"gh\s+release\s+delete\b",
+            r"gh\s+release\s+edit\b",
+            r"gh\s+release\s+create\b",
+            r"gh\s+release\s+upload\b",
+        ):
+            self.assertNotRegex(
+                smoke,
+                re.compile(pattern),
+                "windows-archive-smoke must not mutate releases (found %r)" % pattern,
+            )
+        self.assertIn("gh attestation verify", smoke)
+        self.assertIn("windows-2025", smoke)
+        for marker in ("APPDATA", "RUNNER_TEMP", "Expand-Archive", "--version", "mine --help"):
+            self.assertIn(
+                marker, smoke, "smoke must run the packaged exe sandboxed (missing %r)" % marker
+            )
+        self.assertNotIn("astatine init", smoke)
+        self.assertNotIn("wallet create", smoke)
+        self.assertNotIn("wallet import", smoke)
 
     def test_preflight_has_no_release_admin_verify(self) -> None:
         preflight = self.job_block("preflight")
@@ -379,7 +415,7 @@ class NoAppIsolationTest(unittest.TestCase):
             "emyrinj",
             "1454137135",
             "Jecta-ai/astatine-miner",
-            "v0.1.0-testnet.3",
+            "v0.1.0-testnet.4",
             '"refs/tags/v*"',
             "prevent_self_review",
             "can_admins_bypass",

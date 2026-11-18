@@ -97,14 +97,17 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("default", tag)
         self.assertEqual(parsed.get("name"), "Release")
         jobs = parsed["jobs"]
-        self.assertEqual(set(jobs), {"preflight", "build-macos", "build-linux", "attest-macos", "attest-linux", "release-package", "release-draft"})
-        self.assertEqual(len(jobs), 7)
+        self.assertEqual(set(jobs), {"preflight", "build-macos", "build-linux", "build-windows", "attest-macos", "attest-linux", "attest-windows", "release-package", "windows-archive-smoke", "release-draft"})
+        self.assertEqual(len(jobs), 10)
         self.assertEqual(jobs["release-package"].get("environment"), "release")
         self.assertEqual(jobs["release-draft"].get("environment"), "release")
         self.assertNotIn("environment", jobs["attest-macos"])
         self.assertNotIn("environment", jobs["attest-linux"])
+        self.assertNotIn("environment", jobs["attest-windows"])
         self.assertNotIn("environment", jobs["build-macos"])
         self.assertNotIn("environment", jobs["build-linux"])
+        self.assertNotIn("environment", jobs["build-windows"])
+        self.assertNotIn("environment", jobs["windows-archive-smoke"])
         # Phase1: no admin jobs exist, so no contents:none permission may remain.
         for job_name, job_config in jobs.items():
             self.assertNotEqual(
@@ -137,6 +140,10 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             {"contents": "read"},
         )
         self.assertEqual(
+            jobs["build-windows"].get("permissions"),
+            {"contents": "read"},
+        )
+        self.assertEqual(
             jobs["attest-macos"].get("permissions"),
             {"contents": "read", "id-token": "write", "attestations": "write"},
         )
@@ -144,25 +151,29 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             jobs["attest-linux"].get("permissions"),
             {"contents": "read", "id-token": "write", "attestations": "write"},
         )
+        self.assertEqual(
+            jobs["attest-windows"].get("permissions"),
+            {"contents": "read", "id-token": "write", "attestations": "write"},
+        )
+        self.assertEqual(
+            jobs["windows-archive-smoke"].get("permissions"),
+            {"contents": "read", "attestations": "read"},
+        )
         # R3 needs chain and build outputs.
         self.assertEqual(jobs["attest-macos"].get("needs"), "build-macos")
         self.assertEqual(jobs["attest-linux"].get("needs"), "build-linux")
+        self.assertEqual(jobs["attest-windows"].get("needs"), "build-windows")
         self.assertEqual(
             set(jobs["release-package"].get("needs")),
-            {"build-macos", "build-linux", "attest-macos", "attest-linux"},
+            {"build-macos", "build-linux", "build-windows", "attest-macos", "attest-linux", "attest-windows"},
         )
+        self.assertEqual(jobs["windows-archive-smoke"].get("needs"), "release-package")
         draft_needs = jobs["release-draft"].get("needs")
-        if isinstance(draft_needs, str):
-            draft_needs = {draft_needs}
-        else:
-            draft_needs = set(draft_needs)
-        self.assertEqual(
-            draft_needs,
-            {"release-package"},
-        )
+        self.assertEqual(set(draft_needs), {"release-package", "windows-archive-smoke"})
         self.assertIn("binary_sha256", jobs["build-macos"].get("outputs"))
         self.assertIn("rustc_version", jobs["build-macos"].get("outputs"))
         self.assertIn("cargo_version", jobs["build-macos"].get("outputs"))
+        self.assertIn("binary_sha256", jobs["build-windows"].get("outputs"))
 
     def test_release_hash_mismatch_fails(self) -> None:
         mutated = self.real_text + "\n# benign reviewed-comment probe\n"
@@ -654,7 +665,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
     def test_tag_policy_safe_forms_required(self) -> None:
         # M2: validator in preflight/package + inline exact-tag in draft; no wildcard.
         self.assertIn("support/release/verify-protected-environment.py", self.real_text)
-        self.assertIn('"v0.1.0-testnet.3"', self.real_text)
+        self.assertIn('"v0.1.0-testnet.4"', self.real_text)
         self.assertNotIn('"v0.1.0-testnet.*"', self.real_text)
         self.assertNotIn('"v*",', self.real_text)
         self.assertIn("deployment-branch-policies", self.real_text)
@@ -763,13 +774,12 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         mutated = self.real_text.replace(
             "archive member mode mismatch",
             "mode ok",
-            1,
         )
         self.assertReleaseFails(mutated, "packaged binaries")
 
     def test_draft_binary_format_check_required(self) -> None:
         mutated = self.real_text.replace(
-            "Linux binary format mismatch",
+            "binary format mismatch",
             "format ok",
         )
         self.assertReleaseFails(mutated, "packaged binaries")
@@ -778,7 +788,6 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         mutated = self.real_text.replace(
             '            gh attestation verify "$binary" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$tag"\n',
             "",
-            1,
         )
         self.assertReleaseFails(mutated, "both release-package and release-draft")
 
@@ -789,7 +798,6 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         mutated = head + draft.replace(
             '--source-digest "$GITHUB_SHA"',
             '--source-digest "WRONG"',
-            1,
         )
         self.assertReleaseFails(mutated, "release-draft must verify")
 
@@ -1138,31 +1146,92 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         for marker in (
             "attest-macos",
             "attest-linux",
+            "attest-windows",
             "astatine-macos-arm64",
             "astatine-linux-x86_64",
+            "astatine-windows-x86_64",
             "astatine-release-bundle",
             "Observe pinned toolchain versions",
             "Record binary SHA-256",
             "Verify macOS binary hash matches build output",
             "Verify Linux binary hash matches build output",
+            "Verify Windows binary hash matches build output",
             "hash verified against build output",
             "hash mismatch against build output",
             "binaries verified against build outputs",
             "subject-path: ${{ runner.temp }}/attest/macos/astatine",
             "subject-path: ${{ runner.temp }}/attest/linux/astatine",
+            "subject-path: ${{ runner.temp }}/attest/windows/astatine.exe",
             "needs.build-macos.outputs.binary_sha256",
             "needs.build-linux.outputs.binary_sha256",
+            "needs.build-windows.outputs.binary_sha256",
             "needs.build-macos.outputs.rustc_version",
             "needs.build-macos.outputs.cargo_version",
             "--rustc-version",
             "--cargo-version",
             "rustc 1.94.1 (e408947bf 2026-03-25)",
             "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+            "windows-archive-smoke",
+            "Smoke test packaged Windows archive",
+            "Verify Windows archive attestation before extraction",
+            "Extract Windows archive to sandbox",
+            "Smoke test packaged Windows executable (no wallet, no network)",
         ):
             self.assertIn(marker, self.real_text)
         self.assertNotIn("subject-path: target/release/astatine", self.real_text)
-        self.assertEqual(self.real_text.count("Assert exact tag identity"), 4)
-        self.assertEqual(self.real_text.count("actions/checkout@"), 4)
+        self.assertEqual(self.real_text.count("Assert exact tag identity"), 5)
+        self.assertEqual(self.real_text.count("actions/checkout@"), 5)
+
+    def test_windows_archive_smoke_trust_order_and_sandbox(self) -> None:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        smoke = parsed["jobs"]["windows-archive-smoke"]
+        self.assertEqual(smoke.get("runs-on"), "windows-2025")
+        self.assertEqual(smoke.get("needs"), "release-package")
+        self.assertEqual(
+            smoke.get("permissions"), {"contents": "read", "attestations": "read"}
+        )
+        self.assertNotIn("environment", smoke)
+        steps = smoke.get("steps")
+        names = [step.get("name") for step in steps]
+        self.assertEqual(
+            names,
+            [
+                "Download release bundle",
+                "Verify bundle checksums",
+                "Verify Windows archive attestation before extraction",
+                "Extract Windows archive to sandbox",
+                "Smoke test packaged Windows executable (no wallet, no network)",
+            ],
+        )
+        runs = "\n".join(step.get("run", "") for step in steps)
+        attest_pos = runs.find(
+            'gh attestation verify "bundle/astatine-$tag-windows-x86_64.zip"'
+        )
+        extract_pos = runs.find("Expand-Archive")
+        smoke_pos = runs.find("& $exe --version")
+        self.assertTrue(attest_pos > 0 and extract_pos > 0 and smoke_pos > 0)
+        self.assertTrue(attest_pos < extract_pos < smoke_pos)
+        self.assertIn("sha256sum -c SHA256SUMS", runs)
+        self.assertIn("RUNNER_TEMP", runs)
+        self.assertIn("APPDATA", runs)
+        for cmd in ("& $exe --version", "& $exe --help", "& $exe mine --help"):
+            self.assertIn(cmd, runs)
+        self.assertNotIn("astatine init", runs)
+        self.assertNotIn("wallet create", runs)
+        self.assertNotIn("wallet import", runs)
+        self.assertNotIn("sudo", runs.lower())
+
+    def test_windows_archive_smoke_removal_fails_closed(self) -> None:
+        mutated = self.real_text.replace("windows-archive-smoke", "removed-smoke-job", 1)
+        self.assertReleaseFails(mutated, "windows-archive-smoke")
+
+    def test_draft_without_smoke_acceptance_fails(self) -> None:
+        mutated = self.real_text.replace(
+            "      - windows-archive-smoke\n", "", 1
+        )
+        self.assertReleaseFails(mutated, "windows-archive-smoke")
 
     def test_print_sha_documents_recompute(self) -> None:
         self.assertEqual(
@@ -1186,7 +1255,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         return run.split(marker, 1)[1].rsplit("\nPY\n", 1)[0]
 
     def _run_draft_env_inline(self, env: dict, policies: dict) -> subprocess.CompletedProcess:
-        tag = "v0.1.0-testnet.3"
+        tag = "v0.1.0-testnet.4"
         env_path = self.tmp / "inline-env.json"
         policies_path = self.tmp / "inline-policies.json"
         env_path.write_text(json.dumps(env), encoding="utf-8")
@@ -1223,7 +1292,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
     def _valid_inline_policies() -> dict:
         return {
             "total_count": 1,
-            "branch_policies": [{"type": "tag", "name": "v0.1.0-testnet.3"}],
+            "branch_policies": [{"type": "tag", "name": "v0.1.0-testnet.4"}],
         }
 
     def test_draft_inline_env_accepts_owner_self_approval(self) -> None:
@@ -1329,7 +1398,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
                 str(creation_path),
                 str(immutability_path),
                 "Jecta-ai/astatine-miner",
-                "v0.1.0-testnet.3",
+                "v0.1.0-testnet.4",
             ],
             input=self._draft_ruleset_inline_script(),
             capture_output=True,
@@ -1363,7 +1432,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         # all other v* tags and must fail closed.
         immutability = self._valid_immutability_ruleset()
         immutability["conditions"]["ref_name"]["include"] = [
-            "refs/tags/v0.1.0-testnet.3"
+            "refs/tags/v0.1.0-testnet.4"
         ]
         result = self._run_draft_ruleset_inline(
             self._valid_creation_ruleset(), immutability
@@ -1375,7 +1444,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         # other v* tags and must fail closed.
         creation = self._valid_creation_ruleset()
         creation["conditions"]["ref_name"]["include"] = [
-            "refs/tags/v0.1.0-testnet.3"
+            "refs/tags/v0.1.0-testnet.4"
         ]
         result = self._run_draft_ruleset_inline(
             creation, self._valid_immutability_ruleset()
@@ -1434,7 +1503,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             json.dumps(
                 {
                     "isDraft": is_draft,
-                    "tagName": "v0.1.0-testnet.3",
+                    "tagName": "v0.1.0-testnet.4",
                     "body": body,
                     "assets": [],
                 }
@@ -1446,7 +1515,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
                 sys.executable,
                 "-",
                 str(data_path),
-                "v0.1.0-testnet.3",
+                "v0.1.0-testnet.4",
                 str(notes_path),
             ],
             input=self._draft_body_inline_script(),
@@ -1466,7 +1535,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             json.dumps(
                 {
                     "isDraft": True,
-                    "tagName": "v0.1.0-testnet.3",
+                    "tagName": "v0.1.0-testnet.4",
                     "body": "tampered notes\n",
                     "assets": [],
                 }
@@ -1478,7 +1547,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
                 sys.executable,
                 "-",
                 str(data_path),
-                "v0.1.0-testnet.3",
+                "v0.1.0-testnet.4",
                 str(notes_path),
             ],
             input=self._draft_body_inline_script(),
@@ -1528,13 +1597,16 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
                 "preflight",
                 "build-macos",
                 "build-linux",
+                "build-windows",
                 "attest-macos",
                 "attest-linux",
+                "attest-windows",
                 "release-package",
+                "windows-archive-smoke",
                 "release-draft",
             },
         )
-        self.assertEqual(len(jobs), 7)
+        self.assertEqual(len(jobs), 10)
         self.assertNotIn(
             "tag-ruleset-admin-verify",
             self.real_text,
@@ -1591,10 +1663,10 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         needs = parsed["jobs"]["release-package"].get("needs")
         self.assertEqual(
             set(needs),
-            {"build-macos", "build-linux", "attest-macos", "attest-linux"},
+            {"build-macos", "build-linux", "build-windows", "attest-macos", "attest-linux", "attest-windows"},
         )
 
-    def test_draft_needs_package_only(self) -> None:
+    def test_draft_needs_package_and_smoke_acceptance(self) -> None:
         if _yaml is None:
             self.skipTest("yaml module not available")
         parsed = _yaml.safe_load(self.real_text)
@@ -1603,7 +1675,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             needs = {needs}
         else:
             needs = set(needs)
-        self.assertEqual(needs, {"release-package"})
+        self.assertEqual(needs, {"release-package", "windows-archive-smoke"})
 
     def test_no_admin_needs_chain(self) -> None:
         if _yaml is None:
@@ -1707,8 +1779,8 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
     def test_four_checkouts_total(self) -> None:
         self.assertEqual(
             self.real_text.count("actions/checkout@"),
-            4,
-            "exactly 4 checkouts total (preflight/builds/package; none elsewhere)",
+            5,
+            "exactly 5 checkouts total (preflight/builds/package; none elsewhere)",
         )
         draft = self.real_text.split("  release-draft:", 1)[1]
         self.assertNotIn(
@@ -1877,11 +1949,11 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
 
     def test_no_app_pin_and_counts_policy(self) -> None:
         self.assertNotIn("actions/create-github-app-token@", self.real_text)
-        self.assertEqual(self.real_text.count("actions/checkout@"), 4)
+        self.assertEqual(self.real_text.count("actions/checkout@"), 5)
         if _yaml is None:
             self.skipTest("yaml module not available")
         parsed = _yaml.safe_load(self.real_text)
-        self.assertEqual(len(parsed["jobs"]), 7)
+        self.assertEqual(len(parsed["jobs"]), 10)
 
     def test_workflow_sha_dynamic_no_hardcode(self) -> None:
         # Consume workflow-lane handoff SHA dynamically; no stale SHA pinned here.
@@ -1905,7 +1977,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         import re as _re
         parsed = _yaml.safe_load(self.real_text)
         jobs = parsed["jobs"]
-        self.assertEqual(len(jobs), 7)
+        self.assertEqual(len(jobs), 10)
         self.assertEqual(
             sorted(n for n, j in jobs.items() if j.get("environment") == "release-admin"),
             [],
