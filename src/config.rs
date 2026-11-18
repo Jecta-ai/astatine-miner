@@ -971,13 +971,11 @@ impl ConfigStore {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::MetadataExt;
-            if metadata.file_attributes()
-                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-                != 0
-            {
-                bail!("transaction journal lock is a reparse point");
-            }
+            // Reject reparse points and unsafe existing lock ACLs without
+            // deleting state. New lock files inherit the validated parent
+            // DACL; an existing lock with a broadened DACL fails closed.
+            validate_windows_file_private(&path, &file, true)
+                .context("inspect transaction journal lock ACL")?;
         }
         // A just-released journal lock can transiently report WouldBlock in
         // parallel stress even when lsof shows no remaining holder fd. The
@@ -1188,6 +1186,11 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
         {
             bail!("sensitive storage path is a Windows reparse point; refusing to follow it");
         }
+        // Existing directories must already carry the protected owner/system
+        // DACL created by `create_private_directory`. Inherited or broadened
+        // ACLs are rejected fail-closed without repair or deletion so an
+        // operator can remediate manually.
+        validate_windows_directory_private(path).context("inspect private storage ACL")?;
     }
     #[cfg(unix)]
     {
@@ -1234,7 +1237,17 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
     };
 
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() && !windows_reparse_point(&metadata) => return Ok(()),
+        Ok(metadata) if metadata.is_dir() && !windows_reparse_point(&metadata) => {
+            // A pre-existing path is only accepted when its live DACL already
+            // matches the protected owner/system policy. The error is mapped
+            // without deletion so an unsafe directory is never auto-repaired.
+            validate_windows_directory_private(path).map_err(|error| {
+                std::io::Error::other(format!(
+                    "existing private directory has an unsafe ACL: {error:#}"
+                ))
+            })?;
+            return Ok(());
+        }
         Ok(_) => return Err(std::io::ErrorKind::AlreadyExists.into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
@@ -1244,6 +1257,10 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
+        // The immediate parent may be a shared OS location (for example
+        // `%APPDATA%` or `%TEMP%`) with an inherited ACL. Require only that it
+        // is a real directory and not a reparse point; the private target
+        // itself must still carry the protected owner/system DACL.
         match fs::symlink_metadata(parent) {
             Ok(metadata) if metadata.is_dir() && !windows_reparse_point(&metadata) => {}
             Ok(_) => return Err(std::io::ErrorKind::NotADirectory.into()),
@@ -1287,18 +1304,29 @@ fn create_private_directory(path: &Path) -> std::io::Result<()> {
         lpSecurityDescriptor: descriptor.0,
         bInheritHandle: 0,
     };
-    let path = path
+    let wide_path = path
         .as_os_str()
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
-    if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
+    if unsafe { CreateDirectoryW(wide_path.as_ptr(), &attributes) } == 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() == std::io::ErrorKind::AlreadyExists {
-            return Ok(());
+            // A concurrent creator won the race. Accept only when the live
+            // directory already enforces the protected owner/system DACL.
+            return validate_windows_directory_private(path).map_err(|validate_error| {
+                std::io::Error::other(format!(
+                    "existing private directory has an unsafe ACL: {validate_error:#}"
+                ))
+            });
         }
         return Err(error);
     }
+    validate_windows_directory_private(path).map_err(|error| {
+        std::io::Error::other(format!(
+            "newly created private directory failed ACL validation: {error:#}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -1313,6 +1341,343 @@ fn windows_reparse_point(metadata: &fs::Metadata) -> bool {
     metadata.file_attributes()
         & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
         != 0
+}
+
+/// Validate that a live Windows directory handle carries the protected
+/// owner/system DACL created by `create_private_directory`.
+///
+/// The directory is opened with `FILE_FLAG_OPEN_REPARSE_POINT` so a reparse
+/// point is opened itself and rejected instead of followed. The DACL is then
+/// read from the open handle (not the path) so a swap between the metadata
+/// check and the ACL query cannot redirect validation to another object.
+#[cfg(windows)]
+fn validate_windows_directory_private(path: &Path) -> Result<()> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT
+                | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
+        )
+        .open(path)
+        .context("open sensitive storage directory without following reparse points")?;
+    let metadata = directory
+        .metadata()
+        .context("inspect opened storage directory")?;
+    if !metadata.is_dir() {
+        bail!("sensitive storage path changed and is no longer a directory");
+    }
+    if metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+    {
+        bail!("sensitive storage path is a Windows reparse point; refusing to follow it");
+    }
+    use std::os::windows::io::AsRawHandle;
+    validate_windows_handle_private_dacl(directory.as_raw_handle(), true)
+        .context("validate private storage directory ACL")?;
+    Ok(())
+}
+
+/// Validate a live Windows file handle created with
+/// `FILE_FLAG_OPEN_REPARSE_POINT`. `restrict` mirrors
+/// `open_regular_file`'s contract: external imports (`false`) only reject
+/// reparse points, while private state (`true`) additionally requires the
+/// owner/system DACL inherited from a validated private directory.
+#[cfg(windows)]
+fn validate_windows_file_private(path: &Path, file: &File, restrict: bool) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+
+    let metadata = file.metadata().context("inspect opened file")?;
+    if metadata.file_attributes()
+        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+        != 0
+    {
+        bail!("path is a Windows reparse point; refusing to follow it");
+    }
+    if restrict {
+        validate_windows_handle_private_dacl(file.as_raw_handle(), false).with_context(|| {
+            format!("private file has an unsafe Windows ACL: {}", path.display())
+        })?;
+    }
+    Ok(())
+}
+
+/// Copy the current process user SID. Private state must be owned by the
+/// caller; an Owner Rights ACE alone does not prove ownership when a
+/// different account pre-created the object.
+#[cfg(windows)]
+fn windows_current_user_sid_bytes() -> Result<Vec<u8>> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        Security::{GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: `token` is a valid out-pointer; the process handle is owned by
+    // the OS and must not be closed.
+    if unsafe { OpenProcessToken(unsafe { GetCurrentProcess() }, TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("open process token");
+    }
+    struct TokenGuard(HANDLE);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+    let _guard = TokenGuard(token);
+    let mut needed: u32 = 0;
+    // SAFETY: `needed` is a valid out-pointer. The first call is expected to
+    // fail with insufficient buffer while reporting the required size.
+    unsafe {
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+    }
+    if needed == 0 || needed > 1024 {
+        bail!("process token user size is invalid");
+    }
+    let mut buffer = vec![0u8; needed as usize];
+    // SAFETY: `buffer` is sized from the first call and `needed` receives the
+    // written length.
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr() as *mut core::ffi::c_void,
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("query process token user");
+    }
+    // SAFETY: `GetTokenInformation` with `TokenUser` initialized `buffer` as a
+    // `TOKEN_USER` whose `User.Sid` remains valid for the buffer lifetime. The
+    // SID bytes are copied out before the buffer is dropped.
+    let sid = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+    if sid.is_null() || unsafe { windows_sys::Win32::Security::IsValidSid(sid) } == 0 {
+        bail!("process token user SID is invalid");
+    }
+    let length = unsafe { GetLengthSid(sid) } as usize;
+    if length == 0 || length > 68 {
+        bail!("process token user SID length is invalid");
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(sid as *const u8, length) }.to_vec();
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn validate_windows_handle_private_dacl(
+    handle: *mut core::ffi::c_void,
+    is_directory: bool,
+) -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation,
+            Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+            CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+            GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, INHERIT_ONLY_ACE,
+            INHERITED_ACE, IsValidSid, NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE,
+            OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SE_DACL_PRESENT,
+            SE_DACL_PROTECTED, WinCreatorOwnerRightsSid, WinLocalSystemSid,
+        },
+        Storage::FileSystem::FILE_ALL_ACCESS,
+    };
+
+    let security_info: OBJECT_SECURITY_INFORMATION =
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut owner: *mut core::ffi::c_void = std::ptr::null_mut();
+    let mut dacl: *mut windows_sys::Win32::Security::ACL = std::ptr::null_mut();
+    let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: All out-pointers are valid for writes. `GetSecurityInfo`
+    // allocates `descriptor`; it is freed with `LocalFree` before returning.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            security_info,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .context("query Windows object security");
+    }
+    struct DescriptorGuard(*mut core::ffi::c_void);
+    impl Drop for DescriptorGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+    }
+    let _guard = DescriptorGuard(descriptor);
+    if descriptor.is_null() || owner.is_null() || dacl.is_null() {
+        bail!("Windows object security descriptor is incomplete");
+    }
+    // SAFETY: `owner` and `dacl` are owned by `descriptor` and remain valid
+    // until the guard frees the descriptor at scope exit.
+    if unsafe { IsValidSid(owner) } == 0 {
+        bail!("Windows object owner SID is invalid");
+    }
+    // Bind the object owner to the calling user. An Owner Rights ACE alone
+    // does not prove the caller owns a pre-created object, so a directory or
+    // file owned by a different account must fail closed even when its ACE
+    // set looks like owner plus SYSTEM.
+    let current_user = windows_current_user_sid_bytes().context("resolve process owner")?;
+    let current_user_sid = current_user.as_ptr() as *mut core::ffi::c_void;
+    // SAFETY: `current_user` owns the copied SID bytes for this scope and
+    // `owner` is valid while `descriptor` is alive.
+    if unsafe { EqualSid(owner, current_user_sid) } == 0 {
+        bail!("Windows object is not owned by the current user; refusing untrusted state");
+    }
+    let mut control: u16 = 0;
+    let mut revision: u32 = 0;
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("inspect Windows security descriptor control");
+    }
+    if (control & SE_DACL_PRESENT) == 0 {
+        bail!("Windows object has no DACL; refusing broadly accessible state");
+    }
+    if is_directory && (control & SE_DACL_PROTECTED) == 0 {
+        bail!("Windows directory DACL is not protected from parent inheritance");
+    }
+
+    let mut info = ACL_SIZE_INFORMATION {
+        AceCount: 0,
+        AclBytesInUse: 0,
+        AclBytesFree: 0,
+    };
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            &mut info as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("inspect Windows DACL");
+    }
+    if info.AceCount != 2 {
+        bail!("Windows object DACL must grant access to exactly owner and SYSTEM");
+    }
+
+    let mut system_buffer = [0u8; 68];
+    let mut system_len: u32 = system_buffer.len() as u32;
+    if unsafe {
+        CreateWellKnownSid(
+            WinLocalSystemSid,
+            std::ptr::null_mut(),
+            system_buffer.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut system_len,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("resolve Windows SYSTEM SID");
+    }
+    let system_sid = system_buffer.as_ptr() as *mut core::ffi::c_void;
+    // The creation SDDL uses `OW` (Owner Rights, S-1-3-4). The ACE stores the
+    // Owner Rights SID literally, not the current user SID, so validation must
+    // accept Owner Rights as the owner-equivalent principal alongside an
+    // explicit owner SID for backward compatibility.
+    let mut owner_rights_buffer = [0u8; 68];
+    let mut owner_rights_len: u32 = owner_rights_buffer.len() as u32;
+    if unsafe {
+        CreateWellKnownSid(
+            WinCreatorOwnerRightsSid,
+            std::ptr::null_mut(),
+            owner_rights_buffer.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut owner_rights_len,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("resolve Windows Owner Rights SID");
+    }
+    let owner_rights_sid = owner_rights_buffer.as_ptr() as *mut core::ffi::c_void;
+
+    let mut owner_seen = false;
+    let mut system_seen = false;
+    for index in 0..info.AceCount {
+        let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace_ptr) } == 0 {
+            return Err(std::io::Error::last_os_error()).context("inspect Windows DACL entry");
+        }
+        if ace_ptr.is_null() {
+            bail!("Windows DACL entry is missing");
+        }
+        // SAFETY: `GetAce` returned a valid ACE pointer owned by `descriptor`.
+        let ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
+        if u32::from(ace.Header.AceType)
+            != windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE
+        {
+            bail!("Windows object DACL must contain only allow entries");
+        }
+        if ace.Mask != FILE_ALL_ACCESS {
+            bail!("Windows object DACL must grant full control to owner and SYSTEM only");
+        }
+        let flags = u32::from(ace.Header.AceFlags);
+        // An inherit-only ACE grants nothing to the object itself. Accepting
+        // it would treat an effectively inaccessible directory or file as
+        // private, so reject it for both files and directories.
+        if (flags & INHERIT_ONLY_ACE) != 0 {
+            bail!("Windows object DACL must grant effective access, not inherit-only");
+        }
+        if is_directory {
+            if (flags & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE))
+                != (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)
+            {
+                bail!("Windows directory DACL must propagate to children");
+            }
+            // Protected private directories must not carry inherited ACEs.
+            // An inherited marker here means protection failed or the object
+            // was adopted from a parent-controlled DACL.
+            if (flags & INHERITED_ACE) != 0 {
+                bail!("Windows directory DACL must not contain inherited entries");
+            }
+            // No-propagate would stop the owner/system ACEs from reaching
+            // grandchildren. Nested private state is recreated with an
+            // explicit protected DACL, but enforcing exact OICI keeps the
+            // policy identical to the creation SDDL.
+            if (flags & NO_PROPAGATE_INHERIT_ACE) != 0 {
+                bail!("Windows directory DACL must propagate without limit");
+            }
+        }
+        // SAFETY: `SidStart` is the first DWORD of the ACE's SID; the SID
+        // remains valid while `descriptor` is alive.
+        let sid = unsafe { &ace.SidStart as *const u32 as *mut core::ffi::c_void };
+        if unsafe { IsValidSid(sid) } == 0 {
+            bail!("Windows DACL entry SID is invalid");
+        }
+        // SAFETY: all SIDs are valid while `descriptor`, `system_buffer`, and
+        // `owner_rights_buffer` are alive.
+        let is_owner =
+            unsafe { EqualSid(sid, owner) } != 0 || unsafe { EqualSid(sid, owner_rights_sid) } != 0;
+        let is_system = unsafe { EqualSid(sid, system_sid) } != 0;
+        if !is_owner && !is_system {
+            bail!("Windows object DACL grants access beyond owner and SYSTEM");
+        }
+        owner_seen |= is_owner;
+        system_seen |= is_system;
+    }
+    if !(owner_seen && system_seen) {
+        bail!("Windows object DACL must grant access to both owner and SYSTEM");
+    }
+    Ok(())
 }
 
 /// Read a regular file through a no-follow handle and enforce a hard size limit.
@@ -1363,13 +1728,7 @@ fn open_regular_file(path: &Path, _restrict_windows_permissions: bool) -> Result
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            bail!("path is a Windows reparse point; refusing to follow it");
-        }
+        validate_windows_file_private(path, &file, _restrict_windows_permissions)?;
     }
     Ok(file)
 }
@@ -1412,9 +1771,27 @@ fn atomic_write(path: &Path, data: &[u8], replace: bool) -> Result<()> {
         }
     }
     if replace {
+        #[cfg(windows)]
+        {
+            // Reject an unsafe existing target before any replacement. Without
+            // this pre-check the rename below would overwrite a broadened or
+            // reparse destination and then fail closed, violating the
+            // no-overwrite guarantee for untrusted state. The temporary is
+            // dropped (deleted) on early return; persisted state is untouched.
+            if fs::symlink_metadata(path).is_ok() {
+                open_regular_file(path, true).context("refuse to replace unsafe private file")?;
+            }
+        }
         persist_replace(temporary, path)?;
     } else {
         persist_create(temporary, path)?;
+    }
+    #[cfg(windows)]
+    {
+        // Fail closed when the persisted file does not inherit the validated
+        // private DACL. The file is left in place for manual remediation;
+        // Phase 1 never deletes or overwrites state to repair ACLs.
+        open_regular_file(path, true).context("validate persisted private file ACL")?;
     }
     #[cfg(test)]
     fail_atomic_write_if_requested(path, AtomicWriteFailPoint::AfterRename)?;
@@ -2083,6 +2460,190 @@ transaction_confirmations = 2
                 .save(&AppConfig::default())
                 .is_err()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_existing_directories_without_protected_dacl_are_rejected() {
+        // A pre-existing directory created with default inherited ACLs must
+        // fail closed instead of being auto-repaired or silently adopted.
+        // Uses only isolated synthetic directories; no credential store.
+        let temporary = tempfile::tempdir().unwrap();
+        let insecure = temporary.path().join("insecure-existing-root");
+        std::fs::create_dir(&insecure).unwrap();
+        let error = ConfigStore::at_root(insecure.clone())
+            .save(&AppConfig::default())
+            .expect_err("an inherited-ACL directory must not be adopted as private state");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("unsafe ACL") || message.contains("private storage"),
+            "unexpected rejection reason: {message}"
+        );
+        assert!(
+            insecure.is_dir(),
+            "rejected private state must be left in place for manual remediation"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_files_without_restricted_dacl_are_rejected() {
+        // Files outside a validated private directory inherit a broadened
+        // DACL and must be rejected when private permissions are required,
+        // while external imports (`restrict == false`) still only reject
+        // reparse points. No credential store is accessed.
+        let temporary = tempfile::tempdir().unwrap();
+        let insecure = temporary.path().join("insecure-file-root");
+        std::fs::create_dir(&insecure).unwrap();
+        let path = insecure.join("candidate.json");
+        std::fs::write(&path, b"{\"private\":false}").unwrap();
+        let restricted = super::read_regular_limited(&path, 1_024, true);
+        assert!(
+            restricted.is_err(),
+            "a file with an inherited broadened DACL must not satisfy private reads"
+        );
+        assert!(
+            super::read_regular_limited(&path, 1_024, false).is_ok(),
+            "external imports must remain readable when only reparse protection applies"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_replace_refuses_unsafe_target_without_overwriting() {
+        // `atomic_write(replace = true)` must validate the existing
+        // destination before renaming. Broadening the live config file with
+        // `icacls` simulates an unsafe pre-existing target; the subsequent
+        // save must fail closed and leave the original bytes intact.
+        // Isolated synthetic state only; no credential store.
+        use std::process::Command;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at_root(temporary.path().join("Astatine"));
+        store.save(&AppConfig::default()).unwrap();
+        let path = temporary.path().join("Astatine").join("config.toml");
+        let original = std::fs::read(&path).unwrap();
+        let grant = Command::new("icacls")
+            .arg(&path)
+            .args(["/grant", "Everyone:F"])
+            .output()
+            .expect("Windows icacls must be available for the unsafe-target test");
+        assert!(
+            grant.status.success(),
+            "could not broaden test file DACL: {}",
+            String::from_utf8_lossy(&grant.stderr)
+        );
+        // Sanity: the broadened file must now fail private validation.
+        assert!(
+            super::read_regular_limited(&path, 16 * 1024, true).is_err(),
+            "broadened config file must fail private reads before replace"
+        );
+        let error = store
+            .save(&AppConfig::default())
+            .expect_err("replace must refuse an unsafe existing target");
+        assert!(
+            format!("{error:#}").contains("unsafe"),
+            "replace rejection must name the unsafe target: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "refused replace must not overwrite the unsafe target"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_inherit_only_dacl_grants_nothing_and_is_rejected() {
+        // An inherit-only ACE (`IO`) applies to children, not the object
+        // itself. A directory whose only allows are inherit-only is
+        // effectively inaccessible yet would previously pass an OICI-only
+        // check, so validation must reject it. Isolated synthetic directory;
+        // no credential store.
+        use std::{os::windows::ffi::OsStrExt, ptr::null_mut};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("inherit-only-root");
+        let sddl = "D:P(A;OICIIO;FA;;;OW)(A;OICIIO;FA;;;SY)"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let mut descriptor = null_mut();
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    windows_sys::Win32::Security::Authorization::SDDL_REVISION_1,
+                    &mut descriptor,
+                    null_mut(),
+                )
+            },
+            0,
+            "test SDDL must convert"
+        );
+        struct DescriptorGuard(*mut core::ffi::c_void);
+        impl Drop for DescriptorGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        windows_sys::Win32::Foundation::LocalFree(self.0);
+                    }
+                }
+            }
+        }
+        let _guard = DescriptorGuard(descriptor);
+        let attributes = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::Storage::FileSystem::CreateDirectoryW(
+                    wide.as_ptr(),
+                    &attributes,
+                )
+            },
+            0,
+            "inherit-only test directory must be created"
+        );
+        let error = super::validate_windows_directory_private(&path)
+            .expect_err("inherit-only DACL must not validate as private");
+        assert!(
+            format!("{error:#}").contains("inherit-only")
+                || format!("{error:#}").contains("effective access"),
+            "unexpected inherit-only rejection: {error:#}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_current_user_owns_newly_created_private_directory() {
+        // The process owner helper must return a valid SID and the protected
+        // directory created for the test must pass full validation, binding
+        // the happy path to the calling user. A directory owned by a
+        // different account cannot be synthesized without elevation, so the
+        // cross-user rejection is verified by code inspection plus the
+        // `not owned by the current user` guard; this test locks the positive
+        // side. No credential store is accessed.
+        let current =
+            super::windows_current_user_sid_bytes().expect("current user SID must resolve");
+        assert!(
+            !current.is_empty() && current.len() <= 68,
+            "SID length bounds"
+        );
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("Astatine-owner-bound");
+        let store = ConfigStore::at_root(root.clone());
+        store.save(&AppConfig::default()).unwrap();
+        super::validate_windows_directory_private(&root)
+            .expect("newly created private directory must validate");
     }
 
     #[cfg(target_os = "linux")]
