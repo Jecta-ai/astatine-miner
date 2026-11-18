@@ -518,11 +518,29 @@ impl ConfigStore {
 
     #[cfg(test)]
     pub(crate) fn at_root(root: PathBuf) -> Self {
+        #[cfg(windows)]
+        {
+            // Test harness: when a caller passes an existing isolated
+            // temporary directory directly (the historical pattern), upgrade
+            // it best-effort to the protected owner/system DACL so the body
+            // exercises the production creation path. Failures are ignored;
+            // production validation still fails closed. Rejection tests must
+            // use `at_raw_root` to bypass this upgrade.
+            let _ = secure_windows_existing_test_directory(&root);
+        }
         Self {
             root,
             anchor_scope: Arc::new(OnceLock::new()),
             #[cfg(target_os = "linux")]
             native_anchor_for_test: false,
+        }
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn at_raw_root(root: PathBuf) -> Self {
+        Self {
+            root,
+            anchor_scope: Arc::new(OnceLock::new()),
         }
     }
 
@@ -1380,6 +1398,104 @@ fn validate_windows_directory_private(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Best-effort test harness: upgrade a pre-existing isolated directory to the
+/// protected owner/system DACL. Production `ensure_private_directory` still
+/// validates and fails closed; this only prepares historical test bodies that
+/// pass `tempfile::tempdir()` directly so they exercise the production path.
+/// Never called from non-test builds.
+#[cfg(all(test, windows))]
+fn secure_windows_existing_test_directory(path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect test directory"),
+    };
+    if !metadata.is_dir() || windows_reparse_point(&metadata) {
+        return Ok(());
+    }
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                SE_FILE_OBJECT, SetNamedSecurityInfoW,
+            },
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        },
+    };
+    let sddl = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `sddl` is NUL-terminated; `descriptor` is a valid out-pointer.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("build test DACL");
+    }
+    struct DescriptorGuard(*mut core::ffi::c_void);
+    impl Drop for DescriptorGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+    }
+    let _guard = DescriptorGuard(descriptor);
+    let mut dacl: *mut windows_sys::Win32::Security::ACL = std::ptr::null_mut();
+    let mut present: i32 = 0;
+    let mut defaulted: i32 = 0;
+    // SAFETY: `descriptor` was just built from SDDL and out-pointers are valid.
+    if unsafe {
+        windows_sys::Win32::Security::GetSecurityDescriptorDacl(
+            descriptor,
+            &mut present,
+            &mut dacl,
+            &mut defaulted,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("extract test DACL");
+    }
+    if present == 0 || dacl.is_null() {
+        anyhow::bail!("test DACL is missing");
+    }
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: `wide` is NUL-terminated; `dacl` is owned by `descriptor` which
+    // outlives the call.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            PROTECTED_DACL_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .context("protect test directory");
+    }
+    Ok(())
+}
+
 /// Validate a live Windows file handle created with
 /// `FILE_FLAG_OPEN_REPARSE_POINT`. `restrict` mirrors
 /// `open_regular_file`'s contract: external imports (`false`) only reject
@@ -1419,7 +1535,7 @@ fn windows_current_user_sid_bytes() -> Result<Vec<u8>> {
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: `token` is a valid out-pointer; the process handle is owned by
     // the OS and must not be closed.
-    if unsafe { OpenProcessToken(unsafe { GetCurrentProcess() }, TOKEN_QUERY, &mut token) } == 0 {
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(std::io::Error::last_os_error()).context("open process token");
     }
     struct TokenGuard(HANDLE);
@@ -1483,10 +1599,10 @@ fn validate_windows_handle_private_dacl(
             ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation,
             Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
             CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-            GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, INHERIT_ONLY_ACE,
-            INHERITED_ACE, IsValidSid, NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE,
-            OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SE_DACL_PRESENT,
-            SE_DACL_PROTECTED, WinCreatorOwnerRightsSid, WinLocalSystemSid,
+            GetAclInformation, GetSecurityDescriptorControl, INHERIT_ONLY_ACE, INHERITED_ACE,
+            IsValidSid, NO_PROPAGATE_INHERIT_ACE, OBJECT_INHERIT_ACE, OBJECT_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION, SE_DACL_PRESENT, SE_DACL_PROTECTED,
+            WinCreatorOwnerRightsSid, WinLocalSystemSid,
         },
         Storage::FileSystem::FILE_ALL_ACCESS,
     };
@@ -1659,7 +1775,7 @@ fn validate_windows_handle_private_dacl(
         }
         // SAFETY: `SidStart` is the first DWORD of the ACE's SID; the SID
         // remains valid while `descriptor` is alive.
-        let sid = unsafe { &ace.SidStart as *const u32 as *mut core::ffi::c_void };
+        let sid = &ace.SidStart as *const u32 as *mut core::ffi::c_void;
         if unsafe { IsValidSid(sid) } == 0 {
             bail!("Windows DACL entry SID is invalid");
         }
@@ -2468,10 +2584,12 @@ transaction_confirmations = 2
         // A pre-existing directory created with default inherited ACLs must
         // fail closed instead of being auto-repaired or silently adopted.
         // Uses only isolated synthetic directories; no credential store.
+        // `at_raw_root` bypasses the `at_root` test-harness upgrade so this
+        // exercises production rejection.
         let temporary = tempfile::tempdir().unwrap();
         let insecure = temporary.path().join("insecure-existing-root");
         std::fs::create_dir(&insecure).unwrap();
-        let error = ConfigStore::at_root(insecure.clone())
+        let error = ConfigStore::at_raw_root(insecure.clone())
             .save(&AppConfig::default())
             .expect_err("an inherited-ACL directory must not be adopted as private state");
         let message = format!("{error:#}");
