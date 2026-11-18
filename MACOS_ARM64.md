@@ -1,11 +1,11 @@
 # macOS ARM64 manual installation
 
-This guide describes the `v0.1.0-testnet.3` macOS ARM64 Testnet prerelease candidate, Apple
+This guide describes the `v0.1.0-testnet.4` macOS ARM64 Testnet prerelease candidate, Apple
 Silicon only. Confirm the release record and publication status before use. The
 miner source is MIT; the source tree also contains Apache-2.0 and MIT fixture
 license texts and a fixture NOTICE. Binary archives include MIT and third-party notices. Linux x86_64 is
-documented separately in the [Linux x86_64 guide](LINUX_X86_64.md); Windows is
-outside this package and remains unqualified.
+documented separately in the [Linux x86_64 guide](LINUX_X86_64.md); Windows x86_64 is
+documented separately in the [Windows x86_64 guide](WINDOWS_X86_64.md).
 
 The compiled `support/release-repository.txt` contains only the owner/name pair; it
 does not contain a numeric repository ID or release commit. Obtain the
@@ -16,14 +16,14 @@ itself change compiled inputs or require a rebuild.
 
 ## Download and authenticate — before extracting or running
 
-Choose `astatine-v0.1.0-testnet.3-macos-arm64.tar.gz`, not a debug/source archive.
+Choose `astatine-v0.1.0-testnet.4-macos-arm64.tar.gz`, not a debug/source archive.
 Use a trusted GitHub CLI with `release verify`/`verify-asset` support. Run each
 command individually; **stop on any failure or mismatch**. Never pipe downloads
 to a shell. These commands do not authorize installation or paid mining themselves.
 
 ```sh
-tag=v0.1.0-testnet.3
-asset=astatine-v0.1.0-testnet.3-macos-arm64.tar.gz
+tag=v0.1.0-testnet.4
+asset=astatine-v0.1.0-testnet.4-macos-arm64.tar.gz
 # Set these from the authenticated release record after read-back.
 # Use the verified repository name and numeric ID from that record.
 : "${repo:?set the verified OWNER/REPOSITORY}"
@@ -61,7 +61,7 @@ checksum and archive from the same unauthenticated source alone do not
 authenticate a publisher.
 
 Inspect `tar -tzvf "$asset"` first. Exactly one root directory
-`astatine-v0.1.0-testnet.3-macos-arm64/` must contain exactly five regular files:
+`astatine-v0.1.0-testnet.4-macos-arm64/` must contain exactly five regular files:
 `astatine` (0755), `LICENSE-MIT`, `THIRD_PARTY_LICENSES.md`, `BUILD-INFO.json`,
 and `INSTALL.md` (0644).
 Reject extra/hidden/absolute/traversal paths, duplicates, links and special files.
@@ -102,7 +102,7 @@ install -m 755 "$verified/astatine" "$HOME/.local/bin/astatine"
 "$HOME/.local/bin/astatine" --help
 ```
 
-Require `astatine 0.1.0-testnet.3`, and recheck the installed binary's approved
+Require `astatine 0.1.0-testnet.4`, and recheck the installed binary's approved
 hash. Store `LICENSE-MIT` and `THIRD_PARTY_LICENSES.md` with your installation
 records. Inspect `type -a astatine`/`command -v astatine` for aliases, functions or
 older copies; use the full verified path if resolution is ambiguous.

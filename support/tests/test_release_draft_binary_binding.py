@@ -27,7 +27,7 @@ import yaml
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 STEP_NAME = "Verify packaged binaries match attested compiled binaries"
-TAG = "v0.1.0-testnet.3"
+TAG = "v0.1.0-testnet.4"
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 MACOS_BINARY = (
@@ -43,21 +43,43 @@ LINUX_BINARY[4] = 2
 LINUX_BINARY[5] = 1
 LINUX_BINARY[18:20] = (62).to_bytes(2, "little")
 LINUX_BINARY = bytes(LINUX_BINARY)
+WINDOWS_BINARY = (
+    b"MZ" + bytes(58) + (64).to_bytes(4, "little")
+    + b"PE\x00\x00" + (0x8664).to_bytes(2, "little") + bytes(20) + bytes(64)
+)
 
 TARGETS = {
-    "astatine-v0.1.0-testnet.3-macos-arm64.tar.gz": (
-        "astatine-v0.1.0-testnet.3-macos-arm64",
+    "astatine-v0.1.0-testnet.4-macos-arm64.tar.gz": (
+        "astatine-v0.1.0-testnet.4-macos-arm64",
         "aarch64-apple-darwin",
         MACOS_BINARY,
+        "astatine",
+        False,
     ),
-    "astatine-v0.1.0-testnet.3-linux-x86_64.tar.gz": (
-        "astatine-v0.1.0-testnet.3-linux-x86_64",
+    "astatine-v0.1.0-testnet.4-linux-x86_64.tar.gz": (
+        "astatine-v0.1.0-testnet.4-linux-x86_64",
         "x86_64-unknown-linux-gnu",
         LINUX_BINARY,
+        "astatine",
+        False,
+    ),
+    "astatine-v0.1.0-testnet.4-windows-x86_64.zip": (
+        "astatine-v0.1.0-testnet.4-windows-x86_64",
+        "x86_64-pc-windows-msvc",
+        WINDOWS_BINARY,
+        "astatine.exe",
+        True,
     ),
 }
 FILES = (
     ("astatine", 0o755),
+    ("BUILD-INFO.json", 0o644),
+    ("INSTALL.md", 0o644),
+    ("LICENSE-MIT", 0o644),
+    ("THIRD_PARTY_LICENSES.md", 0o644),
+)
+FILES_WINDOWS = (
+    ("astatine.exe", 0o755),
     ("BUILD-INFO.json", 0o644),
     ("INSTALL.md", 0o644),
     ("LICENSE-MIT", 0o644),
@@ -105,7 +127,7 @@ class DraftBinaryBindingTest(unittest.TestCase):
         out = self.tmp / "out"
         entries = []
         sums = []
-        for filename, (root, target, binary) in TARGETS.items():
+        for filename, (root, target, binary, binary_name, is_zip) in TARGETS.items():
             stored_binary = binary
             if tamper_binary:
                 stored_binary = b"TAMPERED-BINARY"
@@ -113,60 +135,94 @@ class DraftBinaryBindingTest(unittest.TestCase):
                 stored_binary = b"NOT-A-BINARY"
             if cross_target and target == "x86_64-unknown-linux-gnu":
                 stored_binary = MACOS_BINARY
+            if cross_target and target == "x86_64-pc-windows-msvc":
+                stored_binary = LINUX_BINARY
             provenance_binary = binary if tamper_binary else stored_binary
+            files = FILES_WINDOWS if is_zip else FILES
             file_data = {
-                "astatine": stored_binary,
+                binary_name: stored_binary,
                 "BUILD-INFO.json": b"{}",
                 "INSTALL.md": b"install",
                 "LICENSE-MIT": b"mit",
                 "THIRD_PARTY_LICENSES.md": b"third-party",
             }
             archive_path = bundle / filename
-            with tarfile.open(archive_path, mode="w:gz") as tar:
-                for name, mode in FILES:
-                    data = file_data[name]
-                    info = tarfile.TarInfo(f"{root}/{name}")
-                    if name == "astatine" and symlink_binary:
-                        info.type = tarfile.SYMTYPE
-                        info.linkname = "attested-binary"
-                        info.size = 0
-                        tar.addfile(info)
-                        continue
-                    info.size = len(data)
-                    info.mode = 0o777 if wrong_mode and name == "astatine" else mode
-                    info.type = tarfile.REGTYPE
-                    tar.addfile(info, io.BytesIO(data))
-                if extra_member:
-                    data = b"extra"
-                    info = tarfile.TarInfo(f"{root}/EXTRA")
-                    info.size = len(data)
-                    info.mode = 0o644
-                    info.type = tarfile.REGTYPE
-                    tar.addfile(info, io.BytesIO(data))
-                if traversal_member:
-                    data = b"traversal"
-                    info = tarfile.TarInfo(f"{root}/../evil")
-                    info.size = len(data)
-                    info.mode = 0o644
-                    info.type = tarfile.REGTYPE
-                    tar.addfile(info, io.BytesIO(data))
-                if duplicate_member:
-                    data = file_data["astatine"]
-                    info = tarfile.TarInfo(f"{root}/astatine")
-                    info.size = len(data)
-                    info.mode = 0o755
-                    info.type = tarfile.REGTYPE
-                    tar.addfile(info, io.BytesIO(data))
+            if is_zip:
+                import zipfile
+                with zipfile.ZipFile(archive_path, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+                    for name, mode in files:
+                        data = file_data[name]
+                        info = zipfile.ZipInfo(filename=f"{root}/{name}")
+                        info.date_time = (1980, 1, 1, 0, 0, 0)
+                        info.compress_type = zipfile.ZIP_DEFLATED
+                        info.create_system = 3
+                        eff_mode = 0o777 if wrong_mode and name == binary_name else mode
+                        info.external_attr = (eff_mode & 0xFFFF) << 16
+                        # Symlink simulation for zip: create a directory entry with same name to force failure
+                        if symlink_binary and name == binary_name:
+                            # Write a directory entry instead to trigger regular-file failure
+                            dir_info = zipfile.ZipInfo(filename=f"{root}/{name}/")
+                            dir_info.date_time = (1980, 1, 1, 0, 0, 0)
+                            dir_info.external_attr = (0o755 << 16) | 0x10
+                            zf.writestr(dir_info, b"")
+                            continue
+                        zf.writestr(info, data)
+                    if extra_member:
+                        zf.writestr(f"{root}/EXTRA", b"extra")
+                    if traversal_member:
+                        zf.writestr(f"{root}/../evil", b"traversal")
+                    if duplicate_member:
+                        # zipfile allows duplicates; write twice to trigger duplicate detection
+                        info = zipfile.ZipInfo(filename=f"{root}/{binary_name}")
+                        info.date_time = (1980, 1, 1, 0, 0, 0)
+                        info.external_attr = (0o755 << 16)
+                        zf.writestr(info, file_data[binary_name])
+            else:
+                with tarfile.open(archive_path, mode="w:gz") as tar:
+                    for name, mode in files:
+                        data = file_data[name]
+                        info = tarfile.TarInfo(f"{root}/{name}")
+                        if name == binary_name and symlink_binary:
+                            info.type = tarfile.SYMTYPE
+                            info.linkname = "attested-binary"
+                            info.size = 0
+                            tar.addfile(info)
+                            continue
+                        info.size = len(data)
+                        info.mode = 0o777 if wrong_mode and name == binary_name else mode
+                        info.type = tarfile.REGTYPE
+                        tar.addfile(info, io.BytesIO(data))
+                    if extra_member:
+                        data = b"extra"
+                        info = tarfile.TarInfo(f"{root}/EXTRA")
+                        info.size = len(data)
+                        info.mode = 0o644
+                        info.type = tarfile.REGTYPE
+                        tar.addfile(info, io.BytesIO(data))
+                    if traversal_member:
+                        data = b"traversal"
+                        info = tarfile.TarInfo(f"{root}/../evil")
+                        info.size = len(data)
+                        info.mode = 0o644
+                        info.type = tarfile.REGTYPE
+                        tar.addfile(info, io.BytesIO(data))
+                    if duplicate_member:
+                        data = file_data[binary_name]
+                        info = tarfile.TarInfo(f"{root}/{binary_name}")
+                        info.size = len(data)
+                        info.mode = 0o755
+                        info.type = tarfile.REGTYPE
+                        tar.addfile(info, io.BytesIO(data))
 
             members = []
-            for name, mode in FILES:
+            for name, mode in files:
                 data = file_data[name]
                 members.append(
                     {
                         "archive_path": f"{root}/{name}",
                         "sha256": sha256(data),
                         "bytes": len(data),
-                        "mode": oct(0o777 if wrong_mode and name == "astatine" else mode),
+                        "mode": oct(0o777 if wrong_mode and name == binary_name else mode),
                     }
                 )
             entry = {
@@ -211,7 +267,8 @@ class DraftBinaryBindingTest(unittest.TestCase):
         for target, record in manifest["binaries"].items():
             expected_binary = next(v[2] for v in TARGETS.values() if v[1] == target)
             self.assertEqual(record["sha256"], sha256(expected_binary))
-            self.assertTrue((out / target / "astatine").is_file())
+            dest = "astatine.exe" if target == "x86_64-pc-windows-msvc" else "astatine"
+            self.assertTrue((out / target / dest).is_file())
 
     def test_tampered_binary_member_fails(self) -> None:
         bundle, out = self.make_bundle(tamper_binary=True)

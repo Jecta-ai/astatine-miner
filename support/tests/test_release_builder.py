@@ -23,10 +23,12 @@ from pathlib import Path
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 BUILDER_PATH = SOURCE_ROOT / "support" / "release" / "build-release.py"
 
-MACOS_ROOT = "astatine-v0.1.0-testnet.3-macos-arm64"
-LINUX_ROOT = "astatine-v0.1.0-testnet.3-linux-x86_64"
-MACOS_ARCHIVE = "astatine-v0.1.0-testnet.3-macos-arm64.tar.gz"
-LINUX_ARCHIVE = "astatine-v0.1.0-testnet.3-linux-x86_64.tar.gz"
+MACOS_ROOT = "astatine-v0.1.0-testnet.4-macos-arm64"
+LINUX_ROOT = "astatine-v0.1.0-testnet.4-linux-x86_64"
+MACOS_ARCHIVE = "astatine-v0.1.0-testnet.4-macos-arm64.tar.gz"
+WINDOWS_ROOT = "astatine-v0.1.0-testnet.4-windows-x86_64"
+WINDOWS_ARCHIVE = "astatine-v0.1.0-testnet.4-windows-x86_64.zip"
+LINUX_ARCHIVE = "astatine-v0.1.0-testnet.4-linux-x86_64.tar.gz"
 EXPECTED_MACOS_MEMBERS = sorted([
     f"{MACOS_ROOT}/astatine",
     f"{MACOS_ROOT}/LICENSE-MIT",
@@ -41,7 +43,14 @@ EXPECTED_LINUX_MEMBERS = sorted([
     f"{LINUX_ROOT}/BUILD-INFO.json",
     f"{LINUX_ROOT}/INSTALL.md",
 ])
-TAG = "v0.1.0-testnet.3"
+EXPECTED_WINDOWS_MEMBERS = sorted([
+    f"{WINDOWS_ROOT}/astatine.exe",
+    f"{WINDOWS_ROOT}/LICENSE-MIT",
+    f"{WINDOWS_ROOT}/THIRD_PARTY_LICENSES.md",
+    f"{WINDOWS_ROOT}/BUILD-INFO.json",
+    f"{WINDOWS_ROOT}/INSTALL.md",
+])
+TAG = "v0.1.0-testnet.4"
 LEGIT_RUSTC_LINE = "rustc 1.94.1 (e408947bf 2026-03-25)"
 LEGIT_CARGO_LINE = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
 
@@ -56,6 +65,10 @@ FAKE_MACHO = (
     + (0).to_bytes(4, "little")
     + (2).to_bytes(4, "little")
     + bytes(20)
+)
+FAKE_PE = (
+    b"MZ" + bytes(58) + (64).to_bytes(4, "little")
+    + b"PE\x00\x00" + (0x8664).to_bytes(2, "little") + bytes(20) + bytes(64)
 )
 
 
@@ -106,6 +119,7 @@ class ReleaseBuilderTests(unittest.TestCase):
             "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
             "support/release/RELEASE_NOTES-v0.1.0-testnet.2.md",
             "support/release/RELEASE_NOTES-v0.1.0-testnet.3.md",
+            "support/release/RELEASE_NOTES-v0.1.0-testnet.4.md",
         ):
             src = SOURCE_ROOT / rel
             if not src.is_file():
@@ -115,8 +129,10 @@ class ReleaseBuilderTests(unittest.TestCase):
             shutil.copy2(src, dest)
         self.macos_bin = Path(self.bin_tmp.name) / "macos-astatine"
         self.linux_bin = Path(self.bin_tmp.name) / "linux-astatine"
+        self.windows_bin = Path(self.bin_tmp.name) / "windows-astatine.exe"
         self.macos_bin.write_bytes(FAKE_MACHO + b"\x00" * 64)
         self.linux_bin.write_bytes(FAKE_ELF)
+        self.windows_bin.write_bytes(FAKE_PE)
         (self.root / ".gitignore").write_text("target/\n", encoding="utf-8")
         init_repo(self.root)
         self.out = Path(self.out_tmp.name) / "out"
@@ -134,6 +150,7 @@ class ReleaseBuilderTests(unittest.TestCase):
             repository_id="123456789",
             macos_binary=self.macos_bin,
             linux_binary=self.linux_bin,
+            windows_binary=self.windows_bin,
             rustc_version=LEGIT_RUSTC_LINE,
             cargo_version=LEGIT_CARGO_LINE,
         )
@@ -146,21 +163,28 @@ class ReleaseBuilderTests(unittest.TestCase):
         self.assertFalse(result["publication_authorized"])
         self.assertFalse(result["final_release_controls_complete"])
         self.assertEqual(result["tag"], TAG)
-        # Two archives with root-prefixed five members.
+        # Three archives with root-prefixed five members, per-target exact.
         by_name = {e["filename"]: e for e in result["archives"]}
-        self.assertEqual(sorted(by_name), sorted([MACOS_ARCHIVE, LINUX_ARCHIVE]))
+        self.assertEqual(sorted(by_name), sorted([MACOS_ARCHIVE, LINUX_ARCHIVE, WINDOWS_ARCHIVE]))
         for entry in result["archives"]:
             members = sorted(m["archive_path"] for m in entry["members"])
             if entry["filename"] == MACOS_ARCHIVE:
                 self.assertEqual(members, EXPECTED_MACOS_MEMBERS)
-            else:
+            elif entry["filename"] == LINUX_ARCHIVE:
                 self.assertEqual(members, EXPECTED_LINUX_MEMBERS)
-            # Modes preserved inside root.
+            else:
+                self.assertEqual(members, EXPECTED_WINDOWS_MEMBERS)
+            # Modes preserved inside root, per-target exact (never shared).
             for m in entry["members"]:
-                if m["archive_path"].endswith("/astatine"):
+                if m["archive_path"].endswith("/astatine") or m["archive_path"].endswith("/astatine.exe"):
                     self.assertEqual(m["mode"], "0o755")
                 else:
                     self.assertEqual(m["mode"], "0o644")
+            # Per-target exact: Unix must not contain exe, Windows must not contain bare astatine.
+            if entry["filename"] == WINDOWS_ARCHIVE:
+                self.assertNotIn(f"{WINDOWS_ROOT}/astatine", [x for x in members if not x.endswith(".exe")])
+            else:
+                self.assertFalse(any(x.endswith("astatine.exe") for x in members))
         # Deterministic bytes across runs.
         first = {e["filename"]: Path(self.out / e["filename"]).read_bytes() for e in result["archives"]}
         second_out = Path(self.out_tmp.name) / "out-two"
@@ -171,27 +195,46 @@ class ReleaseBuilderTests(unittest.TestCase):
             repository_id="123456789",
             macos_binary=self.macos_bin,
             linux_binary=self.linux_bin,
+            windows_binary=self.windows_bin,
             rustc_version=LEGIT_RUSTC_LINE,
             cargo_version=LEGIT_CARGO_LINE,
         )
         for e in result["archives"]:
             self.assertEqual(first[e["filename"]], (second_out / e["filename"]).read_bytes())
-        # Tar listing shows single root dir; workflow fixture check still works.
-        for archive, root in ((MACOS_ARCHIVE, MACOS_ROOT), (LINUX_ARCHIVE, LINUX_ROOT)):
+        # Archive listing shows single root dir; workflow fixture check still works (tar for Unix, zip for Windows).
+        import zipfile
+        for archive, root, binary_name in ((MACOS_ARCHIVE, MACOS_ROOT, "astatine"), (LINUX_ARCHIVE, LINUX_ROOT, "astatine"), (WINDOWS_ARCHIVE, WINDOWS_ROOT, "astatine.exe")):
             data = (self.out / archive).read_bytes()
-            with tarfile.open(fileobj=io.BytesIO(data), mode="r") as tar:
-                names = tar.getnames()
-                self.assertEqual(sorted(names), sorted(
-                    [f"{root}/astatine", f"{root}/LICENSE-MIT", f"{root}/THIRD_PARTY_LICENSES.md", f"{root}/BUILD-INFO.json", f"{root}/INSTALL.md"]
-                ))
-                # Simulate workflow `tar -tzf` fixture check with prefix.
-                listing = "\n".join(names)
-                self.assertNotIn("tests/fixtures", listing)
-                self.assertNotIn("PROVENANCE.json", listing)
-                for m in tar.getmembers():
-                    self.assertEqual(m.mtime, 0)
-                    self.assertEqual(m.uid, 0)
-                    self.assertFalse(m.issym() or m.islnk())
+            if archive.endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(data), mode="r") as zf:
+                    names = zf.namelist()
+                    self.assertEqual(sorted(names), sorted(
+                        [f"{root}/{binary_name}", f"{root}/LICENSE-MIT", f"{root}/THIRD_PARTY_LICENSES.md", f"{root}/BUILD-INFO.json", f"{root}/INSTALL.md"]
+                    ))
+                    listing = "\n".join(names)
+                    self.assertNotIn("tests/fixtures", listing)
+                    self.assertNotIn("PROVENANCE.json", listing)
+                    self.assertNotIn("\\", listing)
+                    for info in zf.infolist():
+                        self.assertFalse(info.is_dir())
+                        self.assertEqual(info.date_time, (1980, 1, 1, 0, 0, 0))
+                        mode = (info.external_attr >> 16) & 0o777
+                        expected_mode = 0o755 if info.filename.endswith(binary_name) else 0o644
+                        self.assertEqual(mode, expected_mode)
+            else:
+                with tarfile.open(fileobj=io.BytesIO(data), mode="r") as tar:
+                    names = tar.getnames()
+                    self.assertEqual(sorted(names), sorted(
+                        [f"{root}/{binary_name}", f"{root}/LICENSE-MIT", f"{root}/THIRD_PARTY_LICENSES.md", f"{root}/BUILD-INFO.json", f"{root}/INSTALL.md"]
+                    ))
+                    # Simulate workflow `tar -tzf` fixture check with prefix.
+                    listing = "\n".join(names)
+                    self.assertNotIn("tests/fixtures", listing)
+                    self.assertNotIn("PROVENANCE.json", listing)
+                    for m in tar.getmembers():
+                        self.assertEqual(m.mtime, 0)
+                        self.assertEqual(m.uid, 0)
+                        self.assertFalse(m.issym() or m.islnk())
         # SHA256SUMS and provenance.
         sums = (self.out / "SHA256SUMS").read_text(encoding="utf-8")
         for e in result["archives"]:
@@ -202,21 +245,28 @@ class ReleaseBuilderTests(unittest.TestCase):
         self.assertFalse(prov["publication_authorized"])
         self.assertFalse(prov["final_release_controls_complete"])
         self.assertEqual(prov["tag"], TAG)
-        self.assertEqual(len(prov["archives"]), 2)
+        self.assertEqual(len(prov["archives"]), 3)
         dumped = json.dumps(prov)
         self.assertNotIn('"publication_authorized": true', dumped)
         self.assertNotIn(str(self.root.resolve()), dumped)
         self.assertNotIn(str(self.out.resolve()), dumped)
         self.assertNotIn("--macos-binary", dumped)
         self.assertNotIn("--linux-binary", dumped)
+        self.assertNotIn("--windows-binary", dumped)
 
     def test_install_safety_no_sudo_no_xattr(self) -> None:
+        import zipfile
         result = self.run_builder()
         for e in result["archives"]:
-            with tarfile.open(self.out / e["filename"], mode="r") as tar:
-                install = tar.extractfile(
-                    f"{MACOS_ROOT}/INSTALL.md" if "macos" in e["filename"] else f"{LINUX_ROOT}/INSTALL.md"
-                ).read().decode("utf-8")
+            if e["filename"].endswith(".zip"):
+                with zipfile.ZipFile(self.out / e["filename"], mode="r") as zf:
+                    root = WINDOWS_ROOT
+                    install = zf.read(f"{root}/INSTALL.md").decode("utf-8")
+            else:
+                with tarfile.open(self.out / e["filename"], mode="r") as tar:
+                    install = tar.extractfile(
+                        f"{MACOS_ROOT}/INSTALL.md" if "macos" in e["filename"] else f"{LINUX_ROOT}/INSTALL.md"
+                    ).read().decode("utf-8")
             lowered = install.lower()
             if "macos" in e["filename"]:
                 # Ad-hoc only, NOT Developer ID/notarized (macOS only).
@@ -226,7 +276,7 @@ class ReleaseBuilderTests(unittest.TestCase):
                 # Gatekeeper: stop and retain, with an explicit prohibition.
                 self.assertIn("stop and retain", lowered)
                 self.assertIn("Do NOT disable Gatekeeper", install)
-            else:
+            elif "linux" in e["filename"]:
                 # Linux platform notes instead of macOS signing notes.
                 self.assertIn("glibc", lowered)
                 self.assertIn("secret service", lowered)
@@ -234,6 +284,12 @@ class ReleaseBuilderTests(unittest.TestCase):
                 self.assertNotIn("ad-hoc", lowered)
                 self.assertNotIn("developer id", lowered)
                 self.assertNotIn("notarized", lowered)
+            else:
+                # Windows platform notes: elevation prohibited, Credential Manager, no sudo.
+                self.assertIn("windows", lowered)
+                self.assertIn("never require elevation", lowered)
+                self.assertNotIn("ad-hoc", lowered)
+                self.assertNotIn("glibc", lowered)
             # No imperative instructions/commands to weaken system policy or
             # escalate privileges: reject commands, not the word inside a
             # "Do NOT ..." prohibition sentence.
@@ -250,9 +306,13 @@ class ReleaseBuilderTests(unittest.TestCase):
                     f"sudo invocation found: {line!r}",
                 )
                 self.assertNotIn("`sudo ", lowered_line)
-            # User-owned path, never sudo.
-            self.assertIn("$HOME/.local/bin", install)
-            self.assertIn("never require sudo", lowered)
+            # User-owned path, never sudo/elevation.
+            if e["filename"].endswith(".zip"):
+                self.assertIn("$env:USERPROFILE", install)
+                self.assertIn("never require elevation", lowered)
+            else:
+                self.assertIn("$HOME/.local/bin", install)
+                self.assertIn("never require sudo", lowered)
             self.assertNotIn("/usr/local/bin", install)
             # Attestation instructions preserved.
             self.assertIn("build-provenance", install)
@@ -262,21 +322,33 @@ class ReleaseBuilderTests(unittest.TestCase):
             self.assertNotIn("mainnet deployment", install.lower().replace("no mainnet", ""))
         # Platform checksum commands: single-platform filtered rows using the
         # actual archive name; never a full-file check for one platform.
+        import zipfile
         with tarfile.open(self.out / MACOS_ARCHIVE, mode="r") as tar:
             mac_install = tar.extractfile(f"{MACOS_ROOT}/INSTALL.md").read().decode("utf-8")
         with tarfile.open(self.out / LINUX_ARCHIVE, mode="r") as tar:
             lin_install = tar.extractfile(f"{LINUX_ROOT}/INSTALL.md").read().decode("utf-8")
+        with zipfile.ZipFile(self.out / WINDOWS_ARCHIVE, mode="r") as zf:
+            win_install = zf.read(f"{WINDOWS_ROOT}/INSTALL.md").decode("utf-8")
         self.assertIn(f'grep -F "  {MACOS_ARCHIVE}" SHA256SUMS | shasum -a 256 -c -', mac_install)
         self.assertIn(f'grep -F "  {LINUX_ARCHIVE}" SHA256SUMS | sha256sum -c -', lin_install)
+        self.assertIn("Get-FileHash", win_install)
+        self.assertIn("SHA256 mismatch", win_install)
+        self.assertIn("checksum row missing", win_install)
         self.assertNotIn("shasum -a 256 -c SHA256SUMS", mac_install)
         self.assertNotIn("sha256sum -c SHA256SUMS", lin_install)
 
     def test_build_info_record(self) -> None:
+        import zipfile
         result = self.run_builder()
         for e in result["archives"]:
-            root = MACOS_ROOT if "macos" in e["filename"] else LINUX_ROOT
-            with tarfile.open(self.out / e["filename"], mode="r") as tar:
-                info = json.loads(tar.extractfile(f"{root}/BUILD-INFO.json").read().decode("utf-8"))
+            if e["filename"].endswith(".zip"):
+                root = WINDOWS_ROOT
+                with zipfile.ZipFile(self.out / e["filename"], mode="r") as zf:
+                    info = json.loads(zf.read(f"{root}/BUILD-INFO.json").decode("utf-8"))
+            else:
+                root = MACOS_ROOT if "macos" in e["filename"] else LINUX_ROOT
+                with tarfile.open(self.out / e["filename"], mode="r") as tar:
+                    info = json.loads(tar.extractfile(f"{root}/BUILD-INFO.json").read().decode("utf-8"))
             self.assertEqual(info["schema"], "astatine-build-info/v1")
             self.assertTrue(info["release_intent_authorized"])
             self.assertFalse(info["publication_authorized"])
@@ -367,6 +439,40 @@ class ReleaseBuilderTests(unittest.TestCase):
         with self.assertRaisesRegex(BUILDER.ReleaseError, "regeneration script changed"):
             self.run_builder()
 
+    def test_windows_non_pe_binary_rejected(self) -> None:
+        with tempfile.NamedTemporaryFile(prefix="not-a-pe-", delete=False) as handle:
+            handle.write(FAKE_ELF)
+            not_pe = Path(handle.name)
+        try:
+            with self.assertRaisesRegex(BUILDER.ReleaseError, "not a PE"):
+                self.run_builder(windows_binary=not_pe)
+        finally:
+            not_pe.unlink()
+
+    def test_windows_truncated_binary_rejected(self) -> None:
+        with tempfile.NamedTemporaryFile(prefix="truncated-pe-", delete=False) as handle:
+            handle.write(b"MZ" + bytes(10))
+            truncated = Path(handle.name)
+        try:
+            with self.assertRaisesRegex(BUILDER.ReleaseError, "too small"):
+                self.run_builder(windows_binary=truncated)
+        finally:
+            truncated.unlink()
+
+    def test_windows_wrong_arch_rejected(self) -> None:
+        other = bytearray(FAKE_PE)
+        other[0x3C:0x40] = (64).to_bytes(4, "little")
+        other[64:68] = b"PE\x00\x00"
+        other[64 + 4:64 + 6] = (0x014C).to_bytes(2, "little")
+        with tempfile.NamedTemporaryFile(prefix="wrong-arch-pe-", delete=False) as handle:
+            handle.write(bytes(other))
+            wrong_arch = Path(handle.name)
+        try:
+            with self.assertRaisesRegex(BUILDER.ReleaseError, "not an x86-64"):
+                self.run_builder(windows_binary=wrong_arch)
+        finally:
+            wrong_arch.unlink()
+
     def test_mismatched_rustc_rejected(self) -> None:
         with self.assertRaisesRegex(BUILDER.ReleaseError, "--rustc-version"):
             self.run_builder(rustc_version="rustc 1.95.0 (e408947bf 2026-03-25)")
@@ -378,7 +484,7 @@ class ReleaseBuilderTests(unittest.TestCase):
         self.assertFalse(self.out.exists())
 
     def test_missing_toolchain_args_rejected(self) -> None:
-        with self.assertRaises(BUILDER.ReleaseError):
+        with self.assertRaises(TypeError):
             BUILDER.run(
                 source_root=self.root,
                 output_dir=self.out,
@@ -395,6 +501,7 @@ class ReleaseBuilderTests(unittest.TestCase):
                 repository_id="123456789",
                 macos_binary=self.macos_bin,
                 linux_binary=self.linux_bin,
+                windows_binary=self.windows_bin,
                 rustc_version=LEGIT_RUSTC_LINE,
             )
         with self.assertRaises(BUILDER.ReleaseError):
@@ -405,6 +512,7 @@ class ReleaseBuilderTests(unittest.TestCase):
                 repository_id="123456789",
                 macos_binary=self.macos_bin,
                 linux_binary=self.linux_bin,
+                windows_binary=self.windows_bin,
                 rustc_version=LEGIT_RUSTC_LINE,
                 cargo_version="",
             )
@@ -415,6 +523,7 @@ class ReleaseBuilderTests(unittest.TestCase):
                     "--repository-id", "123456789",
                     "--macos-binary", str(self.macos_bin),
                     "--linux-binary", str(self.linux_bin),
+                    "--windows-binary", str(self.windows_bin),
                     "--source-root", str(self.root),
                     "--output-dir", str(self.out),
                 ]
@@ -438,10 +547,16 @@ class ReleaseBuilderTests(unittest.TestCase):
         prov_text = (self.out / "release-provenance.json").read_text(encoding="utf-8")
         self.assertNotIn("independently observed", prov_text)
         self.assertNotIn("independently re-observe", prov_text)
+        import zipfile
         for e in json.loads(prov_text)["archives"]:
-            root = MACOS_ROOT if "macos" in e["filename"] else LINUX_ROOT
-            with tarfile.open(self.out / e["filename"], mode="r") as tar:
-                info_text = tar.extractfile(f"{root}/BUILD-INFO.json").read().decode("utf-8")
+            if e["filename"].endswith(".zip"):
+                root = WINDOWS_ROOT
+                with zipfile.ZipFile(self.out / e["filename"], mode="r") as zf:
+                    info_text = zf.read(f"{root}/BUILD-INFO.json").decode("utf-8")
+            else:
+                root = MACOS_ROOT if "macos" in e["filename"] else LINUX_ROOT
+                with tarfile.open(self.out / e["filename"], mode="r") as tar:
+                    info_text = tar.extractfile(f"{root}/BUILD-INFO.json").read().decode("utf-8")
             self.assertNotIn("independently observed", info_text)
             self.assertNotIn("independently re-observe", info_text)
             self.assertIn("did not independently execute rustc", info_text)
@@ -456,10 +571,16 @@ class ReleaseBuilderTests(unittest.TestCase):
         self.assertFalse(prov["owner_self_approval"]["independent_reviewer"])
         self.assertTrue(prov["owner_self_approval"]["residual_risk_accepted"])
         self.assertEqual(prov["historical_release_intent"]["tag"], "v0.1.0-testnet.1")
+        import zipfile
         for e in result["archives"]:
-            root = MACOS_ROOT if "macos" in e["filename"] else LINUX_ROOT
-            with tarfile.open(self.out / e["filename"], mode="r") as tar:
-                info = json.loads(tar.extractfile(f"{root}/BUILD-INFO.json").read().decode("utf-8"))
+            if e["filename"].endswith(".zip"):
+                root = WINDOWS_ROOT
+                with zipfile.ZipFile(self.out / e["filename"], mode="r") as zf:
+                    info = json.loads(zf.read(f"{root}/BUILD-INFO.json").decode("utf-8"))
+            else:
+                root = MACOS_ROOT if "macos" in e["filename"] else LINUX_ROOT
+                with tarfile.open(self.out / e["filename"], mode="r") as tar:
+                    info = json.loads(tar.extractfile(f"{root}/BUILD-INFO.json").read().decode("utf-8"))
             self.assertEqual(info["release_controls"]["publication_mode"], "draft-only-manual-publish")
             self.assertTrue(info["release_controls"]["manual_publish_required"])
             self.assertTrue(info["release_controls"]["immutable_setting_admin_verification_required"])
@@ -468,7 +589,7 @@ class ReleaseBuilderTests(unittest.TestCase):
             self.assertFalse(info["release_controls"]["environment_prevent_self_review"])
             self.assertFalse(info["release_controls"]["independent_environment_review"])
             self.assertEqual(info["release_controls"]["environment_reviewer_owner_id"], 86115037)
-            self.assertEqual(info["release_controls"]["tag_policy"], "refs/tags/v0.1.0-testnet.3")
+            self.assertEqual(info["release_controls"]["tag_policy"], "refs/tags/v0.1.0-testnet.4")
             self.assertEqual(
                 info["release_controls"]["tag_ruleset_exact_scope"],
                 "refs/tags/v*",
@@ -544,7 +665,7 @@ class ReleaseBuilderTests(unittest.TestCase):
 
     def test_tag_version_mismatch_rejected(self) -> None:
         (self.root / "Cargo.toml").write_text(
-            (self.root / "Cargo.toml").read_text().replace("0.1.0-testnet.3", "0.1.0-testnet.9"),
+            (self.root / "Cargo.toml").read_text().replace("0.1.0-testnet.4", "0.1.0-testnet.9"),
             encoding="utf-8",
         )
         subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)

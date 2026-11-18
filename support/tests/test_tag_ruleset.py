@@ -27,7 +27,7 @@ from pathlib import Path
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = SOURCE_ROOT / "support" / "release" / "verify-tag-ruleset.py"
-TAG = "v0.1.0-testnet.3"
+TAG = "v0.1.0-testnet.4"
 REPOSITORY = "Jecta-ai/astatine-miner"
 
 
@@ -157,6 +157,7 @@ class TagRulesetTests(unittest.TestCase):
             "refs/tags/v0.1.0-testnet.0",
             "refs/tags/v0.1.0-testnet.1",
             "refs/tags/v0.1.0-testnet.2",
+            "refs/tags/v0.1.0-testnet.3",
             f"refs/tags/{TAG}",
         ]
         with self.assertRaises(MOD.TagRulesetError):
@@ -317,6 +318,7 @@ class TagRulesetTests(unittest.TestCase):
             "refs/tags/v0.1.0-testnet.0",
             "refs/tags/v0.1.0-testnet.1",
             "refs/tags/v0.1.0-testnet.2",
+            "refs/tags/v0.1.0-testnet.3",
             f"refs/tags/{TAG}",
         ]
         with self.assertRaises(MOD.TagRulesetError):

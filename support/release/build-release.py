@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Offline release-intent dual-platform release packager (no publication, draft-only).
+"""Offline release-intent triple-platform release packager (no publication, draft-only).
 
 Uses support/release/gate.py and requires the owner-authorized release-intent
 licensing state (not final publication authorization; final release controls
 remain outstanding).
-Packages exactly two deterministic archives for the exact tag
-``v0.1.0-testnet.3`` — macOS ARM64 and Linux x86_64 — each with exactly
-``astatine``, ``LICENSE-MIT``, ``THIRD_PARTY_LICENSES.md``, ``BUILD-INFO.json``,
+Packages exactly three deterministic archives for the exact tag
+``v0.1.0-testnet.4`` — macOS ARM64 and Linux x86_64 (tar.gz) plus Windows x86_64 (zip) — each with exactly
+``astatine``/``astatine.exe``, ``LICENSE-MIT``, ``THIRD_PARTY_LICENSES.md``, ``BUILD-INFO.json``,
 and ``INSTALL.md``. Generates deterministic ``BUILD-INFO.json`` (schema
 ``astatine-build-info/v1``) and platform-specific ``INSTALL.md``, emits
 ``SHA256SUMS`` and ``release-provenance.json`` with no absolute paths or raw
@@ -28,13 +28,13 @@ support/release/build-dry-run.py, which never publishes even when the
 licensing gate is authorized.
 
 Low-10 limitation: this packager validates binary format only (Mach-O 64-bit
-ARM64 / ELF64 x86_64 headers); it does not prove binary identity or
+ARM64 / ELF64 x86_64 / PE x86_64 headers); it does not prove binary identity or
 source-to-binary linkage. Binary identity is established by the workflow build
 jobs and GitHub build provenance, not by this offline packager.
 
 Usage:
-    python3 -B support/release/build-release.py --tag v0.1.0-testnet.3 \\
-        --repository-id <digits> --macos-binary <path> --linux-binary <path> \\
+    python3 -B support/release/build-release.py --tag v0.1.0-testnet.4 \\
+        --repository-id <digits> --macos-binary <path> --linux-binary <path> --windows-binary <path> \\
         --rustc-version "rustc 1.94.1 (e408947bf 2026-03-25)" \\
         --cargo-version "cargo 1.94.1 (29ea6fb6a 2026-03-24)" \\
         --output-dir <new-or-empty-dir-outside-source>
@@ -56,6 +56,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import zipfile
 from pathlib import Path, PurePosixPath
 
 PROVENANCE_REL = "tests/fixtures/PROVENANCE.json"
@@ -84,15 +85,19 @@ BINARY_BUILD_LINKAGE_NOTE = (
     "required to link each archived binary to that tag build, and independent "
     "bit-for-bit reproducibility across hosts is not claimed by this package"
 )
-EXPECTED_RELEASE_VERSION = "0.1.0-testnet.3"
-RELEASE_NOTES_TAG = "v0.1.0-testnet.3"
+EXPECTED_RELEASE_VERSION = "0.1.0-testnet.4"
+RELEASE_NOTES_TAG = "v0.1.0-testnet.4"
 MACOS_TARGET = "aarch64-apple-darwin"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
-MACOS_ARCHIVE = "astatine-v0.1.0-testnet.3-macos-arm64.tar.gz"
-LINUX_ARCHIVE = "astatine-v0.1.0-testnet.3-linux-x86_64.tar.gz"
-MACOS_ROOT = "astatine-v0.1.0-testnet.3-macos-arm64"
-LINUX_ROOT = "astatine-v0.1.0-testnet.3-linux-x86_64"
+MACOS_ARCHIVE = "astatine-v0.1.0-testnet.4-macos-arm64.tar.gz"
+LINUX_ARCHIVE = "astatine-v0.1.0-testnet.4-linux-x86_64.tar.gz"
+MACOS_ROOT = "astatine-v0.1.0-testnet.4-macos-arm64"
+LINUX_ROOT = "astatine-v0.1.0-testnet.4-linux-x86_64"
+WINDOWS_TARGET = "x86_64-pc-windows-msvc"
+WINDOWS_ARCHIVE = "astatine-v0.1.0-testnet.4-windows-x86_64.zip"
+WINDOWS_ROOT = "astatine-v0.1.0-testnet.4-windows-x86_64"
 EXPECTED_BASENAMES = ["BUILD-INFO.json", "INSTALL.md", "LICENSE-MIT", "THIRD_PARTY_LICENSES.md", "astatine"]
+EXPECTED_BASENAMES_WINDOWS = ["BUILD-INFO.json", "INSTALL.md", "LICENSE-MIT", "THIRD_PARTY_LICENSES.md", "astatine.exe"]
 
 
 class ReleaseError(Exception):
@@ -194,6 +199,15 @@ def require_elf_x86_64(data: bytes, label: str) -> None:
     require(data[4] == 2, f"{label} binary is not a 64-bit (EI_CLASS) ELF object")
     require(data[5] == 1, f"{label} binary is not a little-endian (EI_DATA) ELF object")
     require(int.from_bytes(data[18:20], "little") == 62, f"{label} binary is not an x86-64 (e_machine) ELF object")
+
+
+def require_pe_x86_64(data: bytes, label: str) -> None:
+    require(len(data) >= 64, f"{label} binary is too small to be a PE executable")
+    require(data[0:2] == b"MZ", f"{label} binary is not a PE (MZ) executable")
+    e_lfanew = int.from_bytes(data[0x3C:0x40], "little")
+    require(e_lfanew >= 0 and e_lfanew + 6 <= len(data), f"{label} binary has an invalid PE header offset")
+    require(data[e_lfanew:e_lfanew + 4] == b"PE\x00\x00", f"{label} binary is missing the PE signature")
+    require(int.from_bytes(data[e_lfanew + 4:e_lfanew + 6], "little") == 0x8664, f"{label} binary is not an x86-64 (AMD64) PE object")
 
 
 def parse_cargo_package(text: str) -> tuple[str, str]:
@@ -310,6 +324,20 @@ def build_deterministic_tarball(member_bytes: list[tuple[str, bytes, int]]) -> b
     return compressed.getvalue()
 
 
+def build_deterministic_zip(member_bytes: list[tuple[str, bytes, int]]) -> bytes:
+    ordered = sorted(member_bytes, key=lambda item: item[0])
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        for archive_path, data, mode in ordered:
+            info = zipfile.ZipInfo(filename=archive_path)
+            info.date_time = (1980, 1, 1, 0, 0, 0)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.create_system = 3
+            info.external_attr = (mode & 0xFFFF) << 16
+            zf.writestr(info, data)
+    return buffer.getvalue()
+
+
 def prepare_output_dir(output_dir: Path, resolved_root: Path) -> Path:
     require(bool(str(output_dir)), "--output-dir is required")
     candidate = output_dir.resolve(strict=False)
@@ -396,13 +424,14 @@ def generate_build_info(
     gate: dict,
 ) -> bytes:
     how_to_obtain = f"git clone https://github.com/{repository}.git && git checkout {tag}"
+    binary_name = "astatine.exe" if target == WINDOWS_TARGET else EXPECTED_BINARY_NAME
     record = {
         "schema": BUILD_INFO_SCHEMA,
         "distribution": "release-intent-authorized-draft-only",
         "release_intent_authorized": True,
         "publication_authorized": False,
         "final_release_controls_complete": False,
-        "package": {"name": package_name, "version": package_version, "binary": EXPECTED_BINARY_NAME},
+        "package": {"name": package_name, "version": package_version, "binary": binary_name},
         "release": {
             "version": package_version,
             "tag": tag,
@@ -460,7 +489,7 @@ def generate_build_info(
             "license": "LICENSE-MIT",
         },
         "install": {
-            "binary": EXPECTED_BINARY_NAME,
+            "binary": binary_name,
             "mode": oct(FILE_MODE_BIN),
             "instructions": "INSTALL.md",
         },
@@ -518,8 +547,18 @@ def generate_install_md(
     target: str,
 ) -> bytes:
     how_to_obtain = f"git clone https://github.com/{repository}.git && git checkout {tag}"
-    archive_name = MACOS_ARCHIVE if target == MACOS_TARGET else LINUX_ARCHIVE
-    root_dir = MACOS_ROOT if target == MACOS_TARGET else LINUX_ROOT
+    if target == MACOS_TARGET:
+        archive_name = MACOS_ARCHIVE
+        root_dir = MACOS_ROOT
+        binary_name = "astatine"
+    elif target == LINUX_TARGET:
+        archive_name = LINUX_ARCHIVE
+        root_dir = LINUX_ROOT
+        binary_name = "astatine"
+    else:
+        archive_name = WINDOWS_ARCHIVE
+        root_dir = WINDOWS_ROOT
+        binary_name = "astatine.exe"
     if target == MACOS_TARGET:
         platform_section = f"""## macOS ARM64 notes
 
@@ -534,13 +573,13 @@ def generate_install_md(
   archive. Never require sudo. Install only the verified `astatine` binary to
   a user-owned path such as `$HOME/.local/bin` after checking that directory
   and its ownership.
-- Verify only this platform archive against `SHA256SUMS` (which covers both
-  platform archives) with:
+- Verify only this platform archive against `SHA256SUMS` (which covers all
+  three platform archives) with:
   `grep -F "  {archive_name}" SHA256SUMS | shasum -a 256 -c -`
   Always verify the GitHub build-provenance attestations for the exact tag and
   confirm the release is immutable (`gh release view <tag> --json isImmutable --jq .isImmutable`
   prints `true`) before installing; never trust the archive alone."""
-    else:
+    elif target == LINUX_TARGET:
         platform_section = f"""## Linux x86_64 notes
 
 - This package contains a Linux x86_64 (`x86_64-unknown-linux-gnu`) binary
@@ -554,16 +593,63 @@ def generate_install_md(
   untested for this release and CPU mining is the only qualified path.
 - Never require sudo. Install only to a user-owned path such as
   `$HOME/.local/bin` after checking that directory and its ownership.
-- Verify only this platform archive against `SHA256SUMS` (which covers both
-  platform archives) with:
+- Verify only this platform archive against `SHA256SUMS` (which covers all
+  three platform archives) with:
   `grep -F "  {archive_name}" SHA256SUMS | sha256sum -c -`
   Always verify the GitHub build-provenance attestations for the exact tag and
   confirm the release is immutable (`gh release view <tag> --json isImmutable --jq .isImmutable`
   prints `true`) before installing."""
+    else:
+        platform_section = f"""## Windows x86_64 notes
+
+- This package contains a Windows x86_64 (`x86_64-pc-windows-msvc`) binary
+  (`astatine.exe`) built on Windows. No installer, privileged helper, or
+  system modification is performed by this archive. Never require elevation.
+  Install only to a user-owned directory after checking ownership.
+- Paid mining on Windows was not exercised for this release; CPU mining is the
+  qualified path and GPU operation remains unqualified. Keep configuration,
+  keystores, and journals in place and replace only the binary on upgrade.
+- Verify only this platform archive against `SHA256SUMS` (which covers all
+  three platform archives) with PowerShell (fail-closed; stop on a missing
+  row or any mismatch):
+  `$found = Select-String -Path SHA256SUMS -Pattern "  {archive_name}" -SimpleMatch | Select-Object -First 1`
+  `if (-not $found) {{ throw "checksum row missing for {archive_name}" }}`
+  `if ((Get-FileHash .\\{archive_name} -Algorithm SHA256).Hash -ne ($found.Line -split "\s+")[0]) {{ throw "SHA256 mismatch for {archive_name}" }}`
+  Always verify the GitHub build-provenance attestations for the exact tag and
+  confirm the release is immutable (`gh release view <tag> --json isImmutable --jq .isImmutable`
+  prints `true`) before installing; never trust the archive alone."""
     if target == MACOS_TARGET:
         verify_command = f'\n   `grep -F "  {archive_name}" SHA256SUMS | shasum -a 256 -c -`'
-    else:
+    elif target == LINUX_TARGET:
         verify_command = f'\n   `grep -F "  {archive_name}" SHA256SUMS | sha256sum -c -`'
+    else:
+        verify_command = (
+            f'\n   `$found = Select-String -Path SHA256SUMS -Pattern "  {archive_name}" -SimpleMatch | Select-Object -First 1`'
+            f'\n   `if (-not $found) {{ throw "checksum row missing for {archive_name}" }}`'
+            f'\n   `if ((Get-FileHash .\\{archive_name} -Algorithm SHA256).Hash -ne ($found.Line -split "\s+")[0]) {{ throw "SHA256 mismatch for {archive_name}" }}`'
+        )
+    if target == WINDOWS_TARGET:
+        inspect_command = f'`tar -tf {archive_name}` or PowerShell `Expand-Archive -List` equivalent; require exactly `{root_dir}/` with five files'
+        install_steps = f"""3. Extract as your ordinary user into a new empty private directory, never
+   with elevation. For example (PowerShell):
+   `Expand-Archive -Path {archive_name} -DestinationPath "$env:USERPROFILE\\{root_dir}-extract"`
+4. Check the destination directory exists, is user-owned, and is not a
+   symlink. Do not overwrite an active miner or an unexpected existing
+   executable or symlink. For example (PowerShell):
+   `Copy-Item "$env:USERPROFILE\\{root_dir}-extract\\{root_dir}\\{binary_name}" -Destination "$env:USERPROFILE\\.local\\bin\\{binary_name}"`"""
+        confirm_command = f"$env:USERPROFILE\\.local\\bin\\{binary_name} --version"
+    else:
+        inspect_command = f"`tar -tzf {archive_name}`"
+        install_steps = f"""3. Extract as your ordinary user into a new empty private directory, never
+   with sudo. For example:
+   `mkdir -m 700 "$HOME/{root_dir}-extract" && tar -xzf {archive_name} -C "$HOME/{root_dir}-extract"`
+4. Check the destination directory exists, is user-owned, and is not a
+   symlink. Do not overwrite an active miner or an unexpected existing
+   executable or symlink. For example:
+   `mkdir -p "$HOME/.local/bin"`
+   `test ! -e "$HOME/.local/bin/{binary_name}" && test ! -L "$HOME/.local/bin/{binary_name}"`
+   `install -m 755 "$HOME/{root_dir}-extract/{root_dir}/{binary_name}" "$HOME/.local/bin/{binary_name}"`"""
+        confirm_command = f"$HOME/.local/bin/{binary_name} --version"
     text = f"""# Astatine miner {package_version} — {target} install notes
 
 Testnet only. This is Astatine `{tag}` for `{target}`. No mainnet deployment
@@ -576,12 +662,12 @@ and redistribution authority remain owner-attested and have not been
 independently verified.
 
 - Package: {package_name}
-- Binary: {EXPECTED_BINARY_NAME}
+- Binary: {binary_name}
 - Version: {package_version}
 - Tag: {tag}
 - Target: {target}
 - Profile: {EXPECTED_PROFILE}
-- Archive root: {root_dir}/ (exactly five regular files inside)
+- Archive: {archive_name} (exactly five regular files inside {root_dir}/)
 
 {platform_section}
 
@@ -598,40 +684,32 @@ independently verified.
 ## Inspect before extracting
 
 1. List contents without extracting:
-   `tar -tzf {archive_name}`
+   {inspect_command}
 2. Require exactly one top-level root directory `{root_dir}/` containing
-   exactly five regular files: `{root_dir}/astatine` (0755),
+   exactly five regular files: `{root_dir}/{binary_name}` (0755),
    `{root_dir}/LICENSE-MIT`, `{root_dir}/THIRD_PARTY_LICENSES.md`,
    `{root_dir}/BUILD-INFO.json`, `{root_dir}/INSTALL.md` (0644).
 3. Reject extra, hidden, absolute, traversal, duplicate, linked, or
-   special-file entries, or any unexpected mode. A `tar -tzf` fixture check
+   special-file entries, or any unexpected mode. A listing fixture check
    still applies with the root prefix: reject any entry containing
    `tests/fixtures`, `PROVENANCE.json`, or any fixture basename.
 
-## Install (no sudo, user-owned path only)
+## Install (no sudo/elevation, user-owned path only)
 
-1. Verify only this platform archive against `SHA256SUMS` (which covers both
-   platform archives; check this archive's row, never trust an archive alone):{verify_command}
+1. Verify only this platform archive against `SHA256SUMS` (which covers all
+   three platform archives; check this archive's row, never trust an archive alone):{verify_command}
 2. Verify the GitHub build-provenance attestations for the exact tag and
    confirm the release is immutable (`gh release view <tag> --json isImmutable --jq .isImmutable`
    prints `true`) before installing.
-3. Extract as your ordinary user into a new empty private directory, never
-   with sudo. For example:
-   `mkdir -m 700 "$HOME/{root_dir}-extract" && tar -xzf {archive_name} -C "$HOME/{root_dir}-extract"`
-4. Check the destination directory exists, is user-owned, and is not a
-   symlink. Do not overwrite an active miner or an unexpected existing
-   executable or symlink. For example:
-   `mkdir -p "$HOME/.local/bin"`
-   `test ! -e "$HOME/.local/bin/astatine" && test ! -L "$HOME/.local/bin/astatine"`
-   `install -m 755 "$HOME/{root_dir}-extract/{root_dir}/astatine" "$HOME/.local/bin/astatine"`
-5. Confirm: `"$HOME/.local/bin/astatine" --version` (expect {package_version}).
+{install_steps}
+5. Confirm: `{confirm_command}` (expect {package_version}).
 
 ## Upgrade (preserve user state)
 
 1. Stop the running miner first.
 2. Keep your existing configuration, wallets, keystores, credentials, and
    transaction journals exactly where they are.
-3. Replace ONLY the `astatine` binary. Never overwrite, delete, reinitialize,
+3. Replace ONLY the `{binary_name}` binary. Never overwrite, delete, reinitialize,
    or migrate state files to satisfy a new binary.
 4. Downgrade compatibility is not guaranteed; keep a recoverable copy of your
    prior binary and state before upgrading.
@@ -665,6 +743,7 @@ def run(
     repository_id: str,
     macos_binary: Path,
     linux_binary: Path,
+    windows_binary: Path,
     rustc_version: str | None = None,
     cargo_version: str | None = None,
 ) -> dict:
@@ -695,7 +774,7 @@ def run(
     require(gate.get("release_intent_authorized") is True, "release requires release_intent_authorized true")
     require(gate.get("publication_authorized") is False, "release must not claim final publication authorization")
     require(gate.get("final_release_controls_complete") is False, "release requires final release controls to remain outstanding")
-    require(list(gate.get("targets") or []) == [MACOS_TARGET, LINUX_TARGET], "release gate targets changed")
+    require(list(gate.get("targets") or []) == [MACOS_TARGET, LINUX_TARGET, WINDOWS_TARGET], "release gate targets changed")
     require(gate.get("source_status") == "RELEASE-INTENT-AUTHORIZED" and gate.get("binary_status") == "RELEASE-INTENT-AUTHORIZED", "release requires RELEASE-INTENT-AUTHORIZED source and binary distribution")
 
     # Source identity: repository, package version, tag binding, clean tree.
@@ -736,8 +815,10 @@ def run(
     # Binaries: validate headers without executing.
     macos_data = read_input_binary(macos_binary, "macOS")
     linux_data = read_input_binary(linux_binary, "Linux")
+    windows_data = read_input_binary(windows_binary, "Windows")
     require_macho_arm64(macos_data, "macOS")
     require_elf_x86_64(linux_data, "Linux")
+    require_pe_x86_64(windows_data, "Windows")
 
     license_data = read_confined_bytes(resolved_root, LICENSE_MIT_REL, "license")
     third_party_data = read_confined_bytes(resolved_root, THIRD_PARTY_REL, "third-party notices")
@@ -745,11 +826,15 @@ def run(
     # Package each target deterministically with exactly five members under a
     # single platform root directory (the nonpublishing dry-run remains flat;
     # only the authorized release uses the root prefix).
+    # Per-target exact layouts: Unix archives must contain exactly `astatine`
+    # (never `astatine.exe`); Windows must contain exactly `astatine.exe`
+    # (never `astatine`). No shared allowlist accepts the wrong binary.
     outputs: list[dict] = []
     archives: list[tuple[str, bytes]] = []
-    for target, binary_data, filename, root_dir in (
-        (MACOS_TARGET, macos_data, MACOS_ARCHIVE, MACOS_ROOT),
-        (LINUX_TARGET, linux_data, LINUX_ARCHIVE, LINUX_ROOT),
+    for target, binary_data, filename, root_dir, binary_name, is_zip in (
+        (MACOS_TARGET, macos_data, MACOS_ARCHIVE, MACOS_ROOT, "astatine", False),
+        (LINUX_TARGET, linux_data, LINUX_ARCHIVE, LINUX_ROOT, "astatine", False),
+        (WINDOWS_TARGET, windows_data, WINDOWS_ARCHIVE, WINDOWS_ROOT, "astatine.exe", True),
     ):
         build_info = generate_build_info(
             package_name=EXPECTED_PACKAGE_NAME,
@@ -780,7 +865,7 @@ def run(
             target=target,
         )
         member_inputs = [
-            (f"{root_dir}/astatine", binary_data, FILE_MODE_BIN),
+            (f"{root_dir}/{binary_name}", binary_data, FILE_MODE_BIN),
             (f"{root_dir}/LICENSE-MIT", license_data, FILE_MODE_DOC),
             (f"{root_dir}/THIRD_PARTY_LICENSES.md", third_party_data, FILE_MODE_DOC),
             (f"{root_dir}/BUILD-INFO.json", build_info, FILE_MODE_DOC),
@@ -789,15 +874,23 @@ def run(
         # Refuse fixtures/forbidden globs even though inputs are fixed: fail
         # closed if any member name collides. The root prefix does not weaken
         # the check: basenames and full prefixed paths are both screened, so
-        # the workflow `tar -tzf` fixture check keeps working with the prefix.
-        expected_prefixed = sorted(f"{root_dir}/{name}" for name in EXPECTED_BASENAMES)
+        # the workflow listing fixture check keeps working with the prefix.
+        # Per-target exact: Unix expects `astatine`, Windows expects
+        # `astatine.exe`; the wrong binary is never accepted.
+        expected_basenames = EXPECTED_BASENAMES_WINDOWS if is_zip else EXPECTED_BASENAMES
+        expected_prefixed = sorted(f"{root_dir}/{name}" for name in expected_basenames)
         for archive_path, _, _ in member_inputs:
             basename = archive_path.rsplit("/", 1)[-1]
-            require(basename in EXPECTED_BASENAMES, f"unexpected archive member basename: {basename}")
+            require(basename in expected_basenames, f"unexpected archive member basename: {basename}")
             require(archive_path in expected_prefixed, f"unexpected archive member: {archive_path}")
             # Screen both the full prefixed path and the basename against
             # forbidden globs and fixture identities.
             for candidate in (archive_path, basename):
+                # ZIP path safety: reject backslashes, absolute, traversal,
+                # collisions are handled by exact set check; encryption is
+                # never used (store/deflate only, no encryption).
+                require("\\" not in candidate, f"archive member must not contain backslash: {archive_path}")
+                require(not candidate.startswith("/"), f"archive member must not be absolute: {archive_path}")
                 for pattern in ("tests/fixtures/**", "**/PROVENANCE.json"):
                     matched = False
                     if candidate == pattern:
@@ -812,7 +905,10 @@ def run(
                 require("PROVENANCE.json" not in candidate, f"archive member must never carry provenance inventory: {archive_path}")
             require(basename not in ("AstatineMiner.json", "AstatineGenesisCoordinator.json", "MockAST.json", "synthetic-injective-virtual-receipt.json", "PROVENANCE.json"), f"archive member allows a fixture into the release archive: {archive_path}")
         require(sorted(p[0] for p in member_inputs) == expected_prefixed, "archive member set changed; refusing release")
-        archive_bytes = build_deterministic_tarball(member_inputs)
+        if is_zip:
+            archive_bytes = build_deterministic_zip(member_inputs)
+        else:
+            archive_bytes = build_deterministic_tarball(member_inputs)
         archive_sha = sha256_hex(archive_bytes)
         member_records = []
         for archive_path, data, mode in sorted(member_inputs, key=lambda item: item[0]):
@@ -823,7 +919,7 @@ def run(
                 "bytes": len(data),
                 "mode": oct(mode),
             }
-            if basename == "astatine":
+            if basename in ("astatine", "astatine.exe"):
                 entry.update({"source": "prebuilt-binary", "generated": False, "target": target})
             elif basename in ("BUILD-INFO.json", "INSTALL.md"):
                 entry.update({"source": f"generated:{basename}", "generated": True, "generator": "support/release/build-release.py"})
@@ -879,7 +975,7 @@ def run(
             "cargo_version": cargo_version,
             "pinned_toolchain": EXPECTED_TOOLCHAIN,
         },
-        "targets": [MACOS_TARGET, LINUX_TARGET],
+        "targets": [MACOS_TARGET, LINUX_TARGET, WINDOWS_TARGET],
         "archives": outputs,
         "gate": {
             "rights_decision": gate.get("rights_decision"),
@@ -912,7 +1008,7 @@ def run(
     dumped = json.dumps(record, indent=2, sort_keys=True)
     require(str(resolved_root) not in dumped, "provenance must not contain absolute checkout paths")
     # Input binary paths are never recorded, but double-check no invocation leakage.
-    require("--macos-binary" not in dumped and "--linux-binary" not in dumped, "provenance must not contain raw invocation")
+    require("--macos-binary" not in dumped and "--linux-binary" not in dumped and "--windows-binary" not in dumped, "provenance must not contain raw invocation")
     write_exclusive(resolved_out, "release-provenance.json", (dumped + "\n").encode("utf-8"))
 
     return {
@@ -932,11 +1028,12 @@ def run(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Offline release-intent dual-platform release packager (draft-only, no publication).")
-    parser.add_argument("--tag", required=True, help="exact release tag, e.g. v0.1.0-testnet.3")
+    parser = argparse.ArgumentParser(description="Offline release-intent triple-platform release packager (draft-only, no publication).")
+    parser.add_argument("--tag", required=True, help="exact release tag, e.g. v0.1.0-testnet.4")
     parser.add_argument("--repository-id", required=True, help="numeric GitHub repository id")
     parser.add_argument("--macos-binary", required=True, type=Path, help="path to prebuilt macOS ARM64 binary")
     parser.add_argument("--linux-binary", required=True, type=Path, help="path to prebuilt Linux x86_64 binary")
+    parser.add_argument("--windows-binary", required=True, type=Path, help="path to prebuilt Windows x86_64 binary")
     parser.add_argument("--rustc-version", required=True, help="exact `rustc --version` line observed in the CI build jobs")
     parser.add_argument("--cargo-version", required=True, help="exact `cargo --version` line observed in the CI build jobs")
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[2])
@@ -950,6 +1047,7 @@ def main(argv: list[str] | None = None) -> int:
             repository_id=args.repository_id,
             macos_binary=args.macos_binary,
             linux_binary=args.linux_binary,
+            windows_binary=args.windows_binary,
             rustc_version=args.rustc_version,
             cargo_version=args.cargo_version,
         )

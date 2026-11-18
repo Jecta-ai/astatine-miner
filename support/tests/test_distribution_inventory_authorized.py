@@ -47,7 +47,7 @@ NEEDED_FILES = [
     "support/update-genesis-coordinator-fixture.py",
     "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
     "support/release/RELEASE_NOTES-v0.1.0-testnet.2.md",
-    "support/release/RELEASE_NOTES-v0.1.0-testnet.3.md",
+    "support/release/RELEASE_NOTES-v0.1.0-testnet.4.md",
 ]
 
 
@@ -118,7 +118,7 @@ class DistributionInventoryTests(unittest.TestCase):
         self.assertEqual(
             result["rights_decision"],
             "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party "
-            "source and binary distribution intent for v0.1.0-testnet.3 under the "
+            "source and binary distribution intent for v0.1.0-testnet.4 under the "
             "explicitly documented owner self-approval policy; technical NOTICE review "
             "recorded; final release controls outstanding; not a legal conclusion, not "
             "independent review, and not a separate approval.",
@@ -152,11 +152,11 @@ class DistributionInventoryTests(unittest.TestCase):
             result["release_controls"],
             "DRAFT-ONLY \u2014 OWNER SELF-APPROVAL AFTER IMMUTABLE TAG/RELEASE VERIFICATION",
         )
-        self.assertEqual(result["archive_members_checked"], 5)
-        self.assertEqual(result["source_members_checked"], 3)
+        self.assertEqual(result["archive_members_checked"], 6)
+        self.assertEqual(result["source_members_checked"], 4)
         self.assertEqual(result["generated_members_checked"], 2)
         self.assertEqual(result["fixture_paths_checked"], 4)
-        self.assertEqual(result["targets"], ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"])
+        self.assertEqual(result["targets"], ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"])
         self.assertIn("does NOT authorize final publication", result["disclaimer"])
         self.assertNotIn("publication_authorized\": true", json.dumps(result))
 
@@ -168,7 +168,7 @@ class DistributionInventoryTests(unittest.TestCase):
         self.assertFalse(gate["final_release_controls_complete"])
         self.assertEqual(gate["source_status"], "RELEASE-INTENT-AUTHORIZED")
         self.assertEqual(gate["binary_status"], "RELEASE-INTENT-AUTHORIZED")
-        self.assertEqual(gate["targets"], ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"])
+        self.assertEqual(gate["targets"], ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"])
         self.assertEqual(gate["repository"], "Jecta-ai/astatine-miner")
         self.assertTrue(gate["package_version"])
         for key in (
@@ -532,7 +532,7 @@ class DistributionInventoryTests(unittest.TestCase):
 
     def test_historical_release_intent_rewrite_rejected(self) -> None:
         inventory = self.inventory()
-        inventory["historical_release_intent"]["tag"] = "v0.1.0-testnet.3"
+        inventory["historical_release_intent"]["tag"] = "v0.1.0-testnet.4"
         self.write_inventory(inventory)
         with self.assertRaises(VERIFIER.VerificationError):
             VERIFIER.verify(self.root)

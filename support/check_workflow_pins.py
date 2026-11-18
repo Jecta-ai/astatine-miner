@@ -23,7 +23,7 @@ DRY_RUN_WORKFLOW_FILENAME = "linux-release-dry-run.yml"
 RELEASE_WORKFLOW_FILENAME = "release.yml"
 # Pinned SHA-256 of .github/workflows/release.yml. Update only after review.
 # Recompute with: python3 -B support/check_workflow_pins.py --print-release-sha256
-RELEASE_WORKFLOW_SHA256 = "744e1c9c374349f4466c83807cf2e757cb36198ad9fa7006dda9d744d21d0e6b"
+RELEASE_WORKFLOW_SHA256 = "8ddf355a03bcfcdcca0b3c1aaa403b0e0f14a4ec9c72534c95c58c8b43bf7701"
 PINNED_RELEASE_ACTIONS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
@@ -566,7 +566,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     # M1: packaging/attestation and draft creation occur only in protected
     # release jobs; builds are read-only with no OIDC. Separate attest jobs
     # hold OIDC/attestation write and never execute the candidate.
-    expected_jobs = {"preflight", "build-macos", "build-linux", "attest-macos", "attest-linux", "release-package", "release-draft"}
+    expected_jobs = {"preflight", "build-macos", "build-linux", "build-windows", "attest-macos", "attest-linux", "attest-windows", "release-package", "windows-archive-smoke", "release-draft"}
     if set(job_perms) != expected_jobs:
         raise AssertionError(
             f"{workflow}: release jobs must be exactly {sorted(expected_jobs)}, got {sorted(job_perms)}"
@@ -575,8 +575,11 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "preflight": {"contents": "read", "actions": "read"},
         "build-macos": {"contents": "read"},
         "build-linux": {"contents": "read"},
+        "build-windows": {"contents": "read"},
         "attest-macos": {"contents": "read", "id-token": "write", "attestations": "write"},
         "attest-linux": {"contents": "read", "id-token": "write", "attestations": "write"},
+        "attest-windows": {"contents": "read", "id-token": "write", "attestations": "write"},
+        "windows-archive-smoke": {"contents": "read", "attestations": "read"},
         "release-package": {
             "contents": "read",
             "id-token": "write",
@@ -595,9 +598,9 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     # release-package: protected build (no contents:write); release-draft: protected draft-only.
     # builds are read-only; attest jobs hold OIDC/attestation write.
     for job, perms in job_perms.items():
-        if perms.get("attestations") == "read" and job != "release-draft":
+        if perms.get("attestations") == "read" and job not in ("release-draft", "windows-archive-smoke"):
             raise AssertionError(
-                f"{workflow}: attestations: read is allowed only on release-draft (found in {job})"
+                f"{workflow}: attestations: read is allowed only on release-draft and windows-archive-smoke (found in {job})"
             )
         if perms.get("actions") == "read" and job not in ("preflight", "release-package", "release-draft"):
             raise AssertionError(
@@ -611,6 +614,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             if key in ("id-token", "attestations") and job not in (
                 "attest-macos",
                 "attest-linux",
+                "attest-windows",
                 "release-package",
             ):
                 raise AssertionError(
@@ -789,15 +793,20 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "preflight": set(),
         "build-macos": {"preflight"},
         "build-linux": {"preflight"},
+        "build-windows": {"preflight"},
         "attest-macos": {"build-macos"},
         "attest-linux": {"build-linux"},
+        "attest-windows": {"build-windows"},
         "release-package": {
             "build-macos",
             "build-linux",
+            "build-windows",
             "attest-macos",
             "attest-linux",
+            "attest-windows",
         },
-        "release-draft": {"release-package"},
+        "windows-archive-smoke": {"release-package"},
+        "release-draft": {"release-package", "windows-archive-smoke"},
     }
     for job_name, expected in expected_needs.items():
         actual = _job_needs(job_name)
@@ -809,6 +818,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     for build_job, binary_artifact in (
         ("build-macos", "astatine-macos-arm64"),
         ("build-linux", "astatine-linux-x86_64"),
+        ("build-windows", "astatine-windows-x86_64"),
     ):
         outputs = _job_outputs(build_job)
         expected_output_keys = {"binary_sha256", "rustc_version", "cargo_version"}
@@ -852,6 +862,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     for attest_job, build_job, expected_artifact in (
         ("attest-macos", "build-macos", "astatine-macos-arm64"),
         ("attest-linux", "build-linux", "astatine-linux-x86_64"),
+        ("attest-windows", "build-windows", "astatine-windows-x86_64"),
     ):
         allowed_uses = {
             "actions/download-artifact",
@@ -873,6 +884,8 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         expected_hash_step = (
             "Verify macOS binary hash matches build output"
             if attest_job == "attest-macos"
+            else "Verify Windows binary hash matches build output"
+            if attest_job == "attest-windows"
             else "Verify Linux binary hash matches build output"
         )
         run_steps = {name: data for name, data in attest_steps.items() if data["runs"]}
@@ -896,8 +909,21 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
                 continue
             if command in allowed_exact:
                 continue
-            if re.fullmatch(r'binary="\$RUNNER_TEMP/attest/(macos|linux)/astatine"', command):
-                continue
+            if attest_job == "attest-windows":
+                if re.fullmatch(r'binary="\$RUNNER_TEMP/attest/windows/astatine\.exe"', command):
+                    continue
+            else:
+                if re.fullmatch(r'binary="\$RUNNER_TEMP/attest/(macos|linux)/astatine"', command):
+                    # Per-target exact: macos job must use macos path, linux job linux path; reject cross (e.g. macos job using linux binary)
+                    if attest_job == "attest-macos" and "attest/macos/astatine" in command:
+                        continue
+                    if attest_job == "attest-linux" and "attest/linux/astatine" in command:
+                        continue
+                    # Wrong binary/path for this job
+                    raise AssertionError(f"{workflow}: {attest_job} must use its exact binary path, got {command!r}")
+                # Windows binary must never appear in Unix attest jobs
+                if "astatine.exe" in command:
+                    raise AssertionError(f"{workflow}: {attest_job} must not use Windows binary, got {command!r}")
             if re.fullmatch(r'echo "[^"$`]*"(?: >&2)?', command):
                 continue
             raise AssertionError(
@@ -914,14 +940,16 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     for required in (
         'actual_macos="$(sha256sum "$macos_binary" | cut -d\' \' -f1)"',
         'actual_linux="$(sha256sum "$linux_binary" | cut -d\' \' -f1)"',
+        'actual_windows="$(sha256sum "$windows_binary" | cut -d\' \' -f1)"',
         'if [ "$actual_macos" != "$EXPECTED_MACOS_SHA256" ]; then',
         'if [ "$actual_linux" != "$EXPECTED_LINUX_SHA256" ]; then',
+        'if [ "$actual_windows" != "$EXPECTED_WINDOWS_SHA256" ]; then',
     ):
         if required not in hash_step["runs"]:
             raise AssertionError(
                 f"{workflow}: release-package hash/toolchain step must execute exact line {required!r}"
             )
-    builder_line = 'python3 -B support/release/build-release.py --tag "$tag" --repository-id "$repo_id" --macos-binary "$RUNNER_TEMP/retrieved/macos/astatine" --linux-binary "$RUNNER_TEMP/retrieved/linux/astatine" --output-dir "$out" --rustc-version "$RUSTC_VERSION" --cargo-version "$CARGO_VERSION"'
+    builder_line = 'python3 -B support/release/build-release.py --tag "$tag" --repository-id "$repo_id" --macos-binary "$RUNNER_TEMP/retrieved/macos/astatine" --linux-binary "$RUNNER_TEMP/retrieved/linux/astatine" --windows-binary "$RUNNER_TEMP/retrieved/windows/astatine.exe" --output-dir "$out" --rustc-version "$RUSTC_VERSION" --cargo-version "$CARGO_VERSION"'
     if builder_line not in build_step["runs"]:
         raise AssertionError(f"{workflow}: release-package builder step must execute the exact command with --rustc-version/--cargo-version")
 
@@ -1006,14 +1034,56 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             raise AssertionError(f"{workflow}: release workflow must contain needs marker {required!r} (R3 build/attest hash and toolchain chain)")
     # release-package must need all four upstream jobs.
     _pkg_section = _job_section("release-package")
-    for dep in ("build-macos", "build-linux", "attest-macos", "attest-linux"):
+    for dep in ("build-macos", "build-linux", "build-windows", "attest-macos", "attest-linux", "attest-windows"):
         if dep not in _pkg_section:
             raise AssertionError(f"{workflow}: release-package must need {dep} (R3 needs attest+build)")
     # Attest jobs must need their build job and must not need anything else privileged.
-    for attest_job, build_job in (("attest-macos", "build-macos"), ("attest-linux", "build-linux")):
+    for attest_job, build_job in (("attest-macos", "build-macos"), ("attest-linux", "build-linux"), ("attest-windows", "build-windows")):
         _att = _job_section(attest_job)
         if f"needs: {build_job}" not in _att:
             raise AssertionError(f"{workflow}: {attest_job} must declare needs: {build_job} (R3)")
+
+    # Windows archive smoke: the packaged ZIP is extracted and executed only
+    # after its archive attestation is verified, in a sandbox, with no wallet
+    # or network use. The draft is gated on this acceptance.
+    _smoke_section = _job_section("windows-archive-smoke")
+    if "needs: release-package" not in _smoke_section:
+        raise AssertionError(f"{workflow}: windows-archive-smoke must declare needs: release-package (trust order)")
+    if "windows-2025" not in _smoke_section:
+        raise AssertionError(f"{workflow}: windows-archive-smoke must run on the native windows-2025 runner")
+    for _uses in _job_uses("windows-archive-smoke"):
+        if not _uses.startswith("actions/download-artifact@"):
+            raise AssertionError(f"{workflow}: windows-archive-smoke may only use download-artifact, got {_uses!r}")
+    if "actions/checkout@" in _smoke_section:
+        raise AssertionError(f"{workflow}: windows-archive-smoke must not checkout (no candidate build here)")
+    if "attestations: write" in _smoke_section or "id-token: write" in _smoke_section:
+        raise AssertionError(f"{workflow}: windows-archive-smoke must not request OIDC/attestations write; verify-only")
+    _verify_pos = _smoke_section.find("Verify Windows archive attestation before extraction")
+    _extract_pos = _smoke_section.find("Expand-Archive")
+    _smoke_pos = _smoke_section.find("Smoke test packaged Windows executable")
+    if _verify_pos < 0 or _extract_pos < 0 or _smoke_pos < 0:
+        raise AssertionError(f"{workflow}: windows-archive-smoke must verify attestation, then extract, then smoke")
+    if not (_verify_pos < _extract_pos < _smoke_pos):
+        raise AssertionError(f"{workflow}: windows-archive-smoke must verify attestation before extraction and execution (trust order)")
+    for _required in (
+        "sha256sum -c SHA256SUMS",
+        'gh attestation verify "bundle/astatine-$tag-windows-x86_64.zip"',
+        "astatine.exe",
+        "RUNNER_TEMP",
+        "APPDATA",
+        "--version",
+        "mine --help",
+    ):
+        if _required not in _smoke_section:
+            raise AssertionError(f"{workflow}: windows-archive-smoke must contain marker {_required!r}")
+    if "astatine init" in _smoke_section or "wallet create" in _smoke_section or "wallet import" in _smoke_section:
+        raise AssertionError(f"{workflow}: windows-archive-smoke must not create wallets or sessions (no wallet)")
+    for _line in _smoke_section.splitlines():
+        _stripped = _line.strip()
+        if _stripped.startswith("& $exe") and "--help" not in _stripped and "--version" not in _stripped:
+            raise AssertionError(f"{workflow}: windows-archive-smoke may only run safe read-only commands, got {_stripped!r}")
+    if "sudo" in _smoke_section.lower():
+        raise AssertionError(f"{workflow}: windows-archive-smoke must not use elevation")
 
     # Phase1: no isolated verifier jobs, no App integration, no secrets.
     # Absence of the old admin design is enforced globally above; here the
@@ -1172,7 +1242,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     if "--draft --prerelease --verify-tag" not in raw:
         raise AssertionError(f"{workflow}: gh release create must contain --draft --prerelease --verify-tag on one draft line")
     if (
-        'git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.3.md"' not in raw
+        'git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.4.md"' not in raw
         or 'cp "$tagged_notes" "$out/release-notes.md"' not in raw
     ):
         raise AssertionError(
@@ -1310,8 +1380,8 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         if required not in raw:
             raise AssertionError(f"{workflow}: release workflow must enforce exact-tag and pagination policy {required!r} (M2)")
     for required in (
-        "EXPECTED_RELEASE_TAG: \"v0.1.0-testnet.3\"",
-        "EXPECTED_RELEASE_VERSION: \"0.1.0-testnet.3\"",
+        "EXPECTED_RELEASE_TAG: \"v0.1.0-testnet.4\"",
+        "EXPECTED_RELEASE_VERSION: \"0.1.0-testnet.4\"",
         "owner self-approval",
         "no independent review",
         "must record accepted residual risk",
@@ -1346,7 +1416,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "created release is not a draft",
         "created draft body does not exactly match the reviewed release notes",
         "tagged-release-notes.md",
-        "git show \"refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.3.md\"",
+        "git show \"refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.4.md\"",
         'test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"',
         "head_repository",
         "does not belong to the canonical repository",
@@ -1407,7 +1477,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "provenance field rights_decision missing or empty",
         "must record owner-authorized release intent",
         "must not claim publication authorization or a release approver",
-        '["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]',
+        '["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]',
         "provenance archive sha256 mismatch",
         "Draft verified; owner self-approval publication remains required",
         "owner-authorized release intent",
@@ -1451,8 +1521,8 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         raise AssertionError(
             f"{workflow}: release workflow must not remove tag creation protection; creation is a separate restricted ruleset"
         )
-    if raw.count("Assert exact tag identity") != 4:
-        raise AssertionError(f"{workflow}: release workflow must assert exact tag identity after every checkout exactly 4x (B1: preflight+2 builds+package, none in attest/draft), got {raw.count('Assert exact tag identity')}")
+    if raw.count("Assert exact tag identity") != 5:
+        raise AssertionError(f"{workflow}: release workflow must assert exact tag identity after every checkout exactly 5x (B1: preflight+3 builds+package, none in attest/draft), got {raw.count('Assert exact tag identity')}")
     for required in (
         'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
         'test "$(git rev-parse "$RELEASE_TAG^{}")" = "$GITHUB_SHA"',
@@ -1563,7 +1633,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     if raw.count("astatine-release-bundle") < 2:
         raise AssertionError(f"{workflow}: bundle artifact must be uploaded by release-package and downloaded by release-draft (B2)")
     # Artifact names: raw binaries round-trip through attest and package.
-    for required in ("astatine-macos-arm64", "astatine-linux-x86_64"):
+    for required in ("astatine-macos-arm64", "astatine-linux-x86_64", "astatine-windows-x86_64"):
         if raw.count(required) < 3:
             raise AssertionError(f"{workflow}: binary artifact {required!r} must appear in build upload, attest download, and package download (R3)")
     # B2: per-job isolation — package builds (no contents:write, no draft mutation);
@@ -1571,14 +1641,14 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     # attest jobs attest only (no checkout, no candidate execution, no repo scripts).
     # Checkout count must be exactly preflight+2 builds+package (draft+attests have none).
     _checkout_total = raw.count("actions/checkout@")
-    if _checkout_total != 4:
-        raise AssertionError(f"{workflow}: release workflow must have exactly 4 checkouts (preflight+builds+package, none in draft/attest), got {_checkout_total} (B2)")
+    if _checkout_total != 5:
+        raise AssertionError(f"{workflow}: release workflow must have exactly 5 checkouts (preflight+builds+package, none in draft/attest), got {_checkout_total} (B2)")
     # Attest jobs must not checkout; draft must not checkout (B2 isolation, R3 split).
-    for _isolated_job in ("attest-macos", "attest-linux", "release-draft"):
+    for _isolated_job in ("attest-macos", "attest-linux", "attest-windows", "windows-archive-smoke", "release-draft"):
         _section = raw.split(_isolated_job + ":", 1)[-1] if _isolated_job + ":" in raw else ""
         # Bound to the job: cut at the next top-level job (two-space job key).
         _next = None
-        for _candidate in ("preflight:", "build-macos:", "build-linux:", "attest-macos:", "attest-linux:", "release-package:", "release-draft:"):
+        for _candidate in ("preflight:", "build-macos:", "build-linux:", "build-windows:", "attest-macos:", "attest-linux:", "attest-windows:", "release-package:", "windows-archive-smoke:", "release-draft:"):
             if _candidate == _isolated_job + ":":
                 continue
             if _candidate in _section:
@@ -1590,10 +1660,10 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         if "actions/checkout@" in _section:
             raise AssertionError(f"{workflow}: {_isolated_job} must not checkout (no checkout in {_isolated_job}) (B2/R3)")
     # Attest jobs must not execute the candidate nor run repo scripts (R3).
-    for _attest_job in ("attest-macos", "attest-linux"):
+    for _attest_job in ("attest-macos", "attest-linux", "attest-windows"):
         _section = raw.split(_attest_job + ":", 1)[-1] if _attest_job + ":" in raw else ""
         _next = None
-        for _candidate in ("preflight:", "build-macos:", "build-linux:", "attest-macos:", "attest-linux:", "release-package:", "release-draft:"):
+        for _candidate in ("preflight:", "build-macos:", "build-linux:", "build-windows:", "attest-macos:", "attest-linux:", "attest-windows:", "release-package:", "windows-archive-smoke:", "release-draft:"):
             if _candidate == _attest_job + ":":
                 continue
             if _candidate in _section:
@@ -1618,10 +1688,10 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             if _forbidden in _section:
                 raise AssertionError(f"{workflow}: {_attest_job} must not contain candidate execution or repo scripts ({_forbidden!r}) (R3)")
     # Build jobs must not hold OIDC/attestation write nor attest directly (R3 split).
-    for _build_job in ("build-macos", "build-linux"):
+    for _build_job in ("build-macos", "build-linux", "build-windows"):
         _section = raw.split(_build_job + ":", 1)[-1] if _build_job + ":" in raw else ""
         _next = None
-        for _candidate in ("preflight:", "build-macos:", "build-linux:", "attest-macos:", "attest-linux:", "release-package:", "release-draft:"):
+        for _candidate in ("preflight:", "build-macos:", "build-linux:", "build-windows:", "attest-macos:", "attest-linux:", "attest-windows:", "release-package:", "windows-archive-smoke:", "release-draft:"):
             if _candidate == _build_job + ":":
                 continue
             if _candidate in _section:
@@ -1654,8 +1724,8 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     # Draft must create the draft exactly once; package must not.
     if raw.count("gh release create") != 1:
         raise AssertionError(f"{workflow}: gh release create must appear exactly once in release-draft (B2 draft-only)")
-    if "Assert exact tag identity" not in raw or raw.count("Assert exact tag identity") != 4:
-        raise AssertionError(f"{workflow}: release workflow must assert tag identity after every checkout exactly 4x (B1: preflight+builds+package)")
+    if "Assert exact tag identity" not in raw or raw.count("Assert exact tag identity") != 5:
+        raise AssertionError(f"{workflow}: release workflow must assert tag identity after every checkout exactly 5x (B1: preflight+builds+package)")
     # Draft inline env check markers (no validator script in draft).
     for _m in (
         "Re-verify protected environment before mutation",

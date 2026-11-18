@@ -135,7 +135,7 @@ class FixtureProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(
             result["rights_decision"],
-            "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.3 under the explicitly documented owner self-approval policy; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion, not independent review, and not a separate approval.",
+            "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.4 under the explicitly documented owner self-approval policy; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion, not independent review, and not a separate approval.",
         )
         self.assertEqual(
             result["review_ci_branch_push_authorization"],
@@ -687,7 +687,7 @@ class FixtureProvenanceTests(unittest.TestCase):
         self.assertEqual(result["status"], "PASS")
         self.assertEqual(
             result["rights_decision"],
-            "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.3 under the explicitly documented owner self-approval policy; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion, not independent review, and not a separate approval.",
+            "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.4 under the explicitly documented owner self-approval policy; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion, not independent review, and not a separate approval.",
         )
         self.assertEqual(
             result["notice_checklist_status"], "TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent under the explicit owner self-approval policy; final release controls outstanding"
@@ -712,7 +712,7 @@ class FixtureProvenanceTests(unittest.TestCase):
 
     def test_historical_release_intent_mutation_fails(self) -> None:
         inventory = self.inventory()
-        inventory["historical_release_intent"]["tag"] = "v0.1.0-testnet.3"
+        inventory["historical_release_intent"]["tag"] = "v0.1.0-testnet.4"
         self.write_inventory(inventory)
         with self.assertRaisesRegex(
             VERIFIER.VerificationError, "historical .1 release intent"
@@ -1157,7 +1157,7 @@ class FixtureProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(
             result["rights_decision"],
-            "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.3 under the explicitly documented owner self-approval policy; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion, not independent review, and not a separate approval.",
+            "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.4 under the explicitly documented owner self-approval policy; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion, not independent review, and not a separate approval.",
         )
         self.assertEqual(result["notice_applicability"], "TECHNICALLY REVIEWED \u2014 no separate upstream NOTICE file was found in the pinned contract fixture subtrees; the private EVM root NOTICE is scoped to a separate Rust subtree; Apache-2.0 license text and fixture NOTICE are included. This is an evidence-based technical review, not a legal conclusion or separate approval.")
         self.assertTrue(result["release_intent_authorized"])
