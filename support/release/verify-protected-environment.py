@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
-"""Offline bounded validator for the release and release-admin environments.
+"""Offline bounded validator for the protected `release` environment (no App, Phase1).
 
 Validates actual GitHub environment/tag-protection JSON snapshots against the
 fail-closed, version-scoped owner self-approval requirements without network
-access, for EITHER ``release`` (package/draft mutation jobs) OR
-``release-admin`` (three verifier jobs only) selected via
-``--expected-environment`` (default ``release``). Both environments require the
-same policy: owner sole self-approval (User 86115037), ``prevent_self_review``
-exactly false, ``can_admins_bypass`` false, and the exact current release tag
-``v0.1.0-testnet.2`` with no wildcards. GitHub deployment branch and tag
-policies combine with OR, so the policies snapshot must contain exactly one
-policy and that policy must be the exact current release tag; anything broader
-fails closed. The deployment-policy response must include a ``total_count``
-that equals the number of returned policies so a paginated response cannot
-hide a second, broadening policy.
+access. Phase1 automation validates ONLY ``release`` (package/draft mutation
+jobs) via ``--expected-environment release`` (the default). ``release-admin``
+remains supported as ``--expected-environment`` for manual owner checks
+OUTSIDE the workflow only; it is NOT used by automation, and no App, private
+key, installation token, or extra secret is used.
+
+Both environments share the same policy when checked: owner sole self-approval
+(User 86115037), ``prevent_self_review`` exactly false, ``can_admins_bypass``
+false, and the exact current release tag ``v0.1.0-testnet.2`` with no
+wildcards. GitHub deployment branch and tag policies combine with OR, so the
+policies snapshot must contain exactly one policy and that policy must be the
+exact current release tag; anything broader fails closed. The
+deployment-policy response must include a ``total_count`` that equals the
+number of returned policies so a paginated response cannot hide a second,
+broadening policy.
 
 The required reviewer is pinned to the owner's immutable numeric GitHub user id
 (86115037) and login. ``prevent_self_review`` must be exactly false because the
 owner explicitly authorized owner self-approval; this is a documented reduction
 in separation of duties, not independent review. Admin bypass must be false and
 the environment must use custom tag policies. Sequencing note (temporal,
-non-atomic): environment approvals can introduce delays between a check and a
-later mutation, so no check is atomic or immediate and same-run ``needs`` does
-NOT inherit SHA/tag binding; each job independently verifies its own gate live
-and manual prepublish recheck remains required. Reads only the two JSON files
-given on the command line, prints only safe booleans and field names (never
-reviewer identities or full JSON), and exits 0 on PASS or 1 on any failure.
-Stdlib-only and offline.
+non-atomic, TOCTOU): environment approvals can introduce delays between a
+check and a later mutation, so no check is atomic or immediate and same-run
+``needs`` does NOT inherit SHA/tag binding; each job independently verifies its
+own gate live, the draft remains mutable by repository writers until
+publication, and manual prepublish recheck (environment, split tag rulesets
+with the owner credential, immutable-releases flag, every draft asset digest,
+draft body) remains required immediately before manual publication. Reads only
+the two JSON files given on the command line, prints only safe booleans and
+field names (never reviewer identities or full JSON), and exits 0 on PASS or 1
+on any failure. Stdlib-only and offline. No publication comes from automation;
+the workflow creates and verifies a draft prerelease only.
 
 Usage:
     python3 -B support/release/verify-protected-environment.py \\

@@ -23,13 +23,12 @@ DRY_RUN_WORKFLOW_FILENAME = "linux-release-dry-run.yml"
 RELEASE_WORKFLOW_FILENAME = "release.yml"
 # Pinned SHA-256 of .github/workflows/release.yml. Update only after review.
 # Recompute with: python3 -B support/check_workflow_pins.py --print-release-sha256
-RELEASE_WORKFLOW_SHA256 = "9e73f070180bdef5d24f68157c04226b17fe246c9ac9e98038d1ea83b0039d24"
+RELEASE_WORKFLOW_SHA256 = "02ca5f2d50cf1035f1cf36d99f6fe9c67d2c80020976c4ce4d65c66ad12a23e7"
 PINNED_RELEASE_ACTIONS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
     "actions/download-artifact": "9000827ccba6bdab643e8b6fd33ac0654aef8333",
     "actions/attest-build-provenance": "4d101475d8b20a2381f78447822ac1eab6504dd8",
-    "actions/create-github-app-token": "64ab729a6294000f5aa4a4bc0b73d1f32bc45510",
 }
 RELEASE_TAG_PATTERN = r"^v[0-9]+\.[0-9]+\.[0-9]+-testnet\.[0-9]+$"
 WRITE_KEY_ALTERNATION = (
@@ -468,47 +467,57 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
 
     Strict non-release workflows keep the no-write/no-secrets isolation above.
     release.yml is allowed only with: workflow_dispatch-only with a required
-    string tag input, job-level least privilege (contents:write plus
-    attestations:read only on publish, id-token/attestations:write only on
-    package, environment only on publish), pinned actions, no secrets,
-    no tag creation, no PR triggers, no git push, no registry publication,
-    no mutable refs, and no persist-credentials:true. The exact bytes are
-    additionally pinned via RELEASE_WORKFLOW_SHA256; edits must deliberately
-    update the pin.
+    string tag input, job-level least privilege (contents:write only on the
+    draft job, id-token/attestations:write only on package plus attest jobs,
+    environment only on package/draft), pinned actions, zero secrets-context
+    references, no tag creation, no PR triggers, no git push, no registry
+    publication, no mutable refs, and no persist-credentials:true. Phase1 uses
+    only the read-only GITHUB_TOKEN in automation; bypass_actors has no
+    automated verification (owner manual live check outside the workflow). The
+    exact bytes are additionally pinned via RELEASE_WORKFLOW_SHA256; edits must
+    deliberately update the pin.
     """
     raw = contents.lstrip("\ufeff")
-    # Structural ambiguity must fail closed even for release.
-    # The three isolated release-admin verifier jobs are the only allowed
-    # secrets-context: exactly the two owner-provided release-admin environment
-    # secret references in each admin job's app-token step (6 total, no other
-    # secrets; release-env jobs hold zero App-secrets references).
-    # Job-level `administration` permission stays forbidden everywhere; only the
-    # App action input `permission-administration: read` (candidate under test,
-    # no write fallback) is allowed, and only there.
-    _ADMIN_SECRET_REFS = (
-        "${{ secrets.RELEASE_ADMIN_APP_ID }}",
-        "${{ secrets.RELEASE_ADMIN_APP_PRIVATE_KEY }}",
-    )
-    for _ref in _ADMIN_SECRET_REFS:
-        if raw.count(_ref) != 3:
+    # Structural ambiguity must fail closed even for release. Phase1 has no
+    # isolated verifier jobs and no secrets-context references anywhere:
+    # zero `secrets.` references are allowed. Job-level `administration`
+    # permission stays forbidden everywhere, and the App action input
+    # `permission-administration` is forbidden everywhere too.
+    if re.search(r"\bsecrets\b", raw, re.IGNORECASE):
+        raise AssertionError(
+            f"{workflow}: release workflow must contain zero secrets-context references (Phase1: read-only GITHUB_TOKEN only)"
+        )
+    if "create-github-app-token" in raw:
+        raise AssertionError(
+            f"{workflow}: release workflow must not use the actions/create-github-app-token action (Phase1: no App integration)"
+        )
+    for _absent in (
+        "release-admin",
+        "app-token",
+        "permission-administration",
+        "skip-token-revoke",
+        "RELEASE_ADMIN",
+        "PRIVATE_KEY",
+        "private-key",
+    ):
+        if _absent in raw:
             raise AssertionError(
-                f"{workflow}: release workflow must reference {_ref} exactly three times (once in each isolated admin job)"
+                f"{workflow}: release workflow must not contain {_absent!r} (Phase1: no App/private-key/external-reviewer integration)"
             )
-    _secrets_scrubbed = raw
-    for _ref in _ADMIN_SECRET_REFS:
-        _secrets_scrubbed = _secrets_scrubbed.replace(_ref, "")
+    if "administration" in raw:
+        raise AssertionError(
+            f"{workflow}: release workflow must not contain 'administration' (Phase1: no administration permission or App input)"
+        )
+    if "contents: none" in raw:
+        raise AssertionError(
+            f"{workflow}: release workflow must not define contents:none jobs (Phase1: no isolated verifier jobs)"
+        )
     for description, pattern in ALWAYS_PRIVILEGED_WORKFLOW_PATTERNS:
         if description in (
             "contents write permission",
             "gh release operation",
             "upload/release action",
         ):
-            continue
-        if description == "GitHub secrets context":
-            if pattern.search(_secrets_scrubbed):
-                raise AssertionError(
-                    f"{workflow}: release workflow contains forbidden pattern ({description})"
-                )
             continue
         if pattern.search(raw):
             raise AssertionError(
@@ -555,9 +564,9 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
 
     # Job set and job-level least privilege.
     # M1: packaging/attestation and draft creation occur only in protected
-    # release-draft; builds are read-only with no OIDC. Separate attest jobs
+    # release jobs; builds are read-only with no OIDC. Separate attest jobs
     # hold OIDC/attestation write and never execute the candidate.
-    expected_jobs = {"preflight", "build-macos", "build-linux", "attest-macos", "attest-linux", "tag-ruleset-admin-verify", "tag-ruleset-admin-verify-package", "tag-ruleset-admin-verify-draft", "release-package", "release-draft"}
+    expected_jobs = {"preflight", "build-macos", "build-linux", "attest-macos", "attest-linux", "release-package", "release-draft"}
     if set(job_perms) != expected_jobs:
         raise AssertionError(
             f"{workflow}: release jobs must be exactly {sorted(expected_jobs)}, got {sorted(job_perms)}"
@@ -574,9 +583,6 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             "attestations": "write",
             "actions": "read",
         },
-        "tag-ruleset-admin-verify": {"contents": "none"},
-        "tag-ruleset-admin-verify-package": {"contents": "none"},
-        "tag-ruleset-admin-verify-draft": {"contents": "none"},
         "release-draft": {"contents": "write", "actions": "read", "attestations": "read"},
     }
     for job, expected in expected_perms.items():
@@ -785,21 +791,13 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "build-linux": {"preflight"},
         "attest-macos": {"build-macos"},
         "attest-linux": {"build-linux"},
-        "tag-ruleset-admin-verify": {"preflight"},
-        "tag-ruleset-admin-verify-package": {
-            "attest-macos",
-            "attest-linux",
-            "tag-ruleset-admin-verify",
-        },
-        "tag-ruleset-admin-verify-draft": {"release-package"},
         "release-package": {
             "build-macos",
             "build-linux",
             "attest-macos",
             "attest-linux",
-            "tag-ruleset-admin-verify-package",
         },
-        "release-draft": {"release-package", "tag-ruleset-admin-verify-draft"},
+        "release-draft": {"release-package"},
     }
     for job_name, expected in expected_needs.items():
         actual = _job_needs(job_name)
@@ -958,33 +956,27 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             )
 
     # All protected jobs are environment-gated (B2); no pre-approval package job.
-    # Dedicated envs: release (package/draft mutation only) and release-admin
-    # (three verifier jobs only). Preflight carries no environment and verifies
-    # BOTH live configs; each admin job re-verifies release-admin live before
-    # mint; package/draft keep release re-verify.
+    # Dedicated env: release (package/draft mutation only). Preflight carries
+    # no environment and verifies the live release config itself; package and
+    # draft re-verify release live before mutation.
     try:
         envs = _release_job_environments(raw)
     except _AmbiguousWorkflow as error:
         raise AssertionError(f"{workflow}: release workflow ambiguous environment ({error})")
-    if len(envs) != 5:
-        raise AssertionError(f"{workflow}: release workflow must define exactly five protected environments, got {envs}")
+    if len(envs) != 2:
+        raise AssertionError(f"{workflow}: release workflow must define exactly two protected environments, got {envs}")
     env_jobs = sorted([job for job, _, _ in envs])
-    if env_jobs != ["release-draft", "release-package", "tag-ruleset-admin-verify", "tag-ruleset-admin-verify-draft", "tag-ruleset-admin-verify-package"]:
+    if env_jobs != ["release-draft", "release-package"]:
         raise AssertionError(
-            f"{workflow}: environment jobs must be release-package, release-draft and the three tag-ruleset-admin-verify jobs, got {envs}"
+            f"{workflow}: environment jobs must be exactly release-package and release-draft, got {envs}"
         )
     _env_by_job = {job: value for job, value, _ in envs}
-    for _admin_job in ("tag-ruleset-admin-verify", "tag-ruleset-admin-verify-package", "tag-ruleset-admin-verify-draft"):
-        if _env_by_job.get(_admin_job) != "release-admin":
-            raise AssertionError(
-                f"{workflow}: {_admin_job} must be gated by environment: release-admin (dedicated verifier env), got {_env_by_job.get(_admin_job)!r}"
-            )
     for _mutation_job in ("release-package", "release-draft"):
         if _env_by_job.get(_mutation_job) != "release":
             raise AssertionError(
                 f"{workflow}: {_mutation_job} must stay gated by environment: release (mutation env), got {_env_by_job.get(_mutation_job)!r}"
             )
-    # Preflight must carry no environment (it verifies BOTH live configs itself).
+    # Preflight must carry no environment (it verifies the live release config itself).
 
     # Runners and needs.
     for runner_need in (
@@ -993,9 +985,6 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         ("build-linux", "ubuntu-24.04"),
         ("attest-macos", "ubuntu-24.04"),
         ("attest-linux", "ubuntu-24.04"),
-        ("tag-ruleset-admin-verify", "ubuntu-24.04"),
-        ("tag-ruleset-admin-verify-package", "ubuntu-24.04"),
-        ("tag-ruleset-admin-verify-draft", "ubuntu-24.04"),
         ("release-package", "ubuntu-24.04"),
         ("release-draft", "ubuntu-24.04"),
     ):
@@ -1015,277 +1004,41 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     ):
         if required not in raw:
             raise AssertionError(f"{workflow}: release workflow must contain needs marker {required!r} (R3 build/attest hash and toolchain chain)")
-    # release-package must need all four upstream jobs plus its fresh admin gate.
+    # release-package must need all four upstream jobs.
     _pkg_section = _job_section("release-package")
-    for dep in ("build-macos", "build-linux", "attest-macos", "attest-linux", "tag-ruleset-admin-verify-package"):
+    for dep in ("build-macos", "build-linux", "attest-macos", "attest-linux"):
         if dep not in _pkg_section:
             raise AssertionError(f"{workflow}: release-package must need {dep} (R3 needs attest+build)")
     # Attest jobs must need their build job and must not need anything else privileged.
     for attest_job, build_job in (("attest-macos", "build-macos"), ("attest-linux", "build-linux")):
-        _att = raw.split(attest_job + ":", 1)[-1].split("release-package:", 1)[0] if attest_job + ":" in raw else ""
+        _att = _job_section(attest_job)
         if f"needs: {build_job}" not in _att:
             raise AssertionError(f"{workflow}: {attest_job} must declare needs: {build_job} (R3)")
 
-    # Isolated admin tag-ruleset verifications (App installation token candidate).
-    # Each admin job holds only its two owner-provided release-admin environment
-    # secrets-context references, the only permission-administration inputs, and
-    # contents:none jobs. Job-level `administration` permission stays forbidden
-    # (parsed job permissions never contain it); only the action input
-    # `permission-administration: read` is allowed (candidate under test, no
-    # write fallback), and only in these three jobs scoped to owner Jecta-ai and
-    # repository astatine-miner. Three sequenced verifications: initial gate
-    # (needs preflight), package-sequenced (needs attest jobs + initial)
-    # sequenced via needs before release-package, and draft-sequenced (needs
-    # release-package) sequenced via needs before release-draft. Approvals can
-    # delay mutation after a check, so no check is atomic or immediate. For admin
-    # jobs, needs does NOT automatically inherit SHA binding: preflight verifies
-    # HEAD==GITHUB_SHA and tag peel==GITHUB_SHA via checkout; each admin job
-    # inherits that same-run trust through needs and verifies GITHUB_REF/tag/
-    # repository id live, without a direct SHA equality check (no checkout while
-    # the App token is live). Manual prepublish recheck remains required.
-    _ADMIN_JOBS = (
-        "tag-ruleset-admin-verify",
-        "tag-ruleset-admin-verify-package",
-        "tag-ruleset-admin-verify-draft",
-    )
-    if raw.count("actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510") != 3:
-        raise AssertionError(f"{workflow}: release workflow must mint the admin token exactly three times (once per isolated admin job)")
-    for _admin_job in _ADMIN_JOBS:
-        _admin_section = _job_section(_admin_job)
-        if "timeout-minutes: 10" not in _admin_section:
-            raise AssertionError(f"{workflow}: {_admin_job} must set timeout-minutes: 10")
-        if "environment: release-admin" not in _admin_section:
-            raise AssertionError(f"{workflow}: {_admin_job} must be gated by environment: release-admin (dedicated verifier env)")
-        if "environment: release\n" in _admin_section and "environment: release-admin" not in _admin_section:
-            raise AssertionError(f"{workflow}: {_admin_job} must not use mutation environment release")
-        # Each admin job must reference exactly its two owner-provided release-admin secrets.
-        for _ref in _ADMIN_SECRET_REFS:
-            if _admin_section.count(_ref) != 1:
-                raise AssertionError(f"{workflow}: {_admin_job} must reference {_ref} exactly once")
-        # Dedicated verifier env: release-admin re-verify live inline before mint.
-        for _required in (
-            "Re-verify protected release-admin environment before mint",
-            "GH_TOKEN: ${{ github.token }}",
-            'gh api "repos/$repo/environments/release-admin"',
-            "deployment-branch-policies",
-            "environment name must be exactly release-admin",
-            "release-admin environment re-verified before mint",
-            "exact tag deployment policy re-verified before mint",
-            "same-run needs does NOT inherit SHA",
-            "not atomic or immediate",
-            "manual prepublish recheck remains",
-        ):
-            if _required not in _admin_section:
-                raise AssertionError(f"{workflow}: {_admin_job} must re-verify release-admin live before mint with {_required!r}")
-        for _required in (
-            "id: app-token",
-            "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510",
-            "# v3.3.0",
-            "app-id: ${{ secrets.RELEASE_ADMIN_APP_ID }}",
-            "private-key: ${{ secrets.RELEASE_ADMIN_APP_PRIVATE_KEY }}",
-            "owner: Jecta-ai",
-            "repositories: astatine-miner",
-            "permission-administration: read",
-            "skip-token-revoke: false",
-            "candidate under test",
-            "read sufficiency is UNPROVEN",
-            "STOP",
-            "later explicit",
-            "must not be",
-            "auto-escalat",
-            "UNPROVEN",
-            "fails closed if bypass_actors is absent",
-            "no write fallback",
-            "Metadata",
-            "ruleset-write",
-            "NOT independently confirmed",
-            "llms.txt",
-            "Residual risk",
-            "SHA pin",
-            "not inherent safety",
-            "without claiming elimination",
-            "No credentials are",
-            "auto-revok",
-            "does not prove revocation",
-            "no token value is logged or stored",
-            "Check admin token handling",
-            "GH_TOKEN: ${{ steps.app-token.outputs.token }}",
-            "RELEASE_TAG: ${{ inputs.tag }}",
-            "if: always()",
-            "Read-only gh api GET only",
-            "no -X/--method",
-            "does NOT inherit SHA",
-            "GITHUB_REF/tag/repository id live itself",
-            "GITHUB_SHA trust is inherited from same-run preflight",
-            "through the needs chain",
-            "Preflight verifies HEAD==GITHUB_SHA",
-            "tag peel==GITHUB_SHA via checkout",
-            "No direct SHA equality check here by design",
-            "no checkout while App token is live",
-            "not atomic",
-            "manual prepublish recheck remains",
-            'test "$repo" = "Jecta-ai/astatine-miner"',
-            'test "$tag" = "v0.1.0-testnet.2"',
-            'test "$GITHUB_REF" = "refs/tags/$tag"',
-            'gh api "repos/$repo" --jq .id',
-            'test "$repo_id" = "1454137135"',
-            '"1454137135"',
-            "rulesets?includes_parents=true&per_page=100",
-            "len(data) >= 100",
-            "expected exactly the two active split tag rulesets",
-            "astatine-release-tag-creation",
-            "astatine-release-tags",
-            "86115037",
-            "refs/tags/v*",
-            "current_user_can_bypass",
-            "creation ruleset must retain exactly the creation rule",
-            "immutability ruleset must use exactly update/deletion/non-fast-forward",
-            "absent snapshots fail closed",
-            "split tag rulesets admin-verified",
-        ):
-            if _required not in _admin_section:
-                raise AssertionError(f"{workflow}: {_admin_job} must contain {_required!r}")
-        if re.search(
-            r"\bverifies(?:\s|#)*GITHUB_SHA\b[\s\S]{0,160}?\blive itself\b",
-            _admin_section,
-            re.IGNORECASE,
-        ):
-            raise AssertionError(
-                f"{workflow}: {_admin_job} must not claim it verifies GITHUB_SHA live itself"
-            )
-        if "verifies GITHUB_SHA, tag, repository id, and ref live itself" in _admin_section:
-            raise AssertionError(
-                f"{workflow}: {_admin_job} contains the old direct-SHA-verification overclaim"
-            )
-        if "permission-administration: write" in _admin_section:
-            raise AssertionError(f"{workflow}: {_admin_job} must not use permission-administration: write (minimum privilege read only, no write fallback)")
-        if "Confirm admin token auto-revoke" in _admin_section:
-            raise AssertionError(f"{workflow}: {_admin_job} must use neutral 'Check admin token handling' (do NOT claim echo proves revoke), found old Confirm step")
-        if "intentionally omitted" in _admin_section:
-            raise AssertionError(f"{workflow}: {_admin_job} must set skip-token-revoke: false explicitly (omission forbidden)")
-        if "skip-token-revoke: true" in _admin_section:
-            raise AssertionError(f"{workflow}: {_admin_job} must not bypass revocation with skip-token-revoke: true")
-        # Explicit false is required; omission (relying on default) fails closed.
-        if "skip-token-revoke: false" not in _admin_section:
-            raise AssertionError(f"{workflow}: {_admin_job} must set skip-token-revoke: false explicitly (omission forbidden)")
-        for _forbidden in (
-            "actions/checkout@",
-            "download-artifact",
-            "upload-artifact",
-            "attest-build-provenance",
-            "support/release/",
-            "support/verify-",
-            "cargo build",
-            "target/release",
-            "gh release create",
-            "gh release edit",
-            "gh attestation",
-        ):
-            if _forbidden in _admin_section:
-                raise AssertionError(f"{workflow}: {_admin_job} must not contain {_forbidden!r}")
-        # Read-only gh: admin jobs contain ONLY read-only gh api GET. Forbid
-        # mutating flags/verbs and publish operations; workflow uses only
-        # gh api repos/... GET with default query.
-        for _forbidden_mut in (
-            "-X POST",
-            "-X PUT",
-            "-X PATCH",
-            "-X DELETE",
-            "gh api --method",
-            "--request POST",
-            "--request PUT",
-            "--request PATCH",
-            "--request DELETE",
-            "gh release",
-            "gh attestation",
-            "gh secret",
-            "gh variable",
-            "gh workflow",
-            "gh run ",
-            "curl -X",
-        ):
-            if _forbidden_mut in _admin_section:
-                raise AssertionError(f"{workflow}: {_admin_job} must contain only read-only gh api GET, found forbidden {_forbidden_mut!r}")
-        # Job-level administration permission stays forbidden; only the App action
-        # input permission-administration is allowed (checked above, scoped here).
-        _admin_perms = job_perms.get(_admin_job, {})
-        if "administration" in _admin_perms:
-            raise AssertionError(f"{workflow}: {_admin_job} must not request job-level administration permission")
-        if set(_admin_perms) != {"contents"} or _admin_perms.get("contents") != "none":
-            raise AssertionError(f"{workflow}: {_admin_job} must not hold permissions beyond contents:none, got {_admin_perms}")
-        # Pre-mint re-verify uses the default token exactly once; ruleset reads use
-        # only the App token. No other github.token usage is allowed in admin jobs.
-        if _admin_section.count("github.token") != 1:
-            raise AssertionError(f"{workflow}: {_admin_job} must reference github.token exactly once (pre-mint release-admin re-verify only), got {_admin_section.count('github.token')}")
-        if _admin_section.count("GH_TOKEN: ${{ github.token }}") != 1:
-            raise AssertionError(f"{workflow}: {_admin_job} must bind GH_TOKEN to github.token exactly once for pre-mint re-verify")
-        if _admin_section.count("GH_TOKEN: ${{ steps.app-token.outputs.token }}") != 1:
-            raise AssertionError(f"{workflow}: {_admin_job} must bind GH_TOKEN to the App token exactly once for ruleset reads")
-        # Every gh api invocation in admin jobs must be a read-only GET with
-        # default query against repos/... (no -X/--method, no mutating verbs).
-        for _line in _admin_section.splitlines():
-            _stripped = _line.strip()
-            if _stripped.startswith("#") or "gh api" not in _stripped:
-                continue
-            if 'gh api "repos/$repo' not in _stripped and "gh api \"repos/$repo" not in _stripped:
-                raise AssertionError(f"{workflow}: {_admin_job} gh api must target repos/$repo read-only GET, got {_stripped!r}")
-            for _bad in ("-X ", "--method", "--request ", "-XPOST", "-XPUT", "-XPATCH", "-XDELETE"):
-                if _bad in _stripped:
-                    raise AssertionError(f"{workflow}: {_admin_job} gh api must use default GET query (no -X/--method), got {_stripped!r}")
-        _admin_runs = _job_run_text(_admin_job)
-        for _forbidden_run in (
-            "outputs.token",
-            "$GH_TOKEN",
-            "PRIVATE_KEY",
-            "private-key",
-            "support/",
-            "gh release",
-            "gh attestation",
-            "upload-artifact",
-            "download-artifact",
-            "actions/checkout",
-            "gh api --method",
-        ):
-            if _forbidden_run in _admin_runs:
-                raise AssertionError(f"{workflow}: {_admin_job} run text must not contain {_forbidden_run!r}")
-    # Minted App token must not be reused outside the three isolated admin jobs.
-    _token_ref = "steps.app-token.outputs.token"
-    _token_total = raw.count(_token_ref)
-    _token_in_admin = sum(_job_section(_job).count(_token_ref) for _job in _ADMIN_JOBS)
-    if _token_total != 3 or _token_in_admin != 3:
-        raise AssertionError(f"{workflow}: minted App token must be consumed exactly once per isolated admin job (3 total, no reuse outside)")
-    # Release mutation env must hold zero App-secrets references; all six live
-    # only in the three release-admin verifier jobs.
-    for _mutation_job in ("preflight", "build-macos", "build-linux", "attest-macos", "attest-linux", "release-package", "release-draft"):
-        _mutation_section = _job_section(_mutation_job)
-        for _ref in _ADMIN_SECRET_REFS:
-            if _ref in _mutation_section:
-                raise AssertionError(f"{workflow}: {_mutation_job} (release env) must contain zero App secrets references, found {_ref!r}")
-    # Sequenced verification delegation: release-package and release-draft must not
-    # attempt impossible default-token split-ruleset detail checks; they rely on
-    # the sequenced isolated App job before each stage via needs. Needs ordering
-    # is not atomic or immediate and does not inherit SHA binding; each mutation
-    # job still verifies live itself with manual prepublish recheck required.
-    for _delegated_job, _fresh_gate in (
-        ("release-package", "tag-ruleset-admin-verify-package"),
-        ("release-draft", "tag-ruleset-admin-verify-draft"),
-    ):
-        _delegated_section = _job_section(_delegated_job)
+    # Phase1: no isolated verifier jobs, no App integration, no secrets.
+    # Absence of the old admin design is enforced globally above; here the
+    # package/draft comment contract is checked: no automated bypass
+    # verification is possible with the default token, so both mutation jobs
+    # must document the owner manual live check. Needs ordering is not atomic
+    # or immediate and does not inherit SHA binding; each mutation job still
+    # verifies live itself with a manual prepublish recheck required.
+    for _phase1_job in ("release-package", "release-draft"):
+        _phase1_section = _job_section(_phase1_job)
         for _marker in (
-            "Fresh isolated App verification sequenced via needs",
-            _fresh_gate,
+            "Phase1: no automated bypass verification is possible here",
             "default token cannot see",
             "bypass_actors",
-            "authoritative bypass validation is delegated",
-            "sequenced via needs before this stage",
+            "NOT a silent pass",
+            "owner manual live check required before",
+            "dispatch/publish",
             "is not atomic or immediate",
             "does not inherit SHA",
             "manual prepublish recheck remains",
         ):
-            if _marker not in _delegated_section:
-                raise AssertionError(f"{workflow}: {_delegated_job} must delegate to {_fresh_gate} with marker {_marker!r}")
-        # The impossible default-token detail blocks must be absent here
-        # (preflight retains its tolerated snapshot; admin jobs use the App token).
+            if _marker not in _phase1_section:
+                raise AssertionError(f"{workflow}: {_phase1_job} must document the Phase1 manual-check contract with marker {_marker!r}")
+        # The impossible default-token split-ruleset detail blocks must stay
+        # absent here (preflight keeps only the structural read-only snapshot).
         for _forbidden_detail in (
             "package-rulesets.json",
             "package-tag-ruleset-ids.txt",
@@ -1293,8 +1046,8 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             "draft-tag-ruleset-ids.txt",
             "support/release/verify-tag-ruleset.py",
         ):
-            if _forbidden_detail in _delegated_section:
-                raise AssertionError(f"{workflow}: {_delegated_job} must not contain default-token split-ruleset detail {_forbidden_detail!r} (delegated to {_fresh_gate})")
+            if _forbidden_detail in _phase1_section:
+                raise AssertionError(f"{workflow}: {_phase1_job} must not contain default-token split-ruleset detail {_forbidden_detail!r}")
     # Pinned actions with exact allowlist (L3): only the pinned actions, no other uses even if pinned.
     for number, line in enumerate(raw.splitlines(), 1):
         reference = reference_for_line(line)
@@ -1384,8 +1137,22 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         raise AssertionError(f"{workflow}: release workflow must not execute gh release edit (draft-only)")
     if "--draft=false" in raw:
         raise AssertionError(f"{workflow}: release workflow must not clear draft (no --draft=false)")
-    if "--prerelease" in raw:
-        raise AssertionError(f"{workflow}: release workflow must not mark prerelease from the workflow (draft-only)")
+    _prerelease_lines = [
+        line
+        for line in raw.splitlines()
+        if "--prerelease" in line and not line.strip().startswith("#")
+    ]
+    if len(_prerelease_lines) != 1:
+        raise AssertionError(
+            f"{workflow}: --prerelease must appear exactly once on the draft gh release create line"
+        )
+    _draft_section = _job_section("release-draft")
+    if _prerelease_lines[0] not in _draft_section:
+        raise AssertionError(f"{workflow}: --prerelease is allowed only on the release-draft create line")
+    if not re.search(r"gh\s+release\s+create\b[^\n]*--draft\b[^\n]*--prerelease\b[^\n]*--verify-tag\b", _prerelease_lines[0]):
+        raise AssertionError(
+            f"{workflow}: draft gh release create line must be --draft --prerelease --verify-tag (draft-only prerelease, no publish)"
+        )
     if re.search(r"\bgh\s+release\s+verify\b", raw):
         raise AssertionError(f"{workflow}: release workflow must not auto-verify/publish releases")
     if "gh release verify-asset" in raw:
@@ -1396,13 +1163,14 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "--json assets",
         "--verify-tag",
         "--draft",
+        "--prerelease",
     ):
         if required not in raw:
             raise AssertionError(f"{workflow}: release workflow must contain {required!r}")
     if not re.search(r"gh\s+release\s+create\b[^\n]*--draft\b", raw):
         raise AssertionError(f"{workflow}: gh release create must contain --draft (draft-only)")
-    if "--draft --verify-tag" not in raw and "--verify-tag" not in raw:
-        raise AssertionError(f"{workflow}: gh release create must contain --verify-tag")
+    if "--draft --prerelease --verify-tag" not in raw:
+        raise AssertionError(f"{workflow}: gh release create must contain --draft --prerelease --verify-tag on one draft line")
     if (
         'git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.2.md"' not in raw
         or 'cp "$tagged_notes" "$out/release-notes.md"' not in raw
@@ -1497,28 +1265,25 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     if "tag deployment" not in raw.lower():
         raise AssertionError(f"{workflow}: release workflow must document the tag deployment policy")
     # Protected environment fail-closed verification via bounded validator (L2).
-    # Preflight (no env) verifies BOTH release and release-admin live via gh api
-    # with pagination total_count; package re-verifies release before mutation;
-    # draft and admin pre-mint use inline python with the same exact-tag and
-    # pagination checks, no reviewer identities printed. Validator enforces
+    # Preflight (no env) verifies the live release config via gh api with
+    # pagination total_count; package re-verifies release before mutation;
+    # draft uses inline python with the same exact-tag and pagination checks,
+    # no reviewer identities printed. Validator enforces
     # M2 series/exact allowlist.
     validator_cli = 'python3 -B support/release/verify-protected-environment.py --environment-json'
     if validator_cli not in raw:
         raise AssertionError(
             f"{workflow}: release workflow must call the protected-environment validator with {validator_cli!r}"
         )
-    if raw.count(validator_cli) != 3:
+    if raw.count(validator_cli) != 2:
         raise AssertionError(
-            f"{workflow}: release workflow must call the protected-environment validator exactly 3x (preflight release + preflight release-admin + package release re-verify), got {raw.count(validator_cli)}"
+            f"{workflow}: release workflow must call the protected-environment validator exactly 2x (preflight release + package release re-verify), got {raw.count(validator_cli)}"
         )
     for required in (
         'environments/release"',
-        'environments/release-admin"',
         "deployment-branch-policies",
         "--expected-environment release",
-        "--expected-environment release-admin",
-        "Verify protected release and release-admin environments",
-        "Re-verify protected release-admin environment before mint",
+        "Verify protected release environment",
         "Re-verify protected environment before mutation",
     ):
         if required not in raw:
@@ -1557,42 +1322,17 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "reviewer id must be the immutable owner id 86115037",
         "reviewer login must be the owner login",
         "environment name must be exactly release",
-        "environment name must be exactly release-admin",
-        "release and release-admin",
-        "release-admin environment re-verified before mint",
-        "permission-administration read",
-        "read sufficiency is UNPROVEN",
-        "no write fallback",
-        "STOP",
-        "must not be",
-        "auto-escalat",
-        "skip-token-revoke: false",
-        "does not prove revocation",
-        "no token value is logged or stored",
-        "Read-only gh api GET only",
+        "Phase1 manual-check contract",
+        "no automated bypass verification",
+        "BYPASS_ACTORS NOT AUTOMATICALLY VERIFIED",
+        "TOCTOU",
+        "manual publish",
+        "prerelease",
+        "mutable by repository writers",
         "same-run needs does NOT inherit SHA",
         "is not atomic or immediate",
         "manual prepublish recheck remains",
         "does NOT inherit SHA",
-        "GITHUB_REF/tag/repository id live itself",
-        "GITHUB_SHA trust is inherited from same-run preflight",
-        "through the needs chain",
-        "Preflight verifies HEAD==GITHUB_SHA",
-        "tag peel==GITHUB_SHA via checkout",
-        "No direct SHA equality check here by design",
-        "no checkout while App token is live",
-        "refs/tags/v3.3.0",
-        "64ab729a6294000f5aa4a4bc0b73d1f32bc45510",
-        "action.yml declares",
-        "post dist/post.cjs",
-        "masked",
-        "1 hour expiry",
-        "repositories narrows",
-        "NOT independently confirmed",
-        "llms.txt",
-        "SHA pin",
-        "not inherent safety",
-        "without claiming elimination",
         "total_count must be an integer",
         "rulesets?includes_parents=true&per_page=100",
         "astatine-release-tag-creation",
@@ -1600,9 +1340,6 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "exactly the two active split tag rulesets",
         "creation ruleset must retain exactly the creation rule",
         "immutability ruleset must use exactly update/deletion/non-fast-forward",
-        "Fresh isolated App verification sequenced via needs",
-        "authoritative bypass validation is delegated",
-        "sequenced via needs before this stage",
         "Creation protection is never removed",
         "ruleset-write access",
         "a draft or release already exists",
@@ -1832,16 +1569,16 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     # B2: per-job isolation — package builds (no contents:write, no draft mutation);
     # draft creates draft only (no checkout, no repo scripts/build).
     # attest jobs attest only (no checkout, no candidate execution, no repo scripts).
-    # Checkout count must be exactly preflight+2 builds+package (draft+attests+3 admin jobs have none).
+    # Checkout count must be exactly preflight+2 builds+package (draft+attests have none).
     _checkout_total = raw.count("actions/checkout@")
     if _checkout_total != 4:
-        raise AssertionError(f"{workflow}: release workflow must have exactly 4 checkouts (preflight+builds+package, none in draft/attest/admin), got {_checkout_total} (B2)")
-    # Attest/admin jobs must not checkout; draft must not checkout (B2 isolation, R3 split).
-    for _isolated_job in ("attest-macos", "attest-linux", "release-draft", "tag-ruleset-admin-verify", "tag-ruleset-admin-verify-package", "tag-ruleset-admin-verify-draft"):
+        raise AssertionError(f"{workflow}: release workflow must have exactly 4 checkouts (preflight+builds+package, none in draft/attest), got {_checkout_total} (B2)")
+    # Attest jobs must not checkout; draft must not checkout (B2 isolation, R3 split).
+    for _isolated_job in ("attest-macos", "attest-linux", "release-draft"):
         _section = raw.split(_isolated_job + ":", 1)[-1] if _isolated_job + ":" in raw else ""
         # Bound to the job: cut at the next top-level job (two-space job key).
         _next = None
-        for _candidate in ("preflight:", "build-macos:", "build-linux:", "attest-macos:", "attest-linux:", "tag-ruleset-admin-verify:", "tag-ruleset-admin-verify-package:", "tag-ruleset-admin-verify-draft:", "release-package:", "release-draft:"):
+        for _candidate in ("preflight:", "build-macos:", "build-linux:", "attest-macos:", "attest-linux:", "release-package:", "release-draft:"):
             if _candidate == _isolated_job + ":":
                 continue
             if _candidate in _section:
@@ -1856,7 +1593,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     for _attest_job in ("attest-macos", "attest-linux"):
         _section = raw.split(_attest_job + ":", 1)[-1] if _attest_job + ":" in raw else ""
         _next = None
-        for _candidate in ("preflight:", "build-macos:", "build-linux:", "attest-macos:", "attest-linux:", "tag-ruleset-admin-verify:", "tag-ruleset-admin-verify-package:", "tag-ruleset-admin-verify-draft:", "release-package:", "release-draft:"):
+        for _candidate in ("preflight:", "build-macos:", "build-linux:", "attest-macos:", "attest-linux:", "release-package:", "release-draft:"):
             if _candidate == _attest_job + ":":
                 continue
             if _candidate in _section:
@@ -1884,7 +1621,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     for _build_job in ("build-macos", "build-linux"):
         _section = raw.split(_build_job + ":", 1)[-1] if _build_job + ":" in raw else ""
         _next = None
-        for _candidate in ("preflight:", "build-macos:", "build-linux:", "attest-macos:", "attest-linux:", "tag-ruleset-admin-verify:", "tag-ruleset-admin-verify-package:", "tag-ruleset-admin-verify-draft:", "release-package:", "release-draft:"):
+        for _candidate in ("preflight:", "build-macos:", "build-linux:", "attest-macos:", "attest-linux:", "release-package:", "release-draft:"):
             if _candidate == _build_job + ":":
                 continue
             if _candidate in _section:
@@ -1897,10 +1634,10 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             raise AssertionError(f"{workflow}: {_build_job} must not attest directly; attestation lives in attest jobs (R3)")
         if "id-token: write" in _section or "attestations: write" in _section:
             raise AssertionError(f"{workflow}: {_build_job} must not request OIDC/attestations write; read-only build (R3)")
-    # Validator script only in preflight (release + release-admin) + package release
-    # (draft and admin pre-mint use inline, no repo script while App token live).
-    if raw.count('python3 -B support/release/verify-protected-environment.py --environment-json') != 3:
-        raise AssertionError(f"{workflow}: protected-environment validator must run 3x (preflight release + preflight release-admin + package release), inline in draft/admin pre-mint (B2/L2)")
+    # Validator script only in preflight release + package release verify
+    # (draft uses inline python; no repo script needed there).
+    if raw.count('python3 -B support/release/verify-protected-environment.py --environment-json') != 2:
+        raise AssertionError(f"{workflow}: protected-environment validator must run 2x (preflight release + package release), inline in draft (B2/L2)")
     # Builder only in package with observed toolchain args (R3).
     if raw.count("support/release/build-release.py") != 1:
         raise AssertionError(f"{workflow}: release builder must run exactly once in release-package (B2)")

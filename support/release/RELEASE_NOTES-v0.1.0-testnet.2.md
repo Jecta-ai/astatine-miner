@@ -138,12 +138,29 @@ Before dispatch, these prerequisites must pass:
   still reconfigure or delete rulesets, so tag immutability cannot constrain
   that account; repository administrator authority must remain owner-only.
   GitHub only returns `bypass_actors` to a caller with write access to the
-  ruleset. Whether the default workflow token has that access is not
-  established by this revision. If the field is absent, the validator treats
-  the creation-bypass check as unverifiable and fails closed. No token or
-  secret is added to the workflow. Until a controlled runtime demonstrates the
-  field is visible, or an authorized admin-visible verification path exists,
-  dispatch remains blocked rather than weakening creation protection.
+  ruleset; the default read-only workflow token lacks that access, so an
+  absent field does NOT prove an empty bypass list. Automation does NOT verify
+  bypass: preflight checks structural fields only (names, scope, enforcement,
+  active state, ids, rules; visible mismatch fails) and tolerates an absent
+  `bypass_actors` field ONLY with an explicit manual-verification-required
+  disclosure. No App, private key, installation token, or extra secret is used.
+  The authoritative bypass check is an owner-authorized manual live check
+  OUTSIDE the workflow with the owner `gh` credential, run before dispatch
+  AND again immediately before manual publication (TOCTOU: approvals delay,
+  `needs` does NOT inherit SHA/tag binding, draft mutable by writers):
+
+  ```sh
+  tag=v0.1.0-testnet.2
+  repo=Jecta-ai/astatine-miner
+  gh api "repos/$repo/rulesets?includes_parents=true&per_page=100" --jq '.[] | {id, name, target, source_type, source, enforcement}'
+  gh api "repos/$repo/rulesets/$creation_id" > /tmp/creation.json
+  gh api "repos/$repo/rulesets/$immutability_id" > /tmp/immutability.json
+  python3 -B support/release/verify-tag-ruleset.py --creation-ruleset-json /tmp/creation.json --immutability-ruleset-json /tmp/immutability.json --repository "$repo" --tag "$tag"
+  gh api "repos/$repo/environments/release" > /tmp/release-env.json
+  gh api "repos/$repo/environments/release/deployment-branch-policies?per_page=100" > /tmp/release-policies.json
+  python3 -B support/release/verify-protected-environment.py --environment-json /tmp/release-env.json --policies-json /tmp/release-policies.json --tag "$tag" --expected-environment release
+  gh api "repos/$repo/immutable-releases" --jq .enabled | grep -q true
+  ```
 - An owner/admin checks `GET /repos/{owner}/{repo}/immutable-releases` before
   draft creation and confirms the response is `enabled: true`. Recheck this
   setting immediately before manual publication. Published assets are
@@ -244,9 +261,16 @@ final. Before publishing:
    verify both archive attestations against the exact tag and source digest,
    and compare the downloaded digests with the recorded draft digests.
 4. Immediately before publication, repeat the draft asset digest/size check
-   and the remote-tag check. Re-fetch both split ruleset details with an
-   owner/admin-visible token and run:
-   `python3 -B support/release/verify-tag-ruleset.py --creation-ruleset-json <creation.json> --immutability-ruleset-json <immutability.json> --repository "$repo" --tag "$tag"`.
+   and the remote-tag check. With the owner `gh` credential OUTSIDE the
+   workflow (no App), re-fetch both split ruleset details, re-verify the
+   `release` environment, recheck immutable releases, and run:
+   `gh api "repos/$repo/rulesets?includes_parents=true&per_page=100"`,
+   per-id `gh api "repos/$repo/rulesets/$id"` fetches, then
+   `python3 -B support/release/verify-tag-ruleset.py --creation-ruleset-json <creation.json> --immutability-ruleset-json <immutability.json> --repository "$repo" --tag "$tag"`,
+   plus `gh api "repos/$repo/environments/release"`,
+   `gh api "repos/$repo/environments/release/deployment-branch-policies?per_page=100"`,
+   `python3 -B support/release/verify-protected-environment.py --environment-json <env.json> --policies-json <policies.json> --tag "$tag" --expected-environment release`,
+   and `gh api "repos/$repo/immutable-releases" --jq .enabled`.
    Stop on any difference, missing asset, extra asset, changed release id, or
    ruleset mismatch; do not overwrite, delete, or re-upload the draft to force
    a pass.
