@@ -186,6 +186,54 @@ jobs:
           export DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNNER_TEMP/astatine-no-secret-service"
           cargo test --locked --bin astatine -- --exact config::tests::linux_secret_service_unavailable_fails_closed_without_native_keyring --nocapture
 
+  windows-safe-tests:
+    name: Windows safe unit tests (no native keyring, Anvil, or GPU)
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain components
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+      - name: Run isolated safe unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_home="$RUNNER_TEMP/astatine-safe-test-home"
+          mkdir -p "$test_home"
+          export APPDATA="$test_home/AppData/Roaming"
+          export LOCALAPPDATA="$test_home/AppData/Local"
+          mkdir -p "$APPDATA" "$LOCALAPPDATA"
+          isolated_temp="$test_home/temp"
+          mkdir -p "$isolated_temp"
+          export TEMP="$isolated_temp"
+          export TMP="$isolated_temp"
+          export TMPDIR="$isolated_temp"
+          export HOME="$test_home"
+          export XDG_CONFIG_HOME="$test_home/.config"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=/definitely-unavailable-astatine-test-bus"
+          unset ASTATINE_REQUIRE_NATIVE_CREDENTIAL_STORE || true
+          unset ASTATINE_DISPOSABLE_CREDENTIAL_STORE || true
+          unset ASTATINE_QUALIFICATION_MODE || true
+          unset ASTATINE_E2E_DEVICE || true
+          unset ASTATINE_E2E_GPU_NODE_SET || true
+          cargo test --locked --bin astatine -- \
+            --skip config::tests::native_journal_anchor_persists_across_processes_and_is_root_scoped \
+            --skip config::tests::linux_secret_service_unavailable_fails_closed_without_native_keyring
+      - name: Verify no private state leaked into the real profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -e "$APPDATA/Astatine" ]; then
+            echo "private state leaked into the real Windows profile at $APPDATA/Astatine"
+            exit 1
+          fi
+          echo "Windows safe tests used an isolated APPDATA; real Credential Manager was not accessed"
+
   dependency-policy:
     name: Dependency, advisory, and license checks
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
