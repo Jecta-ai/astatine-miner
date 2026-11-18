@@ -1405,8 +1405,6 @@ fn validate_windows_directory_private(path: &Path) -> Result<()> {
 /// Never called from non-test builds.
 #[cfg(all(test, windows))]
 fn secure_windows_existing_test_directory(path: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1415,6 +1413,38 @@ fn secure_windows_existing_test_directory(path: &Path) -> Result<()> {
     if !metadata.is_dir() || windows_reparse_point(&metadata) {
         return Ok(());
     }
+    apply_windows_protected_dacl(path).context("protect test directory")
+}
+
+/// Recursively upgrade a copied isolated test tree (directories and files) to
+/// the protected owner/system DACL. Used only by the data-root copy fixture;
+/// production validation still runs afterwards and fails closed on any
+/// remaining unsafe entry. Never called from non-test builds.
+#[cfg(all(test, windows))]
+pub(crate) fn secure_windows_test_tree(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).context("inspect copied test path")?;
+    if windows_reparse_point(&metadata) {
+        anyhow::bail!("copied test path is a reparse point");
+    }
+    if metadata.is_dir() {
+        apply_windows_protected_dacl(path)
+            .with_context(|| format!("protect copied test directory {}", path.display()))?;
+        for entry in fs::read_dir(path).context("list copied test directory")? {
+            let entry = entry.context("inspect copied test entry")?;
+            secure_windows_test_tree(&entry.path())?;
+        }
+        Ok(())
+    } else if metadata.is_file() {
+        apply_windows_protected_dacl(path)
+            .with_context(|| format!("protect copied test file {}", path.display()))
+    } else {
+        anyhow::bail!("copied test path is not a regular file or directory");
+    }
+}
+
+#[cfg(all(test, windows))]
+fn apply_windows_protected_dacl(path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::{

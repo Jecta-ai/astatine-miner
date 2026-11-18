@@ -8192,6 +8192,16 @@ mod tests {
                 anyhow::bail!("test data root contains an unsupported file type");
             }
         }
+        // Windows production validation requires the protected owner/system
+        // DACL. A byte copy via `create_dir_all`/`fs::copy` inherits the
+        // destination temp ACL, so upgrade the copied tree best-effort to the
+        // protected DACL. Contents are preserved, so the checkpoint-fork
+        // regression (different canonical roots must not share checkpoints)
+        // is retained; validation still fails closed on any remaining unsafe
+        // entry. Test-only; production paths never call this.
+        #[cfg(all(test, windows))]
+        crate::config::secure_windows_test_tree(destination)
+            .context("protect copied Windows test tree")?;
         Ok(())
     }
 
