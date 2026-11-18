@@ -1,6 +1,6 @@
 {
   "schema": "astatine-fixture-provenance/v3",
-  "scope": "Offline inventory for tests/fixtures only. No upstream source is copied here and no upstream build was performed for this inventory. Offline fixture inventory (fixture bytes and hashes) is unchanged; this revision records owner-authorized release intent and technical NOTICE review.",
+  "scope": "Offline inventory for tests/fixtures only. No upstream source is copied here and no upstream build was performed for this inventory. Offline fixture inventory (fixture bytes and hashes) is unchanged; this revision records owner-authorized release intent for v0.1.0-testnet.2 under the explicit owner self-approval policy and the technical NOTICE review, while preserving the historical v0.1.0-testnet.1 rights decision, scope and approval roles verbatim.",
   "baseline": {
     "canonical_repository_head": "7ba0ff6136c1ed7d084939cce44b8a7da669b671",
     "canonical_tree": "09b7387d6fb9ddc86ac37f105c5f3dd4ceccc417",
@@ -12,7 +12,7 @@
     "network_required": false,
     "build_required": false,
     "regenerated_in_this_review": false,
-    "change_note": "FIX-04 was replaced in an earlier review by a synthetic receipt authored in this repository; the three contract bytecode fixtures were not regenerated. Offline fixture inventory is unchanged in this revision; owner-authorized release intent and technical NOTICE review were recorded.",
+    "change_note": "FIX-04 was replaced in an earlier review by a synthetic receipt authored in this repository; the three contract bytecode fixtures were not regenerated. Offline fixture inventory is unchanged in this revision; owner-authorized release intent for v0.1.0-testnet.2 under the explicit owner self-approval policy and technical NOTICE review were recorded, and the historical .1 intent was preserved.",
     "date_utc": "2026-11-17"
   },
   "fixtures": [
@@ -50,7 +50,7 @@
       "license": {
         "declared_spdx": "Apache-2.0",
         "declaration_evidence": "SPDX header in the pinned source blob d1fc2c6a91c290ce8d4be353a232dc41769f2c51; the file contains no copyright statement.",
-        "rights_status": "first-party work owned by the project owner; Apache-2.0 redistribution is authorized by the project owner with copyright Copyright (c) 2026 emyrinj; Apache-2.0 text in tests/fixtures/LICENSE-APACHE-2.0.txt and fixture NOTICE in tests/fixtures/NOTICE are included; OWNER-ATTESTED \u2014 not independently verified",
+        "rights_status": "first-party work owned by the project owner; Apache-2.0 redistribution is authorized by the project owner with copyright Copyright (c) 2026 emyrinj; Apache-2.0 text in tests/fixtures/LICENSE-APACHE-2.0.txt and fixture NOTICE in tests/fixtures/NOTICE are included; OWNER-ATTESTED — not independently verified",
         "license_text": "tests/fixtures/LICENSE-APACHE-2.0.txt",
         "copyright": "Copyright (c) 2026 emyrinj"
       },
@@ -103,7 +103,7 @@
       "license": {
         "declared_spdx": "Apache-2.0",
         "declaration_evidence": "SPDX header in the pinned source blob abd2ebd9fcefd1c62dc7b17939b3d3f875d09df8; the file contains no copyright statement and has zero direct OpenZeppelin imports.",
-        "rights_status": "first-party work owned by the project owner; Apache-2.0 redistribution is authorized by the project owner with copyright Copyright (c) 2026 emyrinj; Apache-2.0 text in tests/fixtures/LICENSE-APACHE-2.0.txt and fixture NOTICE in tests/fixtures/NOTICE are included; OWNER-ATTESTED \u2014 not independently verified",
+        "rights_status": "first-party work owned by the project owner; Apache-2.0 redistribution is authorized by the project owner with copyright Copyright (c) 2026 emyrinj; Apache-2.0 text in tests/fixtures/LICENSE-APACHE-2.0.txt and fixture NOTICE in tests/fixtures/NOTICE are included; OWNER-ATTESTED — not independently verified",
         "license_text": "tests/fixtures/LICENSE-APACHE-2.0.txt",
         "copyright": "Copyright (c) 2026 emyrinj"
       },
@@ -149,7 +149,7 @@
       "license": {
         "declared_spdx": "MIT",
         "declaration_evidence": "SPDX header in the pinned source blob 0a7480c5586ac26897cbadc4db83c5225ad46c58; the file contains no copyright statement and imports one OpenZeppelin component.",
-        "rights_status": "MockAST is first-party work owned by the project owner; MIT redistribution is authorized by the project owner with copyright Copyright (c) 2026 emyrinj; OpenZeppelin MIT notice is retained in tests/fixtures/OPENZEPPELIN_LICENSE.txt; OWNER-ATTESTED \u2014 not independently verified",
+        "rights_status": "MockAST is first-party work owned by the project owner; MIT redistribution is authorized by the project owner with copyright Copyright (c) 2026 emyrinj; OpenZeppelin MIT notice is retained in tests/fixtures/OPENZEPPELIN_LICENSE.txt; OWNER-ATTESTED — not independently verified",
         "license_text": "tests/fixtures/LICENSE-MIT.txt",
         "copyright": "Copyright (c) 2026 emyrinj"
       },
@@ -207,8 +207,8 @@
   "documents": [
     {
       "path": "tests/fixtures/README.md",
-      "sha256": "cc4436a1df510deb09125bff6597138e5e6bd499e36a1d754a9cc1ebec78ef03",
-      "bytes": 10309
+      "sha256": "086b55c15a9747b7627374b78b8e441fec1f40943eec281c1bb3f7fd4ac117b8",
+      "bytes": 10824
     }
   ],
   "legal_artifacts": [
@@ -241,8 +241,8 @@
     },
     {
       "path": "tests/fixtures/NOTICE",
-      "sha256": "8952db21e62803cad6900a1116e43cba3d13459e22cabbc66e83698d6274e32a",
-      "bytes": 2950,
+      "sha256": "753da3a343e8380577f6e45e0c36c636860dd6071ae1d091840ae327598b1a48",
+      "bytes": 3080,
       "license": "NOTICE",
       "copyright": "Copyright (c) 2026 emyrinj; Copyright (c) 2016-2023 zOS Global Limited and contributors",
       "provenance": "Fixture NOTICE authored in this repository recording first-party Apache-2.0/MIT attributions, accurately scoped OpenZeppelin reference (both EVM trees reference commit dbb6104ce834628e473d2173bbc9d47f81a9eec3; MockAST imports one component; GenesisCoordinator zero direct imports; retained for any applicable redistribution without asserting OZ code in every fixture), and technical NOTICE review finding no separate upstream NOTICE file.",
@@ -261,16 +261,16 @@
   "rights_review": {
     "first_party_license_identity": "The pinned AstatineMiner and AstatineGenesisCoordinator source files declare Apache-2.0; the pinned MockAST source file declares MIT.",
     "copyright_evidence": "The contract files contain no copyright statements. The private EVM origin contains an Apache NOTICE scoped to a separate Rust subtree; the EVM tree root and contract subtree have no LICENSE/NOTICE at the pin. The coordinator origin tree at its pin contains no LICENSE/NOTICE.",
-    "rights_holder_authority": "OWNER-ATTESTED \u2014 not independently verified",
+    "rights_holder_authority": "OWNER-ATTESTED — not independently verified",
     "owner_attestation": {
-      "status": "OWNER-ATTESTED \u2014 not independently verified",
+      "status": "OWNER-ATTESTED — not independently verified",
       "scope": "The AstatineMiner, AstatineGenesisCoordinator, and MockAST contracts are first-party works developed and owned by the project owner.",
       "attested_on": "2026-11-17",
       "attestation_source": "The project owner explicitly confirmed ownership of the first-party AstatineMiner, AstatineGenesisCoordinator, and MockAST contracts and authorized redistribution under Apache-2.0 (AstatineMiner, AstatineGenesisCoordinator) and MIT (MockAST) on 2026-11-17; not independently verified.",
       "independent_verification": false,
       "prior_attestations": [
         {
-          "status": "OWNER-ATTESTED \u2014 not independently verified",
+          "status": "OWNER-ATTESTED — not independently verified",
           "scope": "The AstatineMiner and AstatineGenesisCoordinator contracts are first-party works developed and owned by the project owner.",
           "attested_on": "2026-11-15",
           "attestation_source": "The project owner explicitly confirmed ownership of the first-party ASTATINE mining and genesis coordinator contracts for Phase D; not independently verified.",
@@ -278,9 +278,9 @@
         }
       ]
     },
-    "notice_applicability": "TECHNICALLY REVIEWED \u2014 no separate upstream NOTICE file was found in the pinned contract fixture subtrees; the private EVM root NOTICE is scoped to a separate Rust subtree; Apache-2.0 license text and fixture NOTICE are included. This is an evidence-based technical review, not a legal conclusion or separate approval.",
+    "notice_applicability": "TECHNICALLY REVIEWED — no separate upstream NOTICE file was found in the pinned contract fixture subtrees; the private EVM root NOTICE is scoped to a separate Rust subtree; Apache-2.0 license text and fixture NOTICE are included. This is an evidence-based technical review, not a legal conclusion or separate approval.",
     "notice_checklist": {
-      "status": "TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent; final release controls outstanding",
+      "status": "TECHNICAL REVIEW RECORDED — owner-authorized release intent under the explicit owner self-approval policy; final release controls outstanding",
       "scope": "Manual release gate. No automated check can establish ownership, authority or NOTICE applicability; this list records the exact actions still required before publishing this repository or its release archive.",
       "items": [
         {
@@ -327,7 +327,7 @@
     },
     "not_inferred": "Repository owner identity, commit-author metadata, a personal handle or the CLI MIT license do not by themselves establish ownership or redistribution authority. The owner attestation is an explicit statement of first-party ownership; it is recorded as OWNER-ATTESTED and is not independently verified.",
     "review_ci_branch_push_authorization": {
-      "status": "SUPERSEDED \u2014 OWNER-AUTHORIZED RELEASE INTENT",
+      "status": "SUPERSEDED — OWNER-AUTHORIZED RELEASE INTENT",
       "authorized_by": "project owner",
       "authorized_on": "2026-11-16",
       "scope": "Push the fix/phase-e-e02-e07 remediation branch to the already-public repository solely for review and CI.",
@@ -344,20 +344,21 @@
       "superseded_by": "release_intent_authorization",
       "superseded_on": "2026-11-17"
     },
-    "rights_decision": "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.1; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion or separate approval.",
+    "rights_decision": "OWNER-AUTHORIZED RELEASE INTENT — project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.2 under the explicitly documented owner self-approval policy; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion, not independent review, and not a separate approval.",
     "release_intent_authorization": {
-      "status": "OWNER-AUTHORIZED RELEASE INTENT \u2014 FINAL CONTROLS OUTSTANDING",
+      "status": "OWNER-AUTHORIZED RELEASE INTENT — FINAL CONTROLS OUTSTANDING — OWNER SELF-APPROVAL",
       "authorized_by": "project owner",
       "authorized_on": "2026-11-17",
-      "scope": "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.1 on macOS ARM64 and Linux x86_64; final release controls remain outstanding.",
-      "approval_roles": "Project owner only; no separate release approver was appointed, consulted, or asserted.",
+      "scope": "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.2 on macOS ARM64 and Linux x86_64 under an explicit owner self-approval policy; no independent reviewer or separate approver; final release controls remain outstanding.",
+      "approval_roles": "Project owner only; the owner explicitly authorized owner self-approval for the protected release environment. No independent reviewer and no separate release approver was appointed, consulted, or asserted; separation of duties is explicitly reduced and recorded as a security tradeoff.",
       "evidence": [
         "Project owner authorized first-party MockAST MIT redistribution intent (copyright Copyright (c) 2026 emyrinj) on 2026-11-17; see rights_review.owner_attestation and tests/fixtures/LICENSE-MIT.txt.",
         "Apache-2.0 copyright Copyright (c) 2026 emyrinj for first-party AstatineMiner and AstatineGenesisCoordinator recorded in tests/fixtures/NOTICE and fixture license fields.",
-        "License/notice files included: tests/fixtures/LICENSE-APACHE-2.0.txt (SHA-256 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a), tests/fixtures/LICENSE-MIT.txt (SHA-256 7472688f99a2841cd08d1a66fcf1f6d0ca8d9b7057b79093a9b568f245c6ed2f), tests/fixtures/NOTICE (SHA-256 8952db21e62803cad6900a1116e43cba3d13459e22cabbc66e83698d6274e32a).",
+        "License/notice files included: tests/fixtures/LICENSE-APACHE-2.0.txt (SHA-256 62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a), tests/fixtures/LICENSE-MIT.txt (SHA-256 7472688f99a2841cd08d1a66fcf1f6d0ca8d9b7057b79093a9b568f245c6ed2f), tests/fixtures/NOTICE (SHA-256 753da3a343e8380577f6e45e0c36c636860dd6071ae1d091840ae327598b1a48).",
         "OpenZeppelin MIT notice (Copyright (c) 2016-2023 zOS Global Limited and contributors, commit dbb6104ce834628e473d2173bbc9d47f81a9eec3) retained in tests/fixtures/OPENZEPPELIN_LICENSE.txt for any fixture redistribution to which it applies; MockAST imports one component, GenesisCoordinator zero direct imports, no OpenZeppelin code in AstatineMiner asserted; does not assert OpenZeppelin code in every fixture.",
         "All fixtures remain excluded from binary archives: FIX-01 through FIX-04 set release_archive_member to false; production binaries never load these files.",
-        "No legal conclusion is made and no separate approval is asserted; technical NOTICE review recorded with citations to PROVENANCE.json, README.md, LICENSE-APACHE-2.0.txt, LICENSE-MIT.txt, OPENZEPPELIN_LICENSE.txt, NOTICE."
+        "No legal conclusion is made and no separate approval is asserted; technical NOTICE review recorded with citations to PROVENANCE.json, README.md, LICENSE-APACHE-2.0.txt, LICENSE-MIT.txt, OPENZEPPELIN_LICENSE.txt, NOTICE.",
+        "Project owner explicitly directed a sustainable owner-controlled release without any external human reviewer and expressly authorized v0.1.0-testnet.2 and the owner self-approval model on 2026-11-17; this is owner-provided authorization, not independent review."
       ],
       "technical_notice_review": {
         "reviewed_on": "2026-11-17",
@@ -376,14 +377,94 @@
       },
       "final_release_controls_complete": false,
       "not_authorized": [
-        "Any other tag or version beyond v0.1.0-testnet.1.",
+        "Any other tag or version beyond v0.1.0-testnet.2.",
         "Mainnet deployment or paid-operation risk acceptance.",
         "Independent legal verification, legal advice, legal clearance, or legal conclusion.",
         "Any assertion that a separate release approver was appointed, consulted, or approved the release.",
         "Final release without the exact release tag, main-branch CI, protected environment, writer and write-capable app restriction, immutable-release verification, required attestations, and immutable release artifacts.",
-        "Bypass of release controls or workflow attestation dispatch outside the authorized release process."
+        "Bypass of release controls or workflow attestation dispatch outside the authorized release process.",
+        "Independent review or separation of duties, which the owner self-approval policy explicitly does not provide."
       ],
-      "independent_verification": false
+      "independent_verification": false,
+      "owner_self_approval": {
+        "status": "ACTIVE — OWNER SELF-APPROVAL",
+        "approved_by": "project owner",
+        "approved_on": "2026-11-17",
+        "authorization_source": "Project owner directive in the release implementation task: sustainable owner-controlled release without any external human reviewer; the owner expressly authorized the new version and the owner self-approval model.",
+        "scope": "The owner account emyrinj (immutable numeric GitHub user id 86115037) is the sole required reviewer for the protected release environment and may approve a deployment initiated by the same account. The owner also manually publishes the verified draft.",
+        "independent_reviewer": false,
+        "separation_of_duties": "NONE — the same owner account initiates the workflow, approves the protected environment, and performs manual publication; no independent human approval is required or claimed.",
+        "security_tradeoff": "Removes independent separation of duties and a second-person review. A compromised, malicious, or mistaken owner account can approve and publish without another human check.",
+        "residual_risk_accepted": true,
+        "owner_attested": true,
+        "independent_verification": false,
+        "compensating_controls": [
+          "exact release tag pinned to v0.1.0-testnet.2 and an exact-tag environment deployment policy",
+          "environment cannot be bypassed by administrators (can_admins_bypass: false)",
+          "separate tag creation ruleset must be active with the creation rule and exactly the owner-user bypass (User 86115037, always) for exactly refs/tags/v* with no exclusions; repository-admin bypass is rejected",
+          "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering exactly refs/tags/v* with no exclusions",
+          "tag creation protection must be retained; it must not be removed or broadened",
+          "immutable releases must be enabled before dispatch and rechecked before publication",
+          "exact-commit green main CI for Rust CI and Linux native qualification",
+          "binary and archive build-provenance attestations bound to the exact tag and source digest",
+          "draft-only creation; no automated publication",
+          "owner-only repository write authority and post-publication verification",
+          "all release records explicitly state that review is not independent"
+        ],
+        "not_claimed": [
+          "independent review",
+          "separation of duties",
+          "a separate release approver",
+          "legal conclusion",
+          "immunity from owner-account compromise"
+        ]
+      },
+      "independent_reviewer": false,
+      "separation_of_duties": "NONE — the same owner account initiates the workflow, approves the protected environment, and performs manual publication; no independent human approval is required or claimed."
+    },
+    "owner_self_approval": {
+      "status": "ACTIVE — OWNER SELF-APPROVAL",
+      "approved_by": "project owner",
+      "approved_on": "2026-11-17",
+      "authorization_source": "Project owner directive in the release implementation task: sustainable owner-controlled release without any external human reviewer; the owner expressly authorized the new version and the owner self-approval model.",
+      "scope": "The owner account emyrinj (immutable numeric GitHub user id 86115037) is the sole required reviewer for the protected release environment and may approve a deployment initiated by the same account. The owner also manually publishes the verified draft.",
+      "independent_reviewer": false,
+      "separation_of_duties": "NONE — the same owner account initiates the workflow, approves the protected environment, and performs manual publication; no independent human approval is required or claimed.",
+      "security_tradeoff": "Removes independent separation of duties and a second-person review. A compromised, malicious, or mistaken owner account can approve and publish without another human check.",
+      "residual_risk_accepted": true,
+      "owner_attested": true,
+      "independent_verification": false,
+      "compensating_controls": [
+        "exact release tag pinned to v0.1.0-testnet.2 and an exact-tag environment deployment policy",
+        "environment cannot be bypassed by administrators (can_admins_bypass: false)",
+        "separate tag creation ruleset must be active with the creation rule and exactly the owner-user bypass (User 86115037, always) for exactly refs/tags/v* with no exclusions; repository-admin bypass is rejected",
+        "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering exactly refs/tags/v* with no exclusions",
+        "tag creation protection must be retained; it must not be removed or broadened",
+        "immutable releases must be enabled before dispatch and rechecked before publication",
+        "exact-commit green main CI for Rust CI and Linux native qualification",
+        "binary and archive build-provenance attestations bound to the exact tag and source digest",
+        "draft-only creation; no automated publication",
+        "owner-only repository write authority and post-publication verification",
+        "all release records explicitly state that review is not independent"
+      ],
+      "not_claimed": [
+        "independent review",
+        "separation of duties",
+        "a separate release approver",
+        "legal conclusion",
+        "immunity from owner-account compromise"
+      ]
+    },
+    "historical_release_intent": {
+      "tag": "v0.1.0-testnet.1",
+      "commit": "99a8630a7ae7f5c5950031dfba8c3b0c3f132cbc",
+      "status": "SUPERSEDED — UNPUBLISHED; historical tag and pending draft workflow retained; no publication occurred",
+      "rights_decision": "OWNER-AUTHORIZED RELEASE INTENT — project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.1; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion or separate approval.",
+      "scope": "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.1 on macOS ARM64 and Linux x86_64; final release controls remain outstanding.",
+      "approval_roles": "Project owner only; no separate release approver was appointed, consulted, or asserted.",
+      "release_notes_path": "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
+      "release_notes_sha256": "12d7605b5e48c80f1c838a95d245c08da8cd5c831d008da3bb3dea420bdc31b9",
+      "note": "The .1 rights decision, scope and approval roles are preserved verbatim; the tag, commit, release-notes hash and status metadata are added to identify the historical record. The .1 tag is not moved; its workflow run is not cancelled or deleted; no .1 release was published. The current .2 authorization does not alter the preserved .1 fields."
     }
   },
   "scrub_policy": {
@@ -409,5 +490,22 @@
       "reason": "`src/protocol.rs` test-module comment was genericized to remove the private-origin repository/path reference; no production code changed and no fixture bytes, deployment pins or protocol identifiers were altered."
     },
     "note": "Private-origin repository names were replaced with generic descriptions in prose, help text, and source/protocol test comments. No fixture bytes, deployment pins or protocol identifiers were changed."
+  },
+  "release": {
+    "version": "0.1.0-testnet.2",
+    "tag": "v0.1.0-testnet.2",
+    "tag_policy": "refs/tags/v0.1.0-testnet.2",
+    "exact_tag_required": true
+  },
+  "historical_release_intent": {
+    "tag": "v0.1.0-testnet.1",
+    "commit": "99a8630a7ae7f5c5950031dfba8c3b0c3f132cbc",
+    "status": "SUPERSEDED — UNPUBLISHED; historical tag and pending draft workflow retained; no publication occurred",
+    "rights_decision": "OWNER-AUTHORIZED RELEASE INTENT — project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.1; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion or separate approval.",
+    "scope": "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.1 on macOS ARM64 and Linux x86_64; final release controls remain outstanding.",
+    "approval_roles": "Project owner only; no separate release approver was appointed, consulted, or asserted.",
+    "release_notes_path": "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
+    "release_notes_sha256": "12d7605b5e48c80f1c838a95d245c08da8cd5c831d008da3bb3dea420bdc31b9",
+    "note": "The .1 rights decision, scope and approval roles are preserved verbatim; the tag, commit, release-notes hash and status metadata are added to identify the historical record. The .1 tag is not moved; its workflow run is not cancelled or deleted; no .1 release was published. The current .2 authorization does not alter the preserved .1 fields."
   }
 }

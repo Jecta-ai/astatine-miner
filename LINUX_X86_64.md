@@ -1,6 +1,6 @@
 # Linux x86_64 manual installation
 
-This guide describes the `v0.1.0-testnet.1` Linux x86_64 Testnet prerelease
+This guide describes the `v0.1.0-testnet.2` Linux x86_64 Testnet prerelease
 candidate. Confirm that the release has actually been published and read back
 its authenticated release record before downloading. This guide is not evidence
 that a release or its attestations exist.
@@ -14,8 +14,8 @@ these values from this guide, a checksum, an older binary, or the checkout.
 Run each verification command and stop on any failure or mismatch.
 
 ```sh
-tag=v0.1.0-testnet.1
-asset=astatine-v0.1.0-testnet.1-linux-x86_64.tar.gz
+tag=v0.1.0-testnet.2
+asset=astatine-v0.1.0-testnet.2-linux-x86_64.tar.gz
 # Set these from the authenticated release record after read-back.
 : "${repo:?set the verified OWNER/REPOSITORY}"
 : "${repo_id:?set the verified numeric repository ID}"
@@ -52,7 +52,7 @@ substitute for reviewing the release record.
 ## Inspect and install without elevated privileges
 
 Inspect `tar -tzvf "$asset"` before extraction. The expected single root is
-`astatine-v0.1.0-testnet.1-linux-x86_64/`, containing exactly five regular files:
+`astatine-v0.1.0-testnet.2-linux-x86_64/`, containing exactly five regular files:
 `astatine` (mode 0755), `LICENSE-MIT`, `THIRD_PARTY_LICENSES.md`,
 `BUILD-INFO.json`, and `INSTALL.md` (mode 0644). Reject extra, hidden,
 absolute, traversal, duplicate, linked, or special-file entries, or any
@@ -64,9 +64,9 @@ Install only the verified executable into a user-owned, nonsymlink path such as
 not overwrite an existing executable or symlink.
 
 ```sh
-mkdir -m 700 "$HOME/astatine-v0.1.0-testnet.1-linux-x86_64"
-tar -xzf "$asset" -C "$HOME/astatine-v0.1.0-testnet.1-linux-x86_64"
-verified="$HOME/astatine-v0.1.0-testnet.1-linux-x86_64/astatine-v0.1.0-testnet.1-linux-x86_64"
+mkdir -m 700 "$HOME/astatine-v0.1.0-testnet.2-linux-x86_64"
+tar -xzf "$asset" -C "$HOME/astatine-v0.1.0-testnet.2-linux-x86_64"
+verified="$HOME/astatine-v0.1.0-testnet.2-linux-x86_64/astatine-v0.1.0-testnet.2-linux-x86_64"
 
 mkdir -p "$HOME/.local/bin"
 test ! -e "$HOME/.local/bin/astatine" && test ! -L "$HOME/.local/bin/astatine"
@@ -75,7 +75,7 @@ install -m 755 "$verified/astatine" "$HOME/.local/bin/astatine"
 "$HOME/.local/bin/astatine" --help
 ```
 
-Require `astatine 0.1.0-testnet.1` and recheck the installed executable's
+Require `astatine 0.1.0-testnet.2` and recheck the installed executable's
 approved digest. Keep both license notices with the installation records.
 Check `command -v astatine` for aliases or older copies; use the full verified
 path if resolution is ambiguous. These version/help checks do not create or

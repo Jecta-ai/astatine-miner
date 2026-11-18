@@ -6,7 +6,7 @@ authorized (v3) distribution states against the authoritative fixture
 provenance. No network, build, wallet, mining, or publication operation
 occurs here.
 
-``load_gate(root)`` reads the canonical paths only
+``load_gate(root, require_release_version=...)`` reads the canonical paths only
 (``tests/fixtures/PROVENANCE.json`` and
 ``support/release/distribution-inventory.json``), validates the full shape,
 cross-checks inventory against provenance, requires substantive license
@@ -38,6 +38,57 @@ EXPECTED_REGENERATION_SCRIPTS = {
     "FIX-02": "support/update-genesis-coordinator-fixture.py",
 }
 REPOSITORY_REL = "support/release-repository.txt"
+
+# Current release identity. The owner self-approval model is version-scoped so
+# an older tag cannot be dispatched under the new environment policy.
+EXPECTED_RELEASE_VERSION = "0.1.0-testnet.2"
+EXPECTED_RELEASE_TAG = "v0.1.0-testnet.2"
+EXPECTED_RELEASE_TAG_POLICY = f"refs/tags/{EXPECTED_RELEASE_TAG}"
+# Both composable tag rulesets preserve the live breadth: exactly refs/tags/v*
+# with no exclusions. Narrowing to the single .2 tag or the historical
+# .0/.1/.2 list would weaken protection for all other v* tags.
+EXPECTED_TAG_RULESET_SCOPE = "refs/tags/v*"
+EXPECTED_TAG_IMMUTABILITY_SCOPE = ["refs/tags/v*"]
+EXPECTED_RELEASE_REVIEWER_ID = 86115037
+EXPECTED_RELEASE_REVIEWER_LOGIN = "emyrinj"
+EXPECTED_RELEASE_TAG_CREATION_RULESET_NAME = "astatine-release-tag-creation"
+EXPECTED_RELEASE_TAG_IMMUTABILITY_RULESET_NAME = "astatine-release-tags"
+EXPECTED_RELEASE_TAG_CREATION_BYPASS_ACTORS = [
+    {
+        "actor_id": EXPECTED_RELEASE_REVIEWER_ID,
+        "actor_type": "User",
+        "bypass_mode": "always",
+    },
+]
+
+# Historical .1 release intent. The substantive .1 fields are retained
+# verbatim so the current .2 authorization cannot rewrite or silently erase
+# what was recorded for .1.
+HISTORICAL_RELEASE_TAG = "v0.1.0-testnet.1"
+HISTORICAL_RELEASE_COMMIT = "99a8630a7ae7f5c5950031dfba8c3b0c3f132cbc"
+HISTORICAL_RELEASE_NOTES_REL = "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md"
+HISTORICAL_RELEASE_NOTES_SHA256 = "12d7605b5e48c80f1c838a95d245c08da8cd5c831d008da3bb3dea420bdc31b9"
+RELEASE_NOTES_REL = "support/release/RELEASE_NOTES-v0.1.0-testnet.2.md"
+RELEASE_NOTES_SHA256 = "f2102858c7346ccbbcf24e87ce0b19597947d1bf2cd2538a850bb4878cdb1e6b"
+HISTORICAL_RIGHTS_DECISION = (
+    "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party "
+    "source and binary distribution intent for v0.1.0-testnet.1; technical "
+    "NOTICE review recorded; final release controls outstanding; not a legal "
+    "conclusion or separate approval."
+)
+HISTORICAL_RELEASE_INTENT_SCOPE = (
+    "Owner-authorized first-party source and binary distribution intent "
+    "for v0.1.0-testnet.1 on macOS ARM64 and Linux x86_64; final release "
+    "controls remain outstanding."
+)
+HISTORICAL_APPROVAL_ROLES = (
+    "Project owner only; no separate release approver was appointed, "
+    "consulted, or asserted."
+)
+HISTORICAL_RELEASE_STATUS = (
+    "SUPERSEDED \u2014 UNPUBLISHED; historical tag and pending draft workflow "
+    "retained; no publication occurred"
+)
 
 # ---------------------------------------------------------------------------
 # Blocked (v1) canonical constants — retained for backward-compatible
@@ -141,9 +192,10 @@ INTENT_INVENTORY_SCHEMA = "astatine-distribution-inventory/v3"
 INTENT_PROVENANCE_SCHEMA = "astatine-fixture-provenance/v3"
 INTENT_RIGHTS_DECISION = (
     "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party "
-    "source and binary distribution intent for v0.1.0-testnet.1; technical "
-    "NOTICE review recorded; final release controls outstanding; not a legal "
-    "conclusion or separate approval."
+    "source and binary distribution intent for v0.1.0-testnet.2 under the "
+    "explicitly documented owner self-approval policy; technical NOTICE review "
+    "recorded; final release controls outstanding; not a legal conclusion, not "
+    "independent review, and not a separate approval."
 )
 INTENT_NOTICE_APPLICABILITY = (
     "TECHNICALLY REVIEWED \u2014 no separate upstream NOTICE file was found in "
@@ -153,8 +205,8 @@ INTENT_NOTICE_APPLICABILITY = (
     "legal conclusion or separate approval."
 )
 INTENT_CHECKLIST_STATUS = (
-    "TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent; "
-    "final release controls outstanding"
+    "TECHNICAL REVIEW RECORDED \u2014 owner-authorized release intent under "
+    "the explicit owner self-approval policy; final release controls outstanding"
 )
 AUTHORIZED_TARGETS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
 AUTHORIZED_ARCHIVE_MEMBERS = (
@@ -188,17 +240,24 @@ ATTESTED_RIGHTS = "OWNER-ATTESTED \u2014 not independently verified"
 EXPECTED_REPOSITORY = "Jecta-ai/astatine-miner"
 EXPECTED_PACKAGE_NAME = "astatine-cli-rust"
 
-INTENT_RELEASE_INTENT_STATUS = "OWNER-AUTHORIZED RELEASE INTENT \u2014 FINAL CONTROLS OUTSTANDING"
+INTENT_RELEASE_INTENT_STATUS = (
+    "OWNER-AUTHORIZED RELEASE INTENT \u2014 FINAL CONTROLS OUTSTANDING \u2014 "
+    "OWNER SELF-APPROVAL"
+)
 INTENT_AUTHORIZED_BY = "project owner"
 INTENT_AUTHORIZED_ON = "2026-11-17"
 INTENT_SCOPE = (
-    "Owner-authorized first-party source and binary distribution intent "
-    "for v0.1.0-testnet.1 on macOS ARM64 and Linux x86_64; final release "
-    "controls remain outstanding."
+    "Owner-authorized first-party source and binary distribution intent for "
+    "v0.1.0-testnet.2 on macOS ARM64 and Linux x86_64 under an explicit owner "
+    "self-approval policy; no independent reviewer or separate approver; final "
+    "release controls remain outstanding."
 )
 INTENT_APPROVAL_ROLES = (
-    "Project owner only; no separate release approver was appointed, "
-    "consulted, or asserted."
+    "Project owner only; the owner explicitly authorized owner self-approval "
+    "for the protected release environment. No independent reviewer and no "
+    "separate release approver was appointed, consulted, or asserted; "
+    "separation of duties is explicitly reduced and recorded as a security "
+    "tradeoff."
 )
 INTENT_TECHNICAL_REVIEWED_BY = (
     "Repository technical review; not the project owner and not a separate "
@@ -208,70 +267,168 @@ INTENT_TECHNICAL_REVIEWED_ON = "2026-11-17"
 
 INTENT_INVENTORY_SCOPE = (
     "Candidate source and binary distribution inventory for Astatine "
-    "v0.1.0-testnet.1 on macOS ARM64 and Linux x86_64. Owner-authorized release "
-    "intent with technical NOTICE review recorded (citations included); final "
-    "release controls remain outstanding; licensing is owner-authorized, release "
+    "v0.1.0-testnet.2 on macOS ARM64 and Linux x86_64. Owner-authorized release "
+    "intent under an explicitly documented owner self-approval policy with "
+    "technical NOTICE review recorded (citations included); final release "
+    "controls remain outstanding; licensing is owner-authorized, release "
     "execution remains externally gated draft-only and is not established by "
     "this file."
 )
 INTENT_RULE = (
     "Distribution intent is owner-authorized only with substantive technical "
     "NOTICE review (citations), license evidence (Apache-2.0 and MIT texts, "
-    "fixture NOTICE, fixture license records), pinned allowlists/targets, and "
-    "external draft-only release controls with final release controls "
-    "outstanding; data-only JSON edits without that evidence and controls "
-    "cannot authorize release intent. A PASS only confirms the release-intent "
-    "inventory is truthfully recorded and technically reviewed; it does not "
-    "authorize final publication, establish external environment, tag, or CI "
-    "controls, or claim legal conclusion or separate approval, which remain "
-    "outstanding and are enforced by the release workflow and owner manual "
-    "publication."
+    "fixture NOTICE, fixture license records), pinned allowlists/targets, an "
+    "explicitly recorded owner self-approval policy that does not claim "
+    "independent review, and external draft-only release controls with final "
+    "release controls outstanding; data-only JSON edits without that evidence "
+    "and controls cannot authorize release intent. A PASS only confirms the "
+    "release-intent inventory is truthfully recorded and technically reviewed; "
+    "it does not authorize final publication, establish external environment, "
+    "tag, or CI controls, or claim legal conclusion, independent review, or "
+    "separate approval, which remain outstanding and are enforced by the "
+    "release workflow and owner manual publication."
 )
 INTENT_SOURCE_REASON = (
     "Source distribution intent is owner-authorized (RELEASE-INTENT-AUTHORIZED) "
-    "for v0.1.0-testnet.1 only: GitHub-generated source archives for the exact "
-    "tag include tests/fixtures and the Apache-2.0/MIT license texts and fixture "
-    "NOTICE; final release controls remain outstanding "
-    "(final_release_controls_complete: false); execution still requires external "
-    "draft-only release controls."
+    "for v0.1.0-testnet.2 only under the owner self-approval policy: "
+    "GitHub-generated source archives for the exact tag include tests/fixtures "
+    "and the Apache-2.0/MIT license texts and fixture NOTICE; final release "
+    "controls remain outstanding (final_release_controls_complete: false); "
+    "execution still requires external draft-only release controls."
 )
 INTENT_BINARY_REASON = (
     "Binary distribution intent is owner-authorized (RELEASE-INTENT-AUTHORIZED) "
-    "for v0.1.0-testnet.1 on macOS ARM64 and Linux x86_64 only: pinned allowlist "
-    "archives plus generated BUILD-INFO.json and INSTALL.md; no fixture, "
-    "provenance, or forbidden path may enter a release archive; final release "
-    "controls remain outstanding (final_release_controls_complete: false); "
-    "execution still requires external draft-only release controls."
+    "for v0.1.0-testnet.2 on macOS ARM64 and Linux x86_64 only under the owner "
+    "self-approval policy: pinned allowlist archives plus generated "
+    "BUILD-INFO.json and INSTALL.md; no fixture, provenance, or forbidden path "
+    "may enter a release archive; final release controls remain outstanding "
+    "(final_release_controls_complete: false); execution still requires "
+    "external draft-only release controls."
 )
 INTENT_REVIEW_STATUS = "SUPERSEDED \u2014 OWNER-AUTHORIZED RELEASE INTENT"
 INTENT_REVIEW_SUPERSEDED_BY = "release_intent_authorization"
 INTENT_REVIEW_SUPERSEDED_ON = "2026-11-17"
 
+RELEASE_IDENTITY = {
+    "version": EXPECTED_RELEASE_VERSION,
+    "tag": EXPECTED_RELEASE_TAG,
+    "tag_policy": EXPECTED_RELEASE_TAG_POLICY,
+    "exact_tag_required": True,
+}
+
+OWNER_SELF_APPROVAL_POLICY = {
+    "status": "ACTIVE \u2014 OWNER SELF-APPROVAL",
+    "approved_by": "project owner",
+    "approved_on": "2026-11-17",
+    "authorization_source": (
+        "Project owner directive in the release implementation task: sustainable "
+        "owner-controlled release without any external human reviewer; the owner "
+        "expressly authorized the new version and the owner "
+        "self-approval model."
+    ),
+    "scope": (
+        "The owner account emyrinj (immutable numeric GitHub user id 86115037) "
+        "is the sole required reviewer for the protected release environment and "
+        "may approve a deployment initiated by the same account. The owner also "
+        "manually publishes the verified draft."
+    ),
+    "independent_reviewer": False,
+    "separation_of_duties": (
+        "NONE \u2014 the same owner account initiates the workflow, approves the "
+        "protected environment, and performs manual publication; no independent "
+        "human approval is required or claimed."
+    ),
+    "security_tradeoff": (
+        "Removes independent separation of duties and a second-person review. A "
+        "compromised, malicious, or mistaken owner account can approve and "
+        "publish without another human check."
+    ),
+    "residual_risk_accepted": True,
+    "owner_attested": True,
+    "independent_verification": False,
+    "compensating_controls": [
+        "exact release tag pinned to v0.1.0-testnet.2 and an exact-tag environment deployment policy",
+        "environment cannot be bypassed by administrators (can_admins_bypass: false)",
+        "separate tag creation ruleset must be active with the creation rule and exactly the owner-user bypass (User 86115037, always) for exactly refs/tags/v* with no exclusions; repository-admin bypass is rejected",
+        "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering exactly refs/tags/v* with no exclusions",
+        "tag creation protection must be retained; it must not be removed or broadened",
+        "immutable releases must be enabled before dispatch and rechecked before publication",
+        "exact-commit green main CI for Rust CI and Linux native qualification",
+        "binary and archive build-provenance attestations bound to the exact tag and source digest",
+        "draft-only creation; no automated publication",
+        "owner-only repository write authority and post-publication verification",
+        "all release records explicitly state that review is not independent",
+    ],
+    "not_claimed": [
+        "independent review",
+        "separation of duties",
+        "a separate release approver",
+        "legal conclusion",
+        "immunity from owner-account compromise",
+    ],
+}
+
+HISTORICAL_RELEASE_INTENT = {
+    "tag": HISTORICAL_RELEASE_TAG,
+    "commit": HISTORICAL_RELEASE_COMMIT,
+    "status": HISTORICAL_RELEASE_STATUS,
+    "rights_decision": HISTORICAL_RIGHTS_DECISION,
+    "scope": HISTORICAL_RELEASE_INTENT_SCOPE,
+    "approval_roles": HISTORICAL_APPROVAL_ROLES,
+    "release_notes_path": HISTORICAL_RELEASE_NOTES_REL,
+    "release_notes_sha256": HISTORICAL_RELEASE_NOTES_SHA256,
+    "note": (
+        "The .1 rights decision, scope and approval roles are preserved "
+        "verbatim; the tag, commit, release-notes hash and status metadata are "
+        "added to identify the historical record. The .1 tag is not moved; its "
+        "workflow run is not cancelled or deleted; no .1 release was published. "
+        "The current .2 authorization does not alter the preserved .1 fields."
+    ),
+}
+
 AUTHORIZED_RELEASE_CONTROLS = {
-    "status": "DRAFT-ONLY \u2014 MANUAL PUBLICATION AFTER EXTERNAL IMMUTABLE-SETTING VERIFICATION",
+    "status": "DRAFT-ONLY \u2014 OWNER SELF-APPROVAL AFTER IMMUTABLE TAG/RELEASE VERIFICATION",
     "workflow": ".github/workflows/release.yml",
     "environment": "release",
     "environment_required_reviewer": True,
-    "environment_prevent_self_review": True,
+    "environment_prevent_self_review": False,
+    "environment_reviewer_owner_id": EXPECTED_RELEASE_REVIEWER_ID,
+    "environment_reviewer_owner_login": EXPECTED_RELEASE_REVIEWER_LOGIN,
+    "independent_environment_review": False,
+    "owner_self_approval": True,
     "publication_mode": "draft-only-manual-publish",
     "manual_publish_required": True,
     "final_release_controls_complete": False,
-    "tag_policy": "refs/tags/v0.1.0-testnet.*",
+    "tag_policy": EXPECTED_RELEASE_TAG_POLICY,
+    "exact_tag_required": True,
+    "tag_ruleset_exact_scope": EXPECTED_TAG_RULESET_SCOPE,
     "immutable_release": True,
+    "immutable_tag_required": True,
+    "tag_creation_ruleset_name": EXPECTED_RELEASE_TAG_CREATION_RULESET_NAME,
+    "tag_creation_rule_required": True,
+    "tag_creation_bypass_actors_allowed": [dict(actor) for actor in EXPECTED_RELEASE_TAG_CREATION_BYPASS_ACTORS],
+    "tag_immutability_ruleset_name": EXPECTED_RELEASE_TAG_IMMUTABILITY_RULESET_NAME,
+    "tag_immutability_scope": list(EXPECTED_TAG_IMMUTABILITY_SCOPE),
+    "tag_immutability_bypass_actors_allowed": 0,
     "immutable_setting_admin_verification_required": True,
     "attestations": ["build-provenance"],
     "exact_tag_main_ci": True,
     "external_blockers": [
-        "protected release environment approval by a non-self reviewer (required reviewer, prevent self-review, no admin bypass, custom tag deployment policy)",
-        "exact tag for the exact release commit",
+        "protected release environment requires the owner reviewer (immutable numeric GitHub user id 86115037) with prevent_self_review false and administrator bypass disabled",
+        "exact tag v0.1.0-testnet.2 for the exact release commit, with the environment deployment policy restricted to that exact tag",
+        "separate active astatine-release-tag-creation ruleset restricted to exactly refs/tags/v* with no exclusions and with exactly the owner-user (User 86115037, always) creation bypass; repository-admin bypass is rejected",
+        "separate active astatine-release-tags ruleset limited to update, deletion and non-fast-forward for exactly refs/tags/v* with no exclusions and with zero bypass actors",
+        "tag creation protection is retained; no broader bypass or removal of the creation rule is authorized",
         "green exact-commit main CI for Rust CI and Linux native qualification",
         "owner/admin verifies immutable releases are enabled before dispatch and again immediately before manual publication",
         "repository writers and write-capable apps are restricted so only the release owner/admin can publish or modify the draft",
-        "release tag is rechecked immediately before manual publication",
+        "release tag and draft assets are rechecked immediately before manual publication",
+        "owner self-approval reduces separation of duties; no independent review is claimed",
     ],
     "offline_verification": (
         "Offline verification cannot establish GitHub environment protection, "
-        "tag existence, CI status, or the immutable-release repository setting; "
+        "the split tag creation/immutability ruleset bypass settings, tag "
+        "existence, CI status, or the immutable-release repository setting; "
         "these are enforced by the release workflow preflight, build jobs, and "
         "owner manual publication steps before any publication."
     ),
@@ -726,10 +883,42 @@ def _validate_release_intent(
         f"unexpected distribution inventory schema: {inventory.get('schema')!r}",
     )
     scope = require_string(inventory.get("scope"), "distribution inventory scope")
-    require(scope == INTENT_INVENTORY_SCOPE, "distribution inventory scope changed; the v0.1.0-testnet.1 candidate scope must be recorded exactly")
+    require(scope == INTENT_INVENTORY_SCOPE, "distribution inventory scope changed; the v0.1.0-testnet.2 candidate scope must be recorded exactly")
     require(
         provenance.get("schema") == INTENT_PROVENANCE_SCHEMA,
         f"unexpected fixture provenance schema: {provenance.get('schema')!r}",
+    )
+    release_identity = require_object(inventory.get("release"), "distribution inventory release")
+    require(
+        release_identity == RELEASE_IDENTITY,
+        "distribution inventory release identity changed; the current candidate must be exactly v0.1.0-testnet.2",
+    )
+    require(
+        provenance.get("release") == RELEASE_IDENTITY,
+        "fixture provenance release identity must mirror the current v0.1.0-testnet.2 candidate",
+    )
+    historical = require_object(
+        inventory.get("historical_release_intent"), "distribution inventory historical_release_intent"
+    )
+    require(
+        historical == HISTORICAL_RELEASE_INTENT,
+        "historical .1 release intent record changed; its stored .1 fields must remain exact and must not be rewritten as .2",
+    )
+    require(
+        provenance.get("historical_release_intent") == HISTORICAL_RELEASE_INTENT,
+        "fixture provenance historical .1 release intent must mirror the preserved historical record",
+    )
+    historical_notes = read_confined_bytes(
+        root, HISTORICAL_RELEASE_NOTES_REL, "historical .1 release notes"
+    )
+    require(
+        hashlib.sha256(historical_notes).hexdigest() == HISTORICAL_RELEASE_NOTES_SHA256,
+        "historical .1 release notes changed; preserve the historical .1 intent file byte-for-byte",
+    )
+    release_notes = read_confined_bytes(root, RELEASE_NOTES_REL, "current .2 release notes")
+    require(
+        hashlib.sha256(release_notes).hexdigest() == RELEASE_NOTES_SHA256,
+        "current .2 release notes changed; update the reviewed notes hash deliberately so the non-independence disclosure cannot be silently edited",
     )
     gate = require_object(inventory.get("rights_gate"), "rights_gate")
     require(gate.get("source") == PROVENANCE_REL, "rights_gate source changed")
@@ -774,6 +963,19 @@ def _validate_release_intent(
     require(not_authorized, "release_intent_authorization not_authorized must not be empty")
     require(all(isinstance(item, str) and item for item in not_authorized), "release_intent_authorization not_authorized must be non-empty strings")
     require(inventory_auth.get("independent_verification") is False, "release intent must not be represented as independent verification")
+    require(
+        inventory_auth.get("owner_self_approval") == OWNER_SELF_APPROVAL_POLICY,
+        "release_intent_authorization must record the explicit owner self-approval policy exactly",
+    )
+    require(
+        inventory_auth.get("independent_reviewer") is False,
+        "release_intent_authorization must not claim an independent reviewer",
+    )
+    require(
+        inventory_auth.get("separation_of_duties")
+        == OWNER_SELF_APPROVAL_POLICY["separation_of_duties"],
+        "release_intent_authorization must not claim separation of duties",
+    )
     # Rights-gate-level technical review mirror.
     gate_technical = require_object(gate.get("technical_notice_review"), "rights_gate technical_notice_review")
     require(gate_technical == technical, "rights_gate technical_notice_review does not mirror release_intent_authorization")
@@ -816,12 +1018,29 @@ def _validate_release_intent(
     require(controls.get("workflow") == AUTHORIZED_RELEASE_CONTROLS["workflow"], "release_controls workflow changed")
     require(controls.get("environment") == AUTHORIZED_RELEASE_CONTROLS["environment"], "release_controls environment changed")
     require(controls.get("environment_required_reviewer") is True, "release_controls must require a reviewer")
-    require(controls.get("environment_prevent_self_review") is True, "release_controls must prevent self-review")
+    require(controls.get("environment_prevent_self_review") is False, "release_controls must record the explicit owner self-approval exception: prevent_self_review must be exactly false, not silently true")
+    require(controls.get("environment_reviewer_owner_id") == EXPECTED_RELEASE_REVIEWER_ID, "release_controls must pin the immutable numeric owner reviewer id 86115037")
+    require(controls.get("environment_reviewer_owner_login") == EXPECTED_RELEASE_REVIEWER_LOGIN, "release_controls must pin the owner reviewer login")
+    require(controls.get("independent_environment_review") is False, "release_controls must not claim independent environment review")
+    require(controls.get("owner_self_approval") is True, "release_controls must explicitly record owner self-approval")
+    require(
+        controls.get("owner_self_approval_policy") == OWNER_SELF_APPROVAL_POLICY,
+        "release_controls owner_self_approval_policy changed; the explicit security tradeoff and residual risk must remain recorded",
+    )
     require(controls.get("publication_mode") == AUTHORIZED_RELEASE_CONTROLS["publication_mode"], "release_controls publication_mode changed; the draft-only manual-publish mode cannot be weakened by data edits")
     require(controls.get("manual_publish_required") is True, "release_controls manual_publish_required must be true")
-    require(controls.get("tag_policy") == AUTHORIZED_RELEASE_CONTROLS["tag_policy"], "release_controls tag_policy changed")
+    require(controls.get("tag_policy") == AUTHORIZED_RELEASE_CONTROLS["tag_policy"], "release_controls tag_policy changed; it must be the exact current tag policy, not a series wildcard")
+    require(controls.get("exact_tag_required") is True, "release_controls exact_tag_required must be true")
+    require(controls.get("tag_ruleset_exact_scope") == EXPECTED_TAG_RULESET_SCOPE, "release_controls tag_ruleset_exact_scope must be exactly refs/tags/v* with no exclusions to preserve live breadth")
     require(controls.get("final_release_controls_complete") is False, "release_controls final release controls must remain outstanding")
     require(controls.get("immutable_release") is True, "release_controls immutable_release must be true as the recorded repository setting; verified immutable behavior additionally requires external admin verification")
+    require(controls.get("immutable_tag_required") is True, "release_controls immutable_tag_required must be true")
+    require(controls.get("tag_creation_ruleset_name") == EXPECTED_RELEASE_TAG_CREATION_RULESET_NAME, "release_controls tag_creation_ruleset_name changed")
+    require(controls.get("tag_creation_rule_required") is True, "release_controls must retain the tag creation rule")
+    require(controls.get("tag_creation_bypass_actors_allowed") == [dict(actor) for actor in EXPECTED_RELEASE_TAG_CREATION_BYPASS_ACTORS], "release_controls must pin exactly the owner-user (User 86115037, always) creation bypass; repository-admin bypass is rejected")
+    require(controls.get("tag_immutability_ruleset_name") == EXPECTED_RELEASE_TAG_IMMUTABILITY_RULESET_NAME, "release_controls tag_immutability_ruleset_name changed")
+    require(controls.get("tag_immutability_scope") == list(EXPECTED_TAG_IMMUTABILITY_SCOPE), "release_controls tag_immutability_scope must be exactly [\"refs/tags/v*\"] with no exclusions to preserve live breadth")
+    require(controls.get("tag_immutability_bypass_actors_allowed") == 0, "release_controls must allow zero immutability-ruleset bypass actors")
     require(controls.get("immutable_setting_admin_verification_required") is True, "release_controls immutable_setting_admin_verification_required must be true")
     require(list(controls.get("attestations", [])) == list(AUTHORIZED_RELEASE_CONTROLS["attestations"]), "release_controls attestations changed")
     require(controls.get("exact_tag_main_ci") is True, "release_controls exact_tag_main_ci must be true")
@@ -847,6 +1066,14 @@ def _validate_release_intent(
     require(attestation.get("independent_verification") is False, "owner attestation must not be represented as independent verification")
     provenance_auth = require_object(rights.get("release_intent_authorization"), "rights_review release_intent_authorization")
     require(provenance_auth == inventory_auth, "inventory release_intent_authorization does not mirror tests/fixtures/PROVENANCE.json")
+    require(
+        rights.get("owner_self_approval") == OWNER_SELF_APPROVAL_POLICY,
+        "fixture provenance must record the explicit owner self-approval policy exactly",
+    )
+    require(
+        rights.get("historical_release_intent") == HISTORICAL_RELEASE_INTENT,
+        "fixture provenance historical .1 release intent changed",
+    )
     provenance_push = require_object(rights.get("review_ci_branch_push_authorization"), "rights_review review_ci_branch_push_authorization")
     require(provenance_push == gate_push, "inventory review/CI record does not mirror tests/fixtures/PROVENANCE.json")
     checklist = require_object(rights.get("notice_checklist"), "rights_review notice_checklist")
@@ -953,6 +1180,9 @@ def _validate_release_intent(
         "publication_authorized": False,
         "final_release_controls_complete": False,
         "release_intent_authorization": dict(inventory_auth),
+        "owner_self_approval": dict(OWNER_SELF_APPROVAL_POLICY),
+        "historical_release_intent": dict(HISTORICAL_RELEASE_INTENT),
+        "release": dict(RELEASE_IDENTITY),
         "technical_notice_review": dict(technical),
         "review_ci_branch_push_authorization": dict(gate_push),
         "release_controls": dict(controls),
@@ -973,7 +1203,7 @@ def _is_utf8(data: bytes) -> bool:
         return False
 
 
-def load_gate(root: Path) -> dict:
+def load_gate(root: Path, *, require_release_version: bool = False) -> dict:
     """Load and validate the release gate for ``root``.
 
     Reads exactly ``tests/fixtures/PROVENANCE.json`` and
@@ -988,7 +1218,10 @@ def load_gate(root: Path) -> dict:
     ``release_intent_authorization`` (or blocked ``authorization``),
     ``technical_notice_review``, ``release_controls``, ``targets``,
     ``archive_members``, ``generated_members``, ``forbidden_globs``,
-    ``fixture_paths``, ``repository``, and ``package_version``.
+    ``fixture_paths``, ``repository``, and ``package_version``. Release
+    callers pass ``require_release_version=True`` to bind the Cargo package
+    version to the current ``v0.1.0-testnet.2`` candidate; the nonpublishing
+    dry-run leaves it false for synthetic historical fixtures.
 
     Raises :class:`GateError` fail-closed on any mismatch. Stdlib-only and
     offline; no network, build, wallet, or publication side effects.
@@ -1017,6 +1250,15 @@ def load_gate(root: Path) -> dict:
     require(repository == EXPECTED_REPOSITORY, f"release repository changed: {repository!r}")
     cargo_text = read_confined_bytes(resolved, CARGO_TOML_REL, "cargo manifest").decode("utf-8")
     package_name, package_version = parse_cargo_package(cargo_text)
+    if require_release_version:
+        require(
+            package_version == EXPECTED_RELEASE_VERSION,
+            f"Cargo package version must be exactly {EXPECTED_RELEASE_VERSION!r}, got {package_version!r}",
+        )
+    # The shared gate also serves the nonpublishing dry-run against synthetic
+    # historical package versions; release callers must opt into the exact .2
+    # version check. The final release builder opts in, and the workflow also
+    # checks Cargo.toml directly.
     gate["repository"] = repository
     gate["package_version"] = package_version
     gate["package_name"] = package_name

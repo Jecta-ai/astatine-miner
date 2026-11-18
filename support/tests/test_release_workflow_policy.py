@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import pathlib
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -95,12 +98,25 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertEqual(parsed.get("name"), "Release")
         jobs = parsed["jobs"]
         self.assertEqual(set(jobs), {"preflight", "build-macos", "build-linux", "attest-macos", "attest-linux", "release-package", "release-draft"})
+        self.assertEqual(len(jobs), 7)
         self.assertEqual(jobs["release-package"].get("environment"), "release")
         self.assertEqual(jobs["release-draft"].get("environment"), "release")
         self.assertNotIn("environment", jobs["attest-macos"])
         self.assertNotIn("environment", jobs["attest-linux"])
         self.assertNotIn("environment", jobs["build-macos"])
         self.assertNotIn("environment", jobs["build-linux"])
+        # Phase1: no admin jobs exist, so no contents:none permission may remain.
+        for job_name, job_config in jobs.items():
+            self.assertNotEqual(
+                (job_config.get("permissions") or {}).get("contents"),
+                "none",
+                "%s must not use contents:none (no admin jobs in Phase1)" % job_name,
+            )
+            self.assertNotIn(
+                "administration",
+                job_config.get("permissions") or {},
+                "%s must not request an administration permission" % job_name,
+            )
         self.assertEqual(
             jobs["release-draft"].get("permissions"),
             {"contents": "write", "actions": "read", "attestations": "read"},
@@ -134,6 +150,15 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertEqual(
             set(jobs["release-package"].get("needs")),
             {"build-macos", "build-linux", "attest-macos", "attest-linux"},
+        )
+        draft_needs = jobs["release-draft"].get("needs")
+        if isinstance(draft_needs, str):
+            draft_needs = {draft_needs}
+        else:
+            draft_needs = set(draft_needs)
+        self.assertEqual(
+            draft_needs,
+            {"release-package"},
         )
         self.assertIn("binary_sha256", jobs["build-macos"].get("outputs"))
         self.assertIn("rustc_version", jobs["build-macos"].get("outputs"))
@@ -392,15 +417,123 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
 
     def test_auto_publish_draft_false_rejected(self) -> None:
         mutated = self.real_text.replace(
-            "Draft verified; manual owner publication remains required",
-            "Draft verified; manual owner publication remains required --draft=false",
+            "Draft verified; owner self-approval publication remains required",
+            "Draft verified; owner self-approval publication remains required --draft=false",
             1,
         )
         self.assertReleaseFails(mutated, "draft")
 
+    def test_draft_create_is_prerelease(self) -> None:
+        # The release draft must be explicitly prerelease: exactly one
+        # non-comment `gh release create` line in release-draft, carrying
+        # --draft, --prerelease, and --verify-tag together; publication stays
+        # manual-only outside the workflow.
+        import re as _re
+
+        marker = "\n  release-draft:\n"
+        self.assertIn(marker, self.real_text)
+        draft = self.real_text.split(marker, 1)[1]
+        create_lines = [
+            line
+            for line in draft.splitlines()
+            if "gh release create" in line and not line.strip().startswith("#")
+        ]
+        self.assertEqual(
+            len(create_lines),
+            1,
+            "release-draft must contain exactly one gh release create line, got %r"
+            % create_lines,
+        )
+        for flag in ("--draft", "--prerelease", "--verify-tag"):
+            self.assertIn(
+                flag,
+                create_lines[0],
+                "draft create line must carry %s (got %r)" % (flag, create_lines[0]),
+            )
+        non_comment_prerelease = [
+            line
+            for line in self.real_text.splitlines()
+            if "--prerelease" in line and not line.strip().startswith("#")
+        ]
+        self.assertEqual(
+            len(non_comment_prerelease),
+            1,
+            "--prerelease must appear exactly once outside comments, got %r"
+            % non_comment_prerelease,
+        )
+        self.assertIn(create_lines[0].strip(), non_comment_prerelease[0])
+
     def test_auto_publish_prerelease_rejected(self) -> None:
-        mutated = self.real_text + "\n      # --prerelease\n"
-        self.assertReleaseFails(mutated, "prerelease")
+        # Narrow Phase1 allowlist: --prerelease is permitted exactly once, on
+        # the release-draft `gh release create --draft --prerelease --verify-tag`
+        # line. Any other occurrence, clearing the draft, or editing the
+        # release must fail closed.
+        create_lines = [
+            line
+            for line in self.real_text.splitlines()
+            if "gh release create" in line and not line.strip().startswith("#")
+        ]
+        self.assertEqual(len(create_lines), 1)
+        for flag in ("--draft", "--prerelease", "--verify-tag"):
+            self.assertIn(flag, create_lines[0])
+        stray = self.real_text + "\n      - run: echo stray --prerelease probe\n"
+        self.assertReleaseFails(stray, "prerelease")
+        cleared = self.real_text.replace(
+            "--draft --prerelease --verify-tag",
+            "--draft=false --prerelease --verify-tag",
+            1,
+        )
+        self.assertNotEqual(cleared, self.real_text)
+        self.assertReleaseFails(cleared, "must not clear draft")
+        edited = self.real_text + '\n      - run: gh release edit "$tag" --draft=false\n'
+        self.assertReleaseFails(edited, "forbidden gh release subcommand")
+
+    def test_prerelease_moved_out_of_draft_rejected(self) -> None:
+        # Moved prerelease: exactly one non-comment occurrence but outside
+        # release-draft must fail closed on the draft-section gate (not pass
+        # as the allowlisted draft line).
+        stripped = self.real_text.replace(
+            "--draft --prerelease --verify-tag",
+            "--draft --verify-tag",
+            1,
+        )
+        self.assertNotEqual(stripped, self.real_text)
+        moved = stripped.replace(
+            'echo "no existing release for the exact tag"',
+            'echo "no existing release for the exact tag"\n          echo moved --prerelease probe',
+            1,
+        )
+        self.assertNotEqual(moved, stripped)
+        non_comment = [
+            line
+            for line in moved.splitlines()
+            if "--prerelease" in line and not line.strip().startswith("#")
+        ]
+        self.assertEqual(len(non_comment), 1)
+        self.assertReleaseFails(moved, "allowed only on the release-draft")
+
+    def test_prerelease_without_create_flags_rejected(self) -> None:
+        # Prerelease kept in release-draft but detached from the actual
+        # `gh release create --draft ... --verify-tag` flags must fail closed.
+        broken = self.real_text.replace(
+            "--draft --prerelease --verify-tag",
+            "--prerelease",
+            1,
+        )
+        self.assertNotEqual(broken, self.real_text)
+        self.assertReleaseFails(broken, "must be --draft --prerelease --verify-tag")
+
+    def test_prerelease_comment_does_not_satisfy_rejected(self) -> None:
+        # A comment containing --prerelease must neither satisfy nor bypass the
+        # non-comment exactly-once draft-create gate.
+        stripped = self.real_text.replace(
+            "--draft --prerelease --verify-tag",
+            "--draft --verify-tag",
+            1,
+        )
+        self.assertNotEqual(stripped, self.real_text)
+        commented = stripped + "\n      # --prerelease comment only\n"
+        self.assertReleaseFails(commented, "exactly once")
 
     def test_missing_can_admins_bypass_check_rejected(self) -> None:
         # Environment protection is now enforced via the bounded validator script.
@@ -504,19 +637,28 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         raise AssertionError("unsafe logging mutation unexpectedly accepted")
 
     def test_missing_env_reverify_before_mutation_rejected(self) -> None:
-        validator = 'python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag"'
-        self.assertEqual(self.real_text.count(validator), 2)
-        mutated = self.real_text.replace(validator, "echo no-reverify", 1)
+        # Phase1: exactly 2 release invocations (preflight release + package
+        # release); no release-admin validator exists.
+        release_validator = 'python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag" --expected-environment release'
+        self.assertEqual(self.real_text.count(release_validator), 2)
+        self.assertEqual(
+            self.real_text.count("verify-protected-environment.py --environment-json"), 2
+        )
+        self.assertNotIn("release-admin", self.real_text)
+        self.assertNotIn("$admin_env_out", self.real_text)
+        mutated = self.real_text.replace(release_validator, "echo no-reverify", 1)
         # One invocation remains; remove all to trigger fail-closed.
-        mutated = mutated.replace(validator, "echo no-reverify")
+        mutated = mutated.replace(release_validator, "echo no-reverify")
         self.assertReleaseFails(mutated, "protected-environment")
 
     def test_tag_policy_safe_forms_required(self) -> None:
-        # M2: validator in preflight/package + inline series/exact in draft; no broad v*.
+        # M2: validator in preflight/package + inline exact-tag in draft; no wildcard.
         self.assertIn("support/release/verify-protected-environment.py", self.real_text)
-        self.assertIn('"v0.1.0-testnet.*"', self.real_text)
+        self.assertIn('"v0.1.0-testnet.2"', self.real_text)
+        self.assertNotIn('"v0.1.0-testnet.*"', self.real_text)
         self.assertNotIn('"v*",', self.real_text)
         self.assertIn("deployment-branch-policies", self.real_text)
+        self.assertIn("total_count", self.real_text)
 
     def test_broad_tag_policy_star_rejected(self) -> None:
         # Adding a broad v* policy inline must fail closed.
@@ -542,7 +684,12 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertReleaseFails(mutated, "exact allowlist")
 
     def test_github_ref_binding_required(self) -> None:
-        mutated = self.real_text.replace('test "$GITHUB_REF" = "refs/tags/$', 'test "$GITHUB_REF" = "refs/heads/$', 1)
+        # The single preflight GITHUB_REF tag binding must survive: strip the
+        # only copy and the gate must fail.
+        self.assertGreaterEqual(
+            self.real_text.count('test "$GITHUB_REF" = "refs/tags/$'), 1
+        )
+        mutated = self.real_text.replace('test "$GITHUB_REF" = "refs/tags/$', 'test "$GITHUB_REF" = "refs/heads/$')
         self.assertReleaseFails(mutated, "GITHUB_REF")
 
     def test_latest_push_selection_required(self) -> None:
@@ -560,8 +707,15 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("len(matching) != 1", self.real_text)
 
     def test_validator_invocation_required_twice(self) -> None:
-        validator = 'python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag"'
-        self.assertEqual(self.real_text.count(validator), 2)
+        # Phase1 contract: exactly 2 invocations (preflight release + package
+        # release re-verify); no release-admin validator exists.
+        release_validator = 'python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag" --expected-environment release'
+        self.assertEqual(self.real_text.count(release_validator), 2)
+        self.assertEqual(
+            self.real_text.count("verify-protected-environment.py --environment-json"), 2
+        )
+        self.assertNotIn("--expected-environment release-admin", self.real_text)
+        self.assertNotIn("$admin_env_out", self.real_text)
 
     def test_binary_attestation_binding_required(self) -> None:
         for marker in (
@@ -641,20 +795,20 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
 
     def test_package_contents_write_rejected(self) -> None:
         # release-package must stay contents:read; changing to write must fail.
-        mutated = self.real_text.replace(
-            "  release-package:\n    name: Package and attest release bundle\n    needs:",
-            "  release-package:\n    name: Package and attest release bundle\n    permissions:\n      contents: write\n    needs:",
-            1,
-        )
-        # Directly mutate the existing package permissions block instead
-        mutated2 = self.real_text.replace(
-            "  release-package:\n    name: Package and attest release bundle\n    needs:\n      - build-macos\n      - build-linux\n      - attest-macos\n      - attest-linux\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    environment: release\n    permissions:\n      contents: read",
-            "  release-package:\n    name: Package and attest release bundle\n    needs:\n      - build-macos\n      - build-linux\n      - attest-macos\n      - attest-linux\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    environment: release\n    permissions:\n      contents: write",
-            1,
-        )
-        # Use whichever mutation actually changes the file
-        target = mutated2 if mutated2 != self.real_text else mutated
-        self.assertReleaseFails(target, "must be exactly")
+        # Mutate within the release-package section so the needs chain and job
+        # set stay intact (only the permission changes).
+        import re as _re
+
+        marker = "\n  release-package:\n"
+        self.assertIn(marker, self.real_text)
+        head, tail = self.real_text.split(marker, 1)
+        follower = _re.search(r"(?m)^  [A-Za-z0-9_-]+:\n", tail)
+        section = tail[: follower.start()] if follower else tail
+        rest = tail[follower.start():] if follower else ""
+        self.assertIn("contents: read", section)
+        mutated_section = section.replace("contents: read", "contents: write", 1)
+        self.assertNotEqual(mutated_section, section)
+        self.assertReleaseFails(head + marker + mutated_section + rest, "must be exactly")
 
     def test_draft_checkout_rejected(self) -> None:
         # Draft job must have no checkout; adding one must fail (wrong job set/perms).
@@ -704,17 +858,17 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
     def test_m2_unknown_type_second_policy_rejected(self) -> None:
         # OR policies: a second entry with unknown/missing type must fail closed.
         # Simulate by duplicating the single policy with an unknown-type sibling.
-        anchor = 'allowed_names = {"v0.1.0-testnet.*", tag}'
+        anchor = "if total_count != 1:"
         assert anchor in self.real_text
         mutated = self.real_text.replace(
-            "if len(policies) != 1:",
-            'policies = policies + [{"type": "unknown"}]\n          if len(policies) != 1:',
+            anchor,
+            'policies = policies + [{"type": "unknown"}]\n          if total_count != 1:',
             1,
         )
-        # The workflow itself is unchanged in allowlist, but the test documents the
-        # exact-count requirement: any second entry must be rejected by len==1.
-        # Directly assert the workflow enforces exact count.
-        self.assertIn("if len(policies) != 1:", self.real_text)
+        # The workflow itself is unchanged in the exact-tag policy, but the test
+        # documents the exact-count requirement: any second entry must be
+        # rejected by the total_count/len check.
+        self.assertIn(anchor, self.real_text)
         # Mutating to allow two policies must fail (hash mismatch at minimum, policy ideally).
         try:
             CHECKER.validate_release_workflow(mutated, self.temp_copy(mutated))
@@ -745,7 +899,14 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             "tag policy type XXX",
             1,
         )
-        self.assertReleaseFails(mutated, "tag policy type must be exactly tag")
+        try:
+            CHECKER.validate_release_workflow(mutated, self.temp_copy(mutated))
+        except AssertionError as error:
+            self.assertTrue(
+                "tag policy type must be exactly tag" in str(error) or "hash mismatch" in str(error)
+            )
+            return
+        raise AssertionError("single policy missing type unexpectedly accepted")
 
     def test_draft_remote_check_uses_gh_api_not_ls_remote(self) -> None:
         # Draft (no checkout) must use authenticated gh api tag-ref lookup with peeling.
@@ -1010,6 +1171,767 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         )
         self.assertIn("--print-release-sha256", pathlib.Path(CHECKER_PATH).read_text(encoding="utf-8"))
 
+    def _draft_env_inline_script(self) -> str:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        steps = parsed["jobs"]["release-draft"]["steps"]
+        run = next(
+            step["run"]
+            for step in steps
+            if step.get("name") == "Re-verify protected environment before mutation"
+        )
+        marker = "<<'PY'\n"
+        self.assertIn(marker, run)
+        return run.split(marker, 1)[1].rsplit("\nPY\n", 1)[0]
+
+    def _run_draft_env_inline(self, env: dict, policies: dict) -> subprocess.CompletedProcess:
+        tag = "v0.1.0-testnet.2"
+        env_path = self.tmp / "inline-env.json"
+        policies_path = self.tmp / "inline-policies.json"
+        env_path.write_text(json.dumps(env), encoding="utf-8")
+        policies_path.write_text(json.dumps(policies), encoding="utf-8")
+        return subprocess.run(
+            [sys.executable, "-", str(env_path), str(policies_path), tag],
+            input=self._draft_env_inline_script(),
+            capture_output=True,
+            text=True,
+        )
+
+    @staticmethod
+    def _valid_inline_env() -> dict:
+        return {
+            "name": "release",
+            "can_admins_bypass": False,
+            "prevent_self_review": False,
+            "protection_rules": [
+                {
+                    "type": "required_reviewers",
+                    "prevent_self_review": False,
+                    "reviewers": [
+                        {"type": "User", "reviewer": {"login": "emyrinj", "id": 86115037}}
+                    ],
+                }
+            ],
+            "deployment_branch_policy": {
+                "protected_branches": False,
+                "custom_branch_policies": True,
+            },
+        }
+
+    @staticmethod
+    def _valid_inline_policies() -> dict:
+        return {
+            "total_count": 1,
+            "branch_policies": [{"type": "tag", "name": "v0.1.0-testnet.2"}],
+        }
+
+    def test_draft_inline_env_accepts_owner_self_approval(self) -> None:
+        result = self._run_draft_env_inline(self._valid_inline_env(), self._valid_inline_policies())
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_draft_inline_env_rejects_non_owner_reviewer(self) -> None:
+        env = self._valid_inline_env()
+        env["protection_rules"][0]["reviewers"][0]["reviewer"]["id"] = 25130814
+        result = self._run_draft_env_inline(env, self._valid_inline_policies())
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_env_rejects_prevent_self_review_true(self) -> None:
+        env = self._valid_inline_env()
+        env["protection_rules"][0]["prevent_self_review"] = True
+        result = self._run_draft_env_inline(env, self._valid_inline_policies())
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_env_rejects_wildcard_policy(self) -> None:
+        policies = {
+            "total_count": 1,
+            "branch_policies": [{"type": "tag", "name": "v0.1.0-testnet.*"}],
+        }
+        result = self._run_draft_env_inline(self._valid_inline_env(), policies)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_env_rejects_pagination_mismatch(self) -> None:
+        policies = self._valid_inline_policies()
+        policies["total_count"] = 2
+        result = self._run_draft_env_inline(self._valid_inline_env(), policies)
+        self.assertNotEqual(result.returncode, 0)
+
+    def _draft_ruleset_inline_script(self) -> str:
+        # Phase1 architecture: structural split-ruleset validation lives in
+        # preflight ("Verify split tag rulesets") over the default-token
+        # snapshot. An absent bypass_actors field is expected there (the
+        # default token lacks ruleset-write access) and prints the BYPASS
+        # notice instead of failing; authoritative bypass validation is an
+        # owner manual live check outside the workflow. Execute preflight's
+        # inline validator to preserve strict v* fail-closed coverage on
+        # visible fields.
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        steps = parsed["jobs"]["preflight"]["steps"]
+        marker = 'python3 - "$creation_out" "$immutability_out" "$repo" "$tag" <<\'PY\'\n'
+        runs = [
+            step["run"]
+            for step in steps
+            if isinstance(step.get("run"), str) and marker in step["run"]
+        ]
+        self.assertEqual(
+            len(runs),
+            1,
+            "preflight must carry exactly one split-ruleset inline validator",
+        )
+        run = runs[0]
+        return run.split(marker, 1)[1].rsplit("\nPY\n", 1)[0]
+
+    @staticmethod
+    def _valid_creation_ruleset() -> dict:
+        return {
+            "name": "astatine-release-tag-creation",
+            "target": "tag",
+            "source_type": "Repository",
+            "source": "Jecta-ai/astatine-miner",
+            "enforcement": "active",
+            "conditions": {
+                "ref_name": {"include": ["refs/tags/v*"], "exclude": []}
+            },
+            "rules": [{"type": "creation"}],
+            "bypass_actors": [
+                {"actor_id": 86115037, "actor_type": "User", "bypass_mode": "always"}
+            ],
+        }
+
+    @staticmethod
+    def _valid_immutability_ruleset() -> dict:
+        return {
+            "name": "astatine-release-tags",
+            "target": "tag",
+            "source_type": "Repository",
+            "source": "Jecta-ai/astatine-miner",
+            "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+            "rules": [
+                {"type": "update"},
+                {"type": "deletion"},
+                {"type": "non_fast_forward"},
+            ],
+            "bypass_actors": [],
+        }
+
+    def _run_draft_ruleset_inline(self, creation: dict, immutability: dict) -> subprocess.CompletedProcess:
+        creation_path = self.tmp / "inline-creation.json"
+        immutability_path = self.tmp / "inline-immutability.json"
+        creation_path.write_text(json.dumps(creation), encoding="utf-8")
+        immutability_path.write_text(json.dumps(immutability), encoding="utf-8")
+        return subprocess.run(
+            [
+                sys.executable,
+                "-",
+                str(creation_path),
+                str(immutability_path),
+                "Jecta-ai/astatine-miner",
+                "v0.1.0-testnet.2",
+            ],
+            input=self._draft_ruleset_inline_script(),
+            capture_output=True,
+            text=True,
+        )
+
+    def test_draft_inline_rulesets_accept_split_owner_model(self) -> None:
+        result = self._run_draft_ruleset_inline(
+            self._valid_creation_ruleset(), self._valid_immutability_ruleset()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_draft_inline_rulesets_accept_creation_never_caller_bypass(self) -> None:
+        creation = self._valid_creation_ruleset()
+        creation["current_user_can_bypass"] = "never"
+        result = self._run_draft_ruleset_inline(
+            creation, self._valid_immutability_ruleset()
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_draft_inline_rulesets_reject_creation_bypass_removal(self) -> None:
+        creation = self._valid_creation_ruleset()
+        creation["bypass_actors"] = []
+        result = self._run_draft_ruleset_inline(
+            creation, self._valid_immutability_ruleset()
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_rulesets_reject_2_only_immutability_scope(self) -> None:
+        # Narrowing immutability to the single .2 tag weakens protection for
+        # all other v* tags and must fail closed.
+        immutability = self._valid_immutability_ruleset()
+        immutability["conditions"]["ref_name"]["include"] = [
+            "refs/tags/v0.1.0-testnet.2"
+        ]
+        result = self._run_draft_ruleset_inline(
+            self._valid_creation_ruleset(), immutability
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_rulesets_reject_2_only_creation_scope(self) -> None:
+        # Narrowing creation to the single .2 tag weakens protection for all
+        # other v* tags and must fail closed.
+        creation = self._valid_creation_ruleset()
+        creation["conditions"]["ref_name"]["include"] = [
+            "refs/tags/v0.1.0-testnet.2"
+        ]
+        result = self._run_draft_ruleset_inline(
+            creation, self._valid_immutability_ruleset()
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_rulesets_reject_historical_list_scope(self) -> None:
+        # The historical .0/.1/.2 list is narrower than v* and must fail.
+        immutability = self._valid_immutability_ruleset()
+        immutability["conditions"]["ref_name"]["include"] = [
+            "refs/tags/v0.1.0-testnet.0",
+            "refs/tags/v0.1.0-testnet.1",
+            "refs/tags/v0.1.0-testnet.2",
+        ]
+        result = self._run_draft_ruleset_inline(
+            self._valid_creation_ruleset(), immutability
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_rulesets_tolerate_absent_bypass_with_manual_notice(self) -> None:
+        # Phase1: the default token cannot see bypass_actors, so an absent
+        # field is expected, prints the BYPASS notice, and continues on
+        # structural fields (no fail-closed, no silent pass). Authoritative
+        # bypass validation is the owner manual live check outside automation.
+        creation = self._valid_creation_ruleset()
+        del creation["bypass_actors"]
+        immutability = self._valid_immutability_ruleset()
+        del immutability["bypass_actors"]
+        result = self._run_draft_ruleset_inline(creation, immutability)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "BYPASS_ACTORS NOT AUTOMATICALLY VERIFIED",
+            result.stdout + result.stderr,
+        )
+
+    def _draft_body_inline_script(self) -> str:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        steps = parsed["jobs"]["release-draft"]["steps"]
+        run = next(
+            step["run"]
+            for step in steps
+            if step.get("name") == "Create draft release with assets"
+        )
+        marker = 'python3 - "$RUNNER_TEMP/draft-release.json" "$tag" bundle/release-notes.md <<\'PY\'\n'
+        self.assertIn(marker, run)
+        return run.split(marker, 1)[1].split("\nPY\n", 1)[0]
+
+    def _run_draft_body_inline(self, body: str, is_draft: bool = True) -> subprocess.CompletedProcess:
+        data_path = self.tmp / "draft-release.json"
+        notes_path = self.tmp / "release-notes.md"
+        notes_path.write_text(body, encoding="utf-8")
+        data_path.write_text(
+            json.dumps(
+                {
+                    "isDraft": is_draft,
+                    "tagName": "v0.1.0-testnet.2",
+                    "body": body,
+                    "assets": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                "-",
+                str(data_path),
+                "v0.1.0-testnet.2",
+                str(notes_path),
+            ],
+            input=self._draft_body_inline_script(),
+            capture_output=True,
+            text=True,
+        )
+
+    def test_draft_inline_body_accepts_exact_match(self) -> None:
+        result = self._run_draft_body_inline("reviewed notes\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_draft_inline_body_rejects_mismatch(self) -> None:
+        notes_path = self.tmp / "release-notes.md"
+        notes_path.write_text("reviewed notes\n", encoding="utf-8")
+        data_path = self.tmp / "draft-release.json"
+        data_path.write_text(
+            json.dumps(
+                {
+                    "isDraft": True,
+                    "tagName": "v0.1.0-testnet.2",
+                    "body": "tampered notes\n",
+                    "assets": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-",
+                str(data_path),
+                "v0.1.0-testnet.2",
+                str(notes_path),
+            ],
+            input=self._draft_body_inline_script(),
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_body_rejects_non_draft(self) -> None:
+        result = self._run_draft_body_inline("reviewed notes\n", is_draft=False)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_rulesets_reject_immutability_bypass(self) -> None:
+        immutability = self._valid_immutability_ruleset()
+        immutability["bypass_actors"] = [
+            {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+        ]
+        result = self._run_draft_ruleset_inline(
+            self._valid_creation_ruleset(), immutability
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_draft_inline_rulesets_reject_admin_creation_bypass(self) -> None:
+        # Repository-admin creation bypass contradicts the owner-only model.
+        creation = self._valid_creation_ruleset()
+        creation["bypass_actors"] = [
+            {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+        ]
+        result = self._run_draft_ruleset_inline(
+            creation, self._valid_immutability_ruleset()
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    # ---- Phase1: 7-job / 2-env no-App coverage ----
+    # Workflow lane owns release.yml + checker SHA; this lane asserts the
+    # final 7-job / 2-env no-App shape textually (plus dynamically via CHECKER
+    # for negatives; no hardcoded SHA here).
+
+    def test_seven_job_set_no_admin_jobs(self) -> None:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        jobs = parsed["jobs"]
+        self.assertEqual(
+            set(jobs),
+            {
+                "preflight",
+                "build-macos",
+                "build-linux",
+                "attest-macos",
+                "attest-linux",
+                "release-package",
+                "release-draft",
+            },
+        )
+        self.assertEqual(len(jobs), 7)
+        self.assertNotIn(
+            "tag-ruleset-admin-verify",
+            self.real_text,
+            "no isolated admin verification jobs may remain",
+        )
+
+    def test_two_protected_environments(self) -> None:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        jobs = parsed["jobs"]
+        # Single-env separation: only `release` (package/draft mutation jobs).
+        release_admin = sorted(
+            name for name, job in jobs.items() if job.get("environment") == "release-admin"
+        )
+        self.assertEqual(release_admin, [])
+        release_plain = sorted(
+            name for name, job in jobs.items() if job.get("environment") == "release"
+        )
+        self.assertEqual(
+            release_plain,
+            [
+                "release-draft",
+                "release-package",
+            ],
+        )
+        for name in release_plain:
+            self.assertEqual(jobs[name].get("environment"), "release")
+
+    def test_no_app_token_pin(self) -> None:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        for name, job in parsed["jobs"].items():
+            self.assertNotIn(
+                "administration",
+                job.get("permissions") or {},
+                "%s must not request an administration permission" % name,
+            )
+        # No App-token action anywhere (not once per job, not at all).
+        self.assertNotIn(
+            "actions/create-github-app-token",
+            self.real_text,
+            "Phase1 must not mint App tokens",
+        )
+        self.assertNotIn("permission-administration", self.real_text)
+        self.assertNotIn("skip-token-revoke", self.real_text)
+        self.assertNotIn("RELEASE_ADMIN", self.real_text)
+
+    def test_package_needs_builds_and_attests_only(self) -> None:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        needs = parsed["jobs"]["release-package"].get("needs")
+        self.assertEqual(
+            set(needs),
+            {"build-macos", "build-linux", "attest-macos", "attest-linux"},
+        )
+
+    def test_draft_needs_package_only(self) -> None:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        needs = parsed["jobs"]["release-draft"].get("needs")
+        if isinstance(needs, str):
+            needs = {needs}
+        else:
+            needs = set(needs)
+        self.assertEqual(needs, {"release-package"})
+
+    def test_no_admin_needs_chain(self) -> None:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        for name, job in parsed["jobs"].items():
+            needs = job.get("needs") or []
+            if isinstance(needs, str):
+                needs = [needs]
+            for dep in needs:
+                self.assertNotIn(
+                    "tag-ruleset-admin-verify",
+                    dep,
+                    "%s must not need a removed admin job" % name,
+                )
+
+    def test_github_ref_binding_global_single_source(self) -> None:
+        # The single preflight GITHUB_REF tag binding is the only source;
+        # strip it and the gate must fail.
+        count = self.real_text.count('test "$GITHUB_REF" = "refs/tags/$')
+        self.assertGreaterEqual(count, 1, "expected at least 1 GITHUB_REF binding")
+        mutated = self.real_text.replace(
+            'test "$GITHUB_REF" = "refs/tags/$', 'test "$GITHUB_REF" = "refs/heads/$'
+        )
+        self.assertNotIn('test "$GITHUB_REF" = "refs/tags/$', mutated)
+        self.assertReleaseFails(mutated, "GITHUB_REF")
+
+    def test_no_app_secrets_policy(self) -> None:
+        # Phase1: zero secrets-context references anywhere in automation; only
+        # the default github.token is used.
+        self.assertNotIn("${{ secrets.", self.real_text)
+        self.assertNotIn("RELEASE_ADMIN", self.real_text)
+        self.assertNotIn("PRIVATE_KEY", self.real_text)
+        self.assertIn("${{ github.token }}", self.real_text)
+
+    def test_manual_bypass_disclosure_required(self) -> None:
+        # Automation cannot verify bypass_actors (default token lacks
+        # ruleset-write access), so the owner manual live check outside the
+        # workflow is authoritative. Both mutation jobs must document this
+        # manual-check contract; the workflow must never claim automated
+        # bypass proof, and preflight must not fail closed on the merely
+        # absent field.
+        for marker in (
+            "BYPASS_ACTORS NOT AUTOMATICALLY VERIFIED",
+            "manual prepublish recheck",
+            "does NOT inherit",
+        ):
+            self.assertIn(
+                marker,
+                self.real_text,
+                "workflow must disclose %r (manual-check contract)" % marker,
+            )
+        self.assertIn("TOCTOU", self.real_text)
+        for job in ("release-package", "release-draft"):
+            section = self.real_text.split("  %s:" % job, 1)[1]
+            import re as _re
+
+            nxt = _re.search(r"(?m)^  [A-Za-z0-9_-]+:\n", section)
+            section = section[: nxt.start()] if nxt else section
+            for marker in (
+                "Phase1: no automated bypass verification is possible here",
+                "owner manual live check required before",
+                "manual prepublish recheck remains",
+            ):
+                self.assertIn(
+                    marker,
+                    section,
+                    "%s must document the manual-check contract" % job,
+                )
+        self.assertNotIn("admin-verified", self.real_text.lower())
+        self.assertNotIn(
+            "split tag rulesets admin-verified", self.real_text.lower()
+        )
+        self.assertNotIn(
+            "bypass_actors must be present as a list", self.real_text
+        )
+        self.assertNotIn("tag-ruleset-admin-verify", self.real_text)
+
+    def test_package_draft_forbid_snapshot_and_offline_validator(self) -> None:
+        # Phase1: mutation jobs document the owner manual live check; the
+        # impossible default-token split-ruleset detail blocks stay absent.
+        for section_name in ("release-package", "release-draft"):
+            section = self.real_text.split("  %s:" % section_name, 1)[1]
+            import re as _re
+
+            nxt = _re.search(r"(?m)^  [A-Za-z0-9_-]+:\n", section)
+            section = section[: nxt.start()] if nxt else section
+            for forbidden in (
+                "package-rulesets.json",
+                "package-tag-ruleset-ids.txt",
+                "draft-rulesets.json",
+                "draft-tag-ruleset-ids.txt",
+                "verify-tag-ruleset.py",
+            ):
+                self.assertNotIn(
+                    forbidden,
+                    section,
+                    "%s must not contain %s" % (section_name, forbidden),
+                )
+
+    def test_four_checkouts_total(self) -> None:
+        self.assertEqual(
+            self.real_text.count("actions/checkout@"),
+            4,
+            "exactly 4 checkouts total (preflight/builds/package; none elsewhere)",
+        )
+        draft = self.real_text.split("  release-draft:", 1)[1]
+        self.assertNotIn(
+            "actions/checkout@",
+            draft,
+            "release-draft must have zero checkouts",
+        )
+
+
+
+    # ---- Phase1 NO-GO additive coverage (read-only token, single env) ----
+    # No kept negative above is weakened; new tests assert the no-App
+    # contract. Workflow-lane SHA handoff is consumed dynamically via
+    # CHECKER.RELEASE_WORKFLOW_SHA256 (no hardcoded SHA here) after
+    # `--print-release-sha256` recompute.
+
+    def test_single_env_names_policy(self) -> None:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        jobs = parsed["jobs"]
+        for name in ("release-package", "release-draft"):
+            self.assertEqual(
+                jobs[name].get("environment"), "release", "%s must stay release" % name
+            )
+        self.assertEqual(
+            self.real_text.count("environment: release-admin"),
+            0,
+            "no release-admin environment may remain",
+        )
+
+    def test_no_permission_administration_policy(self) -> None:
+        import re as _re
+        self.assertNotIn("permission-administration", self.real_text)
+        for name in ("release-package", "release-draft", "preflight"):
+            section = self.real_text.split("  %s:" % name, 1)[1]
+            nxt = _re.search(r"(?m)^  [A-Za-z0-9_-]+:\n", section)
+            section = section[: nxt.start()] if nxt else section
+            self.assertNotRegex(
+                section, r"permission-administration\s*:\s*\S+"
+            )
+        # No write fallback anywhere (no App permission exists to escalate).
+        for m in _re.finditer(r"permission-administration\s*:\s*write", self.real_text):
+            self.fail("write fallback forbidden (found at %r)" % (m.group(0),))
+
+    def test_no_skip_token_revoke_policy(self) -> None:
+        self.assertNotIn(
+            "skip-token-revoke",
+            self.real_text,
+            "no minted token exists; no revoke flag may appear",
+        )
+
+    def test_no_revoke_proof_claim_policy(self) -> None:
+        import re as _re
+        # No token handling exists, so no revoke claim of any kind may appear.
+        self.assertNotRegex(
+            self.real_text, _re.compile(r"proves revocation", _re.IGNORECASE)
+        )
+        self.assertNotIn("Check admin token handling", self.real_text)
+
+    def test_readonly_gh_api_policy(self) -> None:
+        import re as _re
+        for name in (
+            "preflight",
+            "build-macos",
+            "build-linux",
+            "attest-macos",
+            "attest-linux",
+        ):
+            section = self.real_text.split("  %s:" % name, 1)[1]
+            nxt = _re.search(r"(?m)^  [A-Za-z0-9_-]+:\n", section)
+            section = section[: nxt.start()] if nxt else section
+            if name == "preflight":
+                for pattern in (
+                    'gh api "repos/$repo/environments/release"',
+                    'gh api "repos/$repo/rulesets?includes_parents=true&per_page=100"',
+                ):
+                    self.assertIn(pattern, section)
+            for pat in (
+                r"gh\s+api\s+-X\b",
+                r"gh\s+api\s+--method\b",
+                r"gh\s+release\s+(create|edit|delete)\b",
+                r"gh\s+attestation\b",
+            ):
+                self.assertNotRegex(section, pat, "%s must not contain %r" % (name, pat))
+
+    def test_mutating_gh_rejected_policy(self) -> None:
+        import re as _re
+        def _readonly_ok(block: str) -> bool:
+            code = "\n".join(
+                line for line in block.splitlines()
+                if not line.strip().startswith("#")
+            )
+            for pat in (
+                r"gh\s+api\s+-X\b",
+                r"gh\s+api\s+--method\b",
+                r"gh\s+release\s+delete\b",
+                r"gh\s+release\s+edit\b",
+            ):
+                if _re.search(pat, code):
+                    return False
+            return True
+        for name in (
+            "preflight",
+            "build-macos",
+            "build-linux",
+            "attest-macos",
+            "attest-linux",
+            "release-package",
+            "release-draft",
+        ):
+            section = self.real_text.split("  %s:" % name, 1)[1]
+            nxt = _re.search(r"(?m)^  [A-Za-z0-9_-]+:\n", section)
+            section = section[: nxt.start()] if nxt else section
+            self.assertTrue(_readonly_ok(section), "%s baseline must be read-only" % name)
+            self.assertFalse(
+                _readonly_ok(section + '\n gh api -X POST "repos/$repo/x"\n'),
+                "%s must reject -X POST mutation" % name,
+            )
+            self.assertFalse(
+                _readonly_ok(section + '\n gh release delete "$tag"\n'),
+                "%s must reject gh release mutation" % name,
+            )
+
+    def test_temporal_markers_policy(self) -> None:
+        self.assertIn("can delay", self.real_text)
+        import re as _re
+        self.assertIn("same-run needs does NOT inherit SHA", self.real_text)
+        self.assertIn("not atomic or immediate", self.real_text)
+        self.assertIn("manual prepublish recheck remains", self.real_text)
+        self.assertRegex(self.real_text, _re.compile(r"does NOT inherit", _re.IGNORECASE))
+        self.assertIn("BYPASS_ACTORS NOT AUTOMATICALLY VERIFIED", self.real_text)
+        self.assertIn("TOCTOU", self.real_text)
+
+    def test_no_admin_token_sha_language_policy(self) -> None:
+        for marker in (
+            "while App token is live",
+            "App installation token",
+            "GITHUB_SHA trust is inherited from same-run preflight",
+            "through the needs chain",
+            "No direct SHA equality check here by design",
+            "admin token",
+            "Check admin token handling",
+        ):
+            self.assertNotIn(
+                marker,
+                self.real_text,
+                "App-era SHA/token language must be gone (%r)" % marker,
+            )
+
+    def test_checker_rejects_reintroduced_admin_job(self) -> None:
+        # Reintroducing any tag-ruleset-admin-* job must fail the exact job set.
+        bad = self.real_text.replace(
+            "  release-package:",
+            "  tag-ruleset-admin-verify:\n    name: Old admin\n  release-package:",
+            1,
+        )
+        self.assertNotEqual(bad, self.real_text)
+        self.assertReleaseFails(bad, "exactly")
+
+    def test_zero_secrets_policy(self) -> None:
+        # Phase1: automation uses only the read-only GITHUB_TOKEN.
+        self.assertNotIn("${{ secrets.", self.real_text)
+        self.assertNotIn("RELEASE_ADMIN", self.real_text)
+        self.assertIn("${{ github.token }}", self.real_text)
+
+    def test_no_app_pin_and_counts_policy(self) -> None:
+        self.assertNotIn("actions/create-github-app-token@", self.real_text)
+        self.assertEqual(self.real_text.count("actions/checkout@"), 4)
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        self.assertEqual(len(parsed["jobs"]), 7)
+
+    def test_workflow_sha_dynamic_no_hardcode(self) -> None:
+        # Consume workflow-lane handoff SHA dynamically; no stale SHA pinned here.
+        # The pin lives in check_workflow_pins.py (workflow-lane owned); this file
+        # uses CHECKER.RELEASE_WORKFLOW_SHA256 dynamically so recompute needs no
+        # edit here.
+        self.assertEqual(
+            CHECKER.compute_release_sha256(self.real_text.encode("utf-8")),
+            CHECKER.RELEASE_WORKFLOW_SHA256,
+        )
+
+
+    def test_final_no_admin_handling_policy(self) -> None:
+        self.assertNotIn("Check admin token handling", self.real_text)
+        self.assertNotIn("Confirm admin token auto-revoke", self.real_text)
+        self.assertNotIn("intentionally omitted", self.real_text)
+
+    def test_final_two_env_names_policy(self) -> None:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        import re as _re
+        parsed = _yaml.safe_load(self.real_text)
+        jobs = parsed["jobs"]
+        self.assertEqual(len(jobs), 7)
+        self.assertEqual(
+            sorted(n for n, j in jobs.items() if j.get("environment") == "release-admin"),
+            [],
+        )
+        self.assertEqual(
+            sorted(n for n, j in jobs.items() if j.get("environment") == "release"),
+            ["release-draft", "release-package"],
+        )
+        self.assertEqual(self.real_text.count("environment: release-admin"), 0)
+        exact_release = len(_re.findall(r"environment:\s*release\s*(?:#.*)?$", self.real_text, _re.MULTILINE))
+        self.assertEqual(exact_release, 2)
+
+    def test_final_preflight_release_only_policy(self) -> None:
+        self.assertIn("--expected-environment release", self.real_text)
+        self.assertNotIn("--expected-environment release-admin", self.real_text)
+        self.assertNotIn("$admin_env_out", self.real_text)
+        self.assertNotIn("$admin_policies_out", self.real_text)
+
+    def test_final_no_stale_sha_anchor_policy(self) -> None:
+        for stale in ("0babaf836c96839d8a52e1d69c63dc1981f1a188bab1b179dbc7d914ab13bba7", "6582958d4149966f60e691d7767b3e39085e6dafedbb481b8e15c88a21cffe94", "e972f7cfb3526bfdfa7c5bb45db445565b3f57e578dd8e294be74ab8eb4ab8ac"):
+            self.assertNotIn(stale, self.real_text)
+        # Dynamic only: the live pin is consumed from the workflow-lane-owned
+        # checker, never hardcoded here.
+        self.assertEqual(
+            CHECKER.compute_release_sha256(self.real_text.encode("utf-8")),
+            CHECKER.RELEASE_WORKFLOW_SHA256,
+        )
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,7 +21,7 @@ fixture tree; the live v3 release-intent fixture suite remains in
 `support/tests/test_fixture_provenance.py`. No prior fixture negative test was
 deleted.
 
-Licensing for candidate `v0.1.0-testnet.1` (macOS ARM64 and Linux x86_64 only)
+Licensing for candidate `v0.1.0-testnet.2` (macOS ARM64 and Linux x86_64 only)
 is owner-authorized first-party source/binary distribution **intent**
 (`release_intent_authorization` dated 2026-11-17); repository technical NOTICE
 review recorded with citations; no legal conclusion and no separate release
@@ -29,15 +29,123 @@ approver appointed/consulted; final release controls outstanding.
 Apache-2.0/MIT texts and fixture NOTICE included; all fixtures remain with
 `release_archive_member: false`. Release execution
 remains externally gated and draft-only: the exact tag, protected `release`
-environment with non-self reviewer (required reviewer, prevent self-review, no
-admin bypass, custom tag deployment policy), exact-commit main CI (Rust CI +
-Linux native qualification), and build-provenance attestations are enforced by
+environment with explicit owner self-approval (owner reviewer pinned to
+immutable numeric GitHub id 86115037 and login, `prevent_self_review: false`, no
+admin bypass, exact-tag deployment policy, verified pagination total count),
+separate refs/tags/v* creation and immutability rulesets, exact-commit main CI
+(Rust CI + Linux native qualification), and build-provenance attestations are
+enforced by
 `.github/workflows/release.yml` preflight/build jobs; immutable-release
-verification and manual publication are owner/admin steps. Neither is performed
-by any offline script.
-Offline checks cannot establish environment, tag, CI, or immutable-setting
-state. The workflow creates and verifies a **draft only**; it does not
-publish.
+verification and manual publication are owner/admin steps. Owner self-approval
+removes independent review and separation of duties; the security tradeoff and
+owner-account residual risk are documented in the release notes and
+inventories. Neither offline check nor draft creation establishes publication.
+The historical `v0.1.0-testnet.1` tag remains at
+`99a8630a7ae7f5c5950031dfba8c3b0c3f132cbc`; its pending workflow was not
+cancelled or deleted and no `.1` release was published. The `.1` rights decision, scope and approval roles are preserved
+in `HISTORICAL-v0.1.0-testnet.1.md` and in the
+`historical_release_intent` inventory records. The `.2` authorization does not
+rewrite that history.
+
+`support/release/verify-protected-environment.py` validates the owner
+self-approval environment snapshot (owner reviewer id `86115037`, false
+self-review prevention, no admin bypass, exact tag policy, verified pagination
+`total_count`). `support/release/verify-tag-ruleset.py` validates the two
+composable ruleset snapshots:
+`astatine-release-tag-creation` (exactly the creation rule, exactly
+`refs/tags/v*` with no exclusions, with exactly the owner-user bypass
+(User 86115037, always) for owner-only creation; repository-admin bypass is
+rejected) and
+`astatine-release-tags` (exactly update/deletion/non-fast-forward with zero
+bypass actors, covering exactly `refs/tags/v*` with no exclusions). Creation
+protection is retained; it is not removed or broadened. Narrowing either
+ruleset to the single `.2` tag or to the historical `.0`/`.1`/`.2` list
+weakens protection for all other `v*` tags and is rejected. Both are offline fail-closed inputs to the workflow; a missing, combined,
+broadened, narrowed, or visibly bypassable snapshot fails closed. GitHub
+returns `bypass_actors` only to a caller with write access to the ruleset;
+the default read-only workflow token lacks that access, so an absent field
+does NOT prove an empty bypass list. The offline tool itself still requires
+`bypass_actors` as a list and fails closed when absent; automation preflight
+tolerates an absent field ONLY with an explicit manual-verification-required
+disclosure and does NOT claim bypass verification, does NOT forge a bypass
+check, and does NOT silently pass. No App, private key, installation token,
+or extra secret is added. Authoritative bypass verification is always the
+owner manual live check OUTSIDE the workflow described below. Creation and
+immutability are each exactly scoped to `refs/tags/v*` with no exclusions,
+preserving the live breadth. Future releases require a reviewed scope update.
+Offline checks cannot establish environment,
+tag, CI, or immutable-setting state. The workflow creates and verifies a
+**draft only**; it does not publish.
+
+## Manual owner-verified tag rulesets (no App, Phase1)
+
+Phase1 uses no GitHub App, no private key, no installation token, no external
+reviewer, and no additional secrets in automation. Automation runs with the
+default read-only `GITHUB_TOKEN` only.
+
+Automated preflight performs structural checks only: ruleset names
+(`astatine-release-tag-creation` and `astatine-release-tags`), `target: tag`,
+`source_type: Repository`, canonical `source` repository, `enforcement: active`,
+numeric ruleset `id`s, exact `rules` sets (`creation` alone for creation;
+`update`/`deletion`/`non_fast_forward` for immutability), and
+`conditions.ref_name` exactly `include: ["refs/tags/v*"]` with `exclude: []`.
+Any visible mismatch fails closed. No App/token/secrets are minted, stored, or
+consumed in automation.
+
+`bypass_actors` are NOT automatically verified. GitHub returns `bypass_actors`
+only to a caller with ruleset-write access; the default workflow token lacks
+that access, so an absent field does NOT prove an empty bypass list. Automation
+tolerates an absent field ONLY with an explicit manual-verification-required
+disclosure and does NOT claim bypass verification, does NOT forge a bypass
+check, and does NOT silently pass.
+
+Authoritative bypass verification is an owner-authorized manual live check
+OUTSIDE the workflow, run with the owner `gh` credential. Run it before
+dispatch AND again immediately before manual publication (TOCTOU: environment
+approvals can delay execution, same-run `needs` does NOT inherit SHA/tag
+binding, and the draft remains mutable by repository writers until publication,
+so a check-then-mutate race remains between any check and its following
+mutation).
+
+Manual owner checks (run each command; stop on any failure):
+
+```sh
+tag=v0.1.0-testnet.2
+repo=Jecta-ai/astatine-miner
+# List split tag rulesets and identify the two ids by name.
+gh api "repos/$repo/rulesets?includes_parents=true&per_page=100" --jq '.[] | {id, name, target, source_type, source, enforcement}'
+# Fetch each ruleset detail with the owner credential (do NOT infer ids).
+creation_id='<creation ruleset id from the list above>'
+immutability_id='<immutability ruleset id from the list above>'
+gh api "repos/$repo/rulesets/$creation_id" > /tmp/creation.json
+gh api "repos/$repo/rulesets/$immutability_id" > /tmp/immutability.json
+python3 -B support/release/verify-tag-ruleset.py --creation-ruleset-json /tmp/creation.json --immutability-ruleset-json /tmp/immutability.json --repository "$repo" --tag "$tag"
+# Verify the protected release environment with the owner credential.
+gh api "repos/$repo/environments/release" > /tmp/release-env.json
+gh api "repos/$repo/environments/release/deployment-branch-policies?per_page=100" > /tmp/release-policies.json
+python3 -B support/release/verify-protected-environment.py --environment-json /tmp/release-env.json --policies-json /tmp/release-policies.json --tag "$tag" --expected-environment release
+# Confirm immutable releases before dispatch and again immediately before publish.
+gh api "repos/$repo/immutable-releases" --jq .enabled | grep -q true
+```
+
+Changed guarantee (explicit): automation guarantees that visible structural
+mismatches fail closed, but it does NOT guarantee `bypass_actors`, does NOT
+verify tag immutability against bypass, and does NOT establish environment,
+tag, CI, or immutable-setting state. The owner manual checks above are the
+only authoritative bypass/environment verification. No bypass or forged checks
+come from automation. No publication comes from automation: the workflow
+creates and verifies a **draft only**; the draft is a prerelease (`isDraft`
+true) and manual publication remains a separate owner step after the
+pre-publish recheck.
+
+Validator coverage is two `verify-protected-environment.py` invocations:
+preflight verifies the protected `release` environment before builds, and
+`release-package` re-verifies `release` immediately before mutation;
+`release-draft` keeps its inline `release` re-verify before draft creation.
+Temporal/SHA language is `same-run needs does NOT inherit SHA/tag binding`,
+`not atomic or immediate`, `manual prepublish recheck remains`.
+
+No mining, wallet, payment, or network-mining behavior is added or changed.
 
 ## Nonpublishing Linux x86_64 dry-run (`build-dry-run.py`)
 
@@ -94,12 +202,12 @@ grant.
 `support/release/build-release.py` requires the release-intent gate via `gate.py`
 (blocked gates fail closed; no final publication is authorized) and packages exactly two deterministic archives:
 
-- `astatine-v0.1.0-testnet.1-macos-arm64.tar.gz` (`aarch64-apple-darwin`)
-- `astatine-v0.1.0-testnet.1-linux-x86_64.tar.gz` (`x86_64-unknown-linux-gnu`)
+- `astatine-v0.1.0-testnet.2-macos-arm64.tar.gz` (`aarch64-apple-darwin`)
+- `astatine-v0.1.0-testnet.2-linux-x86_64.tar.gz` (`x86_64-unknown-linux-gnu`)
 
 Each archive contains exactly five regular files under a single platform
-root directory (`astatine-v0.1.0-testnet.1-macos-arm64/` or
-`astatine-v0.1.0-testnet.1-linux-x86_64/`): `<root>/astatine` (0755),
+root directory (`astatine-v0.1.0-testnet.2-macos-arm64/` or
+`astatine-v0.1.0-testnet.2-linux-x86_64/`): `<root>/astatine` (0755),
 `<root>/LICENSE-MIT`, `<root>/THIRD_PARTY_LICENSES.md`,
 `<root>/BUILD-INFO.json`, `<root>/INSTALL.md` (0644), sorted, with zeroed
 timestamps/ownership, fixed modes, and `gzip -n` equivalent. (The
@@ -128,8 +236,10 @@ repository writers and write-capable apps with contents-write can publish or
 modify the draft outside the protected environment, so release authority must
 be restricted to the owner/admin before dispatch. If that cannot be
 established, draft dispatch remains blocked — do not weaken. Preflight
-verifies the actual protected `release` environment (required reviewer,
-prevent self-review, no admin bypass, custom tag deployment policy) and the
+verifies the actual protected `release` environment (owner reviewer pinned by
+immutable numeric GitHub id 86115037, prevent self-review intentionally false,
+no admin bypass, exact-tag deployment policy with verified pagination total
+count, separate creation and no-bypass immutability rulesets) and the
 canonical repository, and fails closed if the environment is absent or
 unprotected; preflight runs both fixture and distribution-inventory verifiers
 and the package step uses the already-validated gate via `gate.py` (it does
@@ -140,7 +250,7 @@ after admin immutable-setting verification:
 
 ```sh
 # Stop on any failure; run each command individually.
-tag=v0.1.0-testnet.1
+tag=v0.1.0-testnet.2
 repo=Jecta-ai/astatine-miner
 repo_id='<numeric repository ID from the authenticated release record>'
 source_commit='<exact source commit from the authenticated release record>'
@@ -166,6 +276,28 @@ resolved_tag_commit="$(
     '
 )"
 test "$resolved_tag_commit" = "$source_commit"
+# Recheck both split tag rulesets (creation restriction and no-bypass
+# immutability) with an owner/admin-visible token and every draft asset
+# digest/size and the draft body immediately before publishing. Run
+# verify-tag-ruleset.py against fresh creation/immutability snapshots. Draft
+# assets and body are mutable by any repository writer; stop on any change
+# instead of overwriting assets.
+gh release view "$tag" --repo "$repo" --json isDraft,body,assets
+tmpdir="$(mktemp -d)"
+git fetch origin "refs/tags/$tag:refs/tags/$tag"
+git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.2.md" > "$tmpdir/release-notes.md"
+gh api "repos/$repo/releases/tags/$tag" > "$tmpdir/draft.json"
+python3 - "$tmpdir/draft.json" "$tmpdir/release-notes.md" <<'PY'
+import json
+import pathlib
+import sys
+body = json.load(open(sys.argv[1], encoding="utf-8"))["body"].encode("utf-8")
+notes = pathlib.Path(sys.argv[2]).read_bytes()
+if body != notes:
+    raise SystemExit("draft body does not exactly match the tagged release notes")
+print("draft body matches the tagged release notes")
+PY
+rm -rf "$tmpdir"
 # Recheck immutable releases immediately before publishing:
 gh api "repos/$repo/immutable-releases" --jq .enabled | grep -q true
 gh release edit "$tag" --repo "$repo" --draft=false --prerelease
@@ -186,9 +318,9 @@ strip quarantine, alter system policy, or silently bypass; install only to a
 user-owned path such as `$HOME/.local/bin` (never sudo); single-platform
 operators verify only their archive's row (an operator holding both archives
 verifies each row separately):
-`grep -F "  astatine-v0.1.0-testnet.1-macos-arm64.tar.gz" SHA256SUMS | shasum -a 256 -c -`
+`grep -F "  astatine-v0.1.0-testnet.2-macos-arm64.tar.gz" SHA256SUMS | shasum -a 256 -c -`
 on macOS and
-`grep -F "  astatine-v0.1.0-testnet.1-linux-x86_64.tar.gz" SHA256SUMS | sha256sum -c -`
+`grep -F "  astatine-v0.1.0-testnet.2-linux-x86_64.tar.gz" SHA256SUMS | sha256sum -c -`
 on Linux, and always verify GitHub attestations. Linux notes glibc/Ubuntu 24.04,
 unlocked
 Secret Service for paid mining, and CUDA/GPU not qualified. Both state
@@ -202,7 +334,7 @@ both archives/binaries, source identity, lock hash, gate state, and
 Example:
 
 ```sh
-python3 -B support/release/build-release.py --tag v0.1.0-testnet.1 \
+python3 -B support/release/build-release.py --tag v0.1.0-testnet.2 \
   --repository-id 123456789 --macos-binary /tmp/macos-astatine \
   --linux-binary /tmp/linux-astatine --output-dir /tmp/astatine-release-out \
   --rustc-version "rustc 1.94.1 (e408947bf 2026-03-25)" \

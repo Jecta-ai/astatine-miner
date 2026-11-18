@@ -5,7 +5,7 @@ name: Rust CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, release/v0.1.0-testnet.2]
   pull_request:
     branches: [main]
 
@@ -16,8 +16,39 @@ env:
   RUSTUP_TOOLCHAIN: "1.94.1"
 
 jobs:
+  ruleset-bypass-visibility:
+    name: Ruleset bypass actor visibility (diagnostic)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/release/v0.1.0-testnet.2'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Report bypass_actors visibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          if result="$(gh api repos/Jecta-ai/astatine-miner/rulesets/27054770 --jq 'has("bypass_actors")' 2>/dev/null)"; then
+            case "$result" in
+              true|false)
+                printf 'ruleset bypass_actors present: %s\n' "$result"
+                ;;
+              *)
+                printf 'ruleset bypass_actors presence: unknown (exit 0)\n'
+                ;;
+            esac
+          else
+            status=$?
+            printf 'ruleset API request failed (exit %s); bypass_actors presence: unknown\n' "$status"
+          fi
+
   native-checks:
     name: Native checks (${{ matrix.target }})
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     strategy:
       fail-fast: false
       matrix:
@@ -112,6 +143,7 @@ jobs:
 
   linux-safe-tests:
     name: Linux safe unit tests (no native keyring, Anvil, or GPU)
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -156,6 +188,7 @@ jobs:
 
   dependency-policy:
     name: Dependency, advisory, and license checks
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:

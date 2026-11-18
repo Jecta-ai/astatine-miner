@@ -5,7 +5,7 @@ Uses support/release/gate.py and requires the owner-authorized release-intent
 licensing state (not final publication authorization; final release controls
 remain outstanding).
 Packages exactly two deterministic archives for the exact tag
-``v0.1.0-testnet.1`` — macOS ARM64 and Linux x86_64 — each with exactly
+``v0.1.0-testnet.2`` — macOS ARM64 and Linux x86_64 — each with exactly
 ``astatine``, ``LICENSE-MIT``, ``THIRD_PARTY_LICENSES.md``, ``BUILD-INFO.json``,
 and ``INSTALL.md``. Generates deterministic ``BUILD-INFO.json`` (schema
 ``astatine-build-info/v1``) and platform-specific ``INSTALL.md``, emits
@@ -33,7 +33,7 @@ source-to-binary linkage. Binary identity is established by the workflow build
 jobs and GitHub build provenance, not by this offline packager.
 
 Usage:
-    python3 -B support/release/build-release.py --tag v0.1.0-testnet.1 \\
+    python3 -B support/release/build-release.py --tag v0.1.0-testnet.2 \\
         --repository-id <digits> --macos-binary <path> --linux-binary <path> \\
         --rustc-version "rustc 1.94.1 (e408947bf 2026-03-25)" \\
         --cargo-version "cargo 1.94.1 (29ea6fb6a 2026-03-24)" \\
@@ -84,13 +84,14 @@ BINARY_BUILD_LINKAGE_NOTE = (
     "required to link each archived binary to that tag build, and independent "
     "bit-for-bit reproducibility across hosts is not claimed by this package"
 )
-RELEASE_NOTES_TAG = "v0.1.0-testnet.1"
+EXPECTED_RELEASE_VERSION = "0.1.0-testnet.2"
+RELEASE_NOTES_TAG = "v0.1.0-testnet.2"
 MACOS_TARGET = "aarch64-apple-darwin"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
-MACOS_ARCHIVE = "astatine-v0.1.0-testnet.1-macos-arm64.tar.gz"
-LINUX_ARCHIVE = "astatine-v0.1.0-testnet.1-linux-x86_64.tar.gz"
-MACOS_ROOT = "astatine-v0.1.0-testnet.1-macos-arm64"
-LINUX_ROOT = "astatine-v0.1.0-testnet.1-linux-x86_64"
+MACOS_ARCHIVE = "astatine-v0.1.0-testnet.2-macos-arm64.tar.gz"
+LINUX_ARCHIVE = "astatine-v0.1.0-testnet.2-linux-x86_64.tar.gz"
+MACOS_ROOT = "astatine-v0.1.0-testnet.2-macos-arm64"
+LINUX_ROOT = "astatine-v0.1.0-testnet.2-linux-x86_64"
 EXPECTED_BASENAMES = ["BUILD-INFO.json", "INSTALL.md", "LICENSE-MIT", "THIRD_PARTY_LICENSES.md", "astatine"]
 
 
@@ -402,6 +403,14 @@ def generate_build_info(
         "publication_authorized": False,
         "final_release_controls_complete": False,
         "package": {"name": package_name, "version": package_version, "binary": EXPECTED_BINARY_NAME},
+        "release": {
+            "version": package_version,
+            "tag": tag,
+            "tag_policy": (gate.get("release_controls") or {}).get("tag_policy"),
+            "exact_tag_required": (gate.get("release_controls") or {}).get("exact_tag_required"),
+        },
+        "owner_self_approval": gate.get("owner_self_approval"),
+        "historical_release_intent": gate.get("historical_release_intent"),
         "target": target,
         "profile": EXPECTED_PROFILE,
         "source": {
@@ -467,12 +476,28 @@ def generate_build_info(
         "release_controls": {
             "workflow": (gate.get("release_controls") or {}).get("workflow"),
             "environment": (gate.get("release_controls") or {}).get("environment"),
+            "environment_required_reviewer": (gate.get("release_controls") or {}).get("environment_required_reviewer"),
+            "environment_prevent_self_review": (gate.get("release_controls") or {}).get("environment_prevent_self_review"),
+            "environment_reviewer_owner_id": (gate.get("release_controls") or {}).get("environment_reviewer_owner_id"),
+            "environment_reviewer_owner_login": (gate.get("release_controls") or {}).get("environment_reviewer_owner_login"),
+            "independent_environment_review": (gate.get("release_controls") or {}).get("independent_environment_review"),
+            "owner_self_approval": (gate.get("release_controls") or {}).get("owner_self_approval"),
+            "owner_self_approval_policy": (gate.get("release_controls") or {}).get("owner_self_approval_policy"),
             "publication_mode": (gate.get("release_controls") or {}).get("publication_mode"),
             "manual_publish_required": (gate.get("release_controls") or {}).get("manual_publish_required"),
             "final_release_controls_complete": (gate.get("release_controls") or {}).get("final_release_controls_complete"),
             "tag_policy": (gate.get("release_controls") or {}).get("tag_policy"),
-            "attestations": list((gate.get("release_controls") or {}).get("attestations") or []),
+            "exact_tag_required": (gate.get("release_controls") or {}).get("exact_tag_required"),
             "immutable_release": (gate.get("release_controls") or {}).get("immutable_release"),
+            "immutable_tag_required": (gate.get("release_controls") or {}).get("immutable_tag_required"),
+            "tag_ruleset_exact_scope": (gate.get("release_controls") or {}).get("tag_ruleset_exact_scope"),
+            "tag_creation_ruleset_name": (gate.get("release_controls") or {}).get("tag_creation_ruleset_name"),
+            "tag_creation_rule_required": (gate.get("release_controls") or {}).get("tag_creation_rule_required"),
+            "tag_creation_bypass_actors_allowed": (gate.get("release_controls") or {}).get("tag_creation_bypass_actors_allowed"),
+            "tag_immutability_ruleset_name": (gate.get("release_controls") or {}).get("tag_immutability_ruleset_name"),
+            "tag_immutability_scope": (gate.get("release_controls") or {}).get("tag_immutability_scope"),
+            "tag_immutability_bypass_actors_allowed": (gate.get("release_controls") or {}).get("tag_immutability_bypass_actors_allowed"),
+            "attestations": list((gate.get("release_controls") or {}).get("attestations") or []),
             "immutable_setting_admin_verification_required": (gate.get("release_controls") or {}).get("immutable_setting_admin_verification_required"),
             "exact_tag_main_ci": (gate.get("release_controls") or {}).get("exact_tag_main_ci"),
         },
@@ -545,8 +570,10 @@ Testnet only. This is Astatine `{tag}` for `{target}`. No mainnet deployment
 or paid-operation risk acceptance is authorized by this package. Verify
 `SHA256SUMS`, the GitHub build-provenance attestations for the exact tag,
 and the release's immutable status before installing; never trust the archive
-alone. Ownership and redistribution authority remain owner-attested and have
-not been independently verified.
+alone. This release used an explicit owner self-approval policy; no independent
+human reviewer approved it, and no separation of duties is claimed. Ownership
+and redistribution authority remain owner-attested and have not been
+independently verified.
 
 - Package: {package_name}
 - Binary: {EXPECTED_BINARY_NAME}
@@ -661,7 +688,7 @@ def run(
     # Final publication is never authorized by this packager.
     gate_module = _load_gate_module()
     try:
-        gate = gate_module.load_gate(resolved_root)
+        gate = gate_module.load_gate(resolved_root, require_release_version=True)
     except Exception as error:
         raise ReleaseError(str(error)) from error
     require(gate.get("state") == "release-intent-authorized", "release requires the release-intent-authorized gate state; blocked gates fail closed")
@@ -675,6 +702,10 @@ def run(
     repository = gate.get("repository")
     require(repository == EXPECTED_REPOSITORY, f"release repository changed: {repository!r}")
     package_version = gate.get("package_version")
+    require(
+        package_version == EXPECTED_RELEASE_VERSION,
+        f"Cargo package version must be exactly {EXPECTED_RELEASE_VERSION!r}",
+    )
     require(tag == f"v{package_version}", f"--tag {tag!r} does not match Cargo package version {package_version!r}")
     lock_bytes = read_confined_bytes(resolved_root, CARGO_LOCK_REL, "cargo lockfile")
     lock_sha = sha256_hex(lock_bytes)
@@ -830,6 +861,14 @@ def run(
         "source_date": source_date,
         "package_name": EXPECTED_PACKAGE_NAME,
         "package_version": package_version,
+        "release": {
+            "version": package_version,
+            "tag": tag,
+            "tag_policy": (gate.get("release_controls") or {}).get("tag_policy"),
+            "exact_tag_required": (gate.get("release_controls") or {}).get("exact_tag_required"),
+        },
+        "owner_self_approval": gate.get("owner_self_approval"),
+        "historical_release_intent": gate.get("historical_release_intent"),
         "cargo_lock_sha256": lock_sha,
         "toolchain": {
             "rustc": rustc_version,
@@ -893,7 +932,7 @@ def run(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Offline release-intent dual-platform release packager (draft-only, no publication).")
-    parser.add_argument("--tag", required=True, help="exact release tag, e.g. v0.1.0-testnet.1")
+    parser.add_argument("--tag", required=True, help="exact release tag, e.g. v0.1.0-testnet.2")
     parser.add_argument("--repository-id", required=True, help="numeric GitHub repository id")
     parser.add_argument("--macos-binary", required=True, type=Path, help="path to prebuilt macOS ARM64 binary")
     parser.add_argument("--linux-binary", required=True, type=Path, help="path to prebuilt Linux x86_64 binary")

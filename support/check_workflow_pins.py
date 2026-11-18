@@ -23,7 +23,7 @@ DRY_RUN_WORKFLOW_FILENAME = "linux-release-dry-run.yml"
 RELEASE_WORKFLOW_FILENAME = "release.yml"
 # Pinned SHA-256 of .github/workflows/release.yml. Update only after review.
 # Recompute with: python3 -B support/check_workflow_pins.py --print-release-sha256
-RELEASE_WORKFLOW_SHA256 = "2b66efa3b33a0722ccbea5dea57012d72fd869336ba16ad9b30afa88ef3b01f3"
+RELEASE_WORKFLOW_SHA256 = "02ca5f2d50cf1035f1cf36d99f6fe9c67d2c80020976c4ce4d65c66ad12a23e7"
 PINNED_RELEASE_ACTIONS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
@@ -467,16 +467,51 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
 
     Strict non-release workflows keep the no-write/no-secrets isolation above.
     release.yml is allowed only with: workflow_dispatch-only with a required
-    string tag input, job-level least privilege (contents:write plus
-    attestations:read only on publish, id-token/attestations:write only on
-    package, environment only on publish), pinned actions, no secrets,
-    no tag creation, no PR triggers, no git push, no registry publication,
-    no mutable refs, and no persist-credentials:true. The exact bytes are
-    additionally pinned via RELEASE_WORKFLOW_SHA256; edits must deliberately
-    update the pin.
+    string tag input, job-level least privilege (contents:write only on the
+    draft job, id-token/attestations:write only on package plus attest jobs,
+    environment only on package/draft), pinned actions, zero secrets-context
+    references, no tag creation, no PR triggers, no git push, no registry
+    publication, no mutable refs, and no persist-credentials:true. Phase1 uses
+    only the read-only GITHUB_TOKEN in automation; bypass_actors has no
+    automated verification (owner manual live check outside the workflow). The
+    exact bytes are additionally pinned via RELEASE_WORKFLOW_SHA256; edits must
+    deliberately update the pin.
     """
     raw = contents.lstrip("\ufeff")
-    # Structural ambiguity must fail closed even for release.
+    # Structural ambiguity must fail closed even for release. Phase1 has no
+    # isolated verifier jobs and no secrets-context references anywhere:
+    # zero `secrets.` references are allowed. Job-level `administration`
+    # permission stays forbidden everywhere, and the App action input
+    # `permission-administration` is forbidden everywhere too.
+    if re.search(r"\bsecrets\b", raw, re.IGNORECASE):
+        raise AssertionError(
+            f"{workflow}: release workflow must contain zero secrets-context references (Phase1: read-only GITHUB_TOKEN only)"
+        )
+    if "create-github-app-token" in raw:
+        raise AssertionError(
+            f"{workflow}: release workflow must not use the actions/create-github-app-token action (Phase1: no App integration)"
+        )
+    for _absent in (
+        "release-admin",
+        "app-token",
+        "permission-administration",
+        "skip-token-revoke",
+        "RELEASE_ADMIN",
+        "PRIVATE_KEY",
+        "private-key",
+    ):
+        if _absent in raw:
+            raise AssertionError(
+                f"{workflow}: release workflow must not contain {_absent!r} (Phase1: no App/private-key/external-reviewer integration)"
+            )
+    if "administration" in raw:
+        raise AssertionError(
+            f"{workflow}: release workflow must not contain 'administration' (Phase1: no administration permission or App input)"
+        )
+    if "contents: none" in raw:
+        raise AssertionError(
+            f"{workflow}: release workflow must not define contents:none jobs (Phase1: no isolated verifier jobs)"
+        )
     for description, pattern in ALWAYS_PRIVILEGED_WORKFLOW_PATTERNS:
         if description in (
             "contents write permission",
@@ -529,7 +564,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
 
     # Job set and job-level least privilege.
     # M1: packaging/attestation and draft creation occur only in protected
-    # release-draft; builds are read-only with no OIDC. Separate attest jobs
+    # release jobs; builds are read-only with no OIDC. Separate attest jobs
     # hold OIDC/attestation write and never execute the candidate.
     expected_jobs = {"preflight", "build-macos", "build-linux", "attest-macos", "attest-linux", "release-package", "release-draft"}
     if set(job_perms) != expected_jobs:
@@ -756,7 +791,12 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "build-linux": {"preflight"},
         "attest-macos": {"build-macos"},
         "attest-linux": {"build-linux"},
-        "release-package": {"build-macos", "build-linux", "attest-macos", "attest-linux"},
+        "release-package": {
+            "build-macos",
+            "build-linux",
+            "attest-macos",
+            "attest-linux",
+        },
         "release-draft": {"release-package"},
     }
     for job_name, expected in expected_needs.items():
@@ -915,7 +955,10 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
                 f"{workflow}: preflight release-intent gate distribution step must execute exact line {required!r}"
             )
 
-    # Both protected jobs are environment-gated (B2); no pre-approval package job.
+    # All protected jobs are environment-gated (B2); no pre-approval package job.
+    # Dedicated env: release (package/draft mutation only). Preflight carries
+    # no environment and verifies the live release config itself; package and
+    # draft re-verify release live before mutation.
     try:
         envs = _release_job_environments(raw)
     except _AmbiguousWorkflow as error:
@@ -925,13 +968,15 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     env_jobs = sorted([job for job, _, _ in envs])
     if env_jobs != ["release-draft", "release-package"]:
         raise AssertionError(
-            f"{workflow}: environment must be `release` only on release-package and release-draft, got {envs}"
+            f"{workflow}: environment jobs must be exactly release-package and release-draft, got {envs}"
         )
-    for _, value, lineno in envs:
-        if value != "release":
+    _env_by_job = {job: value for job, value, _ in envs}
+    for _mutation_job in ("release-package", "release-draft"):
+        if _env_by_job.get(_mutation_job) != "release":
             raise AssertionError(
-                f"{workflow}:{lineno}: environment must be `release`, got {value!r}"
+                f"{workflow}: {_mutation_job} must stay gated by environment: release (mutation env), got {_env_by_job.get(_mutation_job)!r}"
             )
+    # Preflight must carry no environment (it verifies the live release config itself).
 
     # Runners and needs.
     for runner_need in (
@@ -960,17 +1005,50 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         if required not in raw:
             raise AssertionError(f"{workflow}: release workflow must contain needs marker {required!r} (R3 build/attest hash and toolchain chain)")
     # release-package must need all four upstream jobs.
-    _pkg_section = raw.split("release-package:", 1)[-1].split("release-draft:", 1)[0] if "release-package:" in raw else ""
+    _pkg_section = _job_section("release-package")
     for dep in ("build-macos", "build-linux", "attest-macos", "attest-linux"):
         if dep not in _pkg_section:
             raise AssertionError(f"{workflow}: release-package must need {dep} (R3 needs attest+build)")
     # Attest jobs must need their build job and must not need anything else privileged.
     for attest_job, build_job in (("attest-macos", "build-macos"), ("attest-linux", "build-linux")):
-        _att = raw.split(attest_job + ":", 1)[-1].split("release-package:", 1)[0] if attest_job + ":" in raw else ""
+        _att = _job_section(attest_job)
         if f"needs: {build_job}" not in _att:
             raise AssertionError(f"{workflow}: {attest_job} must declare needs: {build_job} (R3)")
 
-    # Pinned actions with exact allowlist (L3): only the four pinned actions, no other uses even if pinned.
+    # Phase1: no isolated verifier jobs, no App integration, no secrets.
+    # Absence of the old admin design is enforced globally above; here the
+    # package/draft comment contract is checked: no automated bypass
+    # verification is possible with the default token, so both mutation jobs
+    # must document the owner manual live check. Needs ordering is not atomic
+    # or immediate and does not inherit SHA binding; each mutation job still
+    # verifies live itself with a manual prepublish recheck required.
+    for _phase1_job in ("release-package", "release-draft"):
+        _phase1_section = _job_section(_phase1_job)
+        for _marker in (
+            "Phase1: no automated bypass verification is possible here",
+            "default token cannot see",
+            "bypass_actors",
+            "NOT a silent pass",
+            "owner manual live check required before",
+            "dispatch/publish",
+            "is not atomic or immediate",
+            "does not inherit SHA",
+            "manual prepublish recheck remains",
+        ):
+            if _marker not in _phase1_section:
+                raise AssertionError(f"{workflow}: {_phase1_job} must document the Phase1 manual-check contract with marker {_marker!r}")
+        # The impossible default-token split-ruleset detail blocks must stay
+        # absent here (preflight keeps only the structural read-only snapshot).
+        for _forbidden_detail in (
+            "package-rulesets.json",
+            "package-tag-ruleset-ids.txt",
+            "draft-rulesets.json",
+            "draft-tag-ruleset-ids.txt",
+            "support/release/verify-tag-ruleset.py",
+        ):
+            if _forbidden_detail in _phase1_section:
+                raise AssertionError(f"{workflow}: {_phase1_job} must not contain default-token split-ruleset detail {_forbidden_detail!r}")
+    # Pinned actions with exact allowlist (L3): only the pinned actions, no other uses even if pinned.
     for number, line in enumerate(raw.splitlines(), 1):
         reference = reference_for_line(line)
         if reference is None:
@@ -1059,8 +1137,22 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         raise AssertionError(f"{workflow}: release workflow must not execute gh release edit (draft-only)")
     if "--draft=false" in raw:
         raise AssertionError(f"{workflow}: release workflow must not clear draft (no --draft=false)")
-    if "--prerelease" in raw:
-        raise AssertionError(f"{workflow}: release workflow must not mark prerelease from the workflow (draft-only)")
+    _prerelease_lines = [
+        line
+        for line in raw.splitlines()
+        if "--prerelease" in line and not line.strip().startswith("#")
+    ]
+    if len(_prerelease_lines) != 1:
+        raise AssertionError(
+            f"{workflow}: --prerelease must appear exactly once on the draft gh release create line"
+        )
+    _draft_section = _job_section("release-draft")
+    if _prerelease_lines[0] not in _draft_section:
+        raise AssertionError(f"{workflow}: --prerelease is allowed only on the release-draft create line")
+    if not re.search(r"gh\s+release\s+create\b[^\n]*--draft\b[^\n]*--prerelease\b[^\n]*--verify-tag\b", _prerelease_lines[0]):
+        raise AssertionError(
+            f"{workflow}: draft gh release create line must be --draft --prerelease --verify-tag (draft-only prerelease, no publish)"
+        )
     if re.search(r"\bgh\s+release\s+verify\b", raw):
         raise AssertionError(f"{workflow}: release workflow must not auto-verify/publish releases")
     if "gh release verify-asset" in raw:
@@ -1071,15 +1163,21 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "--json assets",
         "--verify-tag",
         "--draft",
+        "--prerelease",
     ):
         if required not in raw:
             raise AssertionError(f"{workflow}: release workflow must contain {required!r}")
     if not re.search(r"gh\s+release\s+create\b[^\n]*--draft\b", raw):
         raise AssertionError(f"{workflow}: gh release create must contain --draft (draft-only)")
-    if "--draft --verify-tag" not in raw and "--verify-tag" not in raw:
-        raise AssertionError(f"{workflow}: gh release create must contain --verify-tag")
-    if "cp support/release/RELEASE_NOTES-v0.1.0-testnet.1.md" not in raw:
-        raise AssertionError(f"{workflow}: release package must copy the reviewed testnet notes into the bundle")
+    if "--draft --prerelease --verify-tag" not in raw:
+        raise AssertionError(f"{workflow}: gh release create must contain --draft --prerelease --verify-tag on one draft line")
+    if (
+        'git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.2.md"' not in raw
+        or 'cp "$tagged_notes" "$out/release-notes.md"' not in raw
+    ):
+        raise AssertionError(
+            f"{workflow}: release package must copy the reviewed .2 notes from the exact tag into the bundle"
+        )
     if "--notes-file bundle/release-notes.md" not in raw:
         raise AssertionError(f"{workflow}: release draft must use bundle/release-notes.md for draft notes")
     if re.search(r"\bgh\s+release\s+create\b[^\n]*\bgit\b", raw, re.IGNORECASE):
@@ -1167,46 +1265,95 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     if "tag deployment" not in raw.lower():
         raise AssertionError(f"{workflow}: release workflow must document the tag deployment policy")
     # Protected environment fail-closed verification via bounded validator (L2).
-    # Preflight + re-verify before mutation in release-draft; no inline env python,
-    # no reviewer identities printed. Validator enforces M2 series/exact allowlist.
-    validator_cli = 'python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag"'
+    # Preflight (no env) verifies the live release config via gh api with
+    # pagination total_count; package re-verifies release before mutation;
+    # draft uses inline python with the same exact-tag and pagination checks,
+    # no reviewer identities printed. Validator enforces
+    # M2 series/exact allowlist.
+    validator_cli = 'python3 -B support/release/verify-protected-environment.py --environment-json'
     if validator_cli not in raw:
         raise AssertionError(
             f"{workflow}: release workflow must call the protected-environment validator with {validator_cli!r}"
         )
-    if raw.count(validator_cli) < 2:
+    if raw.count(validator_cli) != 2:
         raise AssertionError(
-            f"{workflow}: release workflow must call the protected-environment validator in preflight and re-verify before mutation"
+            f"{workflow}: release workflow must call the protected-environment validator exactly 2x (preflight release + package release re-verify), got {raw.count(validator_cli)}"
         )
     for required in (
         'environments/release"',
         "deployment-branch-policies",
+        "--expected-environment release",
+        "Verify protected release environment",
+        "Re-verify protected environment before mutation",
     ):
         if required not in raw:
             raise AssertionError(f"{workflow}: release workflow must contain protected-environment marker {required!r}")
-    # M2: validator in preflight/package enforces series/exact; draft inline enforces
-    # series/exact with no broad v*. Broad *, **, empty, and other broader patterns rejected.
-    if '"v*"' in raw and '"v0.1.0-testnet.*"' not in raw.replace('"v*"', ''):
-        # Allow series pattern but forbid bare broad v* (exact string with comma or brace context)
-        pass
-    # Forbid bare broad v* allowlist entry (exact "v*" as a standalone policy name)
+    # M2: the .2 policy is exact-tag only. The environment deployment policy,
+    # the inline draft check, and the offline validator must all reject
+    # wildcards and require the exact current tag.
     if '"v*", ' in raw or '{"v*"' in raw or ', "v*"' in raw:
-        raise AssertionError(f"{workflow}: release workflow must not accept broad v* tag policy (M2: series/exact only)")
-    if 'allowed_names = {"v0.1.0-testnet.*", tag}' not in raw:
-        raise AssertionError(f"{workflow}: release-draft inline check must require series/exact allowlist (M2)")
-    # M2 OR policy: exactly one tag policy, no second tag or branch (policies are OR).
+        raise AssertionError(f"{workflow}: release workflow must not accept broad v* tag policy (M2: exact tag only)")
+    if '"v0.1.0-testnet.*"' in raw:
+        raise AssertionError(f"{workflow}: release workflow must not accept a series wildcard tag policy for .2 (M2: exact tag only)")
     for required in (
         "tag policies must be exactly one",
         "branch policies must be empty",
-        "tag policy name not in series/exact allowlist",
         "tag policy entry must be an object",
         "tag policy type must be exactly tag",
         "tag policy name missing",
-        "allowed_names",
-        '"v0.1.0-testnet.*"',
+        "tag policy must be the exact tag, not a wildcard",
+        "tag policy name must be exactly the release tag",
+        "total_count",
+        "policies total_count does not match the returned list",
+        "policies JSON must contain exactly one policy array field",
     ):
         if required not in raw:
-            raise AssertionError(f"{workflow}: release workflow must enforce single-tag OR policy {required!r} (M2)")
+            raise AssertionError(f"{workflow}: release workflow must enforce exact-tag and pagination policy {required!r} (M2)")
+    for required in (
+        "EXPECTED_RELEASE_TAG: \"v0.1.0-testnet.2\"",
+        "EXPECTED_RELEASE_VERSION: \"0.1.0-testnet.2\"",
+        "owner self-approval",
+        "no independent review",
+        "must record accepted residual risk",
+        "must record the compromised-owner tradeoff",
+        "must be owner-attested",
+        "must not claim independent verification",
+        "prevent_self_review must be exactly false",
+        "reviewer id must be the immutable owner id 86115037",
+        "reviewer login must be the owner login",
+        "environment name must be exactly release",
+        "Phase1 manual-check contract",
+        "no automated bypass verification",
+        "BYPASS_ACTORS NOT AUTOMATICALLY VERIFIED",
+        "TOCTOU",
+        "manual publish",
+        "prerelease",
+        "mutable by repository writers",
+        "same-run needs does NOT inherit SHA",
+        "is not atomic or immediate",
+        "manual prepublish recheck remains",
+        "does NOT inherit SHA",
+        "total_count must be an integer",
+        "rulesets?includes_parents=true&per_page=100",
+        "astatine-release-tag-creation",
+        "astatine-release-tags",
+        "exactly the two active split tag rulesets",
+        "creation ruleset must retain exactly the creation rule",
+        "immutability ruleset must use exactly update/deletion/non-fast-forward",
+        "Creation protection is never removed",
+        "ruleset-write access",
+        "a draft or release already exists",
+        "created release is not a draft",
+        "created draft body does not exactly match the reviewed release notes",
+        "tagged-release-notes.md",
+        "git show \"refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.2.md\"",
+        'test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"',
+        "head_repository",
+        "does not belong to the canonical repository",
+        "exact-commit run total_count",
+    ):
+        if required not in raw:
+            raise AssertionError(f"{workflow}: release workflow must enforce owner/exact-tag/immutability marker {required!r}")
     # Canonical repository enforcement (fail closed on forks).
     for required in (
         '"Jecta-ai/astatine-miner"',
@@ -1262,7 +1409,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "must not claim publication authorization or a release approver",
         '["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]',
         "provenance archive sha256 mismatch",
-        "Draft verified; manual owner publication remains required",
+        "Draft verified; owner self-approval publication remains required",
         "owner-authorized release intent",
         "final controls",
     ):
@@ -1300,6 +1447,10 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     # B1: per-job exact tag identity immediately after every checkout.
     # preflight + 2 builds + release-package each assert HEAD, tag^{}, describe.
     # Attest jobs have no checkout and must not assert tag identity.
+    if re.search(r"remove\s+(?:the\s+)?creation\s+rule", raw, re.IGNORECASE):
+        raise AssertionError(
+            f"{workflow}: release workflow must not remove tag creation protection; creation is a separate restricted ruleset"
+        )
     if raw.count("Assert exact tag identity") != 4:
         raise AssertionError(f"{workflow}: release workflow must assert exact tag identity after every checkout exactly 4x (B1: preflight+2 builds+package, none in attest/draft), got {raw.count('Assert exact tag identity')}")
     for required in (
@@ -1483,9 +1634,10 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             raise AssertionError(f"{workflow}: {_build_job} must not attest directly; attestation lives in attest jobs (R3)")
         if "id-token: write" in _section or "attestations: write" in _section:
             raise AssertionError(f"{workflow}: {_build_job} must not request OIDC/attestations write; read-only build (R3)")
-    # Validator script only in preflight + package (draft uses inline, no repo script).
-    if raw.count('python3 -B support/release/verify-protected-environment.py --environment-json "$env_out" --policies-json "$policies_out" --tag "$tag"') != 2:
-        raise AssertionError(f"{workflow}: protected-environment validator must run in preflight and package only (2x), inline in draft (B2/L2)")
+    # Validator script only in preflight release + package release verify
+    # (draft uses inline python; no repo script needed there).
+    if raw.count('python3 -B support/release/verify-protected-environment.py --environment-json') != 2:
+        raise AssertionError(f"{workflow}: protected-environment validator must run 2x (preflight release + package release), inline in draft (B2/L2)")
     # Builder only in package with observed toolchain args (R3).
     if raw.count("support/release/build-release.py") != 1:
         raise AssertionError(f"{workflow}: release builder must run exactly once in release-package (B2)")
