@@ -8873,7 +8873,7 @@ SOFTWARE.
 ### MIT License
 
 Used by:
-- [astatine-cli-rust 0.1.0-testnet.2](https://crates.io/crates/astatine-cli-rust)
+- [astatine-cli-rust 0.1.0-testnet.3](https://crates.io/crates/astatine-cli-rust)
 <pre>
 MIT License
 

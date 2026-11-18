@@ -53,8 +53,8 @@ Authority and release intent:
 
 - Ownership and redistribution authority for these fixtures are
   owner-attested by the project owner authorization dated 2026-11-17 for
-  owner-authorized release intent for v0.1.0-testnet.1 (historical, preserved)
-  and v0.1.0-testnet.2 (current). The v0.1.0-testnet.2 release uses the explicit
+  owner-authorized release intent for v0.1.0-testnet.1 (historical, preserved),
+  v0.1.0-testnet.2 (superseded, preserved), and v0.1.0-testnet.3 (current). The v0.1.0-testnet.3 release uses the explicit
   owner self-approval policy; no independent review, separation of duties, or
   separate release approver is claimed. Final release controls remain
   outstanding. This NOTICE makes no legal conclusion, claims no independent

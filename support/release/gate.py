@@ -41,12 +41,12 @@ REPOSITORY_REL = "support/release-repository.txt"
 
 # Current release identity. The owner self-approval model is version-scoped so
 # an older tag cannot be dispatched under the new environment policy.
-EXPECTED_RELEASE_VERSION = "0.1.0-testnet.2"
-EXPECTED_RELEASE_TAG = "v0.1.0-testnet.2"
+EXPECTED_RELEASE_VERSION = "0.1.0-testnet.3"
+EXPECTED_RELEASE_TAG = "v0.1.0-testnet.3"
 EXPECTED_RELEASE_TAG_POLICY = f"refs/tags/{EXPECTED_RELEASE_TAG}"
 # Both composable tag rulesets preserve the live breadth: exactly refs/tags/v*
-# with no exclusions. Narrowing to the single .2 tag or the historical
-# .0/.1/.2 list would weaken protection for all other v* tags.
+# with no exclusions. Narrowing to the single .3 tag or the historical
+# .0/.1/.2/.3 list would weaken protection for all other v* tags.
 EXPECTED_TAG_RULESET_SCOPE = "refs/tags/v*"
 EXPECTED_TAG_IMMUTABILITY_SCOPE = ["refs/tags/v*"]
 EXPECTED_RELEASE_REVIEWER_ID = 86115037
@@ -62,14 +62,14 @@ EXPECTED_RELEASE_TAG_CREATION_BYPASS_ACTORS = [
 ]
 
 # Historical .1 release intent. The substantive .1 fields are retained
-# verbatim so the current .2 authorization cannot rewrite or silently erase
+# verbatim so the current .3 authorization cannot rewrite or silently erase
 # what was recorded for .1.
 HISTORICAL_RELEASE_TAG = "v0.1.0-testnet.1"
 HISTORICAL_RELEASE_COMMIT = "99a8630a7ae7f5c5950031dfba8c3b0c3f132cbc"
 HISTORICAL_RELEASE_NOTES_REL = "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md"
 HISTORICAL_RELEASE_NOTES_SHA256 = "12d7605b5e48c80f1c838a95d245c08da8cd5c831d008da3bb3dea420bdc31b9"
-RELEASE_NOTES_REL = "support/release/RELEASE_NOTES-v0.1.0-testnet.2.md"
-RELEASE_NOTES_SHA256 = "f2102858c7346ccbbcf24e87ce0b19597947d1bf2cd2538a850bb4878cdb1e6b"
+RELEASE_NOTES_REL = "support/release/RELEASE_NOTES-v0.1.0-testnet.3.md"
+RELEASE_NOTES_SHA256 = "b2012608cc4c1ab331916ff3fece5806f18bd307a71e7b7e4fee9a3d1fccd4dd"
 HISTORICAL_RIGHTS_DECISION = (
     "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party "
     "source and binary distribution intent for v0.1.0-testnet.1; technical "
@@ -192,7 +192,7 @@ INTENT_INVENTORY_SCHEMA = "astatine-distribution-inventory/v3"
 INTENT_PROVENANCE_SCHEMA = "astatine-fixture-provenance/v3"
 INTENT_RIGHTS_DECISION = (
     "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party "
-    "source and binary distribution intent for v0.1.0-testnet.2 under the "
+    "source and binary distribution intent for v0.1.0-testnet.3 under the "
     "explicitly documented owner self-approval policy; technical NOTICE review "
     "recorded; final release controls outstanding; not a legal conclusion, not "
     "independent review, and not a separate approval."
@@ -248,7 +248,7 @@ INTENT_AUTHORIZED_BY = "project owner"
 INTENT_AUTHORIZED_ON = "2026-11-17"
 INTENT_SCOPE = (
     "Owner-authorized first-party source and binary distribution intent for "
-    "v0.1.0-testnet.2 on macOS ARM64 and Linux x86_64 under an explicit owner "
+    "v0.1.0-testnet.3 on macOS ARM64 and Linux x86_64 under an explicit owner "
     "self-approval policy; no independent reviewer or separate approver; final "
     "release controls remain outstanding."
 )
@@ -267,7 +267,7 @@ INTENT_TECHNICAL_REVIEWED_ON = "2026-11-17"
 
 INTENT_INVENTORY_SCOPE = (
     "Candidate source and binary distribution inventory for Astatine "
-    "v0.1.0-testnet.2 on macOS ARM64 and Linux x86_64. Owner-authorized release "
+    "v0.1.0-testnet.3 on macOS ARM64 and Linux x86_64. Owner-authorized release "
     "intent under an explicitly documented owner self-approval policy with "
     "technical NOTICE review recorded (citations included); final release "
     "controls remain outstanding; licensing is owner-authorized, release "
@@ -290,7 +290,7 @@ INTENT_RULE = (
 )
 INTENT_SOURCE_REASON = (
     "Source distribution intent is owner-authorized (RELEASE-INTENT-AUTHORIZED) "
-    "for v0.1.0-testnet.2 only under the owner self-approval policy: "
+    "for v0.1.0-testnet.3 only under the owner self-approval policy: "
     "GitHub-generated source archives for the exact tag include tests/fixtures "
     "and the Apache-2.0/MIT license texts and fixture NOTICE; final release "
     "controls remain outstanding (final_release_controls_complete: false); "
@@ -298,7 +298,7 @@ INTENT_SOURCE_REASON = (
 )
 INTENT_BINARY_REASON = (
     "Binary distribution intent is owner-authorized (RELEASE-INTENT-AUTHORIZED) "
-    "for v0.1.0-testnet.2 on macOS ARM64 and Linux x86_64 only under the owner "
+    "for v0.1.0-testnet.3 on macOS ARM64 and Linux x86_64 only under the owner "
     "self-approval policy: pinned allowlist archives plus generated "
     "BUILD-INFO.json and INSTALL.md; no fixture, provenance, or forbidden path "
     "may enter a release archive; final release controls remain outstanding "
@@ -347,7 +347,7 @@ OWNER_SELF_APPROVAL_POLICY = {
     "owner_attested": True,
     "independent_verification": False,
     "compensating_controls": [
-        "exact release tag pinned to v0.1.0-testnet.2 and an exact-tag environment deployment policy",
+        "exact release tag pinned to v0.1.0-testnet.3 and an exact-tag environment deployment policy",
         "environment cannot be bypassed by administrators (can_admins_bypass: false)",
         "separate tag creation ruleset must be active with the creation rule and exactly the owner-user bypass (User 86115037, always) for exactly refs/tags/v* with no exclusions; repository-admin bypass is rejected",
         "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering exactly refs/tags/v* with no exclusions",
@@ -382,7 +382,7 @@ HISTORICAL_RELEASE_INTENT = {
         "verbatim; the tag, commit, release-notes hash and status metadata are "
         "added to identify the historical record. The .1 tag is not moved; its "
         "workflow run is not cancelled or deleted; no .1 release was published. "
-        "The current .2 authorization does not alter the preserved .1 fields."
+        "The current .3 authorization does not alter the preserved .1 fields."
     ),
 }
 
@@ -415,7 +415,7 @@ AUTHORIZED_RELEASE_CONTROLS = {
     "exact_tag_main_ci": True,
     "external_blockers": [
         "protected release environment requires the owner reviewer (immutable numeric GitHub user id 86115037) with prevent_self_review false and administrator bypass disabled",
-        "exact tag v0.1.0-testnet.2 for the exact release commit, with the environment deployment policy restricted to that exact tag",
+        "exact tag v0.1.0-testnet.3 for the exact release commit, with the environment deployment policy restricted to that exact tag",
         "separate active astatine-release-tag-creation ruleset restricted to exactly refs/tags/v* with no exclusions and with exactly the owner-user (User 86115037, always) creation bypass; repository-admin bypass is rejected",
         "separate active astatine-release-tags ruleset limited to update, deletion and non-fast-forward for exactly refs/tags/v* with no exclusions and with zero bypass actors",
         "tag creation protection is retained; no broader bypass or removal of the creation rule is authorized",
@@ -883,7 +883,7 @@ def _validate_release_intent(
         f"unexpected distribution inventory schema: {inventory.get('schema')!r}",
     )
     scope = require_string(inventory.get("scope"), "distribution inventory scope")
-    require(scope == INTENT_INVENTORY_SCOPE, "distribution inventory scope changed; the v0.1.0-testnet.2 candidate scope must be recorded exactly")
+    require(scope == INTENT_INVENTORY_SCOPE, "distribution inventory scope changed; the v0.1.0-testnet.3 candidate scope must be recorded exactly")
     require(
         provenance.get("schema") == INTENT_PROVENANCE_SCHEMA,
         f"unexpected fixture provenance schema: {provenance.get('schema')!r}",
@@ -891,11 +891,11 @@ def _validate_release_intent(
     release_identity = require_object(inventory.get("release"), "distribution inventory release")
     require(
         release_identity == RELEASE_IDENTITY,
-        "distribution inventory release identity changed; the current candidate must be exactly v0.1.0-testnet.2",
+        "distribution inventory release identity changed; the current candidate must be exactly v0.1.0-testnet.3",
     )
     require(
         provenance.get("release") == RELEASE_IDENTITY,
-        "fixture provenance release identity must mirror the current v0.1.0-testnet.2 candidate",
+        "fixture provenance release identity must mirror the current v0.1.0-testnet.3 candidate",
     )
     historical = require_object(
         inventory.get("historical_release_intent"), "distribution inventory historical_release_intent"
@@ -915,10 +915,10 @@ def _validate_release_intent(
         hashlib.sha256(historical_notes).hexdigest() == HISTORICAL_RELEASE_NOTES_SHA256,
         "historical .1 release notes changed; preserve the historical .1 intent file byte-for-byte",
     )
-    release_notes = read_confined_bytes(root, RELEASE_NOTES_REL, "current .2 release notes")
+    release_notes = read_confined_bytes(root, RELEASE_NOTES_REL, "current .3 release notes")
     require(
         hashlib.sha256(release_notes).hexdigest() == RELEASE_NOTES_SHA256,
-        "current .2 release notes changed; update the reviewed notes hash deliberately so the non-independence disclosure cannot be silently edited",
+        "current .3 release notes changed; update the reviewed notes hash deliberately so the non-independence disclosure cannot be silently edited",
     )
     gate = require_object(inventory.get("rights_gate"), "rights_gate")
     require(gate.get("source") == PROVENANCE_REL, "rights_gate source changed")
@@ -1220,7 +1220,7 @@ def load_gate(root: Path, *, require_release_version: bool = False) -> dict:
     ``archive_members``, ``generated_members``, ``forbidden_globs``,
     ``fixture_paths``, ``repository``, and ``package_version``. Release
     callers pass ``require_release_version=True`` to bind the Cargo package
-    version to the current ``v0.1.0-testnet.2`` candidate; the nonpublishing
+    version to the current ``v0.1.0-testnet.3`` candidate; the nonpublishing
     dry-run leaves it false for synthetic historical fixtures.
 
     Raises :class:`GateError` fail-closed on any mismatch. Stdlib-only and
@@ -1256,7 +1256,7 @@ def load_gate(root: Path, *, require_release_version: bool = False) -> dict:
             f"Cargo package version must be exactly {EXPECTED_RELEASE_VERSION!r}, got {package_version!r}",
         )
     # The shared gate also serves the nonpublishing dry-run against synthetic
-    # historical package versions; release callers must opt into the exact .2
+    # historical package versions; release callers must opt into the exact .3
     # version check. The final release builder opts in, and the workflow also
     # checks Cargo.toml directly.
     gate["repository"] = repository

@@ -5,7 +5,7 @@ Uses support/release/gate.py and requires the owner-authorized release-intent
 licensing state (not final publication authorization; final release controls
 remain outstanding).
 Packages exactly two deterministic archives for the exact tag
-``v0.1.0-testnet.2`` — macOS ARM64 and Linux x86_64 — each with exactly
+``v0.1.0-testnet.3`` — macOS ARM64 and Linux x86_64 — each with exactly
 ``astatine``, ``LICENSE-MIT``, ``THIRD_PARTY_LICENSES.md``, ``BUILD-INFO.json``,
 and ``INSTALL.md``. Generates deterministic ``BUILD-INFO.json`` (schema
 ``astatine-build-info/v1``) and platform-specific ``INSTALL.md``, emits
@@ -33,7 +33,7 @@ source-to-binary linkage. Binary identity is established by the workflow build
 jobs and GitHub build provenance, not by this offline packager.
 
 Usage:
-    python3 -B support/release/build-release.py --tag v0.1.0-testnet.2 \\
+    python3 -B support/release/build-release.py --tag v0.1.0-testnet.3 \\
         --repository-id <digits> --macos-binary <path> --linux-binary <path> \\
         --rustc-version "rustc 1.94.1 (e408947bf 2026-03-25)" \\
         --cargo-version "cargo 1.94.1 (29ea6fb6a 2026-03-24)" \\
@@ -84,14 +84,14 @@ BINARY_BUILD_LINKAGE_NOTE = (
     "required to link each archived binary to that tag build, and independent "
     "bit-for-bit reproducibility across hosts is not claimed by this package"
 )
-EXPECTED_RELEASE_VERSION = "0.1.0-testnet.2"
-RELEASE_NOTES_TAG = "v0.1.0-testnet.2"
+EXPECTED_RELEASE_VERSION = "0.1.0-testnet.3"
+RELEASE_NOTES_TAG = "v0.1.0-testnet.3"
 MACOS_TARGET = "aarch64-apple-darwin"
 LINUX_TARGET = "x86_64-unknown-linux-gnu"
-MACOS_ARCHIVE = "astatine-v0.1.0-testnet.2-macos-arm64.tar.gz"
-LINUX_ARCHIVE = "astatine-v0.1.0-testnet.2-linux-x86_64.tar.gz"
-MACOS_ROOT = "astatine-v0.1.0-testnet.2-macos-arm64"
-LINUX_ROOT = "astatine-v0.1.0-testnet.2-linux-x86_64"
+MACOS_ARCHIVE = "astatine-v0.1.0-testnet.3-macos-arm64.tar.gz"
+LINUX_ARCHIVE = "astatine-v0.1.0-testnet.3-linux-x86_64.tar.gz"
+MACOS_ROOT = "astatine-v0.1.0-testnet.3-macos-arm64"
+LINUX_ROOT = "astatine-v0.1.0-testnet.3-linux-x86_64"
 EXPECTED_BASENAMES = ["BUILD-INFO.json", "INSTALL.md", "LICENSE-MIT", "THIRD_PARTY_LICENSES.md", "astatine"]
 
 
@@ -869,6 +869,7 @@ def run(
         },
         "owner_self_approval": gate.get("owner_self_approval"),
         "historical_release_intent": gate.get("historical_release_intent"),
+        "rights_decision": gate.get("rights_decision"),
         "cargo_lock_sha256": lock_sha,
         "toolchain": {
             "rustc": rustc_version,
@@ -932,7 +933,7 @@ def run(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Offline release-intent dual-platform release packager (draft-only, no publication).")
-    parser.add_argument("--tag", required=True, help="exact release tag, e.g. v0.1.0-testnet.2")
+    parser.add_argument("--tag", required=True, help="exact release tag, e.g. v0.1.0-testnet.3")
     parser.add_argument("--repository-id", required=True, help="numeric GitHub repository id")
     parser.add_argument("--macos-binary", required=True, type=Path, help="path to prebuilt macOS ARM64 binary")
     parser.add_argument("--linux-binary", required=True, type=Path, help="path to prebuilt Linux x86_64 binary")

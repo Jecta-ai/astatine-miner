@@ -11,7 +11,7 @@ key, installation token, or extra secret is used.
 
 Both environments share the same policy when checked: owner sole self-approval
 (User 86115037), ``prevent_self_review`` exactly false, ``can_admins_bypass``
-false, and the exact current release tag ``v0.1.0-testnet.2`` with no
+false, and the exact current release tag ``v0.1.0-testnet.3`` with no
 wildcards. GitHub deployment branch and tag policies combine with OR, so the
 policies snapshot must contain exactly one policy and that policy must be the
 exact current release tag; anything broader fails closed. The
@@ -50,7 +50,7 @@ import re
 import sys
 from pathlib import Path
 
-EXPECTED_RELEASE_TAG = "v0.1.0-testnet.2"
+EXPECTED_RELEASE_TAG = "v0.1.0-testnet.3"
 EXPECTED_REVIEWER_ID = 86115037
 EXPECTED_REVIEWER_LOGIN = "emyrinj"
 RELEASE_TAG_PATTERN = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+-testnet\.[0-9]+$")
@@ -233,7 +233,7 @@ def validate_policies(data: object, tag: str) -> dict:
     require(_is_nonempty_string(tag), "--tag must be a non-empty string")
     require(
         tag == EXPECTED_RELEASE_TAG,
-        "release tag must be exactly the current candidate v0.1.0-testnet.2",
+        "release tag must be exactly the current candidate v0.1.0-testnet.3",
     )
     require(
         RELEASE_TAG_PATTERN.fullmatch(tag) is not None,
@@ -254,7 +254,7 @@ def validate_policies(data: object, tag: str) -> dict:
     )
     require(
         name == tag,
-        "policies[0] tag policy name must be exactly the release tag v0.1.0-testnet.2",
+        "policies[0] tag policy name must be exactly the release tag v0.1.0-testnet.3",
     )
     return {
         "tag_policy_count": 1,
