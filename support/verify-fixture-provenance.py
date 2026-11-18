@@ -66,14 +66,14 @@ EXPECTED_SCHEMA_V1 = "astatine-fixture-provenance/v1"
 EXPECTED_SCHEMA_V2 = "astatine-fixture-provenance/v2"
 EXPECTED_SCHEMA_V3 = "astatine-fixture-provenance/v3"
 EXPECTED_VERIFICATION_DATE_V3 = "2026-11-17"
-EXPECTED_RELEASE_VERSION = "0.1.0-testnet.2"
-EXPECTED_RELEASE_TAG = "v0.1.0-testnet.2"
-EXPECTED_RELEASE_TAG_POLICY = "refs/tags/v0.1.0-testnet.2"
+EXPECTED_RELEASE_VERSION = "0.1.0-testnet.3"
+EXPECTED_RELEASE_TAG = "v0.1.0-testnet.3"
+EXPECTED_RELEASE_TAG_POLICY = "refs/tags/v0.1.0-testnet.3"
 EXPECTED_RELEASE_REVIEWER_ID = 86115037
 EXPECTED_RELEASE_REVIEWER_LOGIN = "emyrinj"
 EXPECTED_RIGHTS_DECISION_V3 = (
     "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent "
-    "for v0.1.0-testnet.2 under the explicitly documented owner self-approval policy; technical NOTICE review recorded; "
+    "for v0.1.0-testnet.3 under the explicitly documented owner self-approval policy; technical NOTICE review recorded; "
     "final release controls outstanding; not a legal conclusion, not independent review, and not a separate approval."
 )
 EXPECTED_NOTICE_APPLICABILITY_V3 = (
@@ -91,7 +91,7 @@ EXPECTED_RELEASE_INTENT_STATUS = (
 EXPECTED_RELEASE_INTENT_BY = "project owner"
 EXPECTED_RELEASE_INTENT_ON = "2026-11-17"
 EXPECTED_RELEASE_INTENT_SCOPE = (
-    "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.2 on macOS ARM64 and "
+    "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.3 on macOS ARM64 and "
     "Linux x86_64 under an explicit owner self-approval policy; no independent reviewer or separate approver; "
     "final release controls remain outstanding."
 )
@@ -127,7 +127,7 @@ EXPECTED_OWNER_SELF_APPROVAL_POLICY = {
     "owner_attested": True,
     "independent_verification": False,
     "compensating_controls": [
-        "exact release tag pinned to v0.1.0-testnet.2 and an exact-tag environment deployment policy",
+        "exact release tag pinned to v0.1.0-testnet.3 and an exact-tag environment deployment policy",
         "environment cannot be bypassed by administrators (can_admins_bypass: false)",
         "separate tag creation ruleset must be active with the creation rule and exactly the owner-user bypass (User 86115037, always) for exactly refs/tags/v* with no exclusions; repository-admin bypass is rejected",
         "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering exactly refs/tags/v* with no exclusions",
@@ -171,7 +171,7 @@ EXPECTED_HISTORICAL_RELEASE_INTENT = {
         "The .1 rights decision, scope and approval roles are preserved verbatim; the tag, commit, "
         "release-notes hash and status metadata are added to identify the historical record. The .1 tag is "
         "not moved; its workflow run is not cancelled or deleted; no .1 release was published. The current "
-        ".2 authorization does not alter the preserved .1 fields."
+        ".3 authorization does not alter the preserved .1 fields."
     ),
 }
 EXPECTED_RELEASE_IDENTITY = {
@@ -823,7 +823,7 @@ def verify_inventory(root: Path) -> dict:
     if is_authorized:
         require(
             inventory.get("release") == EXPECTED_RELEASE_IDENTITY,
-            "fixture provenance release identity must be exactly v0.1.0-testnet.2",
+            "fixture provenance release identity must be exactly v0.1.0-testnet.3",
         )
         require(
             inventory.get("historical_release_intent") == EXPECTED_HISTORICAL_RELEASE_INTENT,

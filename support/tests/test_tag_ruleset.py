@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for support/release/verify-tag-ruleset.py.
 
-The .2 release requires two composable rulesets, each exactly
+The .3 release requires two composable rulesets, each exactly
 `refs/tags/v*` with no exclusions, preserving the live breadth:
 
 * ``astatine-release-tag-creation``: exactly the creation rule with exactly
@@ -11,8 +11,8 @@ The .2 release requires two composable rulesets, each exactly
 * ``astatine-release-tags``: exactly update/deletion/non-fast-forward with zero
   bypass actors covering all v* tags.
 
-Narrowing either ruleset to the single .2 tag or to the historical
-.0/.1/.2 list weakens protection for all other v* tags and fails closed.
+Narrowing either ruleset to the single .3 tag or to the historical
+.0/.1/.2/.3 list weakens protection for all other v* tags and fails closed.
 
 Temp files only; no network or repository mutation. Run with ``python3 -B``.
 """
@@ -27,7 +27,7 @@ from pathlib import Path
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = SOURCE_ROOT / "support" / "release" / "verify-tag-ruleset.py"
-TAG = "v0.1.0-testnet.2"
+TAG = "v0.1.0-testnet.3"
 REPOSITORY = "Jecta-ai/astatine-miner"
 
 
@@ -111,7 +111,7 @@ class TagRulesetTests(unittest.TestCase):
         self.assertEqual(result["creation_ruleset"]["tag_scope"], "refs/tags/v*")
 
     def test_creation_narrow_2_only_scope_fails(self) -> None:
-        # Narrowing creation to the single .2 tag would leave all other v*
+        # Narrowing creation to the single .3 tag would leave all other v*
         # tags unprotected and must fail closed.
         creation = make_creation()
         creation["conditions"]["ref_name"]["include"] = [f"refs/tags/{TAG}"]
@@ -150,12 +150,13 @@ class TagRulesetTests(unittest.TestCase):
             self.verify(creation, make_immutability())
 
     def test_creation_historical_list_scope_fails(self) -> None:
-        # The historical .0/.1/.2 list is narrower than v* and weakens
+        # The historical .0/.1/.2/.3 list is narrower than v* and weakens
         # protection for all other v* tags.
         creation = make_creation()
         creation["conditions"]["ref_name"]["include"] = [
             "refs/tags/v0.1.0-testnet.0",
             "refs/tags/v0.1.0-testnet.1",
+            "refs/tags/v0.1.0-testnet.2",
             f"refs/tags/{TAG}",
         ]
         with self.assertRaises(MOD.TagRulesetError):
@@ -301,7 +302,7 @@ class TagRulesetTests(unittest.TestCase):
         self.assertEqual(result["immutability_ruleset"]["protected_tags"], ["refs/tags/v*"])
 
     def test_immutability_exact_2_only_scope_fails_historical_tags_unprotected(self) -> None:
-        # Narrowing immutability to the single .2 tag would leave all other
+        # Narrowing immutability to the single .3 tag would leave all other
         # v* tags unprotected and must fail closed.
         data = make_immutability()
         data["conditions"]["ref_name"]["include"] = [f"refs/tags/{TAG}"]
@@ -309,12 +310,13 @@ class TagRulesetTests(unittest.TestCase):
             self.verify(make_creation(), data)
 
     def test_immutability_historical_list_scope_fails(self) -> None:
-        # The historical .0/.1/.2 list is narrower than v* and weakens
+        # The historical .0/.1/.2/.3 list is narrower than v* and weakens
         # protection for all other v* tags.
         data = make_immutability()
         data["conditions"]["ref_name"]["include"] = [
             "refs/tags/v0.1.0-testnet.0",
             "refs/tags/v0.1.0-testnet.1",
+            "refs/tags/v0.1.0-testnet.2",
             f"refs/tags/{TAG}",
         ]
         with self.assertRaises(MOD.TagRulesetError):

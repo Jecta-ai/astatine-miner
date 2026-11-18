@@ -5,7 +5,7 @@ name: Rust CI
 
 on:
   push:
-    branches: [main, release/v0.1.0-testnet.2]
+    branches: [main, release/v0.1.0-testnet.3]
   pull_request:
     branches: [main]
 
@@ -18,7 +18,7 @@ env:
 jobs:
   ruleset-bypass-visibility:
     name: Ruleset bypass actor visibility (diagnostic)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/release/v0.1.0-testnet.2'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/release/v0.1.0-testnet.3'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     continue-on-error: true

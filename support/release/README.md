@@ -21,7 +21,7 @@ fixture tree; the live v3 release-intent fixture suite remains in
 `support/tests/test_fixture_provenance.py`. No prior fixture negative test was
 deleted.
 
-Licensing for candidate `v0.1.0-testnet.2` (macOS ARM64 and Linux x86_64 only)
+Licensing for candidate `v0.1.0-testnet.3` (macOS ARM64 and Linux x86_64 only)
 is owner-authorized first-party source/binary distribution **intent**
 (`release_intent_authorization` dated 2026-11-17); repository technical NOTICE
 review recorded with citations; no legal conclusion and no separate release
@@ -41,10 +41,10 @@ removes independent review and separation of duties; the security tradeoff and
 owner-account residual risk are documented in the release notes and
 inventories. Neither offline check nor draft creation establishes publication.
 The historical `v0.1.0-testnet.1` tag remains at
-`99a8630a7ae7f5c5950031dfba8c3b0c3f132cbc`; its pending workflow was not
-cancelled or deleted and no `.1` release was published. The `.1` rights decision, scope and approval roles are preserved
+`99a8630a7ae7f5c5950031dfba8c3b0c3f132cbc`; its workflow was cancelled
+and no `.1` release was published. The `.1` rights decision, scope and approval roles are preserved
 in `HISTORICAL-v0.1.0-testnet.1.md` and in the
-`historical_release_intent` inventory records. The `.2` authorization does not
+`historical_release_intent` inventory records. The `.3` authorization does not
 rewrite that history.
 
 `support/release/verify-protected-environment.py` validates the owner
@@ -59,7 +59,7 @@ rejected) and
 `astatine-release-tags` (exactly update/deletion/non-fast-forward with zero
 bypass actors, covering exactly `refs/tags/v*` with no exclusions). Creation
 protection is retained; it is not removed or broadened. Narrowing either
-ruleset to the single `.2` tag or to the historical `.0`/`.1`/`.2` list
+ruleset to the single `.3` tag or to the historical `.0`/`.1`/`.2`/`.3` list
 weakens protection for all other `v*` tags and is rejected. Both are offline fail-closed inputs to the workflow; a missing, combined,
 broadened, narrowed, or visibly bypassable snapshot fails closed. GitHub
 returns `bypass_actors` only to a caller with write access to the ruleset;
@@ -110,7 +110,7 @@ mutation).
 Manual owner checks (run each command; stop on any failure):
 
 ```sh
-tag=v0.1.0-testnet.2
+tag=v0.1.0-testnet.3
 repo=Jecta-ai/astatine-miner
 # List split tag rulesets and identify the two ids by name.
 gh api "repos/$repo/rulesets?includes_parents=true&per_page=100" --jq '.[] | {id, name, target, source_type, source, enforcement}'
@@ -202,12 +202,12 @@ grant.
 `support/release/build-release.py` requires the release-intent gate via `gate.py`
 (blocked gates fail closed; no final publication is authorized) and packages exactly two deterministic archives:
 
-- `astatine-v0.1.0-testnet.2-macos-arm64.tar.gz` (`aarch64-apple-darwin`)
-- `astatine-v0.1.0-testnet.2-linux-x86_64.tar.gz` (`x86_64-unknown-linux-gnu`)
+- `astatine-v0.1.0-testnet.3-macos-arm64.tar.gz` (`aarch64-apple-darwin`)
+- `astatine-v0.1.0-testnet.3-linux-x86_64.tar.gz` (`x86_64-unknown-linux-gnu`)
 
 Each archive contains exactly five regular files under a single platform
-root directory (`astatine-v0.1.0-testnet.2-macos-arm64/` or
-`astatine-v0.1.0-testnet.2-linux-x86_64/`): `<root>/astatine` (0755),
+root directory (`astatine-v0.1.0-testnet.3-macos-arm64/` or
+`astatine-v0.1.0-testnet.3-linux-x86_64/`): `<root>/astatine` (0755),
 `<root>/LICENSE-MIT`, `<root>/THIRD_PARTY_LICENSES.md`,
 `<root>/BUILD-INFO.json`, `<root>/INSTALL.md` (0644), sorted, with zeroed
 timestamps/ownership, fixed modes, and `gzip -n` equivalent. (The
@@ -250,7 +250,7 @@ after admin immutable-setting verification:
 
 ```sh
 # Stop on any failure; run each command individually.
-tag=v0.1.0-testnet.2
+tag=v0.1.0-testnet.3
 repo=Jecta-ai/astatine-miner
 repo_id='<numeric repository ID from the authenticated release record>'
 source_commit='<exact source commit from the authenticated release record>'
@@ -285,7 +285,7 @@ test "$resolved_tag_commit" = "$source_commit"
 gh release view "$tag" --repo "$repo" --json isDraft,body,assets
 tmpdir="$(mktemp -d)"
 git fetch origin "refs/tags/$tag:refs/tags/$tag"
-git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.2.md" > "$tmpdir/release-notes.md"
+git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.3.md" > "$tmpdir/release-notes.md"
 gh api "repos/$repo/releases/tags/$tag" > "$tmpdir/draft.json"
 python3 - "$tmpdir/draft.json" "$tmpdir/release-notes.md" <<'PY'
 import json
@@ -318,9 +318,9 @@ strip quarantine, alter system policy, or silently bypass; install only to a
 user-owned path such as `$HOME/.local/bin` (never sudo); single-platform
 operators verify only their archive's row (an operator holding both archives
 verifies each row separately):
-`grep -F "  astatine-v0.1.0-testnet.2-macos-arm64.tar.gz" SHA256SUMS | shasum -a 256 -c -`
+`grep -F "  astatine-v0.1.0-testnet.3-macos-arm64.tar.gz" SHA256SUMS | shasum -a 256 -c -`
 on macOS and
-`grep -F "  astatine-v0.1.0-testnet.2-linux-x86_64.tar.gz" SHA256SUMS | sha256sum -c -`
+`grep -F "  astatine-v0.1.0-testnet.3-linux-x86_64.tar.gz" SHA256SUMS | sha256sum -c -`
 on Linux, and always verify GitHub attestations. Linux notes glibc/Ubuntu 24.04,
 unlocked
 Secret Service for paid mining, and CUDA/GPU not qualified. Both state
@@ -334,7 +334,7 @@ both archives/binaries, source identity, lock hash, gate state, and
 Example:
 
 ```sh
-python3 -B support/release/build-release.py --tag v0.1.0-testnet.2 \
+python3 -B support/release/build-release.py --tag v0.1.0-testnet.3 \
   --repository-id 123456789 --macos-binary /tmp/macos-astatine \
   --linux-binary /tmp/linux-astatine --output-dir /tmp/astatine-release-out \
   --rustc-version "rustc 1.94.1 (e408947bf 2026-03-25)" \

@@ -1683,7 +1683,7 @@ class DryRunWorkflowInvariantTests(unittest.TestCase):
         self.assertIn("Nonpublishing", readme)
         self.assertIn("build-release.py", readme)
         self.assertIn("externally gated", readme)
-        self.assertIn("v0.1.0-testnet.2", readme)
+        self.assertIn("v0.1.0-testnet.3", readme)
         self.assertIn("macOS ARM64", readme)
 
     def test_workflow_header_requires_green_ci(self) -> None:
@@ -1831,6 +1831,7 @@ class DryRunAuthorizedGateTests(unittest.TestCase):
             "support/update-genesis-coordinator-fixture.py",
             "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
             "support/release/RELEASE_NOTES-v0.1.0-testnet.2.md",
+            "support/release/RELEASE_NOTES-v0.1.0-testnet.3.md",
         ):
             src = SOURCE_ROOT / rel
             dest = self.root / rel
@@ -1841,7 +1842,7 @@ class DryRunAuthorizedGateTests(unittest.TestCase):
         (self.root / "LICENSE-MIT").write_text("test MIT\n", encoding="utf-8")
         (self.root / "THIRD_PARTY_LICENSES.md").write_text("test notices\n", encoding="utf-8")
         (self.root / "Cargo.toml").write_text(
-            TEST_CARGO_TOML.replace('0.1.0-testnet.0', '0.1.0-testnet.2'), encoding="utf-8"
+            TEST_CARGO_TOML.replace('0.1.0-testnet.0', '0.1.0-testnet.3'), encoding="utf-8"
         )
         (self.root / "Cargo.lock").write_bytes(TEST_LOCK_BYTES)
         (self.root / "support" / "release-repository.txt").write_text(TEST_REPOSITORY, encoding="utf-8")
@@ -1855,7 +1856,7 @@ class DryRunAuthorizedGateTests(unittest.TestCase):
         self.assertEqual(
             result["rights_decision"],
             "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party "
-            "source and binary distribution intent for v0.1.0-testnet.2 under the "
+            "source and binary distribution intent for v0.1.0-testnet.3 under the "
             "explicitly documented owner self-approval policy; technical NOTICE review "
             "recorded; final release controls outstanding; not a legal conclusion, not "
             "independent review, and not a separate approval.",
