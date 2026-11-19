@@ -201,6 +201,10 @@ class WindowsArchiveValidationTest(unittest.TestCase):
         for case in ("neg-missing.zip", "neg-extra.zip", "neg-doubleslash.zip", "neg-backslash.zip", "neg-traversal.zip", "neg-absolute.zip"):
             self.assertIn(case, ci)
         self.assertIn("-LiteralPath", ci)
+        # PowerShell .ps1 invocation must rely on terminating errors, not
+        # $LASTEXITCODE (which stays $null for .ps1 and would false-fail
+        # positive). Native python calls may still check $LASTEXITCODE.
+        self.assertNotIn("exact release script failed on positive", ci)
 
 
 if __name__ == "__main__":

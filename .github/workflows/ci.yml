@@ -344,7 +344,6 @@ jobs:
           $extracted = Join-Path $env:RUNNER_TEMP 'extracted-smoke.ps1'
           if (-not (Test-Path -LiteralPath $extracted)) { throw "extracted script missing: $extracted" }
           & $extracted
-          if ($LASTEXITCODE -ne 0) { throw "exact release script failed on positive ($LASTEXITCODE)" }
           $sandbox = Join-Path $env:RUNNER_TEMP 'win-archive-smoke'
           $rootDir = Join-Path $sandbox "astatine-$tag-windows-x86_64"
           $exe = Join-Path $rootDir 'astatine.exe'
