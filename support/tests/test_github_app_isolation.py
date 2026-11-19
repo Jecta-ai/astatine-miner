@@ -30,7 +30,7 @@ The workflow must therefore contain:
   fail-closed-on-absent `bypass_actors must be present as a list`), no
   silent pass (fail-closed `sys.exit(1)` / `exit 1` markers stay);
 * retained release guarantees: owner id 86115037 / login, canonical
-  repository + id, exact tag v0.1.0-testnet.4, `refs/tags/v*` scope,
+  repository + id, exact tag v0.1.0-testnet.5, `refs/tags/v*` scope,
   prevent_self_review false, can_admins_bypass false.
 
 This filename is preserved for history; the old `GithubAppIsolationTest`
@@ -415,7 +415,7 @@ class NoAppIsolationTest(unittest.TestCase):
             "emyrinj",
             "1454137135",
             "Jecta-ai/astatine-miner",
-            "v0.1.0-testnet.4",
+            "v0.1.0-testnet.5",
             '"refs/tags/v*"',
             "prevent_self_review",
             "can_admins_bypass",
