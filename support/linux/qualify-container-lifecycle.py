@@ -200,12 +200,67 @@ def _require_docker_ok(result: subprocess.CompletedProcess[bytes], stage: str) -
 
 
 def _safe_build_diagnostics(output: bytes) -> str:
-    """Reduce compiler output to allowlisted path/package diagnostics only."""
+    """Reduce build output to allowlisted diagnostics and fixed failure categories only."""
     missing_file = re.compile(
         r"error: couldn't read `([^`\r\n]{1,256})`: No such file or directory "
         r"\(os error [0-9]+\)"
     )
     failed_crate = re.compile(r"error: could not compile `([A-Za-z0-9_.-]{1,128})`")
+    # Fixed-category markers only. Matching is substring on the lowercased
+    # line; only the literal category string is ever emitted, never captured
+    # input, paths, digests, or raw lines.
+    CATEGORY_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+        (
+            "base image pull failed",
+            (
+                "failed to resolve",
+                "pull access denied",
+                "manifest unknown",
+                "toomanyrequests",
+                "pull cancelled",
+                "error getting credentials",
+                "failed to copy: httpreadseeker",
+            ),
+        ),
+        (
+            "cargo dependency download failed",
+            (
+                "failed to download",
+                "spurious network error",
+                "failed to fetch",
+                "could not download",
+                "error downloading",
+                "network error",
+            ),
+        ),
+        (
+            "build disk space exhausted",
+            (
+                "no space left on device",
+                "disk quota exceeded",
+                "out of disk",
+                "no space left",
+                "write failed: no space",
+            ),
+        ),
+        (
+            "cargo lockfile mismatch",
+            (
+                "needs to be updated but --locked was passed",
+                "failed to lock",
+                "blocking waiting for file lock",
+                "could not lock",
+            ),
+        ),
+        (
+            "cargo build script failed",
+            (
+                "failed to run custom build command",
+                "build script failed",
+                "failed to run build script",
+            ),
+        ),
+    )
     messages: list[str] = []
     for raw_line in output.decode("utf-8", "replace").splitlines():
         line = raw_line.strip()
@@ -220,9 +275,17 @@ def _safe_build_diagnostics(output: bytes) -> str:
             message = f"missing build input: {normalized}"
         else:
             crate = failed_crate.search(line)
-            if crate is None:
-                continue
-            message = f"Rust crate failed to compile: {crate.group(1)}"
+            if crate is not None:
+                message = f"Rust crate failed to compile: {crate.group(1)}"
+            else:
+                lower = line.lower()
+                message = None  # type: ignore[assignment]
+                for category, markers in CATEGORY_MARKERS:
+                    if any(marker in lower for marker in markers):
+                        message = category
+                        break
+                if message is None:
+                    continue
         if message not in messages:
             messages.append(message)
         if len(messages) == 5:
@@ -1259,6 +1322,90 @@ def _run_ci_self_tests() -> None:
             b"No such file or directory (os error 2)\n"
         ),
         "Docker build diagnostics exposed a path outside the build context",
+    )
+
+    # Categorical classifier: fixed categories only, never raw lines or secrets.
+    pull_diagnostic = _safe_build_diagnostics(
+        b"ERROR: failed to resolve docker.io/library/rust:1.94.1: toomanyrequests\n"
+        b"pull token pull-" + b"canary hunter2 mnemonic seed phrase\n"
+    )
+    _require(
+        "base image pull failed" in pull_diagnostic
+        and "toomanyrequests" not in pull_diagnostic
+        and "docker.io" not in pull_diagnostic
+        and "hunter2" not in pull_diagnostic
+        and "canary" not in pull_diagnostic
+        and "mnemonic" not in pull_diagnostic,
+        "image pull failures were not reduced to a fixed safe category without raw output",
+    )
+    download_diagnostic = _safe_build_diagnostics(
+        b"error: failed to download crates.io/index: spurious network error\n"
+        b"download secret download-" + b"canary token=hunter2\n"
+    )
+    _require(
+        "cargo dependency download failed" in download_diagnostic
+        and "spurious network error" not in download_diagnostic
+        and "crates.io" not in download_diagnostic
+        and "hunter2" not in download_diagnostic
+        and "canary" not in download_diagnostic,
+        "cargo download failures were not reduced to a fixed safe category without raw output",
+    )
+    disk_diagnostic = _safe_build_diagnostics(
+        b"write error: no space left on device os error 28\n"
+        b"disk secret disk-" + b"canary hunter2\n"
+    )
+    _require(
+        "build disk space exhausted" in disk_diagnostic
+        and "no space left on device" not in disk_diagnostic
+        and "hunter2" not in disk_diagnostic
+        and "canary" not in disk_diagnostic,
+        "disk failures were not reduced to a fixed safe category without raw output",
+    )
+    lock_diagnostic = _safe_build_diagnostics(
+        b"error: the lock file Cargo.lock needs to be updated but --locked was passed\n"
+        b"lock secret lock-" + b"canary hunter2\n"
+    )
+    _require(
+        "cargo lockfile mismatch" in lock_diagnostic
+        and "needs to be updated" not in lock_diagnostic
+        and "Cargo.lock" not in lock_diagnostic
+        and "hunter2" not in lock_diagnostic
+        and "canary" not in lock_diagnostic,
+        "lockfile failures were not reduced to a fixed safe category without raw output",
+    )
+    script_diagnostic = _safe_build_diagnostics(
+        b"error: failed to run custom build command for astatine-cli-rust\n"
+        b"script secret script-" + b"canary hunter2\n"
+    )
+    _require(
+        "cargo build script failed" in script_diagnostic
+        and "failed to run custom build command" not in script_diagnostic
+        and "astatine-cli-rust" not in script_diagnostic
+        and "hunter2" not in script_diagnostic
+        and "canary" not in script_diagnostic,
+        "build script failures were not reduced to a fixed safe category without raw output",
+    )
+    unknown_diagnostic = _safe_build_diagnostics(
+        b"some unrecognized builder line with secret " + b"canary-" + b"value hunter2\n"
+    )
+    _require(
+        unknown_diagnostic
+        == "no safe compiler summary matched; raw build diagnostics withheld"
+        and "hunter2" not in unknown_diagnostic
+        and "canary" not in unknown_diagnostic,
+        "unknown build failures must withhold raw diagnostics",
+    )
+    repeated_diagnostic = _safe_build_diagnostics(
+        b"ERROR: failed to resolve x: toomanyrequests\n"
+        b"ERROR: failed to resolve y: toomanyrequests\n"
+        b"error: failed to download foo\n"
+        b"error: failed to download foo\n"
+    )
+    _require(
+        repeated_diagnostic.count("base image pull failed") == 1
+        and repeated_diagnostic.count("cargo dependency download failed") == 1
+        and "toomanyrequests" not in repeated_diagnostic,
+        "build failure categories must deduplicate without raw output",
     )
 
     with tempfile.TemporaryDirectory(prefix="astatine-container-context-selftest.") as temp:

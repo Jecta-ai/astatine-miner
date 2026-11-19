@@ -47,7 +47,7 @@ NEEDED_FILES = [
     "support/update-genesis-coordinator-fixture.py",
     "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
     "support/release/RELEASE_NOTES-v0.1.0-testnet.2.md",
-    "support/release/RELEASE_NOTES-v0.1.0-testnet.4.md",
+    "support/release/RELEASE_NOTES-v0.1.0-testnet.5.md",
 ]
 
 
@@ -118,7 +118,7 @@ class DistributionInventoryTests(unittest.TestCase):
         self.assertEqual(
             result["rights_decision"],
             "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party "
-            "source and binary distribution intent for v0.1.0-testnet.4 under the "
+            "source and binary distribution intent for v0.1.0-testnet.5 under the "
             "explicitly documented owner self-approval policy; technical NOTICE review "
             "recorded; final release controls outstanding; not a legal conclusion, not "
             "independent review, and not a separate approval.",
@@ -532,7 +532,7 @@ class DistributionInventoryTests(unittest.TestCase):
 
     def test_historical_release_intent_rewrite_rejected(self) -> None:
         inventory = self.inventory()
-        inventory["historical_release_intent"]["tag"] = "v0.1.0-testnet.4"
+        inventory["historical_release_intent"]["tag"] = "v0.1.0-testnet.5"
         self.write_inventory(inventory)
         with self.assertRaises(VERIFIER.VerificationError):
             VERIFIER.verify(self.root)

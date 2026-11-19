@@ -21,7 +21,7 @@ from pathlib import Path
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = SOURCE_ROOT / "support" / "release" / "verify-protected-environment.py"
-TAG = "v0.1.0-testnet.4"
+TAG = "v0.1.0-testnet.5"
 
 
 def load_module():

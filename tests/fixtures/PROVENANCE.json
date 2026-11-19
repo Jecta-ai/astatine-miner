@@ -1,6 +1,6 @@
 {
   "schema": "astatine-fixture-provenance/v3",
-  "scope": "Offline inventory for tests/fixtures only. No upstream source is copied here and no upstream build was performed for this inventory. Offline fixture inventory (fixture bytes and hashes) is unchanged; this revision records owner-authorized release intent for v0.1.0-testnet.4 under the explicit owner self-approval policy and the technical NOTICE review, while preserving the historical v0.1.0-testnet.1 rights decision, scope and approval roles verbatim.",
+  "scope": "Offline inventory for tests/fixtures only. No upstream source is copied here and no upstream build was performed for this inventory. Offline fixture inventory (fixture bytes and hashes) is unchanged; this revision records owner-authorized release intent for v0.1.0-testnet.5 under the explicit owner self-approval policy and the technical NOTICE review, while preserving the historical v0.1.0-testnet.1 rights decision, scope and approval roles verbatim.",
   "baseline": {
     "canonical_repository_head": "7ba0ff6136c1ed7d084939cce44b8a7da669b671",
     "canonical_tree": "09b7387d6fb9ddc86ac37f105c5f3dd4ceccc417",
@@ -12,7 +12,7 @@
     "network_required": false,
     "build_required": false,
     "regenerated_in_this_review": false,
-    "change_note": "FIX-04 was replaced in an earlier review by a synthetic receipt authored in this repository; the three contract bytecode fixtures were not regenerated. Offline fixture inventory is unchanged in this revision; owner-authorized release intent for v0.1.0-testnet.4 under the explicit owner self-approval policy and technical NOTICE review were recorded, and the historical .1 intent was preserved.",
+    "change_note": "FIX-04 was replaced in an earlier review by a synthetic receipt authored in this repository; the three contract bytecode fixtures were not regenerated. Offline fixture inventory is unchanged in this revision; owner-authorized release intent for v0.1.0-testnet.5 under the explicit owner self-approval policy and technical NOTICE review were recorded, and the historical .1 intent was preserved.",
     "date_utc": "2026-11-17"
   },
   "fixtures": [
@@ -207,7 +207,7 @@
   "documents": [
     {
       "path": "tests/fixtures/README.md",
-      "sha256": "41050924bfdb2b6912cac0980780b72686c450e2810e197aaf801ad95cb061c0",
+      "sha256": "2e8fb0bd922be1293673081c69669e84f208ef839e73e543d55afdeadae80844",
       "bytes": 11147
     }
   ],
@@ -344,12 +344,12 @@
       "superseded_by": "release_intent_authorization",
       "superseded_on": "2026-11-17"
     },
-    "rights_decision": "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.4 under the explicitly documented owner self-approval policy; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion, not independent review, and not a separate approval.",
+    "rights_decision": "OWNER-AUTHORIZED RELEASE INTENT \u2014 project owner authorized first-party source and binary distribution intent for v0.1.0-testnet.5 under the explicitly documented owner self-approval policy; technical NOTICE review recorded; final release controls outstanding; not a legal conclusion, not independent review, and not a separate approval.",
     "release_intent_authorization": {
       "status": "OWNER-AUTHORIZED RELEASE INTENT \u2014 FINAL CONTROLS OUTSTANDING \u2014 OWNER SELF-APPROVAL",
       "authorized_by": "project owner",
       "authorized_on": "2026-11-17",
-      "scope": "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.4 on macOS ARM64, Linux x86_64, and Windows x86_64 under an explicit owner self-approval policy; no independent reviewer or separate approver; final release controls remain outstanding.",
+      "scope": "Owner-authorized first-party source and binary distribution intent for v0.1.0-testnet.5 on macOS ARM64, Linux x86_64, and Windows x86_64 under an explicit owner self-approval policy; no independent reviewer or separate approver; final release controls remain outstanding.",
       "approval_roles": "Project owner only; the owner explicitly authorized owner self-approval for the protected release environment. No independent reviewer and no separate release approver was appointed, consulted, or asserted; separation of duties is explicitly reduced and recorded as a security tradeoff.",
       "evidence": [
         "Project owner authorized first-party MockAST MIT redistribution intent (copyright Copyright (c) 2026 emyrinj) on 2026-11-17; see rights_review.owner_attestation and tests/fixtures/LICENSE-MIT.txt.",
@@ -358,7 +358,7 @@
         "OpenZeppelin MIT notice (Copyright (c) 2016-2023 zOS Global Limited and contributors, commit dbb6104ce834628e473d2173bbc9d47f81a9eec3) retained in tests/fixtures/OPENZEPPELIN_LICENSE.txt for any fixture redistribution to which it applies; MockAST imports one component, GenesisCoordinator zero direct imports, no OpenZeppelin code in AstatineMiner asserted; does not assert OpenZeppelin code in every fixture.",
         "All fixtures remain excluded from binary archives: FIX-01 through FIX-04 set release_archive_member to false; production binaries never load these files.",
         "No legal conclusion is made and no separate approval is asserted; technical NOTICE review recorded with citations to PROVENANCE.json, README.md, LICENSE-APACHE-2.0.txt, LICENSE-MIT.txt, OPENZEPPELIN_LICENSE.txt, NOTICE.",
-        "Project owner explicitly directed a sustainable owner-controlled release without any external human reviewer and expressly authorized v0.1.0-testnet.4 and the owner self-approval model on 2026-11-17; this is owner-provided authorization, not independent review."
+        "Project owner explicitly directed a sustainable owner-controlled release without any external human reviewer and expressly authorized v0.1.0-testnet.5 and the owner self-approval model on 2026-11-17; this is owner-provided authorization, not independent review."
       ],
       "technical_notice_review": {
         "reviewed_on": "2026-11-17",
@@ -377,7 +377,7 @@
       },
       "final_release_controls_complete": false,
       "not_authorized": [
-        "Any other tag or version beyond v0.1.0-testnet.4.",
+        "Any other tag or version beyond v0.1.0-testnet.5.",
         "Mainnet deployment or paid-operation risk acceptance.",
         "Independent legal verification, legal advice, legal clearance, or legal conclusion.",
         "Any assertion that a separate release approver was appointed, consulted, or approved the release.",
@@ -399,7 +399,7 @@
         "owner_attested": true,
         "independent_verification": false,
         "compensating_controls": [
-          "exact release tag pinned to v0.1.0-testnet.4 and an exact-tag environment deployment policy",
+          "exact release tag pinned to v0.1.0-testnet.5 and an exact-tag environment deployment policy",
           "environment cannot be bypassed by administrators (can_admins_bypass: false)",
           "separate tag creation ruleset must be active with the creation rule and exactly the owner-user bypass (User 86115037, always) for exactly refs/tags/v* with no exclusions; repository-admin bypass is rejected",
           "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering exactly refs/tags/v* with no exclusions",
@@ -435,7 +435,7 @@
       "owner_attested": true,
       "independent_verification": false,
       "compensating_controls": [
-        "exact release tag pinned to v0.1.0-testnet.4 and an exact-tag environment deployment policy",
+        "exact release tag pinned to v0.1.0-testnet.5 and an exact-tag environment deployment policy",
         "environment cannot be bypassed by administrators (can_admins_bypass: false)",
         "separate tag creation ruleset must be active with the creation rule and exactly the owner-user bypass (User 86115037, always) for exactly refs/tags/v* with no exclusions; repository-admin bypass is rejected",
         "separate tag immutability ruleset must be active for update, deletion and non-fast-forward with zero bypass actors covering exactly refs/tags/v* with no exclusions",
@@ -464,7 +464,7 @@
       "approval_roles": "Project owner only; no separate release approver was appointed, consulted, or asserted.",
       "release_notes_path": "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
       "release_notes_sha256": "12d7605b5e48c80f1c838a95d245c08da8cd5c831d008da3bb3dea420bdc31b9",
-      "note": "The .1 rights decision, scope and approval roles are preserved verbatim; the tag, commit, release-notes hash and status metadata are added to identify the historical record. The .1 tag is not moved; its workflow run is not cancelled or deleted; no .1 release was published. The current .4 authorization does not alter the preserved .1 fields."
+      "note": "The .1 rights decision, scope and approval roles are preserved verbatim; the tag, commit, release-notes hash and status metadata are added to identify the historical record. The .1 tag is not moved; its workflow run is not cancelled or deleted; no .1 release was published. The current .5 authorization does not alter the preserved .1 fields."
     }
   },
   "scrub_policy": {
@@ -492,9 +492,9 @@
     "note": "Private-origin repository names were replaced with generic descriptions in prose, help text, and source/protocol test comments. No fixture bytes, deployment pins or protocol identifiers were changed."
   },
   "release": {
-    "version": "0.1.0-testnet.4",
-    "tag": "v0.1.0-testnet.4",
-    "tag_policy": "refs/tags/v0.1.0-testnet.4",
+    "version": "0.1.0-testnet.5",
+    "tag": "v0.1.0-testnet.5",
+    "tag_policy": "refs/tags/v0.1.0-testnet.5",
     "exact_tag_required": true
   },
   "historical_release_intent": {
@@ -506,6 +506,6 @@
     "approval_roles": "Project owner only; no separate release approver was appointed, consulted, or asserted.",
     "release_notes_path": "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
     "release_notes_sha256": "12d7605b5e48c80f1c838a95d245c08da8cd5c831d008da3bb3dea420bdc31b9",
-    "note": "The .1 rights decision, scope and approval roles are preserved verbatim; the tag, commit, release-notes hash and status metadata are added to identify the historical record. The .1 tag is not moved; its workflow run is not cancelled or deleted; no .1 release was published. The current .4 authorization does not alter the preserved .1 fields."
+    "note": "The .1 rights decision, scope and approval roles are preserved verbatim; the tag, commit, release-notes hash and status metadata are added to identify the historical record. The .1 tag is not moved; its workflow run is not cancelled or deleted; no .1 release was published. The current .5 authorization does not alter the preserved .1 fields."
   }
 }

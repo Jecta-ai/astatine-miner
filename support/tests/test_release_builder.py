@@ -23,12 +23,12 @@ from pathlib import Path
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 BUILDER_PATH = SOURCE_ROOT / "support" / "release" / "build-release.py"
 
-MACOS_ROOT = "astatine-v0.1.0-testnet.4-macos-arm64"
-LINUX_ROOT = "astatine-v0.1.0-testnet.4-linux-x86_64"
-MACOS_ARCHIVE = "astatine-v0.1.0-testnet.4-macos-arm64.tar.gz"
-WINDOWS_ROOT = "astatine-v0.1.0-testnet.4-windows-x86_64"
-WINDOWS_ARCHIVE = "astatine-v0.1.0-testnet.4-windows-x86_64.zip"
-LINUX_ARCHIVE = "astatine-v0.1.0-testnet.4-linux-x86_64.tar.gz"
+MACOS_ROOT = "astatine-v0.1.0-testnet.5-macos-arm64"
+LINUX_ROOT = "astatine-v0.1.0-testnet.5-linux-x86_64"
+MACOS_ARCHIVE = "astatine-v0.1.0-testnet.5-macos-arm64.tar.gz"
+WINDOWS_ROOT = "astatine-v0.1.0-testnet.5-windows-x86_64"
+WINDOWS_ARCHIVE = "astatine-v0.1.0-testnet.5-windows-x86_64.zip"
+LINUX_ARCHIVE = "astatine-v0.1.0-testnet.5-linux-x86_64.tar.gz"
 EXPECTED_MACOS_MEMBERS = sorted([
     f"{MACOS_ROOT}/astatine",
     f"{MACOS_ROOT}/LICENSE-MIT",
@@ -50,7 +50,7 @@ EXPECTED_WINDOWS_MEMBERS = sorted([
     f"{WINDOWS_ROOT}/BUILD-INFO.json",
     f"{WINDOWS_ROOT}/INSTALL.md",
 ])
-TAG = "v0.1.0-testnet.4"
+TAG = "v0.1.0-testnet.5"
 LEGIT_RUSTC_LINE = "rustc 1.94.1 (e408947bf 2026-03-25)"
 LEGIT_CARGO_LINE = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
 
@@ -119,7 +119,7 @@ class ReleaseBuilderTests(unittest.TestCase):
             "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
             "support/release/RELEASE_NOTES-v0.1.0-testnet.2.md",
             "support/release/RELEASE_NOTES-v0.1.0-testnet.3.md",
-            "support/release/RELEASE_NOTES-v0.1.0-testnet.4.md",
+            "support/release/RELEASE_NOTES-v0.1.0-testnet.5.md",
         ):
             src = SOURCE_ROOT / rel
             if not src.is_file():
@@ -589,7 +589,7 @@ class ReleaseBuilderTests(unittest.TestCase):
             self.assertFalse(info["release_controls"]["environment_prevent_self_review"])
             self.assertFalse(info["release_controls"]["independent_environment_review"])
             self.assertEqual(info["release_controls"]["environment_reviewer_owner_id"], 86115037)
-            self.assertEqual(info["release_controls"]["tag_policy"], "refs/tags/v0.1.0-testnet.4")
+            self.assertEqual(info["release_controls"]["tag_policy"], "refs/tags/v0.1.0-testnet.5")
             self.assertEqual(
                 info["release_controls"]["tag_ruleset_exact_scope"],
                 "refs/tags/v*",
@@ -665,7 +665,7 @@ class ReleaseBuilderTests(unittest.TestCase):
 
     def test_tag_version_mismatch_rejected(self) -> None:
         (self.root / "Cargo.toml").write_text(
-            (self.root / "Cargo.toml").read_text().replace("0.1.0-testnet.4", "0.1.0-testnet.9"),
+            (self.root / "Cargo.toml").read_text().replace("0.1.0-testnet.5", "0.1.0-testnet.9"),
             encoding="utf-8",
         )
         subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)

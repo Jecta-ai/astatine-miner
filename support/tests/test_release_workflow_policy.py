@@ -665,7 +665,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
     def test_tag_policy_safe_forms_required(self) -> None:
         # M2: validator in preflight/package + inline exact-tag in draft; no wildcard.
         self.assertIn("support/release/verify-protected-environment.py", self.real_text)
-        self.assertIn('"v0.1.0-testnet.4"', self.real_text)
+        self.assertIn('"v0.1.0-testnet.5"', self.real_text)
         self.assertNotIn('"v0.1.0-testnet.*"', self.real_text)
         self.assertNotIn('"v*",', self.real_text)
         self.assertIn("deployment-branch-policies", self.real_text)
@@ -839,7 +839,12 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
 
     def test_missing_per_job_tag_assert_rejected(self) -> None:
         mutated = self.real_text.replace("Assert exact tag identity", "XXX-REMOVED")
-        self.assertReleaseFails(mutated, "B1")
+        # Removing the per-job tag identity also breaks the Windows exact run-step
+        # allowlist; both are fail-closed. Accept either gate.
+        try:
+            self.assertReleaseFails(mutated, "B1")
+        except AssertionError:
+            self.assertReleaseFails(mutated, "run steps must be exactly")
 
     def test_remote_tag_mismatch_before_archive_attest_rejected(self) -> None:
         mutated = self.real_text.replace("remote tag verified at expected commit", "tag ok")
@@ -1223,6 +1228,116 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotIn("wallet import", runs)
         self.assertNotIn("sudo", runs.lower())
 
+    def test_windows_build_shells_exact(self) -> None:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        build = parsed["jobs"]["build-windows"]
+        self.assertEqual(build.get("runs-on"), "windows-2025")
+        steps = {step.get("name"): step for step in build.get("steps")}
+        expected = {
+            "Assert exact tag identity": "bash",
+            "Install pinned Rust toolchain": "bash",
+            "Observe pinned toolchain versions": "bash",
+            "Build locked release binary": "bash",
+            "Smoke test release binary": "bash",
+            "Inspect Windows binary": "pwsh",
+            "Record binary SHA-256": "bash",
+        }
+        for name, shell in expected.items():
+            self.assertIn(name, steps)
+            self.assertEqual(steps[name].get("shell"), shell, f"{name} must declare shell {shell}")
+            run = steps[name].get("run", "")
+            if shell == "bash":
+                if name == "Build locked release binary":
+                    self.assertIn("cargo build --locked --release", run)
+                else:
+                    self.assertIn("set -euo pipefail", run)
+            else:
+                self.assertIn("$ErrorActionPreference", run)
+        # No run step may omit an explicit shell.
+        for name, step in steps.items():
+            if step.get("run"):
+                self.assertIn(step.get("shell"), ("bash", "pwsh"), f"{name} must declare an explicit shell")
+
+    def test_windows_smoke_shells_exact(self) -> None:
+        if _yaml is None:
+            self.skipTest("yaml module not available")
+        parsed = _yaml.safe_load(self.real_text)
+        smoke = parsed["jobs"]["windows-archive-smoke"]
+        steps = {step.get("name"): step for step in smoke.get("steps")}
+        expected = {
+            "Verify bundle checksums": "bash",
+            "Verify Windows archive attestation before extraction": "bash",
+            "Extract Windows archive to sandbox": "pwsh",
+            "Smoke test packaged Windows executable (no wallet, no network)": "pwsh",
+        }
+        for name, shell in expected.items():
+            self.assertIn(name, steps)
+            self.assertEqual(steps[name].get("shell"), shell, f"{name} must declare shell {shell}")
+        self.assertIn("set -euo pipefail", steps["Verify bundle checksums"].get("run", ""))
+        self.assertIn("set -euo pipefail", steps["Verify Windows archive attestation before extraction"].get("run", ""))
+        self.assertIn("$ErrorActionPreference", steps["Extract Windows archive to sandbox"].get("run", ""))
+        self.assertIn("$ErrorActionPreference", steps["Smoke test packaged Windows executable (no wallet, no network)"].get("run", ""))
+
+    def test_windows_build_missing_shell_fails(self) -> None:
+        mutated = self.real_text.replace(
+            "      - name: Install pinned Rust toolchain\n        shell: bash",
+            "      - name: Install pinned Rust toolchain",
+            1,
+        )
+        self.assertNotEqual(mutated, self.real_text)
+        self.assertReleaseFails(mutated, "must declare shell bash")
+
+    def test_windows_smoke_attestation_missing_shell_fails(self) -> None:
+        mutated = self.real_text.replace(
+            "      - name: Verify Windows archive attestation before extraction\n        shell: bash",
+            "      - name: Verify Windows archive attestation before extraction",
+            1,
+        )
+        self.assertNotEqual(mutated, self.real_text)
+        self.assertReleaseFails(mutated, "must declare shell bash")
+
+    def test_windows_build_wrong_shell_fails(self) -> None:
+        mutated = self.real_text.replace(
+            "      - name: Inspect Windows binary\n        shell: pwsh",
+            "      - name: Inspect Windows binary\n        shell: bash",
+            1,
+        )
+        self.assertNotEqual(mutated, self.real_text)
+        self.assertReleaseFails(mutated, "must declare shell pwsh")
+
+    def test_windows_bash_gate_marker_required(self) -> None:
+        # Target the Windows Install step specifically (macOS/Linux installs lack shell:bash).
+        mutated = self.real_text.replace(
+            "      - name: Install pinned Rust toolchain\n        shell: bash\n        run: |\n          set -euo pipefail",
+            "      - name: Install pinned Rust toolchain\n        shell: bash\n        run: |\n          set -e",
+            1,
+        )
+        self.assertNotEqual(mutated, self.real_text)
+        self.assertReleaseFails(mutated, "set -euo pipefail")
+
+    def test_windows_pwsh_gate_marker_required(self) -> None:
+        mutated = self.real_text.replace("$ErrorActionPreference", "$NoPreference", 1)
+        self.assertReleaseFails(mutated, "$ErrorActionPreference")
+
+    def test_windows_extra_run_step_fails(self) -> None:
+        mutated = self.real_text.replace(
+            "      - name: Inspect Windows binary\n        shell: pwsh",
+            "      - name: Extra Windows probe\n        shell: bash\n        run: echo probe\n      - name: Inspect Windows binary\n        shell: pwsh",
+            1,
+        )
+        self.assertNotEqual(mutated, self.real_text)
+        self.assertReleaseFails(mutated, "run steps must be exactly")
+
+    def test_windows_renamed_step_fails(self) -> None:
+        mutated = self.real_text.replace(
+            "Smoke test packaged Windows executable (no wallet, no network)",
+            "Smoke test packaged Windows executable",
+            1,
+        )
+        self.assertReleaseFails(mutated, "run steps must be exactly")
+
     def test_windows_archive_smoke_removal_fails_closed(self) -> None:
         mutated = self.real_text.replace("windows-archive-smoke", "removed-smoke-job", 1)
         self.assertReleaseFails(mutated, "windows-archive-smoke")
@@ -1255,7 +1370,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         return run.split(marker, 1)[1].rsplit("\nPY\n", 1)[0]
 
     def _run_draft_env_inline(self, env: dict, policies: dict) -> subprocess.CompletedProcess:
-        tag = "v0.1.0-testnet.4"
+        tag = "v0.1.0-testnet.5"
         env_path = self.tmp / "inline-env.json"
         policies_path = self.tmp / "inline-policies.json"
         env_path.write_text(json.dumps(env), encoding="utf-8")
@@ -1292,7 +1407,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
     def _valid_inline_policies() -> dict:
         return {
             "total_count": 1,
-            "branch_policies": [{"type": "tag", "name": "v0.1.0-testnet.4"}],
+            "branch_policies": [{"type": "tag", "name": "v0.1.0-testnet.5"}],
         }
 
     def test_draft_inline_env_accepts_owner_self_approval(self) -> None:
@@ -1398,7 +1513,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
                 str(creation_path),
                 str(immutability_path),
                 "Jecta-ai/astatine-miner",
-                "v0.1.0-testnet.4",
+                "v0.1.0-testnet.5",
             ],
             input=self._draft_ruleset_inline_script(),
             capture_output=True,
@@ -1428,11 +1543,11 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
     def test_draft_inline_rulesets_reject_2_only_immutability_scope(self) -> None:
-        # Narrowing immutability to the single .3 tag weakens protection for
+        # Narrowing immutability to the single .5 tag weakens protection for
         # all other v* tags and must fail closed.
         immutability = self._valid_immutability_ruleset()
         immutability["conditions"]["ref_name"]["include"] = [
-            "refs/tags/v0.1.0-testnet.4"
+            "refs/tags/v0.1.0-testnet.5"
         ]
         result = self._run_draft_ruleset_inline(
             self._valid_creation_ruleset(), immutability
@@ -1440,11 +1555,11 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
     def test_draft_inline_rulesets_reject_2_only_creation_scope(self) -> None:
-        # Narrowing creation to the single .3 tag weakens protection for all
+        # Narrowing creation to the single .5 tag weakens protection for all
         # other v* tags and must fail closed.
         creation = self._valid_creation_ruleset()
         creation["conditions"]["ref_name"]["include"] = [
-            "refs/tags/v0.1.0-testnet.4"
+            "refs/tags/v0.1.0-testnet.5"
         ]
         result = self._run_draft_ruleset_inline(
             creation, self._valid_immutability_ruleset()
@@ -1452,13 +1567,14 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
     def test_draft_inline_rulesets_reject_historical_list_scope(self) -> None:
-        # The historical .0/.1/.2/.3 list is narrower than v* and must fail.
+        # The historical .0/.1/.2/.3/.4 list is narrower than v* and must fail.
         immutability = self._valid_immutability_ruleset()
         immutability["conditions"]["ref_name"]["include"] = [
             "refs/tags/v0.1.0-testnet.0",
             "refs/tags/v0.1.0-testnet.1",
             "refs/tags/v0.1.0-testnet.2",
             "refs/tags/v0.1.0-testnet.3",
+            "refs/tags/v0.1.0-testnet.4",
         ]
         result = self._run_draft_ruleset_inline(
             self._valid_creation_ruleset(), immutability
@@ -1503,7 +1619,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             json.dumps(
                 {
                     "isDraft": is_draft,
-                    "tagName": "v0.1.0-testnet.4",
+                    "tagName": "v0.1.0-testnet.5",
                     "body": body,
                     "assets": [],
                 }
@@ -1515,7 +1631,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
                 sys.executable,
                 "-",
                 str(data_path),
-                "v0.1.0-testnet.4",
+                "v0.1.0-testnet.5",
                 str(notes_path),
             ],
             input=self._draft_body_inline_script(),
@@ -1535,7 +1651,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             json.dumps(
                 {
                     "isDraft": True,
-                    "tagName": "v0.1.0-testnet.4",
+                    "tagName": "v0.1.0-testnet.5",
                     "body": "tampered notes\n",
                     "assets": [],
                 }
@@ -1547,7 +1663,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
                 sys.executable,
                 "-",
                 str(data_path),
-                "v0.1.0-testnet.4",
+                "v0.1.0-testnet.5",
                 str(notes_path),
             ],
             input=self._draft_body_inline_script(),

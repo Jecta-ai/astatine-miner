@@ -23,7 +23,7 @@ DRY_RUN_WORKFLOW_FILENAME = "linux-release-dry-run.yml"
 RELEASE_WORKFLOW_FILENAME = "release.yml"
 # Pinned SHA-256 of .github/workflows/release.yml. Update only after review.
 # Recompute with: python3 -B support/check_workflow_pins.py --print-release-sha256
-RELEASE_WORKFLOW_SHA256 = "8ddf355a03bcfcdcca0b3c1aaa403b0e0f14a4ec9c72534c95c58c8b43bf7701"
+RELEASE_WORKFLOW_SHA256 = "2bf5e43ad6106f66751d597cc82cf020b038b6ea6e228b7b302685940af0a2d4"
 PINNED_RELEASE_ACTIONS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
@@ -726,7 +726,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         return set()
 
     def _job_step_runs(job_name: str) -> dict[str, dict]:
-        """Map step name -> {id, runs} using indentation-bounded step blocks."""
+        """Map step name -> {id, runs, shell} using indentation-bounded step blocks."""
         lines = _job_lines(job_name)
         for index, line in enumerate(lines):
             if re.match(r"^    steps:\s*$", line):
@@ -751,6 +751,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         for block in steps:
             name = None
             step_id = None
+            shell = None
             runs: list[str] = []
             index = 0
             while index < len(block):
@@ -761,6 +762,9 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
                 id_match = re.match(r"^\s*(?:-\s*)?id:\s*(\S+)\s*$", line)
                 if id_match:
                     step_id = id_match.group(1)
+                shell_match = re.match(r"^\s*shell:\s*(\S+)\s*(?:#.*)?$", line)
+                if shell_match:
+                    shell = shell_match.group(1).strip().strip("'\"")
                 block_match = re.match(
                     r"^(\s*)(?:-\s*)?run\s*:\s*([|>])\s*$", line
                 )
@@ -786,7 +790,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             key = name if name is not None else "<unnamed>"
             if key in parsed:
                 raise AssertionError(f"{workflow}: job {job_name} has duplicate/unparseable step name {key!r}")
-            parsed[key] = {"id": step_id, "runs": set(_strict_lines("\n".join(runs)))}
+            parsed[key] = {"id": step_id, "runs": set(_strict_lines("\n".join(runs))), "shell": shell}
         return parsed
 
     expected_needs = {
@@ -858,6 +862,59 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
             raise AssertionError(f"{workflow}: {build_job} must not attest in the candidate-execution job (R3)")
         if binary_artifact not in _job_section(build_job):
             raise AssertionError(f"{workflow}: {build_job} must upload artifact {binary_artifact!r}")
+
+    # Windows runner explicit-shell contract: every run step on windows-2025
+    # must declare shell bash for bash and shell pwsh for PowerShell. Bash
+    # steps preserve gates with set -euo pipefail; PowerShell steps preserve
+    # gates with $ErrorActionPreference = 'Stop'. Missing shells would run
+    # under the Windows default (pwsh) and misinterpret bash.
+    expected_windows_shells = {
+        "build-windows": {
+            "Assert exact tag identity": "bash",
+            "Install pinned Rust toolchain": "bash",
+            "Observe pinned toolchain versions": "bash",
+            "Build locked release binary": "bash",
+            "Smoke test release binary": "bash",
+            "Inspect Windows binary": "pwsh",
+            "Record binary SHA-256": "bash",
+        },
+        "windows-archive-smoke": {
+            "Verify bundle checksums": "bash",
+            "Verify Windows archive attestation before extraction": "bash",
+            "Extract Windows archive to sandbox": "pwsh",
+            "Smoke test packaged Windows executable (no wallet, no network)": "pwsh",
+        },
+    }
+    for windows_job, expected_shells in expected_windows_shells.items():
+        section = _job_section(windows_job)
+        if "windows-2025" not in section:
+            raise AssertionError(f"{workflow}: {windows_job} must run on the native windows-2025 runner")
+        steps = _job_step_runs(windows_job)
+        # Exact run-step allowlist per Windows job: no missing, renamed, or extra run steps.
+        run_steps = {name for name, data in steps.items() if data.get("runs")}
+        if run_steps != set(expected_shells):
+            raise AssertionError(f"{workflow}: {windows_job} run steps must be exactly {sorted(expected_shells)}, got {sorted(run_steps)}")
+        for step_name, expected_shell in expected_shells.items():
+            step = steps.get(step_name)
+            if step is None:
+                raise AssertionError(f"{workflow}: {windows_job} must define step {step_name!r} with shell {expected_shell}")
+            if step.get("shell") != expected_shell:
+                raise AssertionError(f"{workflow}: {windows_job} step {step_name!r} must declare shell {expected_shell}, got {step.get('shell')!r}")
+            runs_text = "\n".join(sorted(step.get("runs", set())))
+            if expected_shell == "bash":
+                if step_name == "Build locked release binary":
+                    if "cargo build --locked --release" not in runs_text:
+                        raise AssertionError(f"{workflow}: {windows_job} build step must execute cargo build --locked --release")
+                elif "set -euo pipefail" not in runs_text:
+                    raise AssertionError(f"{workflow}: {windows_job} bash step {step_name!r} must preserve gates with set -euo pipefail")
+            else:
+                if "$ErrorActionPreference" not in runs_text:
+                    raise AssertionError(f"{workflow}: {windows_job} pwsh step {step_name!r} must preserve gates with $ErrorActionPreference")
+        # No run step on Windows runners may omit an explicit shell.
+        for step_name, step in steps.items():
+            if step.get("runs"):
+                if step.get("shell") not in ("bash", "pwsh"):
+                    raise AssertionError(f"{workflow}: {windows_job} run step {step_name!r} must declare an explicit shell (bash or pwsh)")
 
     for attest_job, build_job, expected_artifact in (
         ("attest-macos", "build-macos", "astatine-macos-arm64"),
@@ -1242,7 +1299,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     if "--draft --prerelease --verify-tag" not in raw:
         raise AssertionError(f"{workflow}: gh release create must contain --draft --prerelease --verify-tag on one draft line")
     if (
-        'git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.4.md"' not in raw
+        'git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.5.md"' not in raw
         or 'cp "$tagged_notes" "$out/release-notes.md"' not in raw
     ):
         raise AssertionError(
@@ -1380,8 +1437,8 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         if required not in raw:
             raise AssertionError(f"{workflow}: release workflow must enforce exact-tag and pagination policy {required!r} (M2)")
     for required in (
-        "EXPECTED_RELEASE_TAG: \"v0.1.0-testnet.4\"",
-        "EXPECTED_RELEASE_VERSION: \"0.1.0-testnet.4\"",
+        "EXPECTED_RELEASE_TAG: \"v0.1.0-testnet.5\"",
+        "EXPECTED_RELEASE_VERSION: \"0.1.0-testnet.5\"",
         "owner self-approval",
         "no independent review",
         "must record accepted residual risk",
@@ -1416,7 +1473,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "created release is not a draft",
         "created draft body does not exactly match the reviewed release notes",
         "tagged-release-notes.md",
-        "git show \"refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.4.md\"",
+        "git show \"refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.5.md\"",
         'test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"',
         "head_repository",
         "does not belong to the canonical repository",
