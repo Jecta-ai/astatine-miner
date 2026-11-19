@@ -1,6 +1,6 @@
 # Release pipeline (manual dispatch only).
 #
-# Dispatch against the exact tag ref refs/tags/v0.1.0-testnet.5 via
+# Dispatch against the exact tag ref refs/tags/v0.1.0-testnet.6 via
 # workflow_dispatch. The release is version-scoped: preflight rejects any other
 # tag so an older `.1` candidate cannot run under this owner self-approval
 # policy.
@@ -24,7 +24,7 @@
 # no independent review claimed. The policy pins the owner reviewer by
 # immutable numeric GitHub user id 86115037 and login; prevent_self_review
 # must be exactly false; can_admins_bypass must be false; and the environment
-# deployment policy must be the exact tag v0.1.0-testnet.5, not a wildcard.
+# deployment policy must be the exact tag v0.1.0-testnet.6, not a wildcard.
 # This reduces separation of duties and is documented as a security tradeoff
 # in the release notes and inventories: the provenance must record accepted
 # residual risk, must record the compromised-owner tradeoff, must be
@@ -44,7 +44,7 @@
 # always) for owner-only creation) and `astatine-release-tags` (exactly
 # update/deletion/non-fast-forward with zero bypass actors, covering exactly
 # refs/tags/v*). Both must be active.
-# Narrowing either ruleset to the single .5 tag or the historical .0/.1/.2/.3/.4
+# Narrowing either ruleset to the single .6 tag or the historical .0/.1/.2/.3/.4/.5
 # list weakens protection for all other v* tags and fails closed.
 # Creation protection is never removed or broadened. Immutable releases must
 # still be enabled by the owner; this workflow does not verify that
@@ -82,7 +82,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Exact release tag; must be v0.1.0-testnet.5 for this revision
+        description: Exact release tag; must be v0.1.0-testnet.6 for this revision
         required: true
         type: string
 
@@ -96,8 +96,8 @@ concurrency:
 env:
   RUSTUP_TOOLCHAIN: "1.94.1"
   RELEASE_TAG: ${{ inputs.tag }}
-  EXPECTED_RELEASE_TAG: "v0.1.0-testnet.5"
-  EXPECTED_RELEASE_VERSION: "0.1.0-testnet.5"
+  EXPECTED_RELEASE_TAG: "v0.1.0-testnet.6"
+  EXPECTED_RELEASE_VERSION: "0.1.0-testnet.6"
 
 jobs:
   preflight:
@@ -214,8 +214,8 @@ jobs:
           if repository != "Jecta-ai/astatine-miner":
               print("split ruleset source must be the canonical repository", file=sys.stderr)
               sys.exit(1)
-          if tag != "v0.1.0-testnet.5":
-              print("preflight tag must be exactly v0.1.0-testnet.5", file=sys.stderr)
+          if tag != "v0.1.0-testnet.6":
+              print("preflight tag must be exactly v0.1.0-testnet.6", file=sys.stderr)
               sys.exit(1)
           creation = json.load(open(creation_path, encoding="utf-8"))
           immutability = json.load(open(immutability_path, encoding="utf-8"))
@@ -943,8 +943,8 @@ jobs:
           test -f "$out/SHA256SUMS"
           test -f "$out/release-provenance.json"
           tagged_notes="$RUNNER_TEMP/tagged-release-notes.md"
-          git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.5.md" > "$tagged_notes"
-          cmp support/release/RELEASE_NOTES-v0.1.0-testnet.5.md "$tagged_notes"
+          git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.6.md" > "$tagged_notes"
+          cmp support/release/RELEASE_NOTES-v0.1.0-testnet.6.md "$tagged_notes"
           cp "$tagged_notes" "$out/release-notes.md"
           test -f "$out/release-notes.md"
           if ls "$out" | grep -Ei 'fixture|provenance\.json'; then
@@ -1200,14 +1200,14 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $archive = Get-Item "bundle/astatine-*-windows-x86_64.zip"
+          $archive = Get-Item -Path "bundle/astatine-*-windows-x86_64.zip"
           if (@($archive).Count -ne 1) { throw 'expected exactly one Windows archive in the bundle' }
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead($archive.FullName)
           try {
             $names = @($zip.Entries | ForEach-Object { $_.FullName })
           } finally { $zip.Dispose() }
-          $root = "astatine-$env:RELEASE_TAG-windows-x86_64/"
+          $root = "astatine-$env:RELEASE_TAG-windows-x86_64"
           $expected = @(
             "$root/astatine.exe",
             "$root/LICENSE-MIT",
@@ -1216,23 +1216,33 @@ jobs:
             "$root/INSTALL.md"
           )
           foreach ($name in $expected) {
+            if ($name -match '//') { throw "invalid expected member (double slash): $name" }
+          }
+          foreach ($name in $names) {
+            if ($name.Contains('\')) { throw "unsafe archive member (backslash): $name" }
+            if ($name.StartsWith('/')) { throw "unsafe archive member (absolute): $name" }
+            if ($name -match '(^|/)\.\.(/|$)') { throw "unsafe archive member (traversal): $name" }
+          }
+          foreach ($name in $expected) {
             if ($names -notcontains $name) { throw "archive member missing: $name" }
           }
           foreach ($name in $names) {
             if ($expected -notcontains $name) { throw "unexpected archive member: $name" }
           }
           $sandbox = Join-Path $env:RUNNER_TEMP 'win-archive-smoke'
-          if (Test-Path $sandbox) { Remove-Item $sandbox -Recurse -Force }
+          if (Test-Path -LiteralPath $sandbox) { Remove-Item -LiteralPath $sandbox -Recurse -Force }
           New-Item -ItemType Directory -Path $sandbox | Out-Null
-          Expand-Archive -Path $archive.FullName -DestinationPath $sandbox -Force
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $sandbox -Force
       - name: Smoke test packaged Windows executable (no wallet, no network)
         shell: pwsh
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $exe = Join-Path $env:RUNNER_TEMP "win-archive-smoke/astatine-$env:RELEASE_TAG-windows-x86_64/astatine.exe"
-          if (-not (Test-Path $exe)) { throw 'packaged executable missing after extraction' }
+          $smokeRoot = Join-Path $env:RUNNER_TEMP 'win-archive-smoke'
+          $rootDir = Join-Path $smokeRoot "astatine-$env:RELEASE_TAG-windows-x86_64"
+          $exe = Join-Path $rootDir 'astatine.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw 'packaged executable missing after extraction' }
           $env:APPDATA = Join-Path $env:RUNNER_TEMP 'win-archive-smoke-profile'
           $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'win-archive-smoke-profile'
           New-Item -ItemType Directory -Force -Path $env:APPDATA | Out-Null
@@ -1277,8 +1287,8 @@ jobs:
           import json
           import sys
           env_path, policies_path, tag = sys.argv[1], sys.argv[2], sys.argv[3]
-          if tag != "v0.1.0-testnet.5":
-              print("draft tag must be exactly v0.1.0-testnet.5", file=sys.stderr)
+          if tag != "v0.1.0-testnet.6":
+              print("draft tag must be exactly v0.1.0-testnet.6", file=sys.stderr)
               sys.exit(1)
           env_data = json.load(open(env_path, encoding="utf-8"))
           if env_data.get("name") != "release":
@@ -1406,20 +1416,20 @@ jobs:
           expected_tag = sys.argv[4]
 
           expected = {
-              "astatine-v0.1.0-testnet.5-macos-arm64.tar.gz": (
-                  "astatine-v0.1.0-testnet.5-macos-arm64",
+              "astatine-v0.1.0-testnet.6-macos-arm64.tar.gz": (
+                  "astatine-v0.1.0-testnet.6-macos-arm64",
                   "aarch64-apple-darwin",
                   "astatine",
                   False,
               ),
-              "astatine-v0.1.0-testnet.5-linux-x86_64.tar.gz": (
-                  "astatine-v0.1.0-testnet.5-linux-x86_64",
+              "astatine-v0.1.0-testnet.6-linux-x86_64.tar.gz": (
+                  "astatine-v0.1.0-testnet.6-linux-x86_64",
                   "x86_64-unknown-linux-gnu",
                   "astatine",
                   False,
               ),
-              "astatine-v0.1.0-testnet.5-windows-x86_64.zip": (
-                  "astatine-v0.1.0-testnet.5-windows-x86_64",
+              "astatine-v0.1.0-testnet.6-windows-x86_64.zip": (
+                  "astatine-v0.1.0-testnet.6-windows-x86_64",
                   "x86_64-pc-windows-msvc",
                   "astatine.exe",
                   True,

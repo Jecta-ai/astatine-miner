@@ -23,7 +23,7 @@ DRY_RUN_WORKFLOW_FILENAME = "linux-release-dry-run.yml"
 RELEASE_WORKFLOW_FILENAME = "release.yml"
 # Pinned SHA-256 of .github/workflows/release.yml. Update only after review.
 # Recompute with: python3 -B support/check_workflow_pins.py --print-release-sha256
-RELEASE_WORKFLOW_SHA256 = "2bf5e43ad6106f66751d597cc82cf020b038b6ea6e228b7b302685940af0a2d4"
+RELEASE_WORKFLOW_SHA256 = "6ec5dabb9592cb6dc20eb358662d0d97f4b2bac7471eb24e8a721c623cff2da2"
 PINNED_RELEASE_ACTIONS = {
     "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
     "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
@@ -1299,7 +1299,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
     if "--draft --prerelease --verify-tag" not in raw:
         raise AssertionError(f"{workflow}: gh release create must contain --draft --prerelease --verify-tag on one draft line")
     if (
-        'git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.5.md"' not in raw
+        'git show "refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.6.md"' not in raw
         or 'cp "$tagged_notes" "$out/release-notes.md"' not in raw
     ):
         raise AssertionError(
@@ -1437,8 +1437,8 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         if required not in raw:
             raise AssertionError(f"{workflow}: release workflow must enforce exact-tag and pagination policy {required!r} (M2)")
     for required in (
-        "EXPECTED_RELEASE_TAG: \"v0.1.0-testnet.5\"",
-        "EXPECTED_RELEASE_VERSION: \"0.1.0-testnet.5\"",
+        "EXPECTED_RELEASE_TAG: \"v0.1.0-testnet.6\"",
+        "EXPECTED_RELEASE_VERSION: \"0.1.0-testnet.6\"",
         "owner self-approval",
         "no independent review",
         "must record accepted residual risk",
@@ -1473,7 +1473,7 @@ def validate_release_workflow(contents: str, workflow: pathlib.Path) -> None:
         "created release is not a draft",
         "created draft body does not exactly match the reviewed release notes",
         "tagged-release-notes.md",
-        "git show \"refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.5.md\"",
+        "git show \"refs/tags/$tag:support/release/RELEASE_NOTES-v0.1.0-testnet.6.md\"",
         'test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"',
         "head_repository",
         "does not belong to the canonical repository",

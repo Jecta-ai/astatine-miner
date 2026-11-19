@@ -32,7 +32,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 BUILDER_PATH = ROOT / "support" / "release" / "build-release.py"
 
-TAG = "v0.1.0-testnet.5"
+TAG = "v0.1.0-testnet.6"
 COMMIT_PLACEHOLDER = "0123456789abcdef0123456789abcdef01234567"
 LEGIT_RUSTC_LINE = "rustc 1.94.1 (e408947bf 2026-03-25)"
 LEGIT_CARGO_LINE = "cargo 1.94.1 (29ea6fb6a 2026-03-24)"
@@ -151,7 +151,7 @@ class ReleaseProvenanceSchemaTests(unittest.TestCase):
             "support/update-genesis-coordinator-fixture.py",
             "support/release/RELEASE_NOTES-v0.1.0-testnet.1.md",
             "support/release/RELEASE_NOTES-v0.1.0-testnet.2.md",
-            "support/release/RELEASE_NOTES-v0.1.0-testnet.5.md",
+            "support/release/RELEASE_NOTES-v0.1.0-testnet.6.md",
         ):
             src = ROOT / rel
             if not src.is_file():
