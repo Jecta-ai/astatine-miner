@@ -1,6 +1,6 @@
 # Windows x86_64 manual installation
 
-This guide describes the `v0.1.0-testnet.5` Windows x86_64 Testnet prerelease
+This guide describes the `v0.1.0-testnet.6` Windows x86_64 Testnet prerelease
 candidate. Confirm that the release has actually been published and read back
 its authenticated release record before downloading. This guide is not evidence
 that a release or its attestations exist.
@@ -14,8 +14,8 @@ these values from this guide, a checksum, an older binary, or the checkout.
 Run each verification command and stop on any failure or mismatch.
 
 ```powershell
-$tag = "v0.1.0-testnet.5"
-$asset = "astatine-v0.1.0-testnet.5-windows-x86_64.zip"
+$tag = "v0.1.0-testnet.6"
+$asset = "astatine-v0.1.0-testnet.6-windows-x86_64.zip"
 # Set these from the authenticated release record after read-back.
 # $repo, $repoId, $sourceCommit, $signerWorkflow
 $sourceDigest = $sourceCommit
@@ -49,7 +49,7 @@ substitute for reviewing the release record.
 ## Inspect and install without elevation
 
 List the ZIP contents before extraction. The expected single root is
-`astatine-v0.1.0-testnet.5-windows-x86_64/`, containing exactly five entries:
+`astatine-v0.1.0-testnet.6-windows-x86_64/`, containing exactly five entries:
 `astatine.exe`, `LICENSE-MIT`, `THIRD_PARTY_LICENSES.md`,
 `BUILD-INFO.json`, and `INSTALL.md`. The archive records Unix-style modes
 in its ZIP metadata (`astatine.exe` 0755, the other four files 0644); these
@@ -65,10 +65,10 @@ tar -tf $asset
 # Or PowerShell:
 # Expand-Archive -Path $asset -DestinationPath "$env:USERPROFILE\astatine-inspect" -WhatIf
 
-$extractDir = "$env:USERPROFILE\astatine-v0.1.0-testnet.5-windows-x86_64"
+$extractDir = "$env:USERPROFILE\astatine-v0.1.0-testnet.6-windows-x86_64"
 New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
 Expand-Archive -Path $asset -DestinationPath $extractDir -Force
-$verified = "$extractDir\astatine-v0.1.0-testnet.5-windows-x86_64"
+$verified = "$extractDir\astatine-v0.1.0-testnet.6-windows-x86_64"
 
 $destDir = "$env:USERPROFILE\.local\bin"
 New-Item -ItemType Directory -Force -Path $destDir | Out-Null
@@ -78,7 +78,7 @@ Copy-Item "$verified\astatine.exe" -Destination "$destDir\astatine.exe"
 & "$destDir\astatine.exe" --help
 ```
 
-Require `astatine 0.1.0-testnet.5` and recheck the installed executable's
+Require `astatine 0.1.0-testnet.6` and recheck the installed executable's
 approved digest. Keep both license notices with the installation records.
 These version/help checks do not create or unlock a wallet, start mining, or
 contact an RPC endpoint.

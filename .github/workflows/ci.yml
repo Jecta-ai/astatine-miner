@@ -5,7 +5,7 @@ name: Rust CI
 
 on:
   push:
-    branches: [main, release/v0.1.0-testnet.5]
+    branches: [main, release/v0.1.0-testnet.6]
   pull_request:
     branches: [main]
 
@@ -18,7 +18,7 @@ env:
 jobs:
   ruleset-bypass-visibility:
     name: Ruleset bypass actor visibility (diagnostic)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/release/v0.1.0-testnet.5'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/release/v0.1.0-testnet.6'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     continue-on-error: true
@@ -233,6 +233,146 @@ jobs:
             exit 1
           fi
           echo "Windows safe tests used an isolated APPDATA; real Credential Manager was not accessed"
+
+  windows-archive-validation:
+    name: Windows archive validation (release script verbatim, native)
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build fixtures and extract exact release script verbatim
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = 'v0.1.0-testnet.6'
+          $fixtures = Join-Path $env:RUNNER_TEMP 'win-archive-fixtures'
+          if (Test-Path -LiteralPath $fixtures) { Remove-Item -LiteralPath $fixtures -Recurse -Force }
+          New-Item -ItemType Directory -Path $fixtures | Out-Null
+          $genPy = Join-Path $env:RUNNER_TEMP 'make-win-fixtures.py'
+          if (Test-Path -LiteralPath $genPy) { Remove-Item -LiteralPath $genPy -Force }
+          $genCode = @'
+          import pathlib
+          import sys
+          import zipfile
+          out = pathlib.Path(sys.argv[1])
+          tag = sys.argv[2]
+          root = f"astatine-{tag}-windows-x86_64"
+          members = {
+              f"{root}/astatine.exe": b"fake-pe-binary-for-validation-only",
+              f"{root}/LICENSE-MIT": b"MIT license placeholder\n",
+              f"{root}/THIRD_PARTY_LICENSES.md": b"# Third party notices placeholder\n",
+              f"{root}/BUILD-INFO.json": b'{"synthetic": true}\n',
+              f"{root}/INSTALL.md": b"# Install placeholder\n",
+          }
+          def write_zip(path, member_dict):
+              items = sorted(member_dict.items())
+              with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+                  for name, data in items:
+                      info = zipfile.ZipInfo(filename=name)
+                      info.date_time = (1980, 1, 1, 0, 0, 0)
+                      info.compress_type = zipfile.ZIP_DEFLATED
+                      info.create_system = 3
+                      mode = 0o755 if name.endswith("astatine.exe") else 0o644
+                      info.external_attr = (mode & 0xFFFF) << 16
+                      zf.writestr(info, data)
+          write_zip(out / "positive.zip", members)
+          missing = {k: v for k, v in members.items() if not k.endswith("INSTALL.md")}
+          write_zip(out / "neg-missing.zip", missing)
+          extra = dict(members)
+          extra[f"{root}/evil.exe"] = b"unexpected"
+          write_zip(out / "neg-extra.zip", extra)
+          doubleslash = {}
+          for k, v in members.items():
+              if k.endswith("astatine.exe"):
+                  doubleslash[k.replace(f"{root}/", f"{root}//", 1)] = v
+              else:
+                  doubleslash[k] = v
+          write_zip(out / "neg-doubleslash.zip", doubleslash)
+          backslash = dict(members)
+          backslash[f"{root}\\evil.exe"] = b"unexpected"
+          write_zip(out / "neg-backslash.zip", backslash)
+          traversal = dict(members)
+          traversal[f"{root}/../evil.exe"] = b"unexpected"
+          write_zip(out / "neg-traversal.zip", traversal)
+          absolute = dict(members)
+          absolute["/absolute-evil.exe"] = b"unexpected"
+          write_zip(out / "neg-absolute.zip", absolute)
+          print("synthetic ZIPs created")
+          '@
+          Set-Content -LiteralPath $genPy -Value $genCode -Encoding utf8
+          $pyCmd = $null
+          foreach ($candidate in @('python3', 'python', 'py')) {
+            $found = Get-Command $candidate -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $pyCmd = $found.Source; break }
+          }
+          if (-not $pyCmd) { throw 'no Python interpreter found (python3/python/py)' }
+          if ($pyCmd -like '*py.exe') {
+            & $pyCmd -3 -B $genPy $fixtures $tag
+          } else {
+            & $pyCmd -B $genPy $fixtures $tag
+          }
+          if ($LASTEXITCODE -ne 0) { throw "fixture generation failed ($LASTEXITCODE)" }
+          Get-ChildItem -LiteralPath $fixtures | ForEach-Object { Write-Host $_.FullName }
+          $extracted = Join-Path $env:RUNNER_TEMP 'extracted-smoke.ps1'
+          if (Test-Path -LiteralPath $extracted) { Remove-Item -LiteralPath $extracted -Force }
+          $helper = Join-Path $env:GITHUB_WORKSPACE 'support/release/extract-windows-smoke.py'
+          if (-not (Test-Path -LiteralPath $helper)) { throw "extractor missing: $helper" }
+          if ($pyCmd -like '*py.exe') {
+            & $pyCmd -3 -B $helper --workflow .github/workflows/release.yml --out $extracted
+          } else {
+            & $pyCmd -B $helper --workflow .github/workflows/release.yml --out $extracted
+          }
+          if ($LASTEXITCODE -ne 0) { throw "extraction failed ($LASTEXITCODE)" }
+          if (-not (Test-Path -LiteralPath $extracted)) { throw "extracted script missing after extraction" }
+          $content = Get-Content -LiteralPath $extracted -Raw
+          if ($content -notmatch [regex]::Escape('$root = "astatine-$env:RELEASE_TAG-windows-x86_64"')) { throw 'extracted script missing fixed root' }
+          if ($content -match 'windows-x86_64/"') { throw 'trailing slash in extracted script' }
+      - name: Validate positive synthetic archive with exact release script (no execution)
+        shell: pwsh
+        env:
+          RELEASE_TAG: v0.1.0-testnet.6
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $fixtures = Join-Path $env:RUNNER_TEMP 'win-archive-fixtures'
+          $bundleDir = Join-Path $env:GITHUB_WORKSPACE 'bundle'
+          if (Test-Path -LiteralPath $bundleDir) { Remove-Item -LiteralPath $bundleDir -Recurse -Force }
+          New-Item -ItemType Directory -Path $bundleDir | Out-Null
+          Copy-Item -LiteralPath (Join-Path $fixtures 'positive.zip') -Destination (Join-Path $bundleDir "astatine-$tag-windows-x86_64.zip")
+          $extracted = Join-Path $env:RUNNER_TEMP 'extracted-smoke.ps1'
+          if (-not (Test-Path -LiteralPath $extracted)) { throw "extracted script missing: $extracted" }
+          & $extracted
+          $sandbox = Join-Path $env:RUNNER_TEMP 'win-archive-smoke'
+          $rootDir = Join-Path $sandbox "astatine-$tag-windows-x86_64"
+          $exe = Join-Path $rootDir 'astatine.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw 'positive extracted executable missing' }
+          Write-Host 'Positive synthetic archive validated with exact release script (no execution)'
+      - name: Reject invalid synthetic archives with exact release script (no execution)
+        shell: pwsh
+        env:
+          RELEASE_TAG: v0.1.0-testnet.6
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $fixtures = Join-Path $env:RUNNER_TEMP 'win-archive-fixtures'
+          $bundleDir = Join-Path $env:GITHUB_WORKSPACE 'bundle'
+          $extracted = Join-Path $env:RUNNER_TEMP 'extracted-smoke.ps1'
+          $negCases = @('neg-missing.zip', 'neg-extra.zip', 'neg-doubleslash.zip', 'neg-backslash.zip', 'neg-traversal.zip', 'neg-absolute.zip')
+          foreach ($case in $negCases) {
+            if (Test-Path -LiteralPath $bundleDir) { Remove-Item -LiteralPath $bundleDir -Recurse -Force }
+            New-Item -ItemType Directory -Path $bundleDir | Out-Null
+            Copy-Item -LiteralPath (Join-Path $fixtures $case) -Destination (Join-Path $bundleDir "astatine-$tag-windows-x86_64.zip")
+            try {
+              & $extracted
+              throw "negative case unexpectedly passed: $case"
+            } catch {
+              if ($_.Exception.Message -like 'negative case unexpectedly passed*') { throw }
+              Write-Host "Negative case correctly rejected: $case ($($_.Exception.Message))"
+            }
+          }
+          Write-Host 'Invalid synthetic archives rejected with exact release script (no execution)'
 
   dependency-policy:
     name: Dependency, advisory, and license checks

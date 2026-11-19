@@ -13,7 +13,7 @@ scoped to ``refs/tags/v*`` with no exclusions:
 
 This preserves the breadth of the live tag protection, which restricts
 creation/update/deletion for all ``refs/tags/v*``. Narrowing either ruleset
-to the single ``v0.1.0-testnet.5`` tag, or to the historical
+to the single ``v0.1.0-testnet.6`` tag, or to the historical
 ``v0.1.0-testnet.0``/``.1``/``.2``/``.3`` list, weakens protection for all other
 ``v*`` tags and fails closed. Replacing the live ruleset with a narrowed
 candidate would leave future ``v*`` tags unprotected and is rejected.
@@ -38,7 +38,7 @@ again immediately before manual publication: list rulesets with
 ``gh api repos/Jecta-ai/astatine-miner/rulesets?includes_parents=true&per_page=100``,
 fetch each ruleset by id, then run this validator with
 ``--creation-ruleset-json``/``--immutability-ruleset-json`` plus
-``--repository Jecta-ai/astatine-miner --tag v0.1.0-testnet.5``, plus the
+``--repository Jecta-ai/astatine-miner --tag v0.1.0-testnet.6``, plus the
 ``release`` environment and immutable-releases checks. TOCTOU applies:
 environment approvals can delay execution, same-run ``needs`` does NOT inherit
 SHA/tag binding, and the draft remains mutable by writers until publication,
@@ -50,7 +50,7 @@ combined, broadened, narrowed, or bypassable rulesets fail closed.
 Usage:
     python3 -B support/release/verify-tag-ruleset.py \\
         --creation-ruleset-json <json> --immutability-ruleset-json <json> \\
-        --repository Jecta-ai/astatine-miner --tag v0.1.0-testnet.5
+        --repository Jecta-ai/astatine-miner --tag v0.1.0-testnet.6
 """
 
 from __future__ import annotations
@@ -61,10 +61,10 @@ import sys
 from pathlib import Path
 
 EXPECTED_REPOSITORY = "Jecta-ai/astatine-miner"
-EXPECTED_RELEASE_TAG = "v0.1.0-testnet.5"
+EXPECTED_RELEASE_TAG = "v0.1.0-testnet.6"
 # Both composable rulesets must preserve the live breadth: exactly
-# refs/tags/v* with no exclusions. Narrowing to the single .5 tag or to the
-# historical .0/.1/.2/.3/.4 list weakens protection for all other v* tags.
+# refs/tags/v* with no exclusions. Narrowing to the single .6 tag or to the
+# historical .0/.1/.2/.3/.4/.5 list weakens protection for all other v* tags.
 EXPECTED_TAG_SCOPE = ["refs/tags/v*"]
 EXPECTED_CREATION_RULESET_NAME = "astatine-release-tag-creation"
 EXPECTED_IMMUTABILITY_RULESET_NAME = "astatine-release-tags"
@@ -117,7 +117,7 @@ def _validate_common(
     require(isinstance(exclude, list), "ruleset ref_name.exclude must be a list")
     require(
         include == expected_include,
-        "ruleset ref_name.include must be exactly [\"refs/tags/v*\"]; broader, narrower (including the single .5 tag or the historical .0/.1/.2/.3/.4 list), or additional scopes are rejected",
+        "ruleset ref_name.include must be exactly [\"refs/tags/v*\"]; broader, narrower (including the single .6 tag or the historical .0/.1/.2/.3/.4/.5 list), or additional scopes are rejected",
     )
     require(
         exclude == [],

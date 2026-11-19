@@ -27,7 +27,7 @@ import yaml
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 STEP_NAME = "Verify packaged binaries match attested compiled binaries"
-TAG = "v0.1.0-testnet.5"
+TAG = "v0.1.0-testnet.6"
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 MACOS_BINARY = (
@@ -49,22 +49,22 @@ WINDOWS_BINARY = (
 )
 
 TARGETS = {
-    "astatine-v0.1.0-testnet.5-macos-arm64.tar.gz": (
-        "astatine-v0.1.0-testnet.5-macos-arm64",
+    "astatine-v0.1.0-testnet.6-macos-arm64.tar.gz": (
+        "astatine-v0.1.0-testnet.6-macos-arm64",
         "aarch64-apple-darwin",
         MACOS_BINARY,
         "astatine",
         False,
     ),
-    "astatine-v0.1.0-testnet.5-linux-x86_64.tar.gz": (
-        "astatine-v0.1.0-testnet.5-linux-x86_64",
+    "astatine-v0.1.0-testnet.6-linux-x86_64.tar.gz": (
+        "astatine-v0.1.0-testnet.6-linux-x86_64",
         "x86_64-unknown-linux-gnu",
         LINUX_BINARY,
         "astatine",
         False,
     ),
-    "astatine-v0.1.0-testnet.5-windows-x86_64.zip": (
-        "astatine-v0.1.0-testnet.5-windows-x86_64",
+    "astatine-v0.1.0-testnet.6-windows-x86_64.zip": (
+        "astatine-v0.1.0-testnet.6-windows-x86_64",
         "x86_64-pc-windows-msvc",
         WINDOWS_BINARY,
         "astatine.exe",

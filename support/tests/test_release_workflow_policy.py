@@ -665,7 +665,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
     def test_tag_policy_safe_forms_required(self) -> None:
         # M2: validator in preflight/package + inline exact-tag in draft; no wildcard.
         self.assertIn("support/release/verify-protected-environment.py", self.real_text)
-        self.assertIn('"v0.1.0-testnet.5"', self.real_text)
+        self.assertIn('"v0.1.0-testnet.6"', self.real_text)
         self.assertNotIn('"v0.1.0-testnet.*"', self.real_text)
         self.assertNotIn('"v*",', self.real_text)
         self.assertIn("deployment-branch-policies", self.real_text)
@@ -1370,7 +1370,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         return run.split(marker, 1)[1].rsplit("\nPY\n", 1)[0]
 
     def _run_draft_env_inline(self, env: dict, policies: dict) -> subprocess.CompletedProcess:
-        tag = "v0.1.0-testnet.5"
+        tag = "v0.1.0-testnet.6"
         env_path = self.tmp / "inline-env.json"
         policies_path = self.tmp / "inline-policies.json"
         env_path.write_text(json.dumps(env), encoding="utf-8")
@@ -1407,7 +1407,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
     def _valid_inline_policies() -> dict:
         return {
             "total_count": 1,
-            "branch_policies": [{"type": "tag", "name": "v0.1.0-testnet.5"}],
+            "branch_policies": [{"type": "tag", "name": "v0.1.0-testnet.6"}],
         }
 
     def test_draft_inline_env_accepts_owner_self_approval(self) -> None:
@@ -1513,7 +1513,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
                 str(creation_path),
                 str(immutability_path),
                 "Jecta-ai/astatine-miner",
-                "v0.1.0-testnet.5",
+                "v0.1.0-testnet.6",
             ],
             input=self._draft_ruleset_inline_script(),
             capture_output=True,
@@ -1543,11 +1543,11 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
     def test_draft_inline_rulesets_reject_2_only_immutability_scope(self) -> None:
-        # Narrowing immutability to the single .5 tag weakens protection for
+        # Narrowing immutability to the single .6 tag weakens protection for
         # all other v* tags and must fail closed.
         immutability = self._valid_immutability_ruleset()
         immutability["conditions"]["ref_name"]["include"] = [
-            "refs/tags/v0.1.0-testnet.5"
+            "refs/tags/v0.1.0-testnet.6"
         ]
         result = self._run_draft_ruleset_inline(
             self._valid_creation_ruleset(), immutability
@@ -1555,11 +1555,11 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
     def test_draft_inline_rulesets_reject_2_only_creation_scope(self) -> None:
-        # Narrowing creation to the single .5 tag weakens protection for all
+        # Narrowing creation to the single .6 tag weakens protection for all
         # other v* tags and must fail closed.
         creation = self._valid_creation_ruleset()
         creation["conditions"]["ref_name"]["include"] = [
-            "refs/tags/v0.1.0-testnet.5"
+            "refs/tags/v0.1.0-testnet.6"
         ]
         result = self._run_draft_ruleset_inline(
             creation, self._valid_immutability_ruleset()
@@ -1567,7 +1567,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
     def test_draft_inline_rulesets_reject_historical_list_scope(self) -> None:
-        # The historical .0/.1/.2/.3/.4 list is narrower than v* and must fail.
+        # The historical .0/.1/.2/.3/.4/.5 list is narrower than v* and must fail.
         immutability = self._valid_immutability_ruleset()
         immutability["conditions"]["ref_name"]["include"] = [
             "refs/tags/v0.1.0-testnet.0",
@@ -1619,7 +1619,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             json.dumps(
                 {
                     "isDraft": is_draft,
-                    "tagName": "v0.1.0-testnet.5",
+                    "tagName": "v0.1.0-testnet.6",
                     "body": body,
                     "assets": [],
                 }
@@ -1631,7 +1631,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
                 sys.executable,
                 "-",
                 str(data_path),
-                "v0.1.0-testnet.5",
+                "v0.1.0-testnet.6",
                 str(notes_path),
             ],
             input=self._draft_body_inline_script(),
@@ -1651,7 +1651,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
             json.dumps(
                 {
                     "isDraft": True,
-                    "tagName": "v0.1.0-testnet.5",
+                    "tagName": "v0.1.0-testnet.6",
                     "body": "tampered notes\n",
                     "assets": [],
                 }
@@ -1663,7 +1663,7 @@ class ReleaseWorkflowPolicyTest(unittest.TestCase):
                 sys.executable,
                 "-",
                 str(data_path),
-                "v0.1.0-testnet.5",
+                "v0.1.0-testnet.6",
                 str(notes_path),
             ],
             input=self._draft_body_inline_script(),
