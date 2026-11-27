@@ -2030,8 +2030,10 @@ impl NetworkClient {
             ast_token,
             ast_decimals,
             genesis_activator,
-            revenue_handler,
+            safer_a,
+            safer_b,
             revenue_recipient,
+            setup_locked,
             allocation,
             initial_reward,
             initial_target,
@@ -2060,16 +2062,18 @@ impl NetworkClient {
                 AstatineMinerRead::genesisActivatorCall {},
                 block
             ),
+            call_contract(endpoint, address, AstatineMinerRead::saferACall {}, block),
+            call_contract(endpoint, address, AstatineMinerRead::saferBCall {}, block),
             call_contract(
                 endpoint,
                 address,
-                AstatineMinerRead::revenueHandlerCall {},
+                AstatineMinerRead::revenueRecipientCall {},
                 block
             ),
             call_contract(
                 endpoint,
                 address,
-                AstatineMinerRead::revenueRecipientCall {},
+                AstatineMinerRead::setupLockedCall {},
                 block
             ),
             call_contract(
@@ -2158,10 +2162,11 @@ impl NetworkClient {
             && decode_return::<u64>(&ast_decimals)? == u64::from(config.expected_ast_decimals)
             && decode_return::<Address>(&genesis_activator)?
                 == parse_address(&coordinator.address)?
-            && decode_return::<Address>(&revenue_handler)?
-                == parse_address(&config.revenue_handler)?
+            && decode_return::<Address>(&safer_a)? == parse_address(&config.safer_a)?
+            && decode_return::<Address>(&safer_b)? == parse_address(&config.safer_b)?
             && decode_return::<Address>(&revenue_recipient)?
                 == parse_address(&config.revenue_recipient)?
+            && decode_return::<bool>(&setup_locked)?
             && decode_return::<U256>(&allocation)?
                 == U256::from_str(&config.per_node_allocation_base_units)?
             && decode_return::<U256>(&initial_reward)?
@@ -3145,7 +3150,7 @@ async fn fetch_node(
     address: Address,
     block: &BlockSnapshot,
 ) -> Result<NodeState> {
-    let (work_bytes, candidate_bytes, mining_bytes, paused_bytes) = tokio::try_join!(
+    let (work_bytes, candidate_bytes, mining_bytes) = tokio::try_join!(
         call_contract(
             endpoint,
             address,
@@ -3164,17 +3169,13 @@ async fn fetch_node(
             AstatineMinerRead::miningStateCall {},
             block.number
         ),
-        call_contract(
-            endpoint,
-            address,
-            AstatineMinerRead::miningPausedCall {},
-            block.number
-        ),
     )?;
     let work = decode_work(&work_bytes)?;
     let candidate = decode_candidate(&candidate_bytes)?;
     let mining = decode_mining(&mining_bytes)?;
-    let mining_paused = decode_return::<bool>(&paused_bytes)?;
+    // The deployed contract removed the mining pause control. Keep the local
+    // field false for status/UI compatibility; no on-chain paused() call exists.
+    let mining_paused = false;
     validate_coherent_state(&work, &mining)?;
     if work.submission_fee != U256::from(SUBMISSION_FEE_WEI) {
         bail!("on-chain submission fee does not match the 0.003 INJ protocol constant");
