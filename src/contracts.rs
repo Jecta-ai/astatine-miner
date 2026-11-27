@@ -47,14 +47,15 @@ alloy_sol_types::sol! {
         function work() external view returns (WorkInfo memory);
         function candidateSummary() external view returns (CandidateInfo memory);
         function miningState() external view returns (MiningInfo memory);
-        function miningPaused() external view returns (bool);
         function hasBest() external view returns (bool);
         function astToken() external view returns (address);
         function astDecimals() external view returns (uint8);
         function owner() external view returns (address);
         function genesisActivator() external view returns (address);
-        function revenueHandler() external view returns (address);
+        function saferA() external view returns (address);
+        function saferB() external view returns (address);
         function revenueRecipient() external view returns (address);
+        function setupLocked() external view returns (bool);
         function allocationBaseUnits() external view returns (uint256);
         function initialReward() external view returns (uint256);
         function initialTarget() external view returns (uint256);

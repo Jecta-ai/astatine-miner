@@ -248,7 +248,7 @@ A dishonest selected RPC can also make still-live transactions appear settled an
 
 ## Bundled Testnet deployment
 
-The bundled Testnet manifest pins chain `1439`, the AST token `0x5C730A3110a565bf388120ce64F37bb7dd0c7F83`, nine miner contracts, and their configured Genesis Coordinator. The miners are pinned to source commit `80e8f7cbeb21b18bc5f7475d8b751c9d9e8fb9d1`; the Coordinator is pinned to source commit `c710b4d7add5f10de326487d0ff851eb926499c6`. Startup verifies runtime hashes, token identity, miner constructor parameters, the `0.003 INJ` submission fee, and the Coordinator's configured owner, token, and ordered node list. The deployed miners are initially unstarted; the CLI displays `WAIT GENESIS` and never activates Genesis. Mainnet remains read-only.
+The bundled Testnet manifest pins chain `1439`, the AST token `0x8D1d98b79C45e59fF69b38E1162977B1329e7D86`, nine miner contracts, and their configured Genesis Coordinator. The miners are pinned to the deployed source commit `21bc1c4a05f0d528312236c48a2aa94485c1f75f` (canonical `main` source identity `2daaf73695e27d8eaa7ba6d8a5ebd0547097afe8`); the Coordinator is pinned to source commit `21bc1c4a05f0d528312236c48a2aa94485c1f75f`. Startup verifies runtime hashes, token identity, miner configuration and current governance/revenue role state, the `0.003 INJ` submission fee, and the Coordinator's configured owner, token, and ordered node list. The deployed miners are already active; the CLI never activates Genesis. Inactive or unstarted nodes still display `WAIT GENESIS`. Mainnet remains read-only.
 
 ## Repository checks
 
